@@ -8,6 +8,7 @@ use dre::PacketState;
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
 const RTO_K: f64 = 1.5;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
+const MAX_NUM_REUSED_BUFFERS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct PacketSendSpace {
@@ -15,6 +16,7 @@ pub struct PacketSendSpace {
     transmitting: BTreeMap<u64, TransmittingPacket>,
     min_rtt: Duration,
     smooth_rtt: Duration,
+    reused_buf: Vec<Vec<u8>>,
 }
 impl PacketSendSpace {
     pub fn new() -> Self {
@@ -23,7 +25,12 @@ impl PacketSendSpace {
             transmitting: BTreeMap::new(),
             min_rtt: Duration::MAX,
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
+            reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
         }
+    }
+
+    pub fn reuse_buf(&mut self) -> Option<Vec<u8>> {
+        self.reused_buf.pop()
     }
 
     pub fn ack(&mut self, seq: &[u64], acked: &mut Vec<PacketState>, now: Instant) {
@@ -37,6 +44,11 @@ impl PacketSendSpace {
                 let smooth_rtt = self.smooth_rtt.as_secs_f64() * (1. - SMOOTH_RTT_ALPHA)
                     + rtt.as_secs_f64() * SMOOTH_RTT_ALPHA;
                 self.smooth_rtt = Duration::from_secs_f64(smooth_rtt);
+            }
+            if self.reused_buf.len() != self.reused_buf.capacity() {
+                let mut buf = p.data;
+                buf.clear();
+                self.reused_buf.push(buf);
             }
             acked.push(p.stats);
         }

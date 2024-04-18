@@ -75,10 +75,11 @@ impl ReliableLayer {
         let stats = self
             .connection_stats
             .send_packet_2(now, self.packet_send_space.no_packets_in_flight());
-        let data = self
-            .send_data_buf
-            .drain(..packet_bytes.get())
-            .collect::<Vec<u8>>();
+
+        let mut buf = self.packet_send_space.reuse_buf().unwrap_or_default();
+        let data = self.send_data_buf.drain(..packet_bytes.get());
+        buf.extend(data);
+        let data = buf;
 
         packet[..data.len()].copy_from_slice(&data);
         let p = self.packet_send_space.send(data, stats, now);
