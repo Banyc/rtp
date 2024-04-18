@@ -1,7 +1,8 @@
 [package]
-name = "rtp"
+name = "transport_protocol"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 strict-num = "0.2"
+dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.2" }

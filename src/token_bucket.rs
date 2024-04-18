@@ -22,6 +22,12 @@ impl TokenBucket {
         }
     }
 
+    pub fn tokens(&mut self, now: Instant) -> usize {
+        self.fill_up(now);
+
+        self.tokens
+    }
+
     pub fn set_thruput(&mut self, thruput: NonZeroPositiveF64, now: Instant) {
         self.fill_up(now);
 
