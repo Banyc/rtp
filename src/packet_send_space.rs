@@ -12,7 +12,7 @@ const MAX_NUM_REUSED_BUFFERS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct PacketSendSpace {
-    next_packet: u64,
+    next_seq: u64,
     transmitting: BTreeMap<u64, TransmittingPacket>,
     min_rtt: Duration,
     smooth_rtt: Duration,
@@ -21,7 +21,7 @@ pub struct PacketSendSpace {
 impl PacketSendSpace {
     pub fn new() -> Self {
         Self {
-            next_packet: 0,
+            next_seq: 0,
             transmitting: BTreeMap::new(),
             min_rtt: Duration::MAX,
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
@@ -55,8 +55,8 @@ impl PacketSendSpace {
     }
 
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Packet<'_> {
-        let s = self.next_packet;
-        self.next_packet += 1;
+        let s = self.next_seq;
+        self.next_seq += 1;
 
         let p = TransmittingPacket {
             stats,
