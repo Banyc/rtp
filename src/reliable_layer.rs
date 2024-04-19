@@ -14,6 +14,7 @@ const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
 const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 0.2;
 
+#[derive(Debug, Clone)]
 pub struct ReliableLayer {
     send_data_buf: VecDeque<u8>,
     recv_data_buf: VecDeque<u8>,

@@ -9,3 +9,4 @@ dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.2" }
 strict-num = "0.2"
 tap = "1"
 thiserror = "1"
+tokio = { version = "1", features = ["full"] }

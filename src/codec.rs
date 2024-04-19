@@ -7,14 +7,21 @@ use thiserror::Error;
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
 
-pub fn encode(ack: &[u64], seq: u64, data: &[u8], buf: &mut [u8]) -> Result<usize, EncodeError> {
+pub fn encode(ack: &[u64], data: Option<EncodeData>, buf: &mut [u8]) -> Result<usize, EncodeError> {
     let mut wtr = io::Cursor::new(buf);
     for ack in ack {
         encode_ack(&mut wtr, *ack)?;
     }
-    encode_data(&mut wtr, seq, data)?;
+    if let Some(EncodeData { seq, data }) = data {
+        encode_data(&mut wtr, seq, data)?;
+    }
     let pos = wtr.position();
     Ok(pos as usize)
+}
+#[derive(Debug, Clone)]
+pub struct EncodeData<'a> {
+    pub seq: u64,
+    pub data: &'a [u8],
 }
 
 pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Option<DecodedDataPacket>, DecodeError> {
