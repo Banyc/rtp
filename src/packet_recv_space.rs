@@ -28,6 +28,10 @@ impl PacketRecvSpace {
         self.receiving.insert(seq, data);
     }
 
+    pub fn peak(&mut self) -> Option<&Vec<u8>> {
+        self.receiving.get(&self.next_seq)
+    }
+
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         let p = self.receiving.remove(&self.next_seq)?;
         self.next_seq += 1;

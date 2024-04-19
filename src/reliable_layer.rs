@@ -147,22 +147,26 @@ impl ReliableLayer {
         buf[..n_a].copy_from_slice(&a[..n_a]);
         buf[n_a..read_bytes].copy_from_slice(&b[..n_b]);
         self.recv_data_buf.drain(..read_bytes);
+        self.move_recv_data();
         read_bytes
     }
 
-    /// Return `true` if this packet is acknowledged; otherwise, return `false`
-    pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
-        if self.recv_data_buf.capacity() - self.recv_data_buf.len() < packet.len() {
-            return false;
-        }
+    pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) {
         let mut buf = self.packet_recv_space.reuse_buf().unwrap_or_default();
         buf.extend(packet);
         self.packet_recv_space.recv(seq, buf);
-        if let Some(p) = self.packet_recv_space.pop() {
+        self.move_recv_data();
+    }
+
+    fn move_recv_data(&mut self) {
+        while let Some(p) = self.packet_recv_space.peak() {
+            if self.recv_data_buf.capacity() - self.recv_data_buf.len() < p.len() {
+                return;
+            }
+            let p = self.packet_recv_space.pop().unwrap();
             self.recv_data_buf.extend(&p);
             self.packet_recv_space.return_buf(p);
         }
-        true
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {

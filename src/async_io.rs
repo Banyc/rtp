@@ -192,10 +192,8 @@ impl TransportLayer {
                 let Some(decoded) = decoded else {
                     return Ok(());
                 };
-                let ack = reliable_layer.recv_data_packet(decoded.seq, &udp_buf[decoded.buf_range]);
-                if ack {
-                    ack_to_peer_buf.push(decoded.seq);
-                }
+                reliable_layer.recv_data_packet(decoded.seq, &udp_buf[decoded.buf_range]);
+                ack_to_peer_buf.push(decoded.seq);
             }
         }
 
@@ -283,6 +281,7 @@ impl FirstError {
     }
 }
 
+#[derive(Debug)]
 pub struct AsyncAsyncIo {
     io: AsyncIo,
     no_delay: bool,
@@ -365,5 +364,7 @@ mod tests {
         a.write_all(&send_buf).await.unwrap();
         b.read_exact(&mut recv_buf).await.unwrap();
         assert_eq!(send_buf, recv_buf);
+
+        print!("{:?}", &a);
     }
 }
