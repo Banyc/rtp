@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-strict-num = "0.2"
+byteorder = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.2" }
+strict-num = "0.2"
+tap = "1"
+thiserror = "1"
