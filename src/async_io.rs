@@ -71,7 +71,7 @@ impl AsyncIo {
         }
     }
 
-    pub async fn send(&mut self, data: &[u8], no_delay: bool) -> Result<(), std::io::ErrorKind> {
+    pub async fn send(&mut self, data: &[u8], no_delay: bool) -> Result<usize, std::io::ErrorKind> {
         self.transport_layer
             .send(data, no_delay, &mut self.data_buf, &mut self.udp_buf)
             .await
@@ -216,28 +216,26 @@ impl TransportLayer {
         no_delay: bool,
         data_buf: &mut [u8],
         udp_buf: &mut [u8],
-    ) -> Result<(), std::io::ErrorKind> {
+    ) -> Result<usize, std::io::ErrorKind> {
         let mut sent_data_packet = self.sent_data_packet.notified();
         self.first_error.throw_error()?;
-        let mut written_bytes = 0;
-        loop {
-            {
+        let written_bytes = loop {
+            let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                written_bytes +=
-                    reliable_layer.send_data_buf(&data[written_bytes..], Instant::now());
-            }
+                reliable_layer.send_data_buf(data, Instant::now())
+            };
 
             if no_delay {
                 self.send_packets(data_buf, udp_buf).await?;
             }
 
-            if data.len() == written_bytes {
-                break;
+            if 0 < written_bytes {
+                break written_bytes;
             }
             sent_data_packet.await;
             sent_data_packet = self.sent_data_packet.notified();
-        }
-        Ok(())
+        };
+        Ok(written_bytes)
     }
 
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
@@ -281,5 +279,32 @@ impl FirstError {
             return Err(e.kind());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_async_io() {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+
+        let hello = b"hello";
+        let world = b"world";
+
+        let mut a = AsyncIo::new(a);
+        let mut b = AsyncIo::new(b);
+        a.send(hello, true).await.unwrap();
+        b.send(world, true).await.unwrap();
+
+        let mut recv_buf = [0; BUFFER_SIZE];
+        a.recv(&mut recv_buf).await.unwrap();
+        assert_eq!(&recv_buf[..world.len()], world);
+        b.recv(&mut recv_buf).await.unwrap();
+        assert_eq!(&recv_buf[..hello.len()], hello);
     }
 }
