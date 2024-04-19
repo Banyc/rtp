@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_async_io::{read::AsyncAsyncRead, write::AsyncAsyncWrite};
 use tokio::{net::UdpSocket, task::JoinSet};
 
 use crate::{
@@ -191,7 +192,7 @@ impl TransportLayer {
                 let Some(decoded) = decoded else {
                     return Ok(());
                 };
-                let ack = reliable_layer.recv_data_packet(&udp_buf[decoded.buf_range]);
+                let ack = reliable_layer.recv_data_packet(decoded.seq, &udp_buf[decoded.buf_range]);
                 if ack {
                     ack_to_peer_buf.push(decoded.seq);
                 }
@@ -282,8 +283,42 @@ impl FirstError {
     }
 }
 
+pub struct AsyncAsyncIo {
+    io: AsyncIo,
+    no_delay: bool,
+}
+impl AsyncAsyncIo {
+    pub fn new(no_delay: bool, io: AsyncIo) -> Self {
+        Self { io, no_delay }
+    }
+}
+impl AsyncAsyncRead for AsyncAsyncIo {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.io.recv(buf).await.map_err(std::io::Error::from)
+    }
+}
+impl AsyncAsyncWrite for AsyncAsyncIo {
+    async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.io
+            .send(buf, self.no_delay)
+            .await
+            .map_err(std::io::Error::from)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use async_async_io::{read::PollRead, write::PollWrite};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -306,5 +341,29 @@ mod tests {
         assert_eq!(&recv_buf[..world.len()], world);
         b.recv(&mut recv_buf).await.unwrap();
         assert_eq!(&recv_buf[..hello.len()], hello);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_async_async_io() {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let a = AsyncIo::new(a);
+        let b = AsyncIo::new(b);
+        let a = AsyncAsyncIo::new(true, a);
+        let b = AsyncAsyncIo::new(true, b);
+
+        let mut send_buf = [0; 2 << 16];
+        let mut recv_buf = send_buf;
+
+        for byte in &mut send_buf {
+            *byte = rand::random();
+        }
+        let mut a = PollWrite::new(a);
+        let mut b = PollRead::new(b);
+        a.write_all(&send_buf).await.unwrap();
+        b.read_exact(&mut recv_buf).await.unwrap();
+        assert_eq!(send_buf, recv_buf);
     }
 }

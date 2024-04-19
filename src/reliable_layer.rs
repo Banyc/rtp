@@ -3,7 +3,10 @@ use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 use dre::{ConnectionState, DetectAppLimitedPhaseParams, PacketState};
 use strict_num::NonZeroPositiveF64;
 
-use crate::{packet_send_space::PacketSendSpace, token_bucket::TokenBucket};
+use crate::{
+    packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace,
+    token_bucket::TokenBucket,
+};
 
 const SEND_DATA_BUFFER_LENGTH: usize = 2 << 12;
 const RECV_DATA_BUFFER_LENGTH: usize = 2 << 12;
@@ -21,6 +24,7 @@ pub struct ReliableLayer {
     token_bucket: TokenBucket,
     connection_stats: ConnectionState,
     packet_send_space: PacketSendSpace,
+    packet_recv_space: PacketRecvSpace,
     smooth_delivery_rate: NonZeroPositiveF64,
 
     // Reused buffers
@@ -39,6 +43,7 @@ impl ReliableLayer {
             ),
             connection_stats: ConnectionState::new(now),
             packet_send_space: PacketSendSpace::new(),
+            packet_recv_space: PacketRecvSpace::new(),
             smooth_delivery_rate: NonZeroPositiveF64::new(INIT_SMOOTH_DELIVERY_RATE).unwrap(),
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
@@ -146,11 +151,17 @@ impl ReliableLayer {
     }
 
     /// Return `true` if this packet is acknowledged; otherwise, return `false`
-    pub fn recv_data_packet(&mut self, packet: &[u8]) -> bool {
+    pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
         if self.recv_data_buf.capacity() - self.recv_data_buf.len() < packet.len() {
             return false;
         }
-        self.recv_data_buf.extend(packet);
+        let mut buf = self.packet_recv_space.reuse_buf().unwrap_or_default();
+        buf.extend(packet);
+        self.packet_recv_space.recv(seq, buf);
+        if let Some(p) = self.packet_recv_space.pop() {
+            self.recv_data_buf.extend(&p);
+            self.packet_recv_space.return_buf(p);
+        }
         true
     }
 
