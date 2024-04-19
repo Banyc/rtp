@@ -151,11 +151,15 @@ impl ReliableLayer {
         read_bytes
     }
 
-    pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) {
+    /// Return `false` if the data is rejected due to window capacity
+    pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
         let mut buf = self.packet_recv_space.reuse_buf().unwrap_or_default();
         buf.extend(packet);
-        self.packet_recv_space.recv(seq, buf);
+        if !self.packet_recv_space.recv(seq, buf) {
+            return false;
+        }
         self.move_recv_data();
+        true
     }
 
     fn move_recv_data(&mut self) {

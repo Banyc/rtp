@@ -192,8 +192,10 @@ impl TransportLayer {
                 let Some(decoded) = decoded else {
                     return Ok(());
                 };
-                reliable_layer.recv_data_packet(decoded.seq, &udp_buf[decoded.buf_range]);
-                ack_to_peer_buf.push(decoded.seq);
+                let ack = reliable_layer.recv_data_packet(decoded.seq, &udp_buf[decoded.buf_range]);
+                if ack {
+                    ack_to_peer_buf.push(decoded.seq);
+                }
             }
         }
 

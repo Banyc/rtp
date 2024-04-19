@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+const MAX_NUM_RECEIVING_PACKETS: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct PacketRecvSpace {
     next_seq: u64,
@@ -24,8 +26,14 @@ impl PacketRecvSpace {
         self.reused_buf.push(buf);
     }
 
-    pub fn recv(&mut self, seq: u64, data: Vec<u8>) {
+    /// Return `false` if the data is rejected due to window capacity
+    pub fn recv(&mut self, seq: u64, data: Vec<u8>) -> bool {
+        if self.next_seq + (MAX_NUM_RECEIVING_PACKETS as u64) < seq {
+            self.return_buf(data);
+            return false;
+        }
         self.receiving.insert(seq, data);
+        true
     }
 
     pub fn peak(&mut self) -> Option<&Vec<u8>> {
