@@ -6,7 +6,7 @@ use std::{
 use dre::PacketState;
 
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
-const RTO_K: f64 = 1.5;
+const RTO_K: f64 = 0.5;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
 const MAX_NUM_REUSED_BUFFERS: usize = 64;
 
@@ -125,7 +125,7 @@ struct TransmittingPacket {
 impl TransmittingPacket {
     pub fn rto(&self, smooth_rtt: Duration, now: Instant) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
-        smooth_rtt.as_secs_f64() * RTO_K < sent_elapsed.as_secs_f64()
+        smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K) < sent_elapsed
     }
 }
 

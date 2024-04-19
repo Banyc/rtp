@@ -12,7 +12,7 @@ const MAX_BURST_PACKETS: usize = 12;
 const MSS: usize = 1024;
 const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
-const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 1.2;
+const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 0.2;
 
 pub struct ReliableLayer {
     send_data_buf: VecDeque<u8>,
@@ -115,7 +115,8 @@ impl ReliableLayer {
         };
         let target_deliver_rate = match sr.is_app_limited() {
             true => {
-                let delivery_rate = sr.delivery_rate() * SMOOTH_DELIVERY_RATE_PROBE_K;
+                let delivery_rate =
+                    sr.delivery_rate() + sr.delivery_rate() * SMOOTH_DELIVERY_RATE_PROBE_K;
                 if delivery_rate < self.smooth_delivery_rate.get() {
                     return;
                 }
