@@ -240,8 +240,8 @@ impl TransportLayer {
         udp_buf: &mut [u8],
     ) -> Result<usize, std::io::ErrorKind> {
         let mut sent_data_packet = self.sent_data_packet.notified();
-        self.first_error.throw_error()?;
         let written_bytes = loop {
+            self.first_error.throw_error()?;
             let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_buf(data, Instant::now())
@@ -262,8 +262,8 @@ impl TransportLayer {
 
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
         let mut recv_data_packet = self.recv_data_packet.notified();
-        self.first_error.throw_error()?;
         let read_bytes = loop {
+            self.first_error.throw_error()?;
             {
                 // reliable -{data}> app
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
