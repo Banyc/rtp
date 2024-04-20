@@ -7,7 +7,11 @@ use thiserror::Error;
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
 
-pub fn encode(ack: &[u64], data: Option<EncodeData>, buf: &mut [u8]) -> Result<usize, EncodeError> {
+pub fn encode(
+    ack: &[u64],
+    data: Option<EncodeData<'_>>,
+    buf: &mut [u8],
+) -> Result<usize, EncodeError> {
     let mut wtr = io::Cursor::new(buf);
     for ack in ack {
         encode_ack(&mut wtr, *ack)?;

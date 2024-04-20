@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_async_io::{read::AsyncAsyncRead, write::AsyncAsyncWrite};
+use async_trait::async_trait;
 use tokio::{net::UdpSocket, task::JoinSet};
 
 use crate::{
@@ -20,12 +21,12 @@ const PRINT_DEBUG_MESSAGES: bool = false;
 pub struct AsyncIo {
     transport_layer: Arc<TransportLayer>,
     data_buf: [u8; BUFFER_SIZE],
-    udp_buf: [u8; BUFFER_SIZE],
+    utp_buf: [u8; BUFFER_SIZE],
     _events: Arc<JoinSet<()>>,
 }
 impl AsyncIo {
-    pub fn new(udp: UdpSocket) -> Self {
-        let transport_layer = Arc::new(TransportLayer::new(udp));
+    pub fn new(utp: Box<dyn UnreliableSocket>) -> Self {
+        let transport_layer = Arc::new(TransportLayer::new(utp));
         let mut events = JoinSet::new();
 
         // Send timer
@@ -33,11 +34,11 @@ impl AsyncIo {
             let transport_layer = Arc::clone(&transport_layer);
             async move {
                 let mut data_buf = [0; BUFFER_SIZE];
-                let mut udp_buf = [0; BUFFER_SIZE];
+                let mut utp_buf = [0; BUFFER_SIZE];
                 loop {
                     tokio::time::sleep(TIMER_INTERVAL).await;
                     if transport_layer
-                        .send_packets(&mut data_buf, &mut udp_buf)
+                        .send_packets(&mut data_buf, &mut utp_buf)
                         .await
                         .is_err()
                     {
@@ -51,12 +52,12 @@ impl AsyncIo {
         events.spawn({
             let transport_layer = Arc::clone(&transport_layer);
             async move {
-                let mut udp_buf = [0; BUFFER_SIZE];
+                let mut utp_buf = [0; BUFFER_SIZE];
                 let mut ack_from_peer_buf = vec![];
                 let mut ack_to_peer_buf = vec![];
                 loop {
                     if transport_layer
-                        .recv_packets(&mut udp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
+                        .recv_packets(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                         .await
                         .is_err()
                     {
@@ -69,14 +70,14 @@ impl AsyncIo {
         Self {
             transport_layer,
             data_buf: [0; BUFFER_SIZE],
-            udp_buf: [0; BUFFER_SIZE],
+            utp_buf: [0; BUFFER_SIZE],
             _events: Arc::new(events),
         }
     }
 
     pub async fn send(&mut self, data: &[u8], no_delay: bool) -> Result<usize, std::io::ErrorKind> {
         self.transport_layer
-            .send(data, no_delay, &mut self.data_buf, &mut self.udp_buf)
+            .send(data, no_delay, &mut self.data_buf, &mut self.utp_buf)
             .await
     }
 
@@ -87,22 +88,21 @@ impl AsyncIo {
 
 #[derive(Debug)]
 struct TransportLayer {
-    udp: UdpSocket,
+    utp: Box<dyn UnreliableSocket>,
     reliable_layer: Mutex<ReliableLayer>,
     sent_data_packet: tokio::sync::Notify,
     recv_data_packet: tokio::sync::Notify,
     first_error: FirstError,
 }
 impl TransportLayer {
-    pub fn new(udp: UdpSocket) -> Self {
+    pub fn new(utp: Box<dyn UnreliableSocket>) -> Self {
         let now = Instant::now();
         let reliable_layer = Mutex::new(ReliableLayer::new(now));
-        let udp = udp;
         let sent_data_packet = tokio::sync::Notify::new();
         let recv_data_packet = tokio::sync::Notify::new();
         let first_error = FirstError::new();
         Self {
-            udp,
+            utp,
             reliable_layer,
             sent_data_packet,
             recv_data_packet,
@@ -113,7 +113,7 @@ impl TransportLayer {
     pub async fn send_packets(
         &self,
         data_buf: &mut [u8],
-        udp_buf: &mut [u8],
+        utp_buf: &mut [u8],
     ) -> Result<(), std::io::ErrorKind> {
         let mut written_bytes = 0;
         loop {
@@ -131,14 +131,13 @@ impl TransportLayer {
                 seq: p.seq,
                 data: &data_buf[..p.data_written.get()],
             };
-            let n = encode(&[], Some(data), udp_buf).unwrap();
-            let Err(e) = self.udp.send(&udp_buf[..n]).await else {
+            let n = encode(&[], Some(data), utp_buf).unwrap();
+            let Err(e) = self.utp.send(&utp_buf[..n]).await else {
                 continue;
             };
-            let kind = e.kind();
             self.first_error.set(e);
             self.sent_data_packet.notify_waiters();
-            return Err(kind);
+            return Err(e);
         }
         if 0 < written_bytes {
             if PRINT_DEBUG_MESSAGES {
@@ -151,26 +150,25 @@ impl TransportLayer {
 
     pub async fn recv_packets(
         &self,
-        udp_buf: &mut [u8],
+        utp_buf: &mut [u8],
         ack_from_peer_buf: &mut Vec<u64>,
         ack_to_peer_buf: &mut Vec<u64>,
     ) -> Result<(), std::io::ErrorKind> {
-        let throw_error = |e: std::io::Error| {
-            let kind = e.kind();
+        let throw_error = |e: std::io::ErrorKind| {
             self.first_error.set(e);
             self.recv_data_packet.notify_waiters();
-            kind
+            e
         };
 
         ack_to_peer_buf.clear();
         for _ in 0..MAX_ACK_BATCH_SIZE {
             self.first_error.throw_error()?;
             let res = match ack_to_peer_buf.is_empty() {
-                true => self.udp.recv(udp_buf).await,
+                true => self.utp.recv(utp_buf).await,
                 false => {
-                    let res = self.udp.try_recv(udp_buf);
+                    let res = self.utp.try_recv(utp_buf);
                     if let Err(e) = &res {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                        if *e == std::io::ErrorKind::WouldBlock {
                             break;
                         }
                     }
@@ -188,7 +186,7 @@ impl TransportLayer {
             }
 
             ack_from_peer_buf.clear();
-            let data = match decode(&udp_buf[..read_bytes], ack_from_peer_buf) {
+            let data = match decode(&utp_buf[..read_bytes], ack_from_peer_buf) {
                 Ok(x) => x,
                 Err(_) => continue,
             };
@@ -202,7 +200,7 @@ impl TransportLayer {
 
                 // UDP local -{data}> reliable
                 if let Some(data) = data {
-                    let ack = reliable_layer.recv_data_packet(data.seq, &udp_buf[data.buf_range]);
+                    let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range]);
                     match ack {
                         true => {
                             ack_to_peer_buf.push(data.seq);
@@ -219,9 +217,9 @@ impl TransportLayer {
         }
 
         // reliable -{ACK}> UDP remote
-        let written_bytes = encode(ack_to_peer_buf, None, udp_buf).unwrap();
-        self.udp
-            .send(&udp_buf[..written_bytes])
+        let written_bytes = encode(ack_to_peer_buf, None, utp_buf).unwrap();
+        self.utp
+            .send(&utp_buf[..written_bytes])
             .await
             .map_err(throw_error)?;
         if PRINT_DEBUG_MESSAGES {
@@ -237,7 +235,7 @@ impl TransportLayer {
         data: &[u8],
         no_delay: bool,
         data_buf: &mut [u8],
-        udp_buf: &mut [u8],
+        utp_buf: &mut [u8],
     ) -> Result<usize, std::io::ErrorKind> {
         let mut sent_data_packet = self.sent_data_packet.notified();
         let written_bytes = loop {
@@ -248,7 +246,7 @@ impl TransportLayer {
             };
 
             if no_delay {
-                self.send_packets(data_buf, udp_buf).await?;
+                self.send_packets(data_buf, utp_buf).await?;
             }
 
             if 0 < written_bytes {
@@ -282,9 +280,32 @@ impl TransportLayer {
     }
 }
 
+#[async_trait]
+pub trait UnreliableSocket: core::fmt::Debug + Sync + Send + 'static {
+    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
+
+    fn try_recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
+
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
+}
+#[async_trait]
+impl UnreliableSocket for UdpSocket {
+    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        self.send(buf).await.map_err(|e| e.kind())
+    }
+
+    fn try_recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        self.try_recv(buf).map_err(|e| e.kind())
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        self.recv(buf).await.map_err(|e| e.kind())
+    }
+}
+
 #[derive(Debug)]
 struct FirstError {
-    first_error: RwLock<Option<std::io::Error>>,
+    first_error: RwLock<Option<std::io::ErrorKind>>,
 }
 impl FirstError {
     pub fn new() -> Self {
@@ -292,7 +313,7 @@ impl FirstError {
         Self { first_error }
     }
 
-    pub fn set(&self, err: std::io::Error) {
+    pub fn set(&self, err: std::io::ErrorKind) {
         let mut first_error = self.first_error.write().unwrap();
         if first_error.is_none() {
             *first_error = Some(err);
@@ -302,7 +323,7 @@ impl FirstError {
     pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
         let first_error = self.first_error.read().unwrap();
         if let Some(e) = &*first_error {
-            return Err(e.kind());
+            return Err(*e);
         }
         Ok(())
     }
@@ -357,8 +378,8 @@ mod tests {
         let hello = b"hello";
         let world = b"world";
 
-        let mut a = AsyncIo::new(a);
-        let mut b = AsyncIo::new(b);
+        let mut a = AsyncIo::new(Box::new(a));
+        let mut b = AsyncIo::new(Box::new(b));
         a.send(hello, true).await.unwrap();
         b.send(world, true).await.unwrap();
 
@@ -375,8 +396,8 @@ mod tests {
         let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a = AsyncIo::new(a);
-        let b = AsyncIo::new(b);
+        let a = AsyncIo::new(Box::new(a));
+        let b = AsyncIo::new(Box::new(b));
         let a = AsyncAsyncIo::new(true, a);
         let b = AsyncAsyncIo::new(true, b);
 
