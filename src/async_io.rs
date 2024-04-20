@@ -13,6 +13,8 @@ use crate::{
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(10);
 const BUFFER_SIZE: usize = 1500;
+const MAX_ACK_BATCH_SIZE: usize = 64;
+const PRINT_DEBUG_MESSAGES: bool = false;
 
 #[derive(Debug)]
 pub struct AsyncIo {
@@ -113,9 +115,10 @@ impl TransportLayer {
         data_buf: &mut [u8],
         udp_buf: &mut [u8],
     ) -> Result<(), std::io::ErrorKind> {
-        let mut written = 0;
+        let mut written_bytes = 0;
         loop {
             self.first_error.throw_error()?;
+            // reliable -{data}> UDP remote
             let p = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let Some(p) = reliable_layer.send_data_packet(data_buf, Instant::now()) else {
@@ -123,7 +126,7 @@ impl TransportLayer {
                 };
                 p
             };
-            written += p.data_written.get();
+            written_bytes += p.data_written.get();
             let data = EncodeData {
                 seq: p.seq,
                 data: &data_buf[..p.data_written.get()],
@@ -137,7 +140,10 @@ impl TransportLayer {
             self.sent_data_packet.notify_waiters();
             return Err(kind);
         }
-        if 0 < written {
+        if 0 < written_bytes {
+            if PRINT_DEBUG_MESSAGES {
+                println!("send_packets: data: {written_bytes}");
+            }
             self.sent_data_packet.notify_waiters();
         }
         Ok(())
@@ -157,7 +163,7 @@ impl TransportLayer {
         };
 
         ack_to_peer_buf.clear();
-        loop {
+        for _ in 0..MAX_ACK_BATCH_SIZE {
             self.first_error.throw_error()?;
             let res = match ack_to_peer_buf.is_empty() {
                 true => self.udp.recv(udp_buf).await,
@@ -177,35 +183,50 @@ impl TransportLayer {
                     return Err(throw_error(e));
                 }
             };
+            if PRINT_DEBUG_MESSAGES {
+                println!("recv_packets: recv: {read_bytes}");
+            }
 
             ack_from_peer_buf.clear();
-            let decoded = match decode(&udp_buf[..read_bytes], ack_from_peer_buf) {
+            let data = match decode(&udp_buf[..read_bytes], ack_from_peer_buf) {
                 Ok(x) => x,
-                Err(_) => return Ok(()),
+                Err(_) => continue,
             };
 
             {
                 let now = Instant::now();
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
+
+                // UDP local -{ACK}> reliable
                 reliable_layer.recv_ack_packet(ack_from_peer_buf, now);
 
-                let Some(decoded) = decoded else {
-                    return Ok(());
-                };
-                let ack = reliable_layer.recv_data_packet(decoded.seq, &udp_buf[decoded.buf_range]);
-                if ack {
-                    ack_to_peer_buf.push(decoded.seq);
+                // UDP local -{data}> reliable
+                if let Some(data) = data {
+                    let ack = reliable_layer.recv_data_packet(data.seq, &udp_buf[data.buf_range]);
+                    match ack {
+                        true => {
+                            ack_to_peer_buf.push(data.seq);
+                        }
+                        false => break,
+                    }
                 }
             }
         }
 
-        assert!(!ack_to_peer_buf.is_empty());
+        // No new data received in the reliable layer
+        if ack_to_peer_buf.is_empty() {
+            return Ok(());
+        }
 
+        // reliable -{ACK}> UDP remote
         let written_bytes = encode(ack_to_peer_buf, None, udp_buf).unwrap();
         self.udp
             .send(&udp_buf[..written_bytes])
             .await
             .map_err(throw_error)?;
+        if PRINT_DEBUG_MESSAGES {
+            println!("recv_packets: ack: {ack_to_peer_buf:?}");
+        }
 
         self.recv_data_packet.notify_waiters();
         Ok(())
@@ -244,8 +265,12 @@ impl TransportLayer {
         self.first_error.throw_error()?;
         let read_bytes = loop {
             {
+                // reliable -{data}> app
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let n = reliable_layer.recv_data_buf(data);
+                if PRINT_DEBUG_MESSAGES {
+                    println!("recv: data: {n}");
+                }
                 if 0 < n {
                     break n;
                 }
@@ -355,18 +380,33 @@ mod tests {
         let a = AsyncAsyncIo::new(true, a);
         let b = AsyncAsyncIo::new(true, b);
 
-        let mut send_buf = [0; 2 << 16];
-        let mut recv_buf = send_buf;
+        let mut send_buf = vec![0; 2 << 17];
+        let mut recv_buf = send_buf.clone();
 
         for byte in &mut send_buf {
             *byte = rand::random();
         }
         let mut a = PollWrite::new(a);
         let mut b = PollRead::new(b);
-        a.write_all(&send_buf).await.unwrap();
-        b.read_exact(&mut recv_buf).await.unwrap();
-        assert_eq!(send_buf, recv_buf);
-
-        print!("{:?}", &a);
+        let mut transport = JoinSet::new();
+        let recv_all = Arc::new(tokio::sync::Notify::new());
+        transport.spawn({
+            let send_buf = send_buf.clone();
+            let recv_all = recv_all.clone();
+            async move {
+                let recv_all = recv_all.notified();
+                a.write_all(&send_buf).await.unwrap();
+                print!("{:?}", &a);
+                recv_all.await;
+            }
+        });
+        transport.spawn(async move {
+            b.read_exact(&mut recv_buf).await.unwrap();
+            assert_eq!(send_buf, recv_buf);
+            recv_all.notify_waiters();
+        });
+        while let Some(res) = transport.join_next().await {
+            res.unwrap();
+        }
     }
 }
