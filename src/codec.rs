@@ -14,9 +14,13 @@ pub fn encode(
 ) -> Result<usize, EncodeError> {
     let mut wtr = io::Cursor::new(buf);
     for ack in ack {
+        wtr.write_u8(ACK_CMD)
+            .pipe(wrap_insufficient_buffer_size_err)?;
         encode_ack(&mut wtr, *ack)?;
     }
     if let Some(EncodeData { seq, data }) = data {
+        wtr.write_u8(DATA_CMD)
+            .pipe(wrap_insufficient_buffer_size_err)?;
         encode_data(&mut wtr, seq, data)?;
     }
     let pos = wtr.position();
@@ -47,8 +51,6 @@ pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Option<DecodedDataPacket
 }
 
 fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: u64) -> Result<(), EncodeError> {
-    wtr.write_u8(ACK_CMD)
-        .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u64::<BigEndian>(ack)
         .pipe(wrap_insufficient_buffer_size_err)?;
     Ok(())
@@ -60,8 +62,6 @@ fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<u64, DecodeError> {
 }
 
 fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result<(), EncodeError> {
-    wtr.write_u8(DATA_CMD)
-        .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u64::<BigEndian>(seq)
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u64::<BigEndian>(data.len() as u64)
