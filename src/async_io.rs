@@ -25,8 +25,8 @@ pub struct AsyncIo {
     _events: Arc<JoinSet<()>>,
 }
 impl AsyncIo {
-    pub fn new(utp: Box<dyn UnreliableSocket>) -> Self {
-        let transport_layer = Arc::new(TransportLayer::new(utp));
+    pub fn new(utp_read: Box<dyn UnreliableRead>, utp_write: Box<dyn UnreliableWrite>) -> Self {
+        let transport_layer = Arc::new(TransportLayer::new(utp_read, utp_write));
         let mut events = JoinSet::new();
 
         // Send timer
@@ -88,21 +88,23 @@ impl AsyncIo {
 
 #[derive(Debug)]
 struct TransportLayer {
-    utp: Box<dyn UnreliableSocket>,
+    utp_read: tokio::sync::Mutex<Box<dyn UnreliableRead>>,
+    utp_write: Box<dyn UnreliableWrite>,
     reliable_layer: Mutex<ReliableLayer>,
     sent_data_packet: tokio::sync::Notify,
     recv_data_packet: tokio::sync::Notify,
     first_error: FirstError,
 }
 impl TransportLayer {
-    pub fn new(utp: Box<dyn UnreliableSocket>) -> Self {
+    pub fn new(utp_read: Box<dyn UnreliableRead>, utp_write: Box<dyn UnreliableWrite>) -> Self {
         let now = Instant::now();
         let reliable_layer = Mutex::new(ReliableLayer::new(now));
         let sent_data_packet = tokio::sync::Notify::new();
         let recv_data_packet = tokio::sync::Notify::new();
         let first_error = FirstError::new();
         Self {
-            utp,
+            utp_read: tokio::sync::Mutex::new(utp_read),
+            utp_write,
             reliable_layer,
             sent_data_packet,
             recv_data_packet,
@@ -132,7 +134,7 @@ impl TransportLayer {
                 data: &data_buf[..p.data_written.get()],
             };
             let n = encode(&[], Some(data), utp_buf).unwrap();
-            let Err(e) = self.utp.send(&utp_buf[..n]).await else {
+            let Err(e) = self.utp_write.send(&utp_buf[..n]).await else {
                 continue;
             };
             self.first_error.set(e);
@@ -163,16 +165,19 @@ impl TransportLayer {
         ack_to_peer_buf.clear();
         for _ in 0..MAX_ACK_BATCH_SIZE {
             self.first_error.throw_error()?;
-            let res = match ack_to_peer_buf.is_empty() {
-                true => self.utp.recv(utp_buf).await,
-                false => {
-                    let res = self.utp.try_recv(utp_buf);
-                    if let Err(e) = &res {
-                        if *e == std::io::ErrorKind::WouldBlock {
-                            break;
+            let res = {
+                let mut utp_read = self.utp_read.lock().await;
+                match ack_to_peer_buf.is_empty() {
+                    true => utp_read.recv(utp_buf).await,
+                    false => {
+                        let res = utp_read.try_recv(utp_buf);
+                        if let Err(e) = &res {
+                            if *e == std::io::ErrorKind::WouldBlock {
+                                break;
+                            }
                         }
+                        res
                     }
-                    res
                 }
             };
             let read_bytes = match res {
@@ -218,7 +223,7 @@ impl TransportLayer {
 
         // reliable -{ACK}> UDP remote
         let written_bytes = encode(ack_to_peer_buf, None, utp_buf).unwrap();
-        self.utp
+        self.utp_write
             .send(&utp_buf[..written_bytes])
             .await
             .map_err(throw_error)?;
@@ -281,25 +286,29 @@ impl TransportLayer {
 }
 
 #[async_trait]
-pub trait UnreliableSocket: core::fmt::Debug + Sync + Send + 'static {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
+pub trait UnreliableRead: core::fmt::Debug + Sync + Send + 'static {
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
 
-    fn try_recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
-
-    async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
 }
 #[async_trait]
-impl UnreliableSocket for UdpSocket {
+pub trait UnreliableWrite: core::fmt::Debug + Sync + Send + 'static {
+    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
+}
+#[async_trait]
+impl UnreliableRead for Arc<UdpSocket> {
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        UdpSocket::try_recv(self, buf).map_err(|e| e.kind())
+    }
+
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        UdpSocket::recv(self, buf).await.map_err(|e| e.kind())
+    }
+}
+#[async_trait]
+impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        self.send(buf).await.map_err(|e| e.kind())
-    }
-
-    fn try_recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        self.try_recv(buf).map_err(|e| e.kind())
-    }
-
-    async fn recv(&self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        self.recv(buf).await.map_err(|e| e.kind())
+        UdpSocket::send(self, buf).await.map_err(|e| e.kind())
     }
 }
 
@@ -370,16 +379,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_async_io() {
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
 
         let hello = b"hello";
         let world = b"world";
 
-        let mut a = AsyncIo::new(Box::new(a));
-        let mut b = AsyncIo::new(Box::new(b));
+        let mut a = AsyncIo::new(Box::new(a.clone()), Box::new(a));
+        let mut b = AsyncIo::new(Box::new(b.clone()), Box::new(b));
         a.send(hello, true).await.unwrap();
         b.send(world, true).await.unwrap();
 
@@ -392,12 +401,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_async_async_io() {
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a = AsyncIo::new(Box::new(a));
-        let b = AsyncIo::new(Box::new(b));
+        let a = AsyncIo::new(Box::new(a.clone()), Box::new(a));
+        let b = AsyncIo::new(Box::new(b.clone()), Box::new(b));
         let a = AsyncAsyncIo::new(true, a);
         let b = AsyncAsyncIo::new(true, b);
 
