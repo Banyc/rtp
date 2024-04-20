@@ -1,5 +1,5 @@
 [package]
-name = "transport_protocol"
+name = "rtp"
 version = "0.1.0"
 edition = "2021"
 
