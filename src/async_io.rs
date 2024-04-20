@@ -417,7 +417,7 @@ mod tests {
             async move {
                 let recv_all = recv_all.notified();
                 a.write_all(&send_buf).await.unwrap();
-                print!("{:?}", &a);
+                println!("{:?}", &a);
                 recv_all.await;
             }
         });
