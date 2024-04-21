@@ -15,4 +15,6 @@ tokio = { version = "1", features = ["full"] }
 udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.6" }
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.0.4" }
 rand = "0.8"
