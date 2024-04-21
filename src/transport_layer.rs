@@ -1,10 +1,9 @@
 use std::{
-    sync::{Arc, Mutex, RwLock},
+    sync::{Mutex, RwLock},
     time::Instant,
 };
 
 use async_trait::async_trait;
-use tokio::net::UdpSocket;
 
 use crate::{
     codec::{decode, encode, EncodeData},
@@ -222,22 +221,6 @@ pub trait UnreliableRead: core::fmt::Debug + Sync + Send + 'static {
 #[async_trait]
 pub trait UnreliableWrite: core::fmt::Debug + Sync + Send + 'static {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
-}
-#[async_trait]
-impl UnreliableRead for Arc<UdpSocket> {
-    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::try_recv(self, buf).map_err(|e| e.kind())
-    }
-
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::recv(self, buf).await.map_err(|e| e.kind())
-    }
-}
-#[async_trait]
-impl UnreliableWrite for Arc<UdpSocket> {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::send(self, buf).await.map_err(|e| e.kind())
-    }
 }
 
 #[derive(Debug)]
