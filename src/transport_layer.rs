@@ -197,12 +197,12 @@ impl TransportLayer {
             {
                 // reliable -{data}> app
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                let n = reliable_layer.recv_data_buf(data);
+                let read_bytes = reliable_layer.recv_data_buf(data);
                 if PRINT_DEBUG_MESSAGES {
-                    println!("recv: data: {n}");
+                    println!("recv: data: {read_bytes}");
                 }
-                if 0 < n {
-                    break n;
+                if 0 < read_bytes {
+                    break read_bytes;
                 }
             }
             recv_data_packet.await;
