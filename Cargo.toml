@@ -13,8 +13,8 @@ strict-num = "0.2"
 tap = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
-udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.6" }
+udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.7" }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
-file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.0.4" }
+file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.0.5" }

@@ -192,8 +192,9 @@ source = "git+https://github.com/Banyc/dre.git?tag=v0.0.3#8cbbb66b2ee361d90f0e25
 [[package]]
 name = "file_transfer"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/file_transfer.git?tag=v0.0.4#d7fd48ffed9e6c66f9ab273cea8c5a8de75d253e"
+source = "git+https://github.com/Banyc/file_transfer.git?tag=v0.0.5#6705d169b6c564dbd49822a867837fba2f7d08a4"
 dependencies = [
+ "async_async_io",
  "clap",
  "tokio",
 ]
@@ -436,9 +437,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "signal-hook-registry"
-version = "1.4.1"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8229b473baa5980ac72ef434c4415e70c4b5e71b423043adb4ba059f89c99a1"
+checksum = "a9e9e0b4211b72e7b8b6e85c807d36c212bdb33ea8587f7569562a84df5465b1"
 dependencies = [
  "libc",
 ]
@@ -544,7 +545,7 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.6#971ef2b5c0c18842576447171c962ef84454b33a"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.7#6daaa2cac1b033e532c5a9286f2222e2638da238"
 dependencies = [
  "bytes",
  "lockfree-object-pool",

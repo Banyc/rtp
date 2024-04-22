@@ -18,7 +18,10 @@ async fn main() {
     let args = Cli::parse();
 
     let (protocol, internet_address) = args.server.split_once("://").unwrap();
-    let (read, write): (Box<dyn AsyncRead + Unpin>, Box<dyn AsyncWrite + Unpin>) = match protocol {
+    let (read, write): (
+        Box<dyn AsyncRead + Unpin + Sync + Send + 'static>,
+        Box<dyn AsyncWrite + Unpin + Sync + Send + 'static>,
+    ) = match protocol {
         "tcp" => {
             let stream = TcpStream::connect(internet_address).await.unwrap();
             let (read, write) = stream.into_split();
