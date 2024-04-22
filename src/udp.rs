@@ -38,6 +38,13 @@ impl Listener {
         self.local_addr
     }
 
+    /// Side-effect: same as [`Self::accept()`]
+    pub async fn accept_without_handshake(&self) -> std::io::Result<(ReadSocket, WriteSocket)> {
+        let accepted = self.listener.accept().await?;
+        let (read, write) = accepted.split();
+        Ok(socket(Box::new(read), Box::new(write)))
+    }
+
     /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
@@ -61,20 +68,20 @@ pub async fn connect_without_handshake(
 
 pub async fn connect(
     addr: impl tokio::net::ToSocketAddrs,
-) -> Result<(ReadSocket, WriteSocket), std::io::ErrorKind> {
-    let (read, mut write) = connect_without_handshake(addr)
-        .await
-        .map_err(|e| e.kind())?;
+) -> std::io::Result<(ReadSocket, WriteSocket)> {
+    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    udp.connect(addr).await?;
     let mut challenge = [0; 1];
     let mut rng = rand::thread_rng();
     rng.fill(&mut challenge);
-    let _ = write.send(&challenge, true).await?;
+    let _ = udp.send(&challenge).await?;
     let mut response = [0; 1];
-    let _ = read.recv(&mut response).await?;
+    let _ = udp.recv(&mut response).await?;
     if challenge != response {
-        return Err(std::io::ErrorKind::ConnectionReset);
+        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
     }
-    Ok((read, write))
+    let udp = Arc::new(udp);
+    Ok(socket(Box::new(Arc::clone(&udp)), Box::new(udp)))
 }
 
 // Accepted socket
@@ -139,13 +146,20 @@ mod tests {
     async fn test_connect() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
+        let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                if listener.accept().await.is_err() {
-                    break;
-                }
+                let (r, mut w) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    w.send(msg_1, true).await.unwrap();
+                    let mut buf = [0; 1];
+                    r.recv(&mut buf).await.unwrap();
+                });
             }
         });
-        let _ = connect(addr).await.unwrap();
+        let (r, _w) = connect(addr).await.unwrap();
+        let mut buf = [0; 1024];
+        let n = r.recv(&mut buf).await.unwrap();
+        assert_eq!(msg_1, &buf[..n]);
     }
 }
