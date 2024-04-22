@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
@@ -9,8 +12,8 @@ use tokio::task::JoinSet;
 
 use crate::transport_layer::{TransportLayer, UnreliableRead, UnreliableWrite};
 
-const TIMER_INTERVAL: Duration = Duration::from_millis(10);
-const BUFFER_SIZE: usize = 1500;
+const TIMER_INTERVAL: Duration = Duration::from_millis(1);
+const BUFFER_SIZE: usize = 1024 * 64;
 
 pub fn socket(
     utp_read: Box<dyn UnreliableRead>,
@@ -23,10 +26,19 @@ pub fn socket(
     events.spawn({
         let transport_layer = Arc::clone(&transport_layer);
         async move {
-            let mut data_buf = [0; BUFFER_SIZE];
-            let mut utp_buf = [0; BUFFER_SIZE];
+            let mut data_buf = vec![0; BUFFER_SIZE];
+            let mut utp_buf = vec![0; BUFFER_SIZE];
             loop {
-                tokio::time::sleep(TIMER_INTERVAL).await;
+                // tokio::time::sleep(TIMER_INTERVAL).await;
+                let next_poll_time = {
+                    let reliable_layer = transport_layer.reliable_layer().lock().unwrap();
+                    reliable_layer.packet_send_space().next_poll_time()
+                };
+                let fast_poll_time = Instant::now() + TIMER_INTERVAL;
+                let poll_time = next_poll_time
+                    .map(|t| t.min(fast_poll_time))
+                    .unwrap_or(fast_poll_time);
+                tokio::time::sleep_until(poll_time.into()).await;
                 if transport_layer
                     .send_packets(&mut data_buf, &mut utp_buf)
                     .await
@@ -42,7 +54,7 @@ pub fn socket(
     events.spawn({
         let transport_layer = Arc::clone(&transport_layer);
         async move {
-            let mut utp_buf = [0; BUFFER_SIZE];
+            let mut utp_buf = vec![0; BUFFER_SIZE];
             let mut ack_from_peer_buf = vec![];
             let mut ack_to_peer_buf = vec![];
             loop {
@@ -65,8 +77,8 @@ pub fn socket(
     };
     let write = WriteSocket {
         transport_layer: Arc::clone(&transport_layer),
-        data_buf: [0; BUFFER_SIZE],
-        utp_buf: [0; BUFFER_SIZE],
+        data_buf: vec![0; BUFFER_SIZE],
+        utp_buf: vec![0; BUFFER_SIZE],
         _events: Arc::clone(&events),
     };
     (read, write)
@@ -90,8 +102,8 @@ impl ReadSocket {
 #[derive(Debug)]
 pub struct WriteSocket {
     transport_layer: Arc<TransportLayer>,
-    data_buf: [u8; BUFFER_SIZE],
-    utp_buf: [u8; BUFFER_SIZE],
+    data_buf: Vec<u8>,
+    utp_buf: Vec<u8>,
     _events: Arc<JoinSet<()>>,
 }
 impl WriteSocket {

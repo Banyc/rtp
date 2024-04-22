@@ -39,6 +39,10 @@ impl TransportLayer {
         }
     }
 
+    pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
+        &self.reliable_layer
+    }
+
     pub async fn send_packets(
         &self,
         data_buf: &mut [u8],

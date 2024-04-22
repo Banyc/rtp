@@ -187,7 +187,7 @@ checksum = "acbf1af155f9b9ef647e42cdc158db4b64a1b61f743629225fde6f3e0be2a7c7"
 [[package]]
 name = "dre"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/dre.git?tag=v0.0.2#54ef9e36cc1c743bf429deb4d064f15492724604"
+source = "git+https://github.com/Banyc/dre.git?tag=v0.0.3#8cbbb66b2ee361d90f0e25aa8d884c29fa7e8fc8"
 
 [[package]]
 name = "file_transfer"

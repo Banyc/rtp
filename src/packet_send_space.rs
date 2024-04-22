@@ -6,7 +6,7 @@ use std::{
 use dre::PacketState;
 
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
-const RTO_K: f64 = 0.5;
+const RTO_K: f64 = 1.;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
 const MAX_NUM_REUSED_BUFFERS: usize = 64;
 
@@ -108,6 +108,26 @@ impl PacketSendSpace {
     pub fn num_transmitting_packets(&self) -> usize {
         self.transmitting.len()
     }
+
+    pub fn data_loss_rate(&self, now: Instant) -> f64 {
+        let mut lost = 0;
+        for p in self.transmitting.values() {
+            if p.retransmitted || p.rto(self.smooth_rtt, now) {
+                lost += 1;
+            }
+        }
+        lost as f64 / self.transmitting.len() as f64
+    }
+
+    pub fn next_poll_time(&self) -> Option<Instant> {
+        let mut min_next_poll_time: Option<Instant> = None;
+        for p in self.transmitting.values() {
+            let t = p.next_rto_time(self.smooth_rtt);
+            let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
+            min_next_poll_time = Some(t);
+        }
+        min_next_poll_time
+    }
 }
 impl Default for PacketSendSpace {
     fn default() -> Self {
@@ -125,8 +145,17 @@ struct TransmittingPacket {
 impl TransmittingPacket {
     pub fn rto(&self, smooth_rtt: Duration, now: Instant) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
-        smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K) < sent_elapsed
+        rto_duration(smooth_rtt) <= sent_elapsed
     }
+
+    pub fn next_rto_time(&self, smooth_rtt: Duration) -> Instant {
+        let rto_duration = rto_duration(smooth_rtt);
+        self.sent_time + rto_duration
+    }
+}
+
+fn rto_duration(smooth_rtt: Duration) -> Duration {
+    smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K)
 }
 
 pub struct Packet<'a> {

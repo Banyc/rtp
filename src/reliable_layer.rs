@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 
-use dre::{ConnectionState, DetectAppLimitedPhaseParams, PacketState};
+use dre::{ConnectionState, PacketState};
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
@@ -12,10 +12,12 @@ const SEND_DATA_BUFFER_LENGTH: usize = 2 << 12;
 const RECV_DATA_BUFFER_LENGTH: usize = 2 << 12;
 const INIT_BYTES_PER_SECOND: f64 = 1024.0;
 const MAX_BURST_PACKETS: usize = 12;
-const MSS: usize = 1024;
+const MSS: usize = 1407;
 const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
-const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 0.2;
+const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 0.25;
+const CWND_DATA_LOST_RATE: f64 = 0.2;
+const PRINT_DEBUG_MESSAGES: bool = false;
 
 #[derive(Debug, Clone)]
 pub struct ReliableLayer {
@@ -48,6 +50,10 @@ impl ReliableLayer {
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
+    }
+
+    pub fn packet_send_space(&self) -> &PacketSendSpace {
+        &self.packet_send_space
     }
 
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> usize {
@@ -119,6 +125,9 @@ impl ReliableLayer {
         let Some(sr) = sr else {
             return;
         };
+        if PRINT_DEBUG_MESSAGES {
+            println!("{sr:?}");
+        }
         let target_deliver_rate = match sr.is_app_limited() {
             true => {
                 let delivery_rate =
@@ -174,16 +183,21 @@ impl ReliableLayer {
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {
-        self.connection_stats
-            .detect_application_limited_phases_2(DetectAppLimitedPhaseParams {
-                few_data_to_send: self.send_data_buf.len() < MSS,
-                not_transmitting_a_packet: self.packet_send_space.num_transmitting_packets() == 0,
-                cwnd_not_full: 0 < self.token_bucket.tokens(now),
-                all_lost_packets_retransmitted: self
-                    .packet_send_space
-                    .all_lost_packets_retransmitted(now),
-                pipe: self.packet_send_space.num_transmitting_packets() as u64,
-            });
+        // self.connection_stats
+        //     .detect_application_limited_phases_2(DetectAppLimitedPhaseParams {
+        //         few_data_to_send: self.send_data_buf.len() < MSS,
+        //         not_transmitting_a_packet: self.packet_send_space.num_transmitting_packets() == 0,
+        //         cwnd_not_full: self.packet_send_space.data_loss_rate(now) < CWND_DATA_LOST_RATE,
+        //         all_lost_packets_retransmitted: self
+        //             .packet_send_space
+        //             .all_lost_packets_retransmitted(now),
+        //         pipe: self.packet_send_space.num_transmitting_packets() as u64,
+        //     });
+        let in_app_limited_phase = self.packet_send_space.data_loss_rate(now) < CWND_DATA_LOST_RATE;
+        if in_app_limited_phase {
+            let pipe = self.packet_send_space.num_transmitting_packets() as u64;
+            self.connection_stats.set_application_limited_phases(pipe);
+        }
     }
 }
 
