@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-const MAX_NUM_RECEIVING_PACKETS: usize = 128;
+const MAX_NUM_RECEIVING_PACKETS: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct PacketRecvSpace {
