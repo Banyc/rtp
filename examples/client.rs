@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use clap::Parser;
 use file_transfer::FileTransferCommand;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpStream, UdpSocket},
+    net::TcpStream,
 };
 
 #[derive(Debug, Parser)]
@@ -27,10 +25,7 @@ async fn main() {
             (Box::new(read), Box::new(write))
         }
         "rtp" => {
-            let udp = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-            udp.connect(internet_address).await.unwrap();
-            let udp = Arc::new(udp);
-            let (read, write) = rtp::socket::socket(Box::new(Arc::clone(&udp)), Box::new(udp));
+            let (read, write) = rtp::udp::connect(internet_address).await.unwrap();
             (
                 Box::new(read.into_async_read()),
                 Box::new(write.into_async_write(true)),

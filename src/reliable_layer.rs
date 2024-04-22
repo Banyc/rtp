@@ -16,7 +16,7 @@ const MSS: usize = 1413;
 const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
 const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 0.25;
-const CWND_DATA_LOST_RATE: f64 = 0.2;
+const CWND_DATA_LOST_RATE: f64 = 0.05;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
 #[derive(Debug, Clone)]

@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
 
 use async_trait::async_trait;
+use rand::Rng;
 use tokio::net::UdpSocket;
 use udp_listener::{AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
 
@@ -17,22 +18,63 @@ type IdentityAcceptedUdpRead = AcceptedUdpRead<Packet>;
 #[derive(Debug)]
 pub struct Listener {
     listener: IdentityUdpListener,
+    local_addr: SocketAddr,
 }
 impl Listener {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
+        let local_addr = udp.local_addr()?;
         let listener = UdpListener::new_identity_dispatch(
             udp,
             NonZeroUsize::new(DISPATCHER_BUFFER_SIZE).unwrap(),
         );
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            local_addr,
+        })
     }
 
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
+    ///
+    /// You should keep this method in a loop.
     pub async fn accept(&self) -> std::io::Result<(ReadSocket, WriteSocket)> {
         let accepted = self.listener.accept().await?;
-        let (read, write) = accepted.split();
+        let (mut read, write) = accepted.split();
+        let challenge = read.recv().try_recv().unwrap();
+        write.send(&challenge).await?;
         Ok(socket(Box::new(read), Box::new(write)))
     }
+}
+
+pub async fn connect_without_handshake(
+    addr: impl tokio::net::ToSocketAddrs,
+) -> std::io::Result<(ReadSocket, WriteSocket)> {
+    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    udp.connect(addr).await?;
+    let udp = Arc::new(udp);
+    Ok(socket(Box::new(Arc::clone(&udp)), Box::new(udp)))
+}
+
+pub async fn connect(
+    addr: impl tokio::net::ToSocketAddrs,
+) -> Result<(ReadSocket, WriteSocket), std::io::ErrorKind> {
+    let (read, mut write) = connect_without_handshake(addr)
+        .await
+        .map_err(|e| e.kind())?;
+    let mut challenge = [0; 1];
+    let mut rng = rand::thread_rng();
+    rng.fill(&mut challenge);
+    let _ = write.send(&challenge, true).await?;
+    let mut response = [0; 1];
+    let _ = read.recv(&mut response).await?;
+    if challenge != response {
+        return Err(std::io::ErrorKind::ConnectionReset);
+    }
+    Ok((read, write))
 }
 
 // Accepted socket
@@ -86,5 +128,24 @@ impl UnreliableRead for Arc<UdpSocket> {
 impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         UdpSocket::send(self, buf).await.map_err(|e| e.kind())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_connect() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let _ = connect(addr).await.unwrap();
     }
 }
