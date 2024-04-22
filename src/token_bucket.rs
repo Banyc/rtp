@@ -1,4 +1,7 @@
-use std::{num::NonZeroUsize, time::Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
 use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
@@ -53,6 +56,11 @@ impl TokenBucket {
         let taken_tokens = self.tokens.min(num_tokens);
         self.tokens -= taken_tokens;
         taken_tokens
+    }
+
+    pub fn next_token_time(&self) -> Instant {
+        let remaining_sec = self.sec_per_token.get() * (1. - self.coining_token.get());
+        self.last_update + Duration::from_secs_f64(remaining_sec)
     }
 
     fn fill_up(&mut self, now: Instant) {

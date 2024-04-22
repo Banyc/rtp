@@ -8,16 +8,16 @@ use crate::{
     token_bucket::TokenBucket,
 };
 
-const SEND_DATA_BUFFER_LENGTH: usize = 2 << 12;
-const RECV_DATA_BUFFER_LENGTH: usize = 2 << 12;
+const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
+const RECV_DATA_BUFFER_LENGTH: usize = 2 << 16;
 const INIT_BYTES_PER_SECOND: f64 = 1024.0;
-const MAX_BURST_PACKETS: usize = 12;
+const MAX_BURST_PACKETS: usize = 64;
 const MSS: usize = 1413;
 const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
-const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 0.25;
+const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 1.;
 const CWND_DATA_LOST_RATE: f64 = 0.05;
-const PRINT_DEBUG_MESSAGES: bool = false;
+const PRINT_DEBUG_MESSAGES: bool = true;
 
 #[derive(Debug, Clone)]
 pub struct ReliableLayer {
@@ -54,6 +54,10 @@ impl ReliableLayer {
 
     pub fn packet_send_space(&self) -> &PacketSendSpace {
         &self.packet_send_space
+    }
+
+    pub fn token_bucket(&self) -> &TokenBucket {
+        &self.token_bucket
     }
 
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> usize {
@@ -144,8 +148,11 @@ impl ReliableLayer {
             + target_deliver_rate * SMOOTH_DELIVERY_RATE_ALPHA;
         self.smooth_delivery_rate = NonZeroPositiveF64::new(smooth_delivery_rate).unwrap();
 
-        self.token_bucket
-            .set_thruput(self.smooth_delivery_rate, now);
+        let send_rate =
+            self.smooth_delivery_rate.get() + self.smooth_delivery_rate.get() * CWND_DATA_LOST_RATE;
+        let send_rate = NonZeroPositiveF64::new(send_rate).unwrap();
+
+        self.token_bucket.set_thruput(send_rate, now);
     }
 
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {

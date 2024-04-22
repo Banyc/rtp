@@ -32,12 +32,10 @@ pub fn socket(
                 // tokio::time::sleep(TIMER_INTERVAL).await;
                 let next_poll_time = {
                     let reliable_layer = transport_layer.reliable_layer().lock().unwrap();
-                    reliable_layer.packet_send_space().next_poll_time()
+                    reliable_layer.token_bucket().next_token_time()
                 };
                 let fast_poll_time = Instant::now() + TIMER_INTERVAL;
-                let poll_time = next_poll_time
-                    .map(|t| t.min(fast_poll_time))
-                    .unwrap_or(fast_poll_time);
+                let poll_time = next_poll_time.min(fast_poll_time);
                 tokio::time::sleep_until(poll_time.into()).await;
                 if transport_layer
                     .send_packets(&mut data_buf, &mut utp_buf)
