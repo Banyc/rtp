@@ -64,7 +64,7 @@ fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<u64, DecodeError> {
 fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result<(), EncodeError> {
     wtr.write_u64::<BigEndian>(seq)
         .pipe(wrap_insufficient_buffer_size_err)?;
-    wtr.write_u64::<BigEndian>(data.len() as u64)
+    wtr.write_u16::<BigEndian>(data.len().try_into().unwrap())
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_all(data)
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -73,9 +73,8 @@ fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result
 
 fn decode_data(rdr: &mut io::Cursor<&[u8]>) -> Result<DecodedDataPacket, DecodeError> {
     let seq = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
-    let len = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
-    let end = rdr.position() + len;
-    let end = end as usize;
+    let len = rdr.read_u16::<BigEndian>().pipe(wrap_corrupted_err)?;
+    let end = usize::try_from(rdr.position()).unwrap() + usize::from(len);
     if rdr.get_ref().len() < end {
         return Err(DecodeError::Corrupted);
     }
