@@ -32,6 +32,10 @@ impl PacketRecvSpace {
             self.return_buf(data);
             return false;
         }
+        if seq < self.next_seq {
+            self.return_buf(data);
+            return true;
+        }
         self.receiving.insert(seq, data);
         true
     }
