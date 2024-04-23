@@ -545,7 +545,7 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.7#6daaa2cac1b033e532c5a9286f2222e2638da238"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.8#5ee5b1163f12f4592896bba24456b5499ca17820"
 dependencies = [
  "bytes",
  "lockfree-object-pool",
