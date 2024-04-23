@@ -16,7 +16,7 @@ const MSS: usize = 1413;
 const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
 const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 1.;
-const CWND_DATA_LOST_RATE: f64 = 0.05;
+const CWND_DATA_LOSS_RATE: f64 = 0.02;
 const PRINT_DEBUG_MESSAGES: bool = true;
 
 #[derive(Debug, Clone)]
@@ -149,7 +149,7 @@ impl ReliableLayer {
         self.smooth_delivery_rate = NonZeroPositiveF64::new(smooth_delivery_rate).unwrap();
 
         let send_rate =
-            self.smooth_delivery_rate.get() + self.smooth_delivery_rate.get() * CWND_DATA_LOST_RATE;
+            self.smooth_delivery_rate.get() + self.smooth_delivery_rate.get() * CWND_DATA_LOSS_RATE;
         let send_rate = NonZeroPositiveF64::new(send_rate).unwrap();
 
         self.token_bucket.set_thruput(send_rate, now);
@@ -200,7 +200,7 @@ impl ReliableLayer {
         //             .all_lost_packets_retransmitted(now),
         //         pipe: self.packet_send_space.num_transmitting_packets() as u64,
         //     });
-        let in_app_limited_phase = self.packet_send_space.data_loss_rate(now) < CWND_DATA_LOST_RATE;
+        let in_app_limited_phase = self.packet_send_space.data_loss_rate(now) < CWND_DATA_LOSS_RATE;
         if in_app_limited_phase {
             let pipe = self.packet_send_space.num_transmitting_packets() as u64;
             self.connection_stats.set_application_limited_phases(pipe);
