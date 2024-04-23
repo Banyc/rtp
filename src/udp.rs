@@ -97,7 +97,7 @@ pub async fn connect(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Co
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
     let mut challenge = [0; 1];
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rngs::OsRng;
     rng.fill(&mut challenge);
     let _ = udp.send(&challenge).await?;
     let mut response = [0; 1];
@@ -209,5 +209,11 @@ mod tests {
         let mut buf = [0; 1024];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(msg_1, &buf[..n]);
+    }
+
+    #[test]
+    fn require_fn_to_be_send() {
+        fn require_send<T: Send>(_t: T) {}
+        require_send(connect("0.0.0.0:0"));
     }
 }

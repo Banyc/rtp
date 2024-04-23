@@ -19,6 +19,12 @@ pub type WriteStream = PollWrite<WriteSocket2>;
 pub type ReadStream = PollRead<ReadSocket>;
 pub type IoStream = PollIo<ReadSocket, WriteSocket2>;
 
+const _: () = {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<WriteStream>;
+    let _ = assert_send::<ReadStream>;
+};
+
 pub fn socket(
     utp_read: Box<dyn UnreliableRead>,
     utp_write: Box<dyn UnreliableWrite>,
