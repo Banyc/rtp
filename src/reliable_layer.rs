@@ -13,9 +13,9 @@ const RECV_DATA_BUFFER_LENGTH: usize = 2 << 16;
 const INIT_BYTES_PER_SECOND: f64 = 1024.0;
 const MAX_BURST_PACKETS: usize = 64;
 const MSS: usize = 1413;
-const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
+const SMOOTH_SEND_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
-const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 1.;
+const PROBE_RATE: f64 = 1.;
 const CWND_DATA_LOSS_RATE: f64 = 0.02;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
@@ -27,7 +27,7 @@ pub struct ReliableLayer {
     connection_stats: ConnectionState,
     packet_send_space: PacketSendSpace,
     packet_recv_space: PacketRecvSpace,
-    smooth_delivery_rate: NonZeroPositiveF64,
+    smooth_send_rate: NonZeroPositiveF64,
 
     // Reused buffers
     packet_stats_buf: Vec<PacketState>,
@@ -46,7 +46,7 @@ impl ReliableLayer {
             connection_stats: ConnectionState::new(now),
             packet_send_space: PacketSendSpace::new(),
             packet_recv_space: PacketRecvSpace::new(),
-            smooth_delivery_rate: NonZeroPositiveF64::new(INIT_SMOOTH_DELIVERY_RATE).unwrap(),
+            smooth_send_rate: NonZeroPositiveF64::new(INIT_SMOOTH_DELIVERY_RATE).unwrap(),
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
@@ -132,24 +132,22 @@ impl ReliableLayer {
         if PRINT_DEBUG_MESSAGES {
             println!("{sr:?}");
         }
-        let target_deliver_rate = match sr.is_app_limited() {
+        let target_send_rate = match sr.is_app_limited() {
             true => {
-                let delivery_rate =
-                    sr.delivery_rate() + sr.delivery_rate() * SMOOTH_DELIVERY_RATE_PROBE_K;
-                if delivery_rate < self.smooth_delivery_rate.get() {
+                let send_rate = sr.delivery_rate() + sr.delivery_rate() * PROBE_RATE;
+                if send_rate < self.smooth_send_rate.get() {
                     return;
                 }
-                delivery_rate
+                send_rate
             }
             false => sr.delivery_rate(),
         };
-        let smooth_delivery_rate = self.smooth_delivery_rate.get()
-            * (1. - SMOOTH_DELIVERY_RATE_ALPHA)
-            + target_deliver_rate * SMOOTH_DELIVERY_RATE_ALPHA;
-        self.smooth_delivery_rate = NonZeroPositiveF64::new(smooth_delivery_rate).unwrap();
+        let smooth_send_rate = self.smooth_send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
+            + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
+        self.smooth_send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
 
         let send_rate =
-            self.smooth_delivery_rate.get() + self.smooth_delivery_rate.get() * CWND_DATA_LOSS_RATE;
+            self.smooth_send_rate.get() + self.smooth_send_rate.get() * CWND_DATA_LOSS_RATE;
         let send_rate = NonZeroPositiveF64::new(send_rate).unwrap();
 
         self.token_bucket.set_thruput(send_rate, now);
