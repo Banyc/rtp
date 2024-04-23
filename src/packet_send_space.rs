@@ -109,14 +109,17 @@ impl PacketSendSpace {
         self.transmitting.len()
     }
 
-    pub fn data_loss_rate(&self, now: Instant) -> f64 {
+    pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
+        if self.transmitting.is_empty() {
+            return None;
+        }
         let mut lost = 0;
         for p in self.transmitting.values() {
             if p.retransmitted || p.rto(self.smooth_rtt, now) {
                 lost += 1;
             }
         }
-        lost as f64 / self.transmitting.len() as f64
+        Some(lost as f64 / self.transmitting.len() as f64)
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {

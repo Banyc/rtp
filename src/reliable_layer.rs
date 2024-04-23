@@ -14,7 +14,7 @@ const INIT_BYTES_PER_SECOND: f64 = 1024.0;
 const MAX_BURST_PACKETS: usize = 64;
 const MSS: usize = 1413;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.1;
-const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
+const INIT_SMOOTH_SEND_RATE: f64 = 12.;
 const PROBE_RATE: f64 = 1.;
 const CWND_DATA_LOSS_RATE: f64 = 0.02;
 const PRINT_DEBUG_MESSAGES: bool = false;
@@ -46,7 +46,7 @@ impl ReliableLayer {
             connection_stats: ConnectionState::new(now),
             packet_send_space: PacketSendSpace::new(),
             packet_recv_space: PacketRecvSpace::new(),
-            smooth_send_rate: NonZeroPositiveF64::new(INIT_SMOOTH_DELIVERY_RATE).unwrap(),
+            smooth_send_rate: NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap(),
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
@@ -71,6 +71,13 @@ impl ReliableLayer {
 
     pub fn send_data_packet(&mut self, packet: &mut [u8], now: Instant) -> Option<DataPacket> {
         self.detect_application_limited_phases(now);
+
+        if let Some(loss_rate) = self.packet_send_space.data_loss_rate(now) {
+            if loss_rate == 1. {
+                self.smooth_send_rate = NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap();
+                self.token_bucket.set_thruput(self.smooth_send_rate, now);
+            }
+        }
 
         if !self.token_bucket.take_exact_tokens(1, now) {
             return None;
@@ -198,7 +205,10 @@ impl ReliableLayer {
         //             .all_lost_packets_retransmitted(now),
         //         pipe: self.packet_send_space.num_transmitting_packets() as u64,
         //     });
-        let in_app_limited_phase = self.packet_send_space.data_loss_rate(now) < CWND_DATA_LOSS_RATE;
+        let in_app_limited_phase = match self.packet_send_space.data_loss_rate(now) {
+            Some(loss_rate) => loss_rate < CWND_DATA_LOSS_RATE,
+            None => true,
+        };
         if in_app_limited_phase {
             let pipe = self.packet_send_space.num_transmitting_packets() as u64;
             self.connection_stats.set_application_limited_phases(pipe);
