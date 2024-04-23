@@ -15,6 +15,10 @@ use crate::transport_layer::{TransportLayer, UnreliableRead, UnreliableWrite};
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
 const BUFFER_SIZE: usize = 1024 * 64;
 
+pub type WriteStream = PollWrite<WriteSocket2>;
+pub type ReadStream = PollRead<ReadSocket>;
+pub type IoStream = PollIo<ReadSocket, WriteSocket2>;
+
 pub fn socket(
     utp_read: Box<dyn UnreliableRead>,
     utp_write: Box<dyn UnreliableWrite>,
@@ -92,7 +96,7 @@ impl ReadSocket {
         self.transport_layer.recv(data).await
     }
 
-    pub fn into_async_read(self) -> PollRead<Self> {
+    pub fn into_async_read(self) -> ReadStream {
         PollRead::new(self)
     }
 }
@@ -111,7 +115,7 @@ impl WriteSocket {
             .await
     }
 
-    pub fn into_async_write(self, no_delay: bool) -> PollWrite<WriteSocket2> {
+    pub fn into_async_write(self, no_delay: bool) -> WriteStream {
         let write = WriteSocket2 {
             write: self,
             no_delay,
@@ -120,10 +124,7 @@ impl WriteSocket {
     }
 }
 
-pub fn unsplit(
-    read: PollRead<ReadSocket>,
-    write: PollWrite<WriteSocket2>,
-) -> PollIo<ReadSocket, WriteSocket2> {
+pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {
     PollIo::new(read, write)
 }
 
