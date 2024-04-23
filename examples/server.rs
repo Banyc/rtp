@@ -30,7 +30,7 @@ async fn main() {
         }
         "rtp" => {
             let listener = rtp::udp::Listener::bind(internet_address).await.unwrap();
-            let (read, write) = listener.accept().await.unwrap();
+            let accepted = listener.accept().await.unwrap();
             tokio::spawn(async move {
                 loop {
                     if listener.accept().await.is_err() {
@@ -39,8 +39,8 @@ async fn main() {
                 }
             });
             (
-                Box::new(read.into_async_read()),
-                Box::new(write.into_async_write(true)),
+                Box::new(accepted.read.into_async_read()),
+                Box::new(accepted.write.into_async_write(true)),
             )
         }
         _ => panic!("unknown protocol `{protocol}`"),

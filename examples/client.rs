@@ -28,10 +28,10 @@ async fn main() {
             (Box::new(read), Box::new(write))
         }
         "rtp" => {
-            let (read, write) = rtp::udp::connect(internet_address).await.unwrap();
+            let connected = rtp::udp::connect(internet_address).await.unwrap();
             (
-                Box::new(read.into_async_read()),
-                Box::new(write.into_async_write(true)),
+                Box::new(connected.read.into_async_read()),
+                Box::new(connected.write.into_async_write(true)),
             )
         }
         _ => panic!("unknown protocol `{protocol}`"),

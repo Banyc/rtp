@@ -39,38 +39,63 @@ impl Listener {
     }
 
     /// Side-effect: same as [`Self::accept()`]
-    pub async fn accept_without_handshake(&self) -> std::io::Result<(ReadSocket, WriteSocket)> {
+    pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted> {
         let accepted = self.listener.accept().await?;
+        let peer_addr = *accepted.dispatch_key();
         let (read, write) = accepted.split();
-        Ok(socket(Box::new(read), Box::new(write)))
+        let (read, write) = socket(Box::new(read), Box::new(write));
+        Ok(Accepted {
+            read,
+            write,
+            peer_addr,
+        })
     }
 
     /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
-    pub async fn accept(&self) -> std::io::Result<(ReadSocket, WriteSocket)> {
+    pub async fn accept(&self) -> std::io::Result<Accepted> {
         let accepted = self.listener.accept().await?;
+        let peer_addr = *accepted.dispatch_key();
         let (mut read, write) = accepted.split();
         let challenge = read.recv().try_recv().unwrap();
         write.send(&challenge).await?;
-        Ok(socket(Box::new(read), Box::new(write)))
+        let (read, write) = socket(Box::new(read), Box::new(write));
+        Ok(Accepted {
+            read,
+            write,
+            peer_addr,
+        })
     }
+}
+#[derive(Debug)]
+pub struct Accepted {
+    pub read: ReadSocket,
+    pub write: WriteSocket,
+    pub peer_addr: SocketAddr,
 }
 
 pub async fn connect_without_handshake(
     addr: impl tokio::net::ToSocketAddrs,
-) -> std::io::Result<(ReadSocket, WriteSocket)> {
+) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(addr).await?;
+    let local_addr = udp.local_addr()?;
+    let peer_addr = udp.peer_addr()?;
     let udp = Arc::new(udp);
-    Ok(socket(Box::new(Arc::clone(&udp)), Box::new(udp)))
+    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp));
+    Ok(Connected {
+        read,
+        write,
+        local_addr,
+        peer_addr,
+    })
 }
-
-pub async fn connect(
-    addr: impl tokio::net::ToSocketAddrs,
-) -> std::io::Result<(ReadSocket, WriteSocket)> {
+pub async fn connect(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(addr).await?;
+    let local_addr = udp.local_addr()?;
+    let peer_addr = udp.peer_addr()?;
     let mut challenge = [0; 1];
     let mut rng = rand::thread_rng();
     rng.fill(&mut challenge);
@@ -81,7 +106,20 @@ pub async fn connect(
         return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
     }
     let udp = Arc::new(udp);
-    Ok(socket(Box::new(Arc::clone(&udp)), Box::new(udp)))
+    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp));
+    Ok(Connected {
+        read,
+        write,
+        local_addr,
+        peer_addr,
+    })
+}
+#[derive(Debug)]
+pub struct Connected {
+    pub read: ReadSocket,
+    pub write: WriteSocket,
+    pub local_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
 }
 
 // Accepted socket
@@ -159,17 +197,17 @@ mod tests {
         let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                let (r, mut w) = listener.accept().await.unwrap();
+                let mut accepted = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    w.send(msg_1, true).await.unwrap();
+                    accepted.write.send(msg_1, true).await.unwrap();
                     let mut buf = [0; 1];
-                    r.recv(&mut buf).await.unwrap();
+                    accepted.read.recv(&mut buf).await.unwrap();
                 });
             }
         });
-        let (r, _w) = connect(addr).await.unwrap();
+        let connected = connect(addr).await.unwrap();
         let mut buf = [0; 1024];
-        let n = r.recv(&mut buf).await.unwrap();
+        let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(msg_1, &buf[..n]);
     }
 }
