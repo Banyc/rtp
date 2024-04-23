@@ -17,7 +17,7 @@ const SMOOTH_DELIVERY_RATE_ALPHA: f64 = 0.1;
 const INIT_SMOOTH_DELIVERY_RATE: f64 = 12.;
 const SMOOTH_DELIVERY_RATE_PROBE_K: f64 = 1.;
 const CWND_DATA_LOSS_RATE: f64 = 0.02;
-const PRINT_DEBUG_MESSAGES: bool = true;
+const PRINT_DEBUG_MESSAGES: bool = false;
 
 #[derive(Debug, Clone)]
 pub struct ReliableLayer {
