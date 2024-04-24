@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
+use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use rand::Rng;
@@ -7,7 +7,7 @@ use udp_listener::{AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
 
 use crate::{
     socket::{socket, ReadSocket, WriteSocket},
-    transport_layer::{UnreliableRead, UnreliableWrite},
+    transport_layer::{self, UnreliableRead, UnreliableWrite},
 };
 
 const DISPATCHER_BUFFER_SIZE: usize = 1024;
@@ -43,7 +43,7 @@ impl Listener {
         let accepted = self.listener.accept().await?;
         let peer_addr = *accepted.dispatch_key();
         let (read, write) = accepted.split();
-        let (read, write) = socket(Box::new(read), Box::new(write));
+        let (read, write) = socket(Box::new(read), Box::new(write), None);
         Ok(Accepted {
             read,
             write,
@@ -60,7 +60,7 @@ impl Listener {
         let (mut read, write) = accepted.split();
         let challenge = read.recv().try_recv().unwrap();
         write.send(&challenge).await?;
-        let (read, write) = socket(Box::new(read), Box::new(write));
+        let (read, write) = socket(Box::new(read), Box::new(write), None);
         Ok(Accepted {
             read,
             write,
@@ -77,13 +77,18 @@ pub struct Accepted {
 
 pub async fn connect_without_handshake(
     addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
 ) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
+    let log_config = match log_config {
+        Some(c) => Some(c.transport_layer_log_config(local_addr, peer_addr).await?),
+        None => None,
+    };
     let udp = Arc::new(udp);
-    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp));
+    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp), log_config);
     Ok(Connected {
         read,
         write,
@@ -91,11 +96,18 @@ pub async fn connect_without_handshake(
         peer_addr,
     })
 }
-pub async fn connect(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Connected> {
+pub async fn connect(
+    addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
+) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
+    let log_config = match log_config {
+        Some(c) => Some(c.transport_layer_log_config(local_addr, peer_addr).await?),
+        None => None,
+    };
     let mut challenge = [0; 1];
     let mut rng = rand::rngs::OsRng;
     rng.fill(&mut challenge);
@@ -106,7 +118,7 @@ pub async fn connect(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Co
         return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
     }
     let udp = Arc::new(udp);
-    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp));
+    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp), log_config);
     Ok(Connected {
         read,
         write,
@@ -186,11 +198,29 @@ impl UnreliableWrite for Arc<UdpSocket> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LogConfig<'a> {
+    pub log_dir_path: &'a Path,
+}
+impl LogConfig<'_> {
+    pub(crate) async fn transport_layer_log_config(
+        &self,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+    ) -> std::io::Result<transport_layer::LogConfig> {
+        tokio::fs::create_dir_all(&self.log_dir_path).await?;
+        let file_name = format!("{local_addr}_{peer_addr}.csv");
+        Ok(transport_layer::LogConfig {
+            reliable_layer_log_path: self.log_dir_path.join(file_name),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_connect() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
@@ -205,7 +235,14 @@ mod tests {
                 });
             }
         });
-        let connected = connect(addr).await.unwrap();
+        let connected = connect(
+            addr,
+            Some(LogConfig {
+                log_dir_path: Path::new("target/tests"),
+            }),
+        )
+        .await
+        .unwrap();
         let mut buf = [0; 1024];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(msg_1, &buf[..n]);
@@ -214,6 +251,6 @@ mod tests {
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
-        require_send(connect("0.0.0.0:0"));
+        require_send(connect("0.0.0.0:0", None));
     }
 }

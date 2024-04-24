@@ -25,7 +25,11 @@ impl TokenBucket {
         }
     }
 
-    pub fn tokens(&mut self, now: Instant) -> usize {
+    pub fn outdated_tokens(&self) -> f64 {
+        self.tokens as f64 + self.coining_token.get()
+    }
+
+    pub fn gen_tokens(&mut self, now: Instant) -> usize {
         self.fill_up(now);
 
         self.tokens

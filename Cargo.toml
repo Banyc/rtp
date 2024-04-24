@@ -7,8 +7,10 @@ edition = "2021"
 async-trait = "0.1"
 async_async_io = "0.2"
 byteorder = "1"
+csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 strict-num = "0.2"
 tap = "1"
 thiserror = "1"

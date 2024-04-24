@@ -17,6 +17,14 @@ impl PacketRecvSpace {
         }
     }
 
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn num_received_packets(&self) -> usize {
+        self.receiving.len()
+    }
+
     pub fn reuse_buf(&mut self) -> Option<Vec<u8>> {
         self.reused_buf.pop()
     }

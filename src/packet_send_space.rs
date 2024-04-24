@@ -29,6 +29,25 @@ impl PacketSendSpace {
         }
     }
 
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn smooth_rtt(&self) -> Duration {
+        self.smooth_rtt
+    }
+
+    pub fn num_retransmitted_packets(&self) -> usize {
+        let mut n = 0;
+        for p in self.transmitting.values() {
+            if !p.retransmitted {
+                continue;
+            }
+            n += 1;
+        }
+        n
+    }
+
     pub fn reuse_buf(&mut self) -> Option<Vec<u8>> {
         self.reused_buf.pop()
     }

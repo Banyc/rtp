@@ -10,7 +10,7 @@ use async_async_io::{
 };
 use tokio::task::JoinSet;
 
-use crate::transport_layer::{TransportLayer, UnreliableRead, UnreliableWrite};
+use crate::transport_layer::{LogConfig, TransportLayer, UnreliableRead, UnreliableWrite};
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
 const BUFFER_SIZE: usize = 1024 * 64;
@@ -28,8 +28,9 @@ const _: () = {
 pub fn socket(
     utp_read: Box<dyn UnreliableRead>,
     utp_write: Box<dyn UnreliableWrite>,
+    log_config: Option<LogConfig>,
 ) -> (ReadSocket, WriteSocket) {
-    let transport_layer = Arc::new(TransportLayer::new(utp_read, utp_write));
+    let transport_layer = Arc::new(TransportLayer::new(utp_read, utp_write, log_config));
     let mut events = JoinSet::new();
 
     // Send timer
@@ -186,8 +187,8 @@ mod tests {
         let hello = b"hello";
         let world = b"world";
 
-        let (a_r, mut a_w) = socket(Box::new(a.clone()), Box::new(a));
-        let (b_r, mut b_w) = socket(Box::new(b.clone()), Box::new(b));
+        let (a_r, mut a_w) = socket(Box::new(a.clone()), Box::new(a), None);
+        let (b_r, mut b_w) = socket(Box::new(b.clone()), Box::new(b), None);
         a_w.send(hello, true).await.unwrap();
         b_w.send(world, true).await.unwrap();
 
@@ -204,8 +205,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (a_r, a_w) = socket(Box::new(a.clone()), Box::new(a));
-        let (b_r, b_w) = socket(Box::new(b.clone()), Box::new(b));
+        let (a_r, a_w) = socket(Box::new(a.clone()), Box::new(a), None);
+        let (b_r, b_w) = socket(Box::new(b.clone()), Box::new(b), None);
 
         let mut send_buf = vec![0; 2 << 17];
         let mut recv_buf = send_buf.clone();

@@ -1,6 +1,11 @@
-use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
+use std::{
+    collections::VecDeque,
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
 use dre::{ConnectionState, PacketState};
+use serde::{Deserialize, Serialize};
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
@@ -113,7 +118,7 @@ impl ReliableLayer {
         })
     }
 
-    pub fn recv_ack_packet(&mut self, ack: &[u64], now: Instant) {
+    pub fn recv_ack_packet(&mut self, ack: &[u64], now: Instant) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
         self.packet_send_space
@@ -133,9 +138,7 @@ impl ReliableLayer {
         self.packet_stats_buf.clear();
         self.packet_buf.clear();
 
-        let Some(sr) = sr else {
-            return;
-        };
+        let sr = sr?;
         if PRINT_DEBUG_MESSAGES {
             println!("{sr:?}");
         }
@@ -143,7 +146,7 @@ impl ReliableLayer {
             true => {
                 let send_rate = sr.delivery_rate() + sr.delivery_rate() * PROBE_RATE;
                 if send_rate < self.smooth_send_rate.get() {
-                    return;
+                    return Some(sr);
                 }
                 send_rate
             }
@@ -158,6 +161,7 @@ impl ReliableLayer {
         let send_rate = NonZeroPositiveF64::new(send_rate).unwrap();
 
         self.token_bucket.set_thruput(send_rate, now);
+        Some(sr)
     }
 
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
@@ -214,10 +218,46 @@ impl ReliableLayer {
             self.connection_stats.set_application_limited_phases(pipe);
         }
     }
+
+    pub fn log(&self) -> Log {
+        let now = Instant::now();
+        let min_rtt = self.packet_send_space.min_rtt();
+        let min_rtt = if min_rtt == Duration::MAX {
+            None
+        } else {
+            Some(min_rtt)
+        };
+        Log {
+            tokens: self.token_bucket.outdated_tokens(),
+            send_rate: self.smooth_send_rate.get(),
+            loss_rate: self.packet_send_space.data_loss_rate(now),
+            num_tx_pkts: self.packet_send_space.num_transmitting_packets(),
+            num_rt_pkts: self.packet_send_space.num_retransmitted_packets(),
+            send_seq: self.packet_send_space.next_seq(),
+            min_rtt: min_rtt.map(|t| t.as_millis()),
+            rtt: self.packet_send_space.smooth_rtt().as_millis(),
+            num_rx_pkts: self.packet_recv_space.num_received_packets(),
+            recv_seq: self.packet_recv_space.next_seq(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct DataPacket {
     pub seq: u64,
     pub data_written: NonZeroUsize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Log {
+    pub tokens: f64,
+    pub send_rate: f64,
+    pub loss_rate: Option<f64>,
+    pub num_tx_pkts: usize,
+    pub num_rt_pkts: usize,
+    pub send_seq: u64,
+    pub min_rtt: Option<u128>,
+    pub rtt: u128,
+    pub num_rx_pkts: usize,
+    pub recv_seq: u64,
 }

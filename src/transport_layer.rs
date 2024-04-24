@@ -1,9 +1,11 @@
 use std::{
+    path::PathBuf,
     sync::{Mutex, RwLock},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::{decode, encode, EncodeData},
@@ -13,6 +15,8 @@ use crate::{
 const MAX_ACK_BATCH_SIZE: usize = 64;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
+type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
+
 #[derive(Debug)]
 pub struct TransportLayer {
     utp_read: tokio::sync::Mutex<Box<dyn UnreliableRead>>,
@@ -21,14 +25,28 @@ pub struct TransportLayer {
     sent_data_packet: tokio::sync::Notify,
     recv_data_packet: tokio::sync::Notify,
     first_error: FirstError,
+    reliable_layer_logger: Option<ReliableLayerLogger>,
 }
 impl TransportLayer {
-    pub fn new(utp_read: Box<dyn UnreliableRead>, utp_write: Box<dyn UnreliableWrite>) -> Self {
+    pub fn new(
+        utp_read: Box<dyn UnreliableRead>,
+        utp_write: Box<dyn UnreliableWrite>,
+        log_config: Option<LogConfig>,
+    ) -> Self {
         let now = Instant::now();
         let reliable_layer = Mutex::new(ReliableLayer::new(now));
         let sent_data_packet = tokio::sync::Notify::new();
         let recv_data_packet = tokio::sync::Notify::new();
         let first_error = FirstError::new();
+        let reliable_layer_logger = log_config.as_ref().map(|c| {
+            let file = std::fs::File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&c.reliable_layer_log_path)
+                .expect("open log file");
+            Mutex::new(csv::WriterBuilder::new().from_writer(file))
+        });
         Self {
             utp_read: tokio::sync::Mutex::new(utp_read),
             utp_write,
@@ -36,6 +54,7 @@ impl TransportLayer {
             sent_data_packet,
             recv_data_packet,
             first_error,
+            reliable_layer_logger,
         }
     }
 
@@ -52,12 +71,13 @@ impl TransportLayer {
         loop {
             self.first_error.throw_error()?;
             // reliable -{data}> UDP remote
-            let p = {
+            let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                let Some(p) = reliable_layer.send_data_packet(data_buf, Instant::now()) else {
-                    break;
-                };
-                p
+                reliable_layer.send_data_packet(data_buf, Instant::now())
+            };
+            self.log("send_data_packet");
+            let Some(p) = res else {
+                break;
             };
             written_bytes += p.data_written.get();
             let data = EncodeData {
@@ -127,23 +147,27 @@ impl TransportLayer {
                 Err(_) => continue,
             };
 
-            {
-                let now = Instant::now();
-                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+            let now = Instant::now();
+            let mut reliable_layer = self.reliable_layer.lock().unwrap();
 
-                // UDP local -{ACK}> reliable
-                reliable_layer.recv_ack_packet(ack_from_peer_buf, now);
+            // UDP local -{ACK}> reliable
+            reliable_layer.recv_ack_packet(ack_from_peer_buf, now);
 
-                // UDP local -{data}> reliable
-                if let Some(data) = data {
-                    let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range]);
-                    match ack {
-                        true => {
-                            ack_to_peer_buf.push(data.seq);
-                        }
-                        false => break,
-                    }
+            let Some(data) = data else {
+                drop(reliable_layer);
+                self.log("recv_ack_packet");
+                continue;
+            };
+
+            // UDP local -{data}> reliable
+            let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range]);
+            drop(reliable_layer);
+            self.log("recv_data_packet");
+            match ack {
+                true => {
+                    ack_to_peer_buf.push(data.seq);
                 }
+                false => break,
             }
         }
 
@@ -180,6 +204,7 @@ impl TransportLayer {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_buf(data, Instant::now())
             };
+            self.log("send_data_buf");
 
             if no_delay {
                 self.send_packets(data_buf, utp_buf).await?;
@@ -198,21 +223,52 @@ impl TransportLayer {
         let mut recv_data_packet = self.recv_data_packet.notified();
         let read_bytes = loop {
             self.first_error.throw_error()?;
-            {
-                // reliable -{data}> app
+
+            // reliable -{data}> app
+            let read_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                let read_bytes = reliable_layer.recv_data_buf(data);
-                if PRINT_DEBUG_MESSAGES {
-                    println!("recv: data: {read_bytes}");
-                }
-                if 0 < read_bytes {
-                    break read_bytes;
-                }
+                reliable_layer.recv_data_buf(data)
+            };
+            self.log("recv_data_buf");
+            if PRINT_DEBUG_MESSAGES {
+                println!("recv: data: {read_bytes}");
+            }
+            if 0 < read_bytes {
+                break read_bytes;
             }
             recv_data_packet.await;
             recv_data_packet = self.recv_data_packet.notified();
         };
         Ok(read_bytes)
+    }
+
+    fn log(&self, op: &str) {
+        let Some(logger) = &self.reliable_layer_logger else {
+            return;
+        };
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix timestamp");
+        let log = self.reliable_layer.lock().unwrap().log();
+        let log = Log {
+            op,
+            time: time.as_micros(),
+            tokens: log.tokens,
+            send_rate: log.send_rate,
+            loss_rate: log.loss_rate,
+            num_tx_pkts: log.num_tx_pkts,
+            num_rt_pkts: log.num_rt_pkts,
+            send_seq: log.send_seq,
+            min_rtt: log.min_rtt,
+            rtt: log.rtt,
+            num_rx_pkts: log.num_rx_pkts,
+            recv_seq: log.recv_seq,
+        };
+        logger
+            .lock()
+            .unwrap()
+            .serialize(&log)
+            .expect("write CSV log");
     }
 }
 
@@ -251,4 +307,26 @@ impl FirstError {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LogConfig {
+    pub reliable_layer_log_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Log<'a> {
+    pub time: u128,
+    pub op: &'a str,
+
+    pub tokens: f64,
+    pub send_rate: f64,
+    pub loss_rate: Option<f64>,
+    pub num_tx_pkts: usize,
+    pub num_rt_pkts: usize,
+    pub send_seq: u64,
+    pub min_rtt: Option<u128>,
+    pub rtt: u128,
+    pub num_rx_pkts: usize,
+    pub recv_seq: u64,
 }
