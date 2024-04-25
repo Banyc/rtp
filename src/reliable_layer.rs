@@ -18,11 +18,23 @@ const RECV_DATA_BUFFER_LENGTH: usize = 2 << 16;
 const INIT_BYTES_PER_SECOND: f64 = 1024.0;
 const MAX_BURST_PACKETS: usize = 64;
 const MSS: usize = 1413;
-const SMOOTH_SEND_RATE_ALPHA: f64 = 0.1;
+const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const INIT_SMOOTH_SEND_RATE: f64 = 12.;
 const PROBE_RATE: f64 = 1.;
-const CWND_DATA_LOSS_RATE: f64 = 0.02;
+const CWND_DATA_LOSS_RATE: f64 = 0.1;
+const MAX_DATA_LOSS_RATE: f64 = 0.3;
 const PRINT_DEBUG_MESSAGES: bool = false;
+
+#[derive(Debug, Clone)]
+enum State {
+    Init {},
+    Fluctuating,
+}
+impl State {
+    pub fn new() -> Self {
+        Self::Init {}
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ReliableLayer {
@@ -33,6 +45,8 @@ pub struct ReliableLayer {
     packet_send_space: PacketSendSpace,
     packet_recv_space: PacketRecvSpace,
     smooth_send_rate: NonZeroPositiveF64,
+    state: State,
+    prev_sample_rate: Option<dre::RateSample>,
 
     // Reused buffers
     packet_stats_buf: Vec<PacketState>,
@@ -52,6 +66,8 @@ impl ReliableLayer {
             packet_send_space: PacketSendSpace::new(),
             packet_recv_space: PacketRecvSpace::new(),
             smooth_send_rate: NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap(),
+            state: State::new(),
+            prev_sample_rate: None,
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
@@ -77,8 +93,8 @@ impl ReliableLayer {
     pub fn send_data_packet(&mut self, packet: &mut [u8], now: Instant) -> Option<DataPacket> {
         self.detect_application_limited_phases(now);
 
-        if let Some(loss_rate) = self.packet_send_space.data_loss_rate(now) {
-            if loss_rate == 1. {
+        if let Some(loss_rate) = self.data_loss_rate(now) {
+            if MAX_DATA_LOSS_RATE < loss_rate {
                 self.smooth_send_rate = NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap();
                 self.token_bucket.set_thruput(self.smooth_send_rate, now);
             }
@@ -142,19 +158,8 @@ impl ReliableLayer {
         if PRINT_DEBUG_MESSAGES {
             println!("{sr:?}");
         }
-        let target_send_rate = match sr.is_app_limited() {
-            true => {
-                let send_rate = sr.delivery_rate() + sr.delivery_rate() * PROBE_RATE;
-                if send_rate < self.smooth_send_rate.get() {
-                    return Some(sr);
-                }
-                send_rate
-            }
-            false => sr.delivery_rate(),
-        };
-        let smooth_send_rate = self.smooth_send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
-            + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
-        self.smooth_send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
+        self.prev_sample_rate = Some(sr.clone());
+        self.adjust_smooth_send_rate(&sr, now);
 
         let send_rate =
             self.smooth_send_rate.get() + self.smooth_send_rate.get() * CWND_DATA_LOSS_RATE;
@@ -162,6 +167,37 @@ impl ReliableLayer {
 
         self.token_bucket.set_thruput(send_rate, now);
         Some(sr)
+    }
+
+    fn adjust_smooth_send_rate(&mut self, sr: &dre::RateSample, now: Instant) {
+        let little_data_loss = self.data_loss_rate(now).map(|lr| lr < CWND_DATA_LOSS_RATE);
+        let should_probe = little_data_loss != Some(false);
+        let target_send_rate = match should_probe {
+            true => {
+                let send_rate = sr.delivery_rate() + sr.delivery_rate() * PROBE_RATE;
+                if send_rate < self.smooth_send_rate.get() {
+                    return;
+                }
+                send_rate
+            }
+            false => sr.delivery_rate(),
+        };
+
+        match &mut self.state {
+            State::Init {} => {
+                if !should_probe {
+                    self.state = State::Fluctuating;
+                    self.adjust_smooth_send_rate(sr, now);
+                    return;
+                }
+                self.smooth_send_rate = NonZeroPositiveF64::new(target_send_rate).unwrap();
+            }
+            State::Fluctuating => {
+                let smooth_send_rate = self.smooth_send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
+                    + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
+                self.smooth_send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
+            }
+        }
     }
 
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
@@ -209,7 +245,7 @@ impl ReliableLayer {
         //             .all_lost_packets_retransmitted(now),
         //         pipe: self.packet_send_space.num_transmitting_packets() as u64,
         //     });
-        let in_app_limited_phase = match self.packet_send_space.data_loss_rate(now) {
+        let in_app_limited_phase = match self.data_loss_rate(now) {
             Some(loss_rate) => loss_rate < CWND_DATA_LOSS_RATE,
             None => true,
         };
@@ -217,6 +253,11 @@ impl ReliableLayer {
             let pipe = self.packet_send_space.num_transmitting_packets() as u64;
             self.connection_stats.set_application_limited_phases(pipe);
         }
+    }
+
+    fn data_loss_rate(&mut self, now: Instant) -> Option<f64> {
+        self.packet_send_space
+            .data_loss_rate(now, self.token_bucket.gen_tokens(now))
     }
 
     pub fn log(&self) -> Log {
@@ -230,7 +271,9 @@ impl ReliableLayer {
         Log {
             tokens: self.token_bucket.outdated_tokens(),
             send_rate: self.smooth_send_rate.get(),
-            loss_rate: self.packet_send_space.data_loss_rate(now),
+            loss_rate: self
+                .packet_send_space
+                .data_loss_rate(now, self.token_bucket.outdated_coined_tokens()),
             num_tx_pkts: self.packet_send_space.num_transmitting_packets(),
             num_rt_pkts: self.packet_send_space.num_retransmitted_packets(),
             send_seq: self.packet_send_space.next_seq(),
@@ -238,6 +281,11 @@ impl ReliableLayer {
             rtt: self.packet_send_space.smooth_rtt().as_millis(),
             num_rx_pkts: self.packet_recv_space.num_received_packets(),
             recv_seq: self.packet_recv_space.next_seq(),
+            delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),
+            state: match &self.state {
+                State::Init { .. } => 0,
+                State::Fluctuating => 1,
+            },
         }
     }
 }
@@ -260,4 +308,6 @@ pub struct Log {
     pub rtt: u128,
     pub num_rx_pkts: usize,
     pub recv_seq: u64,
+    pub delivery_rate: Option<f64>,
+    pub state: u8,
 }

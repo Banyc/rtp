@@ -97,6 +97,7 @@ impl PacketSendSpace {
             if !p.rto(self.smooth_rtt, now) {
                 continue;
             }
+            p.retransmitted = true;
             p.sent_time = now;
             let p = Packet {
                 seq: *s,
@@ -128,12 +129,13 @@ impl PacketSendSpace {
         self.transmitting.len()
     }
 
-    pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
+    /// Only consider `take` amount of low-sequence-number packets
+    pub fn data_loss_rate(&self, now: Instant, take: usize) -> Option<f64> {
         if self.transmitting.is_empty() {
             return None;
         }
         let mut lost = 0;
-        for p in self.transmitting.values() {
+        for p in self.transmitting.values().take(take) {
             if p.retransmitted || p.rto(self.smooth_rtt, now) {
                 lost += 1;
             }

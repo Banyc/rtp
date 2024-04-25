@@ -263,6 +263,8 @@ impl TransportLayer {
             rtt: log.rtt,
             num_rx_pkts: log.num_rx_pkts,
             recv_seq: log.recv_seq,
+            delivery_rate: log.delivery_rate,
+            state: log.state,
         };
         logger
             .lock()
@@ -329,4 +331,6 @@ pub struct Log<'a> {
     pub rtt: u128,
     pub num_rx_pkts: usize,
     pub recv_seq: u64,
+    pub delivery_rate: Option<f64>,
+    pub state: u8,
 }

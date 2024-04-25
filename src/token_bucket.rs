@@ -29,6 +29,10 @@ impl TokenBucket {
         self.tokens as f64 + self.coining_token.get()
     }
 
+    pub fn outdated_coined_tokens(&self) -> usize {
+        self.tokens
+    }
+
     pub fn gen_tokens(&mut self, now: Instant) -> usize {
         self.fill_up(now);
 
@@ -71,7 +75,7 @@ impl TokenBucket {
         let dur = now.duration_since(self.last_update);
         let new_tokens = dur.as_secs_f64() / self.sec_per_token.get() + self.coining_token.get();
         let new_complete_tokens = new_tokens as usize;
-        let coining_token = new_tokens - new_complete_tokens as f64;
+        let coining_token = (new_tokens - new_complete_tokens as f64).clamp(0.0, 1.0);
         let coining_token = NormalizedF64::new(coining_token).unwrap();
         let tokens = self.tokens + new_complete_tokens;
         let tokens = tokens.min(self.max_tokens.get());
