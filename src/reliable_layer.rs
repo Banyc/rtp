@@ -265,7 +265,7 @@ impl ReliableLayer {
             send_seq: self.packet_send_space.next_seq(),
             min_rtt: min_rtt.map(|t| t.as_millis()),
             rtt: self.packet_send_space.smooth_rtt().as_millis(),
-            cwnd: self.packet_send_space.cwnd(),
+            cwnd: self.packet_send_space.cwnd().get(),
             num_rx_pkts: self.packet_recv_space.num_received_packets(),
             recv_seq: self.packet_recv_space.next_seq(),
             delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),

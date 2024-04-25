@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
@@ -19,7 +20,7 @@ pub struct PacketSendSpace {
     min_rtt: Option<Duration>,
     smooth_rtt: Duration,
     reused_buf: Vec<Vec<u8>>,
-    cwnd: usize,
+    cwnd: NonZeroUsize,
 }
 impl PacketSendSpace {
     pub fn new() -> Self {
@@ -29,11 +30,11 @@ impl PacketSendSpace {
             min_rtt: None,
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
             reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
-            cwnd: INIT_CWND,
+            cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
         }
     }
 
-    pub fn cwnd(&self) -> usize {
+    pub fn cwnd(&self) -> NonZeroUsize {
         self.cwnd
     }
 
@@ -85,7 +86,7 @@ impl PacketSendSpace {
     }
 
     pub fn accepts_new_packet(&self) -> bool {
-        self.transmitting.len() < self.cwnd
+        self.transmitting.len() < self.cwnd.get()
     }
 
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Packet<'_> {
@@ -133,7 +134,7 @@ impl PacketSendSpace {
         };
         let cwnd = min_rtt.as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
-        self.cwnd = cwnd;
+        self.cwnd = NonZeroUsize::new(cwnd).unwrap_or(NonZeroUsize::new(1).unwrap());
     }
 
     pub fn no_packets_in_flight(&self) -> bool {
