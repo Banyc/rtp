@@ -4,29 +4,37 @@ use std::{
 };
 
 use dre::PacketState;
+use strict_num::NonZeroPositiveF64;
 
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
 const RTO_K: f64 = 1.;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
 const MAX_NUM_REUSED_BUFFERS: usize = 64;
+const INIT_CWND: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct PacketSendSpace {
     next_seq: u64,
     transmitting: BTreeMap<u64, TransmittingPacket>,
-    min_rtt: Duration,
+    min_rtt: Option<Duration>,
     smooth_rtt: Duration,
     reused_buf: Vec<Vec<u8>>,
+    cwnd: usize,
 }
 impl PacketSendSpace {
     pub fn new() -> Self {
         Self {
             next_seq: 0,
             transmitting: BTreeMap::new(),
-            min_rtt: Duration::MAX,
+            min_rtt: None,
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
             reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
+            cwnd: INIT_CWND,
         }
+    }
+
+    pub fn cwnd(&self) -> usize {
+        self.cwnd
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -59,7 +67,10 @@ impl PacketSendSpace {
             };
             if !p.retransmitted {
                 let rtt = now - p.sent_time;
-                self.min_rtt = self.min_rtt.min(rtt);
+                self.min_rtt = Some(match self.min_rtt {
+                    Some(min_rtt) => min_rtt.min(rtt),
+                    None => rtt,
+                });
                 let smooth_rtt = self.smooth_rtt.as_secs_f64() * (1. - SMOOTH_RTT_ALPHA)
                     + rtt.as_secs_f64() * SMOOTH_RTT_ALPHA;
                 self.smooth_rtt = Duration::from_secs_f64(smooth_rtt);
@@ -71,6 +82,10 @@ impl PacketSendSpace {
             }
             acked.push(p.stats);
         }
+    }
+
+    pub fn accepts_new_packet(&self) -> bool {
+        self.transmitting.len() < self.cwnd
     }
 
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Packet<'_> {
@@ -108,8 +123,17 @@ impl PacketSendSpace {
         None
     }
 
-    pub fn min_rtt(&self) -> Duration {
+    pub fn min_rtt(&self) -> Option<Duration> {
         self.min_rtt
+    }
+
+    pub fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64) {
+        let Some(min_rtt) = self.min_rtt else {
+            return;
+        };
+        let cwnd = min_rtt.as_secs_f64() * send_rate.get();
+        let cwnd = cwnd.round() as usize;
+        self.cwnd = cwnd;
     }
 
     pub fn no_packets_in_flight(&self) -> bool {
@@ -129,13 +153,12 @@ impl PacketSendSpace {
         self.transmitting.len()
     }
 
-    /// Only consider `take` amount of low-sequence-number packets
-    pub fn data_loss_rate(&self, now: Instant, take: usize) -> Option<f64> {
+    pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
         if self.transmitting.is_empty() {
             return None;
         }
         let mut lost = 0;
-        for p in self.transmitting.values().take(take) {
+        for p in self.transmitting.values() {
             if p.retransmitted || p.rto(self.smooth_rtt, now) {
                 lost += 1;
             }
