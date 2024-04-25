@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
-    packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace,
+    packet_recv_space::PacketRecvSpace,
+    packet_send_space::{PacketSendSpace, INIT_CWND},
     token_bucket::TokenBucket,
 };
 
@@ -18,7 +19,7 @@ const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const INIT_SMOOTH_SEND_RATE: f64 = 12.;
 const PROBE_RATE: f64 = 1.;
 const CWND_DATA_LOSS_RATE: f64 = 0.1;
-// const MAX_DATA_LOSS_RATE: f64 = 0.3;
+const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
 #[derive(Debug, Clone)]
@@ -90,6 +91,18 @@ impl ReliableLayer {
     /// Move data from inner data buffer to inner packet space and return one of the packets if possible
     pub fn send_data_packet(&mut self, packet: &mut [u8], now: Instant) -> Option<DataPacket> {
         self.detect_application_limited_phases(now);
+
+        // reset on huge data loss
+        if let Some(data_loss_rate) = self.packet_send_space.data_loss_rate(now) {
+            if INIT_CWND < self.packet_send_space.num_transmitting_packets()
+                && MAX_DATA_LOSS_RATE < data_loss_rate
+            {
+                let send_rate = NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap();
+                self.smooth_send_rate = send_rate;
+                self.packet_send_space.set_send_rate(send_rate);
+                self.token_bucket.set_thruput(send_rate, now);
+            }
+        }
 
         if !self.token_bucket.take_exact_tokens(1, now) {
             return None;

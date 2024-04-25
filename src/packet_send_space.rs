@@ -11,7 +11,7 @@ const SMOOTH_RTT_ALPHA: f64 = 0.1;
 const RTO_K: f64 = 1.;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
 const MAX_NUM_REUSED_BUFFERS: usize = 64;
-const INIT_CWND: usize = 16;
+pub const INIT_CWND: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct PacketSendSpace {
