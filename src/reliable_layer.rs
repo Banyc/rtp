@@ -139,12 +139,6 @@ impl ReliableLayer {
         };
         f();
 
-        // idle
-        if self.send_data_buf.is_empty() && self.packet_send_space.num_transmitting_packets() == 0 {
-            // Re-estimate the max delivery rate
-            self.state = State::init();
-        }
-
         if !self.token_bucket.take_exact_tokens(1, now) {
             return None;
         }
@@ -211,6 +205,11 @@ impl ReliableLayer {
         self.prev_sample_rate = Some(sr.clone());
 
         self.adjust_smooth_send_rate(&sr, now);
+
+        // Re-estimate the max delivery rate
+        if sr.is_app_limited() && matches!(self.state, State::Fluctuating { .. }) {
+            self.state = State::init();
+        }
 
         let send_rate = self.smooth_send_rate;
         self.packet_send_space.set_send_rate(send_rate);
