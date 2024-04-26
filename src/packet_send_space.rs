@@ -133,8 +133,8 @@ impl PacketSendSpace {
             return;
         };
         let cwnd = min_rtt.as_secs_f64() * send_rate.get();
-        let cwnd = cwnd.round() as usize;
-        self.cwnd = NonZeroUsize::new(cwnd).unwrap_or(NonZeroUsize::new(1).unwrap());
+        let cwnd = INIT_CWND.max(cwnd.round() as usize);
+        self.cwnd = NonZeroUsize::new(cwnd).unwrap();
     }
 
     pub fn no_packets_in_flight(&self) -> bool {
@@ -175,6 +175,10 @@ impl PacketSendSpace {
             min_next_poll_time = Some(t);
         }
         min_next_poll_time
+    }
+
+    pub fn rto_duration(&self) -> Duration {
+        rto_duration(self.smooth_rtt)
     }
 }
 impl Default for PacketSendSpace {
