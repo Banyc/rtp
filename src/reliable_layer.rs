@@ -308,12 +308,14 @@ impl ReliableLayer {
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
                 few_data_to_send: self.send_data_buf.len() < MSS,
-                not_transmitting_a_packet: self.packet_send_space.num_transmitting_packets() == 0,
+                not_transmitting_a_packet: true,
                 cwnd_not_full: self.packet_send_space.accepts_new_packet(),
                 all_lost_packets_retransmitted: self
                     .packet_send_space
                     .all_lost_packets_retransmitted(now),
-                pipe: self.packet_send_space.num_transmitting_packets() as u64,
+                pipe: self
+                    .packet_send_space
+                    .num_not_lost_transmitting_packets(now) as u64,
             },
         );
     }

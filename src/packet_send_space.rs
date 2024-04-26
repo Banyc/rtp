@@ -150,6 +150,17 @@ impl PacketSendSpace {
         true
     }
 
+    pub fn num_not_lost_transmitting_packets(&self, now: Instant) -> usize {
+        let mut not_lost = 0;
+        for p in self.transmitting.values() {
+            if p.rto(self.smooth_rtt, now) {
+                continue;
+            }
+            not_lost += 1;
+        }
+        not_lost
+    }
+
     pub fn num_transmitting_packets(&self) -> usize {
         self.transmitting.len()
     }
