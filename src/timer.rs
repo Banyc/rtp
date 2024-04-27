@@ -10,17 +10,17 @@ pub enum ContActTimerOn {
 /// Only return the value if there is only the same kind of actions performed during a specific duration
 #[derive(Debug, Clone)]
 pub struct ContActTimer<T> {
-    start: Option<Instant>,
+    timer: PollTimer,
     value: T,
     on: ContActTimerOn,
 }
 impl<T> ContActTimer<T> {
     pub fn new(value: T, now: Instant, on: ContActTimerOn) -> Self {
-        let start = match on {
-            ContActTimerOn::Unchanged => None,
-            ContActTimerOn::Hot => Some(now),
-        };
-        Self { start, value, on }
+        let mut timer = PollTimer::new_cleared();
+        if matches!(on, ContActTimerOn::Hot) {
+            timer.ensure_started(now);
+        }
+        Self { timer, value, on }
     }
 
     /// `at_least_for`: The timer sets off in at least this duration
@@ -44,54 +44,61 @@ impl<T> ContActTimer<T> {
             None => false,
         };
 
-        // Reset timer and reject
+        // Clear timer and reject
         match (set, &self.on) {
             (true, ContActTimerOn::Unchanged) | (false, ContActTimerOn::Hot) => {
-                self.start = None;
+                self.timer.clear();
                 return None;
             }
             _ => (),
         }
 
-        // Get start of the timer
-        let start = match self.start {
-            Some(x) => x,
-            None => {
-                self.start = Some(now);
-                now
-            }
-        };
-
         // Check the duration condition
-        let dur = now.duration_since(start);
-        if dur < at_least_for {
+        if !self.timer.set_and_check(at_least_for, now) {
             return None;
         }
 
-        // Sets off and reset the timer
-        self.start = Some(now);
+        // Sets off and restart the timer
+        self.timer.restart(now);
         Some(&self.value)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ContActTimer2 {
-    timer: ContActTimer<()>,
+pub struct PollTimer {
+    start: Option<Instant>,
 }
-impl ContActTimer2 {
-    pub fn new(now: Instant) -> Self {
-        Self {
-            timer: ContActTimer::new((), now, ContActTimerOn::Hot),
+impl PollTimer {
+    /// Create an cleared timer
+    pub fn new_cleared() -> Self {
+        Self { start: None }
+    }
+
+    pub fn clear(&mut self) {
+        self.start = None;
+    }
+
+    pub fn restart(&mut self, now: Instant) {
+        self.start = Some(now);
+    }
+
+    /// Return the start time
+    pub fn ensure_started(&mut self, now: Instant) -> Instant {
+        match self.start {
+            Some(x) => x,
+            None => {
+                self.start = Some(now);
+                now
+            }
         }
     }
 
-    pub fn check(&mut self, continue_: bool, at_least_for: Duration, now: Instant) -> bool {
-        self.timer
-            .try_set_and_get(
-                |_| if continue_ { Some(()) } else { None },
-                at_least_for,
-                now,
-            )
-            .is_some()
+    /// Return `true` iff the timer sets off
+    pub fn set_and_check(&mut self, at_least_for: Duration, now: Instant) -> bool {
+        let start = self.ensure_started(now);
+
+        // Check the duration condition
+        let dur = now.duration_since(start);
+        at_least_for <= dur
     }
 }

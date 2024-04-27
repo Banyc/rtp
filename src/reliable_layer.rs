@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
-    cont_act_timer::{ContActTimer, ContActTimer2, ContActTimerOn},
     packet_recv_space::PacketRecvSpace,
     packet_send_space::{PacketSendSpace, INIT_CWND},
     shared::SharedCell,
+    timer::{ContActTimer, ContActTimerOn, PollTimer},
     token_bucket::TokenBucket,
 };
 
@@ -36,7 +36,7 @@ enum State {
     },
     Fluctuating {
         max_delivery_rate: NonZeroPositiveF64,
-        close_send_delivery_rate: ContActTimer2,
+        close_send_delivery_rate: PollTimer,
     },
 }
 impl State {
@@ -46,10 +46,10 @@ impl State {
         }
     }
 
-    pub fn fluctuating(max_delivery_rate: NonZeroPositiveF64, now: Instant) -> Self {
+    pub fn fluctuating(max_delivery_rate: NonZeroPositiveF64) -> Self {
         Self::Fluctuating {
             max_delivery_rate,
-            close_send_delivery_rate: ContActTimer2::new(now),
+            close_send_delivery_rate: PollTimer::new_cleared(),
         }
     }
 }
@@ -65,7 +65,7 @@ pub struct ReliableLayer {
     send_rate: NonZeroPositiveF64,
     state: State,
     prev_sample_rate: Option<dre::RateSample>,
-    huge_data_loss_start: Option<Instant>,
+    huge_data_loss_timer: PollTimer,
     init_send_rate: SharedCell<NonZeroPositiveF64>,
 
     // Reused buffers
@@ -90,7 +90,7 @@ impl ReliableLayer {
             send_rate,
             state: State::init(),
             prev_sample_rate: None,
-            huge_data_loss_start: None,
+            huge_data_loss_timer: PollTimer::new_cleared(),
             init_send_rate,
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
@@ -122,23 +122,20 @@ impl ReliableLayer {
         // backoff on unrecovered huge data loss
         let mut f = || {
             let Some(data_loss_rate) = self.packet_send_space.data_loss_rate(now) else {
-                self.huge_data_loss_start = None;
+                self.huge_data_loss_timer.clear();
                 return;
             };
             let huge_data_loss = INIT_CWND < self.packet_send_space.num_transmitting_packets()
                 && MAX_DATA_LOSS_RATE < data_loss_rate;
             if !huge_data_loss {
-                self.huge_data_loss_start = None;
+                self.huge_data_loss_timer.clear();
                 return;
             }
-            if self.huge_data_loss_start.is_none() {
-                self.huge_data_loss_start = Some(now);
-            }
-            let dur = now.duration_since(self.huge_data_loss_start.unwrap());
-            if dur <= self.packet_send_space.rto_duration().mul_f64(2.) {
+            let at_least_for = self.packet_send_space.rto_duration().mul_f64(2.);
+            if !self.huge_data_loss_timer.set_and_check(at_least_for, now) {
                 return;
             }
-            self.huge_data_loss_start = None;
+            self.huge_data_loss_timer.clear();
             // exponential backoff
             let send_rate = NonZeroPositiveF64::new(self.send_rate.get() / 2.).unwrap();
             self.set_send_rate(send_rate, now);
@@ -248,7 +245,7 @@ impl ReliableLayer {
                 );
                 if let Some(max_delivery_rate) = max_delivery_rate {
                     let send_rate = *max_delivery_rate;
-                    self.state = State::fluctuating(*max_delivery_rate, now);
+                    self.state = State::fluctuating(*max_delivery_rate);
                     self.set_send_rate(send_rate, now);
                     self.init_send_rate.set(self.send_rate);
                     self.adjust_send_rate(sr, now);
@@ -290,11 +287,12 @@ impl ReliableLayer {
                 let close_send_delivery_rate_ = send_rate.get()
                     < sr.delivery_rate() + sr.delivery_rate() * SEND_DELIVERY_RATE_EPSILON
                     && send_rate == *max_delivery_rate;
-                let good_delivery_rate = close_send_delivery_rate.check(
-                    close_send_delivery_rate_,
-                    self.packet_send_space.rto_duration(),
-                    now,
-                );
+                let good_delivery_rate = if close_send_delivery_rate_ {
+                    close_send_delivery_rate
+                        .set_and_check(self.packet_send_space.rto_duration(), now)
+                } else {
+                    false
+                };
                 if few_data_to_send || good_delivery_rate {
                     self.state = State::init();
                 }
