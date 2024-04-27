@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
-    cont_act_timer::{ContActTimer, ContActTimerOn},
+    cont_act_timer::{ContActTimer, ContActTimer2, ContActTimerOn},
     packet_recv_space::PacketRecvSpace,
     packet_send_space::{PacketSendSpace, INIT_CWND},
     token_bucket::TokenBucket,
@@ -22,6 +22,7 @@ const SEND_RATE_PROBE_RATE: f64 = 1.;
 const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
+const SEND_DELIVERY_RATE_EPSILON: f64 = 0.1;
 
 #[derive(Debug, Clone)]
 enum State {
@@ -30,6 +31,7 @@ enum State {
     },
     Fluctuating {
         max_delivery_rate: NonZeroPositiveF64,
+        close_send_delivery_rate: ContActTimer2,
     },
 }
 impl State {
@@ -39,8 +41,11 @@ impl State {
         }
     }
 
-    pub fn fluctuating(max_delivery_rate: NonZeroPositiveF64) -> Self {
-        Self::Fluctuating { max_delivery_rate }
+    pub fn fluctuating(max_delivery_rate: NonZeroPositiveF64, now: Instant) -> Self {
+        Self::Fluctuating {
+            max_delivery_rate,
+            close_send_delivery_rate: ContActTimer2::new(now),
+        }
     }
 }
 
@@ -234,7 +239,7 @@ impl ReliableLayer {
                 );
                 if let Some(max_delivery_rate) = max_delivery_rate {
                     let send_rate = *max_delivery_rate;
-                    self.state = State::fluctuating(*max_delivery_rate);
+                    self.state = State::fluctuating(*max_delivery_rate, now);
                     self.set_send_rate(send_rate, now);
                     self.adjust_send_rate(sr, now);
                     return;
@@ -244,7 +249,10 @@ impl ReliableLayer {
                 let send_rate = NonZeroPositiveF64::new(delivery_rate.get() * 2.).unwrap();
                 self.set_send_rate(send_rate, now);
             }
-            State::Fluctuating { max_delivery_rate } => {
+            State::Fluctuating {
+                max_delivery_rate,
+                close_send_delivery_rate,
+            } => {
                 let little_data_loss = self
                     .packet_send_space
                     .data_loss_rate(now)
@@ -265,15 +273,23 @@ impl ReliableLayer {
                 let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
                     + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
                 let send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
-                self.set_send_rate(send_rate, now);
 
                 // Re-estimate the max delivery rate
                 let few_data_to_send = self.send_data_buf.len() <= MSS
                     && self.packet_send_space.no_packets_in_flight();
-                // if sr.is_app_limited() {
-                if few_data_to_send {
+                let close_send_delivery_rate_ = send_rate.get()
+                    < sr.delivery_rate() + sr.delivery_rate() * SEND_DELIVERY_RATE_EPSILON
+                    && send_rate == *max_delivery_rate;
+                let good_delivery_rate = close_send_delivery_rate.check(
+                    close_send_delivery_rate_,
+                    self.packet_send_space.rto_duration(),
+                    now,
+                );
+                if few_data_to_send || good_delivery_rate {
                     self.state = State::init();
                 }
+
+                self.set_send_rate(send_rate, now);
             }
         }
     }

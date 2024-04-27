@@ -73,3 +73,25 @@ impl<T> ContActTimer<T> {
         Some(&self.value)
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct ContActTimer2 {
+    timer: ContActTimer<()>,
+}
+impl ContActTimer2 {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            timer: ContActTimer::new((), now, ContActTimerOn::Hot),
+        }
+    }
+
+    pub fn check(&mut self, continue_: bool, at_least_for: Duration, now: Instant) -> bool {
+        self.timer
+            .try_set_and_get(
+                |_| if continue_ { Some(()) } else { None },
+                at_least_for,
+                now,
+            )
+            .is_some()
+    }
+}
