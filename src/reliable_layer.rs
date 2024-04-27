@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 
 use dre::{ConnectionState, PacketState};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use strict_num::NonZeroPositiveF64;
 
@@ -8,6 +9,7 @@ use crate::{
     cont_act_timer::{ContActTimer, ContActTimer2, ContActTimerOn},
     packet_recv_space::PacketRecvSpace,
     packet_send_space::{PacketSendSpace, INIT_CWND},
+    shared::SharedCell,
     token_bucket::TokenBucket,
 };
 
@@ -23,6 +25,9 @@ const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 const SEND_DELIVERY_RATE_EPSILON: f64 = 0.1;
+
+static GLOBAL_INIT_SEND_RATE: Lazy<SharedCell<NonZeroPositiveF64>> =
+    Lazy::new(|| SharedCell::new(NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap()));
 
 #[derive(Debug, Clone)]
 enum State {
@@ -61,6 +66,7 @@ pub struct ReliableLayer {
     state: State,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_start: Option<Instant>,
+    init_send_rate: SharedCell<NonZeroPositiveF64>,
 
     // Reused buffers
     packet_stats_buf: Vec<PacketState>,
@@ -68,21 +74,24 @@ pub struct ReliableLayer {
 }
 impl ReliableLayer {
     pub fn new(now: Instant) -> Self {
+        let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
+        let send_rate = init_send_rate.get();
         Self {
             send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
             recv_data_buf: VecDeque::with_capacity(RECV_DATA_BUFFER_LENGTH),
             token_bucket: TokenBucket::new(
-                NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap(),
+                send_rate,
                 NonZeroUsize::new(MAX_BURST_PACKETS).unwrap(),
                 now,
             ),
             connection_stats: ConnectionState::new(now),
             packet_send_space: PacketSendSpace::new(),
             packet_recv_space: PacketRecvSpace::new(),
-            send_rate: NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap(),
+            send_rate,
             state: State::init(),
             prev_sample_rate: None,
             huge_data_loss_start: None,
+            init_send_rate,
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
@@ -241,6 +250,7 @@ impl ReliableLayer {
                     let send_rate = *max_delivery_rate;
                     self.state = State::fluctuating(*max_delivery_rate, now);
                     self.set_send_rate(send_rate, now);
+                    self.init_send_rate.set(self.send_rate);
                     self.adjust_send_rate(sr, now);
                     return;
                 }
