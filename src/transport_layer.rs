@@ -266,6 +266,7 @@ impl TransportLayer {
             recv_seq: log.recv_seq,
             delivery_rate: log.delivery_rate,
             state: log.state,
+            app_limited: log.app_limited,
         };
         logger
             .lock()
@@ -335,4 +336,5 @@ pub struct Log<'a> {
     pub recv_seq: u64,
     pub delivery_rate: Option<f64>,
     pub state: u8,
+    pub app_limited: Option<bool>,
 }

@@ -1,14 +1,11 @@
-use std::{
-    collections::VecDeque,
-    num::NonZeroUsize,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 
 use dre::{ConnectionState, PacketState};
 use serde::{Deserialize, Serialize};
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
+    cont_act_timer::{ContActTimer, ContActTimerOn},
     packet_recv_space::PacketRecvSpace,
     packet_send_space::{PacketSendSpace, INIT_CWND},
     token_bucket::TokenBucket,
@@ -16,20 +13,20 @@ use crate::{
 
 const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
 const RECV_DATA_BUFFER_LENGTH: usize = 2 << 16;
-const INIT_BYTES_PER_SECOND: f64 = 1024.0;
 const MAX_BURST_PACKETS: usize = 64;
 const MSS: usize = 1413;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
-const INIT_SMOOTH_SEND_RATE: f64 = 16.;
-const PROBE_RATE: f64 = 1.;
-const CWND_DATA_LOSS_RATE: f64 = 0.2;
+const MIN_SEND_RATE: f64 = 16.;
+const INIT_SEND_RATE: f64 = 128.;
+const SEND_RATE_PROBE_RATE: f64 = 1.;
+const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
 #[derive(Debug, Clone)]
 enum State {
     Init {
-        max_delivery_rate: Option<MaxDeliveryRate>,
+        max_delivery_rate: Option<ContActTimer<NonZeroPositiveF64>>,
     },
     Fluctuating {
         max_delivery_rate: NonZeroPositiveF64,
@@ -55,7 +52,7 @@ pub struct ReliableLayer {
     connection_stats: ConnectionState,
     packet_send_space: PacketSendSpace,
     packet_recv_space: PacketRecvSpace,
-    smooth_send_rate: NonZeroPositiveF64,
+    send_rate: NonZeroPositiveF64,
     state: State,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_start: Option<Instant>,
@@ -70,14 +67,14 @@ impl ReliableLayer {
             send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
             recv_data_buf: VecDeque::with_capacity(RECV_DATA_BUFFER_LENGTH),
             token_bucket: TokenBucket::new(
-                NonZeroPositiveF64::new(INIT_BYTES_PER_SECOND).unwrap(),
+                NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap(),
                 NonZeroUsize::new(MAX_BURST_PACKETS).unwrap(),
                 now,
             ),
             connection_stats: ConnectionState::new(now),
             packet_send_space: PacketSendSpace::new(),
             packet_recv_space: PacketRecvSpace::new(),
-            smooth_send_rate: NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap(),
+            send_rate: NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap(),
             state: State::init(),
             prev_sample_rate: None,
             huge_data_loss_start: None,
@@ -129,11 +126,8 @@ impl ReliableLayer {
             }
             self.huge_data_loss_start = None;
             // exponential backoff
-            let send_rate = NonZeroPositiveF64::new(self.smooth_send_rate.get() / 2.).unwrap();
-            let send_rate = send_rate.max(NonZeroPositiveF64::new(INIT_SMOOTH_SEND_RATE).unwrap());
-            self.smooth_send_rate = send_rate;
-            self.packet_send_space.set_send_rate(send_rate);
-            self.token_bucket.set_thruput(send_rate, now);
+            let send_rate = NonZeroPositiveF64::new(self.send_rate.get() / 2.).unwrap();
+            self.set_send_rate(send_rate, now);
             // Re-estimate the max delivery rate
             self.state = State::init();
         };
@@ -204,20 +198,12 @@ impl ReliableLayer {
         }
         self.prev_sample_rate = Some(sr.clone());
 
-        self.adjust_smooth_send_rate(&sr, now);
+        self.adjust_send_rate(&sr, now);
 
-        // Re-estimate the max delivery rate
-        if sr.is_app_limited() && matches!(self.state, State::Fluctuating { .. }) {
-            self.state = State::init();
-        }
-
-        let send_rate = self.smooth_send_rate;
-        self.packet_send_space.set_send_rate(send_rate);
-        self.token_bucket.set_thruput(send_rate, now);
         Some(sr)
     }
 
-    fn adjust_smooth_send_rate(&mut self, sr: &dre::RateSample, now: Instant) {
+    fn adjust_send_rate(&mut self, sr: &dre::RateSample, now: Instant) {
         match &mut self.state {
             State::Init { max_delivery_rate } => {
                 let Some(delivery_rate) = NonZeroPositiveF64::new(sr.delivery_rate()) else {
@@ -226,31 +212,49 @@ impl ReliableLayer {
                 let max_delivery_rate = match max_delivery_rate {
                     Some(x) => x,
                     None => {
-                        *max_delivery_rate = Some(MaxDeliveryRate::new(delivery_rate, now));
+                        *max_delivery_rate = Some(ContActTimer::new(
+                            delivery_rate,
+                            now,
+                            ContActTimerOn::Unchanged,
+                        ));
                         max_delivery_rate.as_mut().unwrap()
                     }
                 };
-                let dur = max_delivery_rate.set(delivery_rate, now);
                 let rto = self.packet_send_space.rto_duration();
-                if rto.mul_f64(2.) < dur {
-                    self.state = State::fluctuating(max_delivery_rate.get());
-                    self.adjust_smooth_send_rate(sr, now);
+                let max_delivery_rate = max_delivery_rate.try_set_and_get(
+                    |max| {
+                        if *max < delivery_rate {
+                            Some(delivery_rate)
+                        } else {
+                            None
+                        }
+                    },
+                    rto.mul_f64(2.),
+                    now,
+                );
+                if let Some(max_delivery_rate) = max_delivery_rate {
+                    let send_rate = *max_delivery_rate;
+                    self.state = State::fluctuating(*max_delivery_rate);
+                    self.set_send_rate(send_rate, now);
+                    self.adjust_send_rate(sr, now);
                     return;
                 }
 
                 // exponential growth
-                self.smooth_send_rate = NonZeroPositiveF64::new(delivery_rate.get() * 2.).unwrap();
+                let send_rate = NonZeroPositiveF64::new(delivery_rate.get() * 2.).unwrap();
+                self.set_send_rate(send_rate, now);
             }
             State::Fluctuating { max_delivery_rate } => {
                 let little_data_loss = self
                     .packet_send_space
                     .data_loss_rate(now)
-                    .map(|lr| lr < CWND_DATA_LOSS_RATE);
+                    .map(|lr| lr < CC_DATA_LOSS_RATE);
                 let should_probe = little_data_loss != Some(false);
                 let target_send_rate = match should_probe {
                     true => {
-                        let send_rate = sr.delivery_rate() + sr.delivery_rate() * PROBE_RATE;
-                        if send_rate < self.smooth_send_rate.get() {
+                        let send_rate =
+                            sr.delivery_rate() + sr.delivery_rate() * SEND_RATE_PROBE_RATE;
+                        if send_rate < self.send_rate.get() {
                             return;
                         }
                         send_rate.min(max_delivery_rate.get())
@@ -258,9 +262,18 @@ impl ReliableLayer {
                     false => sr.delivery_rate(),
                 };
 
-                let smooth_send_rate = self.smooth_send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
+                let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
                     + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
-                self.smooth_send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
+                let send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
+                self.set_send_rate(send_rate, now);
+
+                // Re-estimate the max delivery rate
+                let few_data_to_send = self.send_data_buf.len() <= MSS
+                    && self.packet_send_space.no_packets_in_flight();
+                // if sr.is_app_limited() {
+                if few_data_to_send {
+                    self.state = State::init();
+                }
             }
         }
     }
@@ -319,12 +332,21 @@ impl ReliableLayer {
         );
     }
 
+    fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64, now: Instant) {
+        let send_rate = NonZeroPositiveF64::new(MIN_SEND_RATE)
+            .unwrap()
+            .max(send_rate);
+        self.send_rate = send_rate;
+        self.packet_send_space.set_send_rate(send_rate);
+        self.token_bucket.set_thruput(send_rate, now);
+    }
+
     pub fn log(&self) -> Log {
         let now = Instant::now();
         let min_rtt = self.packet_send_space.min_rtt();
         Log {
             tokens: self.token_bucket.outdated_tokens(),
-            send_rate: self.smooth_send_rate.get(),
+            send_rate: self.send_rate.get(),
             loss_rate: self.packet_send_space.data_loss_rate(now),
             num_tx_pkts: self.packet_send_space.num_transmitting_packets(),
             num_rt_pkts: self.packet_send_space.num_retransmitted_packets(),
@@ -339,6 +361,7 @@ impl ReliableLayer {
                 State::Init { .. } => 0,
                 State::Fluctuating { .. } => 1,
             },
+            app_limited: self.prev_sample_rate.as_ref().map(|sr| sr.is_app_limited()),
         }
     }
 }
@@ -364,32 +387,5 @@ pub struct Log {
     pub recv_seq: u64,
     pub delivery_rate: Option<f64>,
     pub state: u8,
-}
-
-#[derive(Debug, Clone)]
-struct MaxDeliveryRate {
-    max_delivery_rate: NonZeroPositiveF64,
-    last_update: Instant,
-}
-impl MaxDeliveryRate {
-    pub fn new(delivery_rate: NonZeroPositiveF64, now: Instant) -> Self {
-        Self {
-            max_delivery_rate: delivery_rate,
-            last_update: now,
-        }
-    }
-
-    /// Return duration since last update
-    pub fn set(&mut self, delivery_rate: NonZeroPositiveF64, now: Instant) -> Duration {
-        if self.max_delivery_rate < delivery_rate {
-            self.max_delivery_rate = delivery_rate;
-            self.last_update = now;
-        }
-
-        now.duration_since(self.last_update)
-    }
-
-    pub fn get(&self) -> NonZeroPositiveF64 {
-        self.max_delivery_rate
-    }
+    pub app_limited: Option<bool>,
 }
