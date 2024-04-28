@@ -74,6 +74,26 @@ impl TransportLayer {
         data_buf: &mut [u8],
         utp_buf: &mut [u8],
     ) -> Result<(), std::io::ErrorKind> {
+        let detect_broken_pipe_proactively = || -> Result<(), std::io::ErrorKind> {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let Some(no_response_for) = reliable_layer
+                .packet_send_space()
+                .no_response_for(Instant::now())
+            else {
+                return Ok(());
+            };
+            if no_response_for
+                < reliable_layer
+                    .packet_send_space()
+                    .rto_duration()
+                    .mul_f64(16.0)
+            {
+                return Ok(());
+            }
+            Err(std::io::ErrorKind::BrokenPipe)
+        };
+        detect_broken_pipe_proactively()?;
+
         let mut written_bytes = 0;
         loop {
             self.first_error.throw_error()?;

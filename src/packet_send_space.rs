@@ -21,9 +21,10 @@ pub struct PacketSendSpace {
     smooth_rtt: Duration,
     reused_buf: Vec<Vec<u8>>,
     cwnd: NonZeroUsize,
+    last_ack_time: Instant,
 }
 impl PacketSendSpace {
-    pub fn new() -> Self {
+    pub fn new(now: Instant) -> Self {
         Self {
             next_seq: 0,
             transmitting: BTreeMap::new(),
@@ -31,6 +32,7 @@ impl PacketSendSpace {
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
             reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
+            last_ack_time: now,
         }
     }
 
@@ -61,6 +63,13 @@ impl PacketSendSpace {
         self.reused_buf.pop()
     }
 
+    pub fn no_response_for(&self, now: Instant) -> Option<Duration> {
+        if self.transmitting.is_empty() {
+            return None;
+        }
+        Some(now.duration_since(self.last_ack_time))
+    }
+
     pub fn ack(&mut self, seq: &[u64], acked: &mut Vec<PacketState>, now: Instant) {
         for s in seq {
             let Some(p) = self.transmitting.remove(s) else {
@@ -83,6 +92,7 @@ impl PacketSendSpace {
             }
             acked.push(p.stats);
         }
+        self.last_ack_time = now;
     }
 
     pub fn accepts_new_packet(&self) -> bool {
@@ -190,11 +200,6 @@ impl PacketSendSpace {
 
     pub fn rto_duration(&self) -> Duration {
         rto_duration(self.smooth_rtt)
-    }
-}
-impl Default for PacketSendSpace {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

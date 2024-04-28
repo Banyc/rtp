@@ -85,7 +85,7 @@ impl ReliableLayer {
                 now,
             ),
             connection_stats: ConnectionState::new(now),
-            packet_send_space: PacketSendSpace::new(),
+            packet_send_space: PacketSendSpace::new(now),
             packet_recv_space: PacketRecvSpace::new(),
             send_rate,
             state: State::init(),
