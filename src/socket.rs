@@ -30,11 +30,15 @@ pub fn socket(
     utp_write: Box<dyn UnreliableWrite>,
     log_config: Option<LogConfig>,
 ) -> (ReadSocket, WriteSocket) {
+    let read_shutdown = tokio_util::sync::CancellationToken::new();
+    let write_shutdown = tokio_util::sync::CancellationToken::new();
+    let io_erred = tokio_util::sync::CancellationToken::new();
     let transport_layer = Arc::new(TransportLayer::new(utp_read, utp_write, log_config));
     let mut events = JoinSet::new();
 
     // Send timer
     events.spawn({
+        let io_erred = io_erred.clone();
         let transport_layer = Arc::clone(&transport_layer);
         async move {
             let mut data_buf = vec![0; BUFFER_SIZE];
@@ -53,6 +57,7 @@ pub fn socket(
                     .await
                     .is_err()
                 {
+                    io_erred.cancel();
                     return;
                 }
             }
@@ -61,34 +66,56 @@ pub fn socket(
 
     // Recv
     events.spawn({
+        let read_shutdown = read_shutdown.clone();
+        let io_erred = io_erred.clone();
         let transport_layer = Arc::clone(&transport_layer);
         async move {
             let mut utp_buf = vec![0; BUFFER_SIZE];
             let mut ack_from_peer_buf = vec![];
             let mut ack_to_peer_buf = vec![];
             loop {
-                if transport_layer
+                let Ok(recv_packets) = transport_layer
                     .recv_packets(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
-                    .is_err()
-                {
+                else {
+                    io_erred.cancel();
                     return;
+                };
+                if read_shutdown.is_cancelled() && 0 < recv_packets.num_data_segments {
+                    let _ = transport_layer.send_kill_packet().await;
                 }
             }
         }
     });
 
-    let events = Arc::new(events);
+    tokio::spawn({
+        let read_shutdown = read_shutdown.clone();
+        let write_shutdown = write_shutdown.clone();
+        let transport_layer = Arc::clone(&transport_layer);
+        async move {
+            let _event_guard = events;
+
+            read_shutdown.cancelled().await;
+            write_shutdown.cancelled().await;
+
+            let _ = transport_layer.send_kill_packet().await;
+
+            tokio::select! {
+                () = io_erred.cancelled() => (),
+                () = tokio::time::sleep(Duration::from_secs(675)) => (),
+            }
+        }
+    });
 
     let read = ReadSocket {
         transport_layer: Arc::clone(&transport_layer),
-        _events: Arc::clone(&events),
+        _shutdown_guard: read_shutdown.drop_guard(),
     };
     let write = WriteSocket {
         transport_layer: Arc::clone(&transport_layer),
         data_buf: vec![0; BUFFER_SIZE],
         utp_buf: vec![0; BUFFER_SIZE],
-        _events: Arc::clone(&events),
+        _shutdown_guard: write_shutdown.drop_guard(),
     };
     (read, write)
 }
@@ -96,7 +123,7 @@ pub fn socket(
 #[derive(Debug)]
 pub struct ReadSocket {
     transport_layer: Arc<TransportLayer>,
-    _events: Arc<JoinSet<()>>,
+    _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl ReadSocket {
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
@@ -113,7 +140,7 @@ pub struct WriteSocket {
     transport_layer: Arc<TransportLayer>,
     data_buf: Vec<u8>,
     utp_buf: Vec<u8>,
-    _events: Arc<JoinSet<()>>,
+    _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl WriteSocket {
     pub async fn send(&mut self, data: &[u8], no_delay: bool) -> Result<usize, std::io::ErrorKind> {

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::{decode, encode, EncodeData},
+    codec::{decode, encode_ack_data, encode_kill, EncodeData},
     reliable_layer::ReliableLayer,
 };
 
@@ -62,6 +62,13 @@ impl TransportLayer {
         &self.reliable_layer
     }
 
+    pub async fn send_kill_packet(&self) -> Result<(), std::io::Error> {
+        let mut buf = [0; 1];
+        encode_kill(&mut buf).unwrap();
+        self.utp_write.send(&buf).await?;
+        Ok(())
+    }
+
     pub async fn send_packets(
         &self,
         data_buf: &mut [u8],
@@ -84,7 +91,7 @@ impl TransportLayer {
                 seq: p.seq,
                 data: &data_buf[..p.data_written.get()],
             };
-            let n = encode(&[], Some(data), utp_buf).unwrap();
+            let n = encode_ack_data(&[], Some(data), utp_buf).unwrap();
             let Err(e) = self.utp_write.send(&utp_buf[..n]).await else {
                 continue;
             };
@@ -106,11 +113,15 @@ impl TransportLayer {
         utp_buf: &mut [u8],
         ack_from_peer_buf: &mut Vec<u64>,
         ack_to_peer_buf: &mut Vec<u64>,
-    ) -> Result<(), std::io::ErrorKind> {
+    ) -> Result<RecvPackets, std::io::ErrorKind> {
         let throw_error = |e: std::io::ErrorKind| {
             self.first_error.set(e);
             self.recv_data_packet.notify_waiters();
             e
+        };
+        let mut recv_packets = RecvPackets {
+            num_ack_segments: 0,
+            num_data_segments: 0,
         };
 
         ack_to_peer_buf.clear();
@@ -147,13 +158,18 @@ impl TransportLayer {
                 Err(_) => continue,
             };
 
+            if data.killed {
+                return Err(std::io::ErrorKind::BrokenPipe);
+            }
+
             let now = Instant::now();
             let mut reliable_layer = self.reliable_layer.lock().unwrap();
 
             // UDP local -{ACK}> reliable
             reliable_layer.recv_ack_packet(ack_from_peer_buf, now);
+            recv_packets.num_ack_segments += 1;
 
-            let Some(data) = data else {
+            let Some(data) = data.data else {
                 drop(reliable_layer);
                 self.log("recv_ack_packet");
                 continue;
@@ -161,6 +177,7 @@ impl TransportLayer {
 
             // UDP local -{data}> reliable
             let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range]);
+            recv_packets.num_data_segments += 1;
             drop(reliable_layer);
             self.log("recv_data_packet");
             match ack {
@@ -173,11 +190,11 @@ impl TransportLayer {
 
         // No new data received in the reliable layer
         if ack_to_peer_buf.is_empty() {
-            return Ok(());
+            return Ok(recv_packets);
         }
 
         // reliable -{ACK}> UDP remote
-        let written_bytes = encode(ack_to_peer_buf, None, utp_buf).unwrap();
+        let written_bytes = encode_ack_data(ack_to_peer_buf, None, utp_buf).unwrap();
         self.utp_write
             .send(&utp_buf[..written_bytes])
             .await
@@ -187,7 +204,7 @@ impl TransportLayer {
         }
 
         self.recv_data_packet.notify_waiters();
-        Ok(())
+        Ok(recv_packets)
     }
 
     pub async fn send(
@@ -274,6 +291,12 @@ impl TransportLayer {
             .serialize(&log)
             .expect("write CSV log");
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecvPackets {
+    pub num_ack_segments: usize,
+    pub num_data_segments: usize,
 }
 
 #[async_trait]

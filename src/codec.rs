@@ -6,8 +6,17 @@ use thiserror::Error;
 
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
+const KILL_CMD: u8 = 2;
 
-pub fn encode(
+pub fn encode_kill(buf: &mut [u8]) -> Result<usize, EncodeError> {
+    let mut wtr = io::Cursor::new(buf);
+    wtr.write_u8(KILL_CMD)
+        .pipe(wrap_insufficient_buffer_size_err)?;
+    let pos = wtr.position();
+    Ok(pos as usize)
+}
+
+pub fn encode_ack_data(
     ack: &[u64],
     data: Option<EncodeData<'_>>,
     buf: &mut [u8],
@@ -32,7 +41,14 @@ pub struct EncodeData<'a> {
     pub data: &'a [u8],
 }
 
-pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Option<DecodedDataPacket>, DecodeError> {
+#[derive(Debug, Clone)]
+pub struct Decoded {
+    pub data: Option<DecodedDataPacket>,
+    /// broken pipe
+    pub killed: bool,
+}
+pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Decoded, DecodeError> {
+    let mut killed = false;
     let mut rdr = io::Cursor::new(buf);
     while let Ok(cmd) = rdr.read_u8() {
         match cmd {
@@ -42,12 +58,18 @@ pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Option<DecodedDataPacket
             }
             DATA_CMD => {
                 let data = decode_data(&mut rdr)?;
-                return Ok(Some(data));
+                return Ok(Decoded {
+                    data: Some(data),
+                    killed,
+                });
+            }
+            KILL_CMD => {
+                killed = true;
             }
             _ => return Err(DecodeError::Corrupted),
         }
     }
-    Ok(None)
+    Ok(Decoded { data: None, killed })
 }
 
 fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: u64) -> Result<(), EncodeError> {
