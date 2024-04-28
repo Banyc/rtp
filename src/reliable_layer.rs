@@ -400,6 +400,7 @@ pub struct DataPacket {
 pub struct Log {
     pub tokens: f64,
     pub send_rate: f64,
+    pub delivery_rate: Option<f64>,
     pub loss_rate: Option<f64>,
     pub num_tx_pkts: usize,
     pub num_rt_pkts: usize,
@@ -409,7 +410,6 @@ pub struct Log {
     pub cwnd: usize,
     pub num_rx_pkts: usize,
     pub recv_seq: u64,
-    pub delivery_rate: Option<f64>,
     pub state: u8,
     pub app_limited: Option<bool>,
 }
