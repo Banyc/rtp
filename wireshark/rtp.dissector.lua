@@ -17,9 +17,9 @@ pf_ack.this = ProtoField.uint64(NAME .. ".ack", "ack")
 rtp.fields[#rtp.fields + 1] = pf_ack.this
 
 local pf_data = {
-    this    = ProtoField.uint64(NAME .. ".data", "data"),
-    seq     = ProtoField.uint64(NAME .. ".data.seq", "seq"),
-    payload = ProtoField.bytes(NAME .. ".data.payload", "payload"),
+    this = ProtoField.uint64(NAME .. ".data", "data"),
+    seq = ProtoField.uint64(NAME .. ".data.seq", "seq"),
+    payload = ProtoField.bytes(NAME .. ".data.payload", "payload")
 }
 rtp.fields[#rtp.fields + 1] = pf_data.this
 rtp.fields[#rtp.fields + 1] = pf_data.seq
@@ -29,20 +29,17 @@ local pf_kill = ProtoField.bool(NAME .. ".kill", "kill")
 rtp.fields[#rtp.fields + 1] = pf_kill
 
 local ef_out_of_order = ProtoExpert.new(NAME .. ".data.seq.out_of_order.expert", "Seq out of order",
-                                        expert.group.COMMENTS_GROUP, expert.severity.NOTE)
+    expert.group.COMMENTS_GROUP, expert.severity.NOTE)
 out_of_order = {
     last_seq = {},
-    packets = {},
+    packets = {}
 }
 
-rtp.experts = { ef_out_of_order }
+rtp.experts = {ef_out_of_order}
 
 function five_tuple_string(pktinfo)
-    local key =
-        tostring(pktinfo.net_src) .. ":" ..
-        tostring(pktinfo.src_port) .. ":" ..
-        tostring(pktinfo.net_dst) .. ":" ..
-        tostring(pktinfo.dst_port)
+    local key = tostring(pktinfo.net_src) .. ":" .. tostring(pktinfo.src_port) .. ":" .. tostring(pktinfo.net_dst) ..
+                    ":" .. tostring(pktinfo.dst_port)
     return key
 end
 
@@ -67,7 +64,7 @@ function rtp.dissector(tvbuf, pktinfo, root)
         pos = pos + 1
         if cmd:uint() == ACK_CMD then
             tree:add(pf_ack.this, cmd)
-            
+
             local seq = tvbuf:range(pos, 8)
             pos = pos + 8
             tree:add(pf_ack[ack_index], seq)
@@ -92,8 +89,7 @@ function rtp.dissector(tvbuf, pktinfo, root)
 
             -- out of order
             if not pktinfo.visited then
-                if not (out_of_order.last_seq[key] == nil)
-                   and seq:uint64() <= out_of_order.last_seq[key] then
+                if not (out_of_order.last_seq[key] == nil) and seq:uint64() <= out_of_order.last_seq[key] then
                     out_of_order.packets[pktinfo.number] = true
                 else
                     out_of_order.last_seq[key] = seq:uint64()
@@ -106,7 +102,7 @@ function rtp.dissector(tvbuf, pktinfo, root)
             end
         elseif cmd:uint() == KILL_CMD then
             tree:add(pf_kill, cmd)
-            
+
             info = info .. " Kill"
         else
             print(cmd:uint())
