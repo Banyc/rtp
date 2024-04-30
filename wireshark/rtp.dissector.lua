@@ -38,7 +38,8 @@ local ef_out_of_order = ProtoExpert.new(NAME .. ".data.seq.out_of_order.expert",
     expert.group.COMMENTS_GROUP, expert.severity.NOTE)
 out_of_order = {
     last_seq = {},
-    packets = {}
+    packets = {},
+    seq = {}
 }
 
 rtp.experts = {ef_out_of_order}
@@ -105,15 +106,23 @@ function rtp.dissector(tvbuf, pktinfo, root)
             -- out of order
             if not pktinfo.visited then
                 if not (out_of_order.last_seq[key] == nil) and seq:uint64() <= out_of_order.last_seq[key] then
-                    out_of_order.packets[pktinfo.number] = true
+                    local key = key .. ":" .. seq:uint64()
+                    local times = out_of_order.seq[key]
+                    if times == nil then
+                        times = 0
+                    end
+                    times = times + 1
+                    out_of_order.seq[key] = times
+                    out_of_order.packets[pktinfo.number] = times
                 else
                     out_of_order.last_seq[key] = seq:uint64()
                 end
             end
-            if out_of_order.packets[pktinfo.number] then
+            local times = out_of_order.packets[pktinfo.number]
+            if not (times == nil) then
                 -- print("out of order", key, seq:uint64(), out_of_order.last_seq[key])
                 tree:add_tvb_expert_info(ef_out_of_order, seq)
-                info = info .. " [out of order]"
+                info = info .. " [out of order; " .. times .. "]"
             end
         elseif cmd:uint() == KILL_CMD then
             tree:add(pf_kill, cmd)
