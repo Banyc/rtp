@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::sack::AckQueue;
+
 const MAX_NUM_RECEIVING_PACKETS: usize = 2 << 12;
 
 #[derive(Debug, Clone)]
@@ -7,6 +9,7 @@ pub struct PacketRecvSpace {
     next_seq: u64,
     receiving: BTreeMap<u64, Vec<u8>>,
     reused_buf: Vec<Vec<u8>>,
+    ack_history: AckQueue,
 }
 impl PacketRecvSpace {
     pub fn new() -> Self {
@@ -14,7 +17,16 @@ impl PacketRecvSpace {
             next_seq: 0,
             receiving: BTreeMap::new(),
             reused_buf: vec![],
+            ack_history: AckQueue::new(),
         }
+    }
+
+    pub fn save_ack(&mut self, seq: u64) {
+        self.ack_history.insert(seq);
+    }
+
+    pub fn ack_history(&self) -> &AckQueue {
+        &self.ack_history
     }
 
     pub fn next_seq(&self) -> u64 {
