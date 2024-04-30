@@ -1,8 +1,15 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    num::NonZeroU64,
+};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tap::Pipe;
 use thiserror::Error;
+
+use crate::sack::{AckBall, AckQueue};
+
+pub const MAX_NUM_ACK: usize = 32;
 
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
@@ -17,15 +24,15 @@ pub fn encode_kill(buf: &mut [u8]) -> Result<usize, EncodeError> {
 }
 
 pub fn encode_ack_data(
-    ack: &[u64],
+    ack: &AckQueue,
     data: Option<EncodeData<'_>>,
     buf: &mut [u8],
 ) -> Result<usize, EncodeError> {
     let mut wtr = io::Cursor::new(buf);
-    for ack in ack {
+    for ack in ack.balls().take(MAX_NUM_ACK) {
         wtr.write_u8(ACK_CMD)
             .pipe(wrap_insufficient_buffer_size_err)?;
-        encode_ack(&mut wtr, *ack)?;
+        encode_ack(&mut wtr, ack)?;
     }
     if let Some(EncodeData { seq, data }) = data {
         wtr.write_u8(DATA_CMD)
@@ -47,7 +54,7 @@ pub struct Decoded {
     /// broken pipe
     pub killed: bool,
 }
-pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Decoded, DecodeError> {
+pub fn decode(buf: &[u8], ack: &mut Vec<AckBall>) -> Result<Decoded, DecodeError> {
     let mut killed = false;
     let mut rdr = io::Cursor::new(buf);
     while let Ok(cmd) = rdr.read_u8() {
@@ -72,15 +79,19 @@ pub fn decode(buf: &[u8], ack: &mut Vec<u64>) -> Result<Decoded, DecodeError> {
     Ok(Decoded { data: None, killed })
 }
 
-fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: u64) -> Result<(), EncodeError> {
-    wtr.write_u64::<BigEndian>(ack)
+fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: AckBall) -> Result<(), EncodeError> {
+    wtr.write_u64::<BigEndian>(ack.start)
+        .pipe(wrap_insufficient_buffer_size_err)?;
+    wtr.write_u64::<BigEndian>(ack.size.get())
         .pipe(wrap_insufficient_buffer_size_err)?;
     Ok(())
 }
 
-fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<u64, DecodeError> {
-    let ack = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
-    Ok(ack)
+fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<AckBall, DecodeError> {
+    let start = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
+    let size = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
+    let size = NonZeroU64::new(size).ok_or(DecodeError::Corrupted)?;
+    Ok(AckBall { start, size })
 }
 
 fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result<(), EncodeError> {

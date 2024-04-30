@@ -8,11 +8,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::{decode, encode_ack_data, encode_kill, EncodeData},
+    codec::{decode, encode_ack_data, encode_kill, EncodeData, MAX_NUM_ACK},
     reliable_layer::ReliableLayer,
+    sack::{AckBall, AckBallSequence, AckQueue},
 };
 
-const MAX_ACK_BATCH_SIZE: usize = 64;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
@@ -132,7 +132,7 @@ impl TransportLayer {
                 seq: p.seq,
                 data: &data_buf[..data_written],
             };
-            let n = encode_ack_data(&[], Some(data), utp_buf).unwrap();
+            let n = encode_ack_data(&AckQueue::new(), Some(data), utp_buf).unwrap();
             let Err(e) = self.utp_write.send(&utp_buf[..n]).await else {
                 continue;
             };
@@ -152,7 +152,7 @@ impl TransportLayer {
     pub async fn recv_packets(
         &self,
         utp_buf: &mut [u8],
-        ack_from_peer_buf: &mut Vec<u64>,
+        ack_from_peer_buf: &mut Vec<AckBall>,
         ack_to_peer_buf: &mut Vec<u64>,
     ) -> Result<RecvPackets, std::io::ErrorKind> {
         let throw_error = |e: std::io::ErrorKind| {
@@ -167,7 +167,7 @@ impl TransportLayer {
         };
 
         ack_to_peer_buf.clear();
-        for _ in 0..MAX_ACK_BATCH_SIZE {
+        for _ in 0..MAX_NUM_ACK {
             self.first_error.throw_error()?;
             let res = {
                 let mut utp_read = self.utp_read.lock().await;
@@ -210,7 +210,7 @@ impl TransportLayer {
             let mut reliable_layer = self.reliable_layer.lock().unwrap();
 
             // UDP local -{ACK}> reliable
-            reliable_layer.recv_ack_packet(ack_from_peer_buf, now);
+            reliable_layer.recv_ack_packet(AckBallSequence::new(ack_from_peer_buf), now);
             recv_packets.num_ack_segments += 1;
 
             let Some(data) = data.data else {
@@ -242,7 +242,11 @@ impl TransportLayer {
         }
 
         // reliable -{ACK}> UDP remote
-        let written_bytes = encode_ack_data(ack_to_peer_buf, None, utp_buf).unwrap();
+        let written_bytes = {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let packet_recv_space = reliable_layer.packet_recv_space();
+            encode_ack_data(packet_recv_space.ack_history(), None, utp_buf).unwrap()
+        };
         self.utp_write
             .send(&utp_buf[..written_bytes])
             .await

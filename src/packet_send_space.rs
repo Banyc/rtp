@@ -7,6 +7,8 @@ use std::{
 use dre::PacketState;
 use strict_num::NonZeroPositiveF64;
 
+use crate::sack::AckBallSequence;
+
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
 const RTO_K: f64 = 1.;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
@@ -22,6 +24,11 @@ pub struct PacketSendSpace {
     reused_buf: Vec<Vec<u8>>,
     cwnd: NonZeroUsize,
     response_wait_start: Option<Instant>,
+    imm_retrans_seq_end: u64,
+
+    // reused buffers
+    pipe_buf: Vec<u64>,
+    ack_buf: Vec<u64>,
 }
 impl PacketSendSpace {
     pub fn new() -> Self {
@@ -33,6 +40,9 @@ impl PacketSendSpace {
             reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
+            imm_retrans_seq_end: 0,
+            pipe_buf: vec![],
+            ack_buf: vec![],
         }
     }
 
@@ -67,8 +77,15 @@ impl PacketSendSpace {
         Some(now.duration_since(self.response_wait_start?))
     }
 
-    pub fn ack(&mut self, seq: &[u64], acked: &mut Vec<PacketState>, now: Instant) {
-        for s in seq {
+    pub fn ack(&mut self, seq: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+        if let Some(seq) = seq.imm_retrans_seq_end() {
+            self.imm_retrans_seq_end = seq;
+        }
+        self.pipe_buf.clear();
+        self.pipe_buf.extend(self.transmitting.keys());
+        self.ack_buf.clear();
+        seq.ack(&self.pipe_buf, &mut self.ack_buf);
+        for s in &self.ack_buf {
             let Some(p) = self.transmitting.remove(s) else {
                 continue;
             };
@@ -125,9 +142,13 @@ impl PacketSendSpace {
 
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
         for (s, p) in &mut self.transmitting {
-            if !p.rto(self.smooth_rtt, now) {
+            let out_of_order_rt =
+                *s < self.imm_retrans_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
+
+            if !p.rto(self.smooth_rtt, now) || !out_of_order_rt {
                 continue;
             }
+
             p.retransmitted = true;
             p.sent_time = now;
             let p = Packet {

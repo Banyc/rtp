@@ -2,7 +2,7 @@ local NAME = "my_rtp"
 
 local rtp = Proto(NAME, NAME)
 
-local MAX_NUM_ACK = 128
+local MAX_NUM_ACK = 32
 
 local ACK_CMD = 0
 local DATA_CMD = 1
@@ -10,8 +10,12 @@ local KILL_CMD = 2
 
 local pf_ack = {}
 for i = 1, MAX_NUM_ACK do
-    pf_ack[i] = ProtoField.uint64(NAME .. ".ack." .. i, "ack." .. i)
-    rtp.fields[#rtp.fields + 1] = pf_ack[i]
+    pf_ack[i] = {
+        start = ProtoField.uint64(NAME .. ".ack." .. i .. ".start", "ack." .. i .. ".start"),
+        size = ProtoField.uint64(NAME .. ".ack." .. i .. ".size", "ack." .. i .. ".size")
+    }
+    rtp.fields[#rtp.fields + 1] = pf_ack[i].start
+    rtp.fields[#rtp.fields + 1] = pf_ack[i].size
 end
 pf_ack.this = ProtoField.uint64(NAME .. ".ack", "ack")
 rtp.fields[#rtp.fields + 1] = pf_ack.this
@@ -67,12 +71,15 @@ function rtp.dissector(tvbuf, pktinfo, root)
         if cmd:uint() == ACK_CMD then
             tree:add(pf_ack.this, cmd)
 
-            local seq = tvbuf:range(pos, 8)
+            local start = tvbuf:range(pos, 8)
             pos = pos + 8
-            tree:add(pf_ack[ack_index], seq)
+            tree:add(pf_ack[ack_index].start, start)
+            local size = tvbuf:range(pos, 8)
+            pos = pos + 8
+            tree:add(pf_ack[ack_index].size, size)
             ack_index = ack_index + 1
 
-            info = info .. " Ack=" .. seq:uint64()
+            info = info .. " Ack=" .. start:uint64() .. "," .. size:uint64()
         elseif cmd:uint() == DATA_CMD then
             tree:add(pf_data.this, cmd)
 

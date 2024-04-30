@@ -8,6 +8,7 @@ use strict_num::NonZeroPositiveF64;
 use crate::{
     packet_recv_space::PacketRecvSpace,
     packet_send_space::{PacketSendSpace, INIT_CWND},
+    sack::AckBallSequence,
     shared::SharedCell,
     timer::{ContActTimer, ContActTimerOn, PollTimer},
     token_bucket::TokenBucket,
@@ -105,6 +106,10 @@ impl ReliableLayer {
 
     pub fn packet_send_space(&self) -> &PacketSendSpace {
         &self.packet_send_space
+    }
+
+    pub fn packet_recv_space(&self) -> &PacketRecvSpace {
+        &self.packet_recv_space
     }
 
     pub fn token_bucket(&self) -> &TokenBucket {
@@ -207,7 +212,11 @@ impl ReliableLayer {
     }
 
     /// Take ACKs from the unreliable layer
-    pub fn recv_ack_packet(&mut self, ack: &[u64], now: Instant) -> Option<dre::RateSample> {
+    pub fn recv_ack_packet(
+        &mut self,
+        ack: AckBallSequence<'_>,
+        now: Instant,
+    ) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
         self.packet_send_space
@@ -349,6 +358,7 @@ impl ReliableLayer {
     ///
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
+        self.packet_recv_space.save_ack(seq);
         let mut buf = self.packet_recv_space.reuse_buf().unwrap_or_default();
         buf.extend(packet);
         if !self.packet_recv_space.recv(seq, buf) {
