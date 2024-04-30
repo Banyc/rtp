@@ -179,7 +179,9 @@ impl TransportLayer {
             };
 
             if data.killed {
-                return Err(std::io::ErrorKind::BrokenPipe);
+                let e = std::io::ErrorKind::BrokenPipe;
+                throw_error(e);
+                return Err(e);
             }
 
             let now = Instant::now();
