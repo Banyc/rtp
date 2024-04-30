@@ -81,7 +81,7 @@ pub fn socket(
                     io_erred.cancel();
                     return;
                 };
-                if read_shutdown.is_cancelled() && 0 < recv_packets.num_data_segments {
+                if read_shutdown.is_cancelled() && 0 < recv_packets.num_payload_segments {
                     let _ = transport_layer.send_kill_packet().await;
                 }
             }

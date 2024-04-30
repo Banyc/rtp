@@ -162,7 +162,8 @@ impl TransportLayer {
         };
         let mut recv_packets = RecvPackets {
             num_ack_segments: 0,
-            num_data_segments: 0,
+            num_payload_segments: 0,
+            num_fin_segments: 0,
         };
 
         ack_to_peer_buf.clear();
@@ -219,9 +220,13 @@ impl TransportLayer {
             };
 
             // UDP local -{data}> reliable
-            let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range]);
-            recv_packets.num_data_segments += 1;
+            let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range.clone()]);
             drop(reliable_layer);
+            if data.buf_range.is_empty() {
+                recv_packets.num_fin_segments += 1;
+            } else {
+                recv_packets.num_payload_segments += 1;
+            }
             self.log("recv_data_packet");
             match ack {
                 true => {
@@ -352,7 +357,8 @@ impl TransportLayer {
 #[derive(Debug, Clone)]
 pub struct RecvPackets {
     pub num_ack_segments: usize,
-    pub num_data_segments: usize,
+    pub num_payload_segments: usize,
+    pub num_fin_segments: usize,
 }
 
 #[async_trait]
