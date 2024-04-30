@@ -19,10 +19,12 @@ rtp.fields[#rtp.fields + 1] = pf_ack.this
 local pf_data = {
     this = ProtoField.uint64(NAME .. ".data", "data"),
     seq = ProtoField.uint64(NAME .. ".data.seq", "seq"),
+    fin = ProtoField.bool(NAME .. ".data.fin", "fin"),
     payload = ProtoField.bytes(NAME .. ".data.payload", "payload")
 }
 rtp.fields[#rtp.fields + 1] = pf_data.this
 rtp.fields[#rtp.fields + 1] = pf_data.seq
+rtp.fields[#rtp.fields + 1] = pf_data.fin
 rtp.fields[#rtp.fields + 1] = pf_data.payload
 
 local pf_kill = ProtoField.bool(NAME .. ".kill", "kill")
@@ -78,14 +80,20 @@ function rtp.dissector(tvbuf, pktinfo, root)
             pos = pos + 8
             tree:add(pf_data.seq, seq)
 
-            local len = tvbuf:range(pos, 2):uint()
+            local len = tvbuf:range(pos, 2)
             pos = pos + 2
 
-            local payload = tvbuf:range(pos, len)
-            pos = pos + len
-            tree:add(pf_data.payload, payload)
+            if len:uint() == 0 then
+                tree:add(pf_data.fin, len)
 
-            info = info .. " Seq=" .. seq:uint64()
+                info = info .. " Fin=" .. seq:uint64()
+            else
+                local payload = tvbuf:range(pos, len:uint())
+                pos = pos + len:uint()
+                tree:add(pf_data.payload, payload)
+
+                info = info .. " Seq=" .. seq:uint64()
+            end
 
             -- out of order
             if not pktinfo.visited then

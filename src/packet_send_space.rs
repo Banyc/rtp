@@ -226,6 +226,7 @@ fn rto_duration(smooth_rtt: Duration) -> Duration {
     smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K)
 }
 
+#[derive(Debug, Clone)]
 pub struct Packet<'a> {
     pub seq: u64,
     pub data: &'a [u8],

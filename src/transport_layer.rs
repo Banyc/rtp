@@ -62,6 +62,10 @@ impl TransportLayer {
         &self.reliable_layer
     }
 
+    pub fn send_fin_buf(&self) {
+        self.reliable_layer.lock().unwrap().send_fin_buf();
+    }
+
     pub async fn send_kill_packet(&self) -> Result<(), std::io::Error> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
@@ -95,6 +99,7 @@ impl TransportLayer {
         detect_broken_pipe_proactively()?;
 
         let mut written_bytes = 0;
+        let mut written_fin = false;
         loop {
             self.first_error.throw_error()?;
             // reliable -{data}> UDP remote
@@ -106,10 +111,19 @@ impl TransportLayer {
             let Some(p) = res else {
                 break;
             };
-            written_bytes += p.data_written.get();
+            let data_written = match p.data_written {
+                crate::reliable_layer::DataPacketPayload::Data(data_written) => {
+                    written_bytes += data_written.get();
+                    data_written.get()
+                }
+                crate::reliable_layer::DataPacketPayload::Fin => {
+                    written_fin = true;
+                    0
+                }
+            };
             let data = EncodeData {
                 seq: p.seq,
-                data: &data_buf[..p.data_written.get()],
+                data: &data_buf[..data_written],
             };
             let n = encode_ack_data(&[], Some(data), utp_buf).unwrap();
             let Err(e) = self.utp_write.send(&utp_buf[..n]).await else {
@@ -119,9 +133,9 @@ impl TransportLayer {
             self.sent_data_packet.notify_waiters();
             return Err(e);
         }
-        if 0 < written_bytes {
+        if 0 < written_bytes || written_fin {
             if PRINT_DEBUG_MESSAGES {
-                println!("send_packets: data: {written_bytes}");
+                println!("send_packets: {{ data: {written_bytes}; fin: {written_fin} }}");
             }
             self.sent_data_packet.notify_waiters();
         }
@@ -264,9 +278,12 @@ impl TransportLayer {
             self.first_error.throw_error()?;
 
             // reliable -{data}> app
-            let read_bytes = {
+            let (read_bytes, fin) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.recv_data_buf(data)
+                (
+                    reliable_layer.recv_data_buf(data),
+                    reliable_layer.recv_fin_buf(),
+                )
             };
             self.log("recv_data_buf");
             if PRINT_DEBUG_MESSAGES {
@@ -274,6 +291,12 @@ impl TransportLayer {
             }
             if 0 < read_bytes {
                 break read_bytes;
+            }
+            if fin {
+                let e = std::io::ErrorKind::UnexpectedEof;
+                self.first_error.set(e);
+                self.recv_data_packet.notify_waiters();
+                return Err(e);
             }
             recv_data_packet.await;
             recv_data_packet = self.recv_data_packet.notified();

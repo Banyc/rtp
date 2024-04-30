@@ -57,7 +57,11 @@ impl State {
 #[derive(Debug, Clone)]
 pub struct ReliableLayer {
     send_data_buf: VecDeque<u8>,
+    /// one-element queue
+    send_fin_buf: bool,
     recv_data_buf: VecDeque<u8>,
+    /// set-only
+    recv_fin_buf: bool,
     token_bucket: TokenBucket,
     connection_stats: ConnectionState,
     packet_send_space: PacketSendSpace,
@@ -78,7 +82,9 @@ impl ReliableLayer {
         let send_rate = init_send_rate.get();
         Self {
             send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
+            send_fin_buf: false,
             recv_data_buf: VecDeque::with_capacity(RECV_DATA_BUFFER_LENGTH),
+            recv_fin_buf: false,
             token_bucket: TokenBucket::new(
                 send_rate,
                 NonZeroUsize::new(MAX_BURST_PACKETS).unwrap(),
@@ -103,6 +109,10 @@ impl ReliableLayer {
 
     pub fn token_bucket(&self) -> &TokenBucket {
         &self.token_bucket
+    }
+
+    pub fn send_fin_buf(&mut self) {
+        self.send_fin_buf = true;
     }
 
     /// Store data in the inner data buffer
@@ -151,9 +161,12 @@ impl ReliableLayer {
         if let Some(p) = self.packet_send_space.retransmit(now) {
             packet[..p.data.len()].copy_from_slice(p.data);
 
+            let data_written = NonZeroUsize::new(p.data.len())
+                .map(DataPacketPayload::Data)
+                .unwrap_or(DataPacketPayload::Fin);
             return Some(DataPacket {
                 seq: p.seq,
-                data_written: NonZeroUsize::new(p.data.len()).unwrap(),
+                data_written,
             });
         }
 
@@ -163,23 +176,33 @@ impl ReliableLayer {
         }
 
         let packet_bytes = packet.len().min(MSS).min(self.send_data_buf.len());
-        let packet_bytes = NonZeroUsize::new(packet_bytes)?;
+        let packet_bytes = match (NonZeroUsize::new(packet_bytes), self.send_fin_buf) {
+            (Some(x), _) => x.get(),
+            (None, true) => {
+                self.send_fin_buf = false;
+                0
+            }
+            (None, false) => return None,
+        };
 
         let stats = self
             .connection_stats
             .send_packet_2(now, self.packet_send_space.no_packets_in_flight());
 
         let mut buf = self.packet_send_space.reuse_buf().unwrap_or_default();
-        let data = self.send_data_buf.drain(..packet_bytes.get());
+        let data = self.send_data_buf.drain(..packet_bytes);
         buf.extend(data);
         let data = buf;
 
         packet[..data.len()].copy_from_slice(&data);
         let p = self.packet_send_space.send(data, stats, now);
 
+        let data_written = NonZeroUsize::new(packet_bytes)
+            .map(DataPacketPayload::Data)
+            .unwrap_or(DataPacketPayload::Fin);
         Some(DataPacket {
             seq: p.seq,
-            data_written: packet_bytes,
+            data_written,
         })
     }
 
@@ -302,7 +325,14 @@ impl ReliableLayer {
         }
     }
 
+    /// Return `true` iff received FIN
+    pub fn recv_fin_buf(&self) -> bool {
+        self.recv_fin_buf
+    }
+
     /// Return data from the inner data buffer and inner packet space
+    ///
+    /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
         let read_bytes = buf.len().min(self.recv_data_buf.len());
         let (a, b) = self.recv_data_buf.as_slices();
@@ -330,11 +360,19 @@ impl ReliableLayer {
 
     /// Move data from packet space to data buffer
     fn move_recv_data(&mut self) {
+        if self.recv_fin_buf {
+            return;
+        }
         while let Some(p) = self.packet_recv_space.peak() {
             if self.recv_data_buf.capacity() - self.recv_data_buf.len() < p.len() {
                 return;
             }
             let p = self.packet_recv_space.pop().unwrap();
+            if p.is_empty() {
+                self.recv_fin_buf = true;
+                self.packet_recv_space.return_buf(p);
+                return;
+            }
             self.recv_data_buf.extend(&p);
             self.packet_recv_space.return_buf(p);
         }
@@ -393,7 +431,12 @@ impl ReliableLayer {
 #[derive(Debug, Clone)]
 pub struct DataPacket {
     pub seq: u64,
-    pub data_written: NonZeroUsize,
+    pub data_written: DataPacketPayload,
+}
+#[derive(Debug, Clone)]
+pub enum DataPacketPayload {
+    Data(NonZeroUsize),
+    Fin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
