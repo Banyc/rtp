@@ -101,6 +101,7 @@ pub fn socket(
             read_shutdown.cancelled().await;
 
             tokio::select! {
+                () = transport_layer.recv_fin().cancelled() => (),
                 () = io_erred.cancelled() => (),
                 () = tokio::time::sleep(Duration::from_secs(675)) => (),
             }

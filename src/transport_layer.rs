@@ -24,6 +24,7 @@ pub struct TransportLayer {
     reliable_layer: Mutex<ReliableLayer>,
     sent_data_packet: tokio::sync::Notify,
     recv_data_packet: tokio::sync::Notify,
+    recv_fin: tokio_util::sync::CancellationToken,
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
 }
@@ -37,6 +38,7 @@ impl TransportLayer {
         let reliable_layer = Mutex::new(ReliableLayer::new(now));
         let sent_data_packet = tokio::sync::Notify::new();
         let recv_data_packet = tokio::sync::Notify::new();
+        let recv_fin = tokio_util::sync::CancellationToken::new();
         let first_error = FirstError::new();
         let reliable_layer_logger = log_config.as_ref().map(|c| {
             let file = std::fs::File::options()
@@ -53,6 +55,7 @@ impl TransportLayer {
             reliable_layer,
             sent_data_packet,
             recv_data_packet,
+            recv_fin,
             first_error,
             reliable_layer_logger,
         }
@@ -64,6 +67,10 @@ impl TransportLayer {
 
     pub fn send_fin_buf(&self) {
         self.reliable_layer.lock().unwrap().send_fin_buf();
+    }
+
+    pub fn recv_fin(&self) -> &tokio_util::sync::CancellationToken {
+        &self.recv_fin
     }
 
     pub async fn send_kill_packet(&self) -> Result<(), std::io::Error> {
@@ -277,8 +284,15 @@ impl TransportLayer {
         let read_bytes = loop {
             self.first_error.throw_error()?;
 
+            if self.recv_fin.is_cancelled() {
+                let e = std::io::ErrorKind::UnexpectedEof;
+                self.first_error.set(e);
+                self.recv_data_packet.notify_waiters();
+                return Err(e);
+            }
+
             // reliable -{data}> app
-            let (read_bytes, fin) = {
+            let (read_bytes, read_fin) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 (
                     reliable_layer.recv_data_buf(data),
@@ -292,11 +306,8 @@ impl TransportLayer {
             if 0 < read_bytes {
                 break read_bytes;
             }
-            if fin {
-                let e = std::io::ErrorKind::UnexpectedEof;
-                self.first_error.set(e);
-                self.recv_data_packet.notify_waiters();
-                return Err(e);
+            if read_fin {
+                self.recv_fin.cancel();
             }
             recv_data_packet.await;
             recv_data_packet = self.recv_data_packet.notified();
