@@ -52,11 +52,11 @@ pub fn socket(
                 let fast_poll_time = Instant::now() + TIMER_INTERVAL;
                 let poll_time = next_poll_time.min(fast_poll_time);
                 tokio::time::sleep_until(poll_time.into()).await;
-                if transport_layer
+                if let Err(e) = transport_layer
                     .send_packets(&mut data_buf, &mut utp_buf)
                     .await
-                    .is_err()
                 {
+                    println!("send: {e}");
                     io_erred.cancel();
                     return;
                 }
@@ -74,12 +74,16 @@ pub fn socket(
             let mut ack_from_peer_buf = vec![];
             let mut ack_to_peer_buf = vec![];
             loop {
-                let Ok(recv_packets) = transport_layer
+                let recv_packets = match transport_layer
                     .recv_packets(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
-                else {
-                    io_erred.cancel();
-                    return;
+                {
+                    Ok(x) => x,
+                    Err(e) => {
+                        println!("recv: {e}");
+                        io_erred.cancel();
+                        return;
+                    }
                 };
                 if read_shutdown.is_cancelled() && 0 < recv_packets.num_payload_segments {
                     let _ = transport_layer.send_kill_packet().await;
