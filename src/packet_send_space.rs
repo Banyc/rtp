@@ -21,10 +21,10 @@ pub struct PacketSendSpace {
     smooth_rtt: Duration,
     reused_buf: Vec<Vec<u8>>,
     cwnd: NonZeroUsize,
-    last_ack_time: Instant,
+    response_wait_start: Option<Instant>,
 }
 impl PacketSendSpace {
-    pub fn new(now: Instant) -> Self {
+    pub fn new() -> Self {
         Self {
             next_seq: 0,
             transmitting: BTreeMap::new(),
@@ -32,7 +32,7 @@ impl PacketSendSpace {
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
             reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
-            last_ack_time: now,
+            response_wait_start: None,
         }
     }
 
@@ -64,10 +64,7 @@ impl PacketSendSpace {
     }
 
     pub fn no_response_for(&self, now: Instant) -> Option<Duration> {
-        if self.transmitting.is_empty() {
-            return None;
-        }
-        Some(now.duration_since(self.last_ack_time))
+        Some(now.duration_since(self.response_wait_start?))
     }
 
     pub fn ack(&mut self, seq: &[u64], acked: &mut Vec<PacketState>, now: Instant) {
@@ -92,7 +89,11 @@ impl PacketSendSpace {
             }
             acked.push(p.stats);
         }
-        self.last_ack_time = now;
+        if self.transmitting.is_empty() {
+            self.response_wait_start = None;
+        } else {
+            self.response_wait_start = Some(now);
+        }
     }
 
     pub fn accepts_new_packet(&self) -> bool {
@@ -111,6 +112,10 @@ impl PacketSendSpace {
         };
 
         self.transmitting.insert(s, p);
+        if self.response_wait_start.is_none() {
+            self.response_wait_start = Some(now);
+        }
+
         let p = Packet {
             seq: s,
             data: &self.transmitting.get(&s).unwrap().data,
@@ -200,6 +205,11 @@ impl PacketSendSpace {
 
     pub fn rto_duration(&self) -> Duration {
         rto_duration(self.smooth_rtt)
+    }
+}
+impl Default for PacketSendSpace {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
