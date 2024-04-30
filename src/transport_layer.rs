@@ -284,16 +284,14 @@ impl TransportLayer {
         Ok(written_bytes)
     }
 
+    /// Return `Ok(0)` when the read stream hits EOF
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
         let mut recv_data_packet = self.recv_data_packet.notified();
         let read_bytes = loop {
             self.first_error.throw_error()?;
 
             if self.recv_fin.is_cancelled() {
-                let e = std::io::ErrorKind::UnexpectedEof;
-                self.first_error.set(e);
-                self.recv_data_packet.notify_waiters();
-                return Err(e);
+                return Ok(0);
             }
 
             // reliable -{data}> app
@@ -313,6 +311,7 @@ impl TransportLayer {
             }
             if read_fin {
                 self.recv_fin.cancel();
+                continue;
             }
             recv_data_packet.await;
             recv_data_packet = self.recv_data_packet.notified();
