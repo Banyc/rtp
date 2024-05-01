@@ -195,7 +195,7 @@ impl PacketSendSpace {
             return;
         };
         let cwnd = min_rtt.as_secs_f64() * send_rate.get();
-        let cwnd = INIT_CWND.max(cwnd.round() as usize);
+        let cwnd = 1.max(cwnd.round() as usize);
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
 
         let last_seq_in_cwnd = || {
