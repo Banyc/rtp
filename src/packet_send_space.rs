@@ -25,6 +25,8 @@ pub struct PacketSendSpace {
     cwnd: NonZeroUsize,
     response_wait_start: Option<Instant>,
     imm_retrans_seq_end: u64,
+    /// Any sequence after this does not participate in data loss analysis.
+    max_pipe_seq: Option<u64>,
 
     // reused buffers
     pipe_buf: Vec<u64>,
@@ -41,6 +43,7 @@ impl PacketSendSpace {
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
             imm_retrans_seq_end: 0,
+            max_pipe_seq: None,
             pipe_buf: vec![],
             ack_buf: vec![],
         }
@@ -121,10 +124,13 @@ impl PacketSendSpace {
         let s = self.next_seq;
         self.next_seq += 1;
 
+        self.max_pipe_seq = Some(s);
+
         let p = TransmittingPacket {
             stats,
             sent_time: now,
             retransmitted: false,
+            considered_new_in_cwnd: false,
             data,
         };
 
@@ -149,6 +155,23 @@ impl PacketSendSpace {
                 continue;
             }
 
+            // fresh packet for this cwnd
+            let max_pipe_seq = self.max_pipe_seq;
+            let mut considered_first_send = || {
+                self.max_pipe_seq = Some(*s);
+                p.considered_new_in_cwnd = true;
+            };
+            match max_pipe_seq {
+                Some(max_pipe_seq) => {
+                    if max_pipe_seq < *s {
+                        considered_first_send();
+                    }
+                }
+                None => {
+                    considered_first_send();
+                }
+            }
+
             p.retransmitted = true;
             p.sent_time = now;
             let p = Packet {
@@ -164,6 +187,7 @@ impl PacketSendSpace {
         self.min_rtt
     }
 
+    #[allow(clippy::redundant_closure_call)]
     pub fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64) {
         let Some(min_rtt) = self.min_rtt else {
             return;
@@ -171,6 +195,26 @@ impl PacketSendSpace {
         let cwnd = min_rtt.as_secs_f64() * send_rate.get();
         let cwnd = INIT_CWND.max(cwnd.round() as usize);
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
+
+        let last_seq_in_cwnd = || {
+            if let Some(s) = self.transmitting.keys().nth(cwnd) {
+                return Some(*s);
+            }
+            if let Some(s) = self.transmitting.keys().last() {
+                return Some(*s);
+            }
+            None
+        };
+
+        // Retract max sequence in pipe
+        let last_seq_in_cwnd = last_seq_in_cwnd();
+        match (self.max_pipe_seq, last_seq_in_cwnd) {
+            (None, _) => (),
+            (Some(_), None) => self.max_pipe_seq = None,
+            (Some(max_pipe_seq), Some(last_seq_in_cwnd)) => {
+                self.max_pipe_seq = Some(max_pipe_seq.min(last_seq_in_cwnd));
+            }
+        }
     }
 
     pub fn no_packets_in_flight(&self) -> bool {
@@ -202,17 +246,27 @@ impl PacketSendSpace {
     }
 
     pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
-        let len = self.transmitting.iter().take(self.cwnd.get()).len();
+        let len = self.packets_in_pipe().count();
         if len == 0 {
             return None;
         }
         let mut lost = 0;
-        for p in self.transmitting.values().take(len) {
-            if p.retransmitted || p.rto(self.smooth_rtt, now) {
+        for (_, p) in self.packets_in_pipe() {
+            let retransmitted = !p.considered_new_in_cwnd && p.retransmitted;
+            if retransmitted || p.rto(self.smooth_rtt, now) {
                 lost += 1;
             }
         }
         Some(lost as f64 / len as f64)
+    }
+
+    fn packets_in_pipe(&self) -> impl Iterator<Item = (&u64, &TransmittingPacket)> + '_ {
+        self.transmitting
+            .iter()
+            .take_while(|(s, _)| match self.max_pipe_seq {
+                Some(max_pipe_seq) => **s <= max_pipe_seq,
+                None => false,
+            })
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {
@@ -240,6 +294,7 @@ struct TransmittingPacket {
     pub stats: PacketState,
     pub sent_time: Instant,
     pub retransmitted: bool,
+    pub considered_new_in_cwnd: bool,
     pub data: Vec<u8>,
 }
 impl TransmittingPacket {
