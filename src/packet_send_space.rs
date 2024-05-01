@@ -165,6 +165,8 @@ impl PacketSendSpace {
                 Some(max_pipe_seq) => {
                     if max_pipe_seq < *s {
                         considered_first_send();
+                    } else {
+                        p.considered_new_in_cwnd = false;
                     }
                 }
                 None => {
