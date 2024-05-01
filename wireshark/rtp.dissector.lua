@@ -140,6 +140,16 @@ function rtp.dissector(tvbuf, pktinfo, root)
     return pos
 end
 
-for port = 1024, 65535 do
-    DissectorTable.get("udp.port"):add(port, rtp)
+local function heuristic(tvbuf, pktinfo, root)
+    local cmd = tvbuf:range(0, 1)
+    if not (cmd:uint() == ACK_CMD) and not (cmd:uint() == DATA_CMD) and not (cmd:uint() == KILL_CMD) then
+        return false
+    end
+    rtp.dissector(tvbuf, pktinfo, root)
+    return true
 end
+rtp:register_heuristic("udp", heuristic)
+
+-- for port = 1024, 65535 do
+--     DissectorTable.get("udp.port"):add(port, rtp)
+-- end
