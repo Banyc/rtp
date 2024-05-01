@@ -2,12 +2,12 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 #[derive(Debug, Clone)]
 pub struct AckQueue {
-    seq_to_successors: BTreeMap<u64, NonZeroU64>,
+    start_to_size: BTreeMap<u64, NonZeroU64>,
 }
 impl AckQueue {
     pub fn new() -> Self {
         Self {
-            seq_to_successors: BTreeMap::new(),
+            start_to_size: BTreeMap::new(),
         }
     }
 
@@ -34,17 +34,17 @@ impl AckQueue {
             let Some(merged) = other.merge(&this) else {
                 return this;
             };
-            self.seq_to_successors.remove(&other.start);
+            self.start_to_size.remove(&other.start);
             merged
         };
         let this = merge_pair(this, prev);
         let this = merge_pair(this, next);
 
-        self.seq_to_successors.insert(this.start, this.size);
+        self.start_to_size.insert(this.start, this.size);
     }
 
     pub fn balls(&self) -> impl Iterator<Item = AckBall> + '_ {
-        self.seq_to_successors.iter().map(|(s, n)| AckBall {
+        self.start_to_size.iter().map(|(s, n)| AckBall {
             start: *s,
             size: *n,
         })
@@ -174,6 +174,6 @@ mod tests {
         a.insert(1);
         a.insert(3);
         a.insert(2);
-        assert_eq!(a.seq_to_successors.len(), 1);
+        assert_eq!(a.start_to_size.len(), 1);
     }
 }
