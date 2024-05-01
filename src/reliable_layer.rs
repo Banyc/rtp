@@ -241,11 +241,37 @@ impl ReliableLayer {
         }
         self.prev_sample_rate = Some(sr.clone());
 
-        self.adjust_send_rate(&sr, now);
+        // self.adjust_send_rate(&sr, now);
+        self.adjust_send_rate_exponential(&sr, now);
 
         Some(sr)
     }
 
+    fn adjust_send_rate_exponential(&mut self, sr: &dre::RateSample, now: Instant) {
+        let little_data_loss = self
+            .packet_send_space
+            .data_loss_rate(now)
+            .map(|lr| lr < CC_DATA_LOSS_RATE);
+        let should_probe = little_data_loss != Some(false);
+        let target_send_rate = match should_probe {
+            true => {
+                let send_rate = sr.delivery_rate() + sr.delivery_rate() * SEND_RATE_PROBE_RATE;
+                if send_rate < self.send_rate.get() {
+                    return;
+                }
+                send_rate
+            }
+            false => sr.delivery_rate(),
+        };
+
+        let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
+            + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
+        let send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
+        self.set_send_rate(send_rate, now);
+        GLOBAL_INIT_SEND_RATE.try_set(send_rate);
+    }
+
+    #[allow(dead_code)]
     fn adjust_send_rate(&mut self, sr: &dre::RateSample, now: Instant) {
         match &mut self.state {
             State::Init { max_delivery_rate } => {

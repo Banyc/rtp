@@ -18,6 +18,14 @@ where
         *self.value.lock().unwrap() = value;
     }
 
+    pub fn try_set(&self, value: T) -> bool {
+        let Ok(mut v) = self.value.try_lock() else {
+            return false;
+        };
+        *v = value;
+        true
+    }
+
     pub fn get(&self) -> T {
         self.value.lock().unwrap().clone()
     }
