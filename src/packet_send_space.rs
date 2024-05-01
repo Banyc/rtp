@@ -141,7 +141,7 @@ impl PacketSendSpace {
     }
 
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
-        for (s, p) in &mut self.transmitting {
+        for (s, p) in self.transmitting.iter_mut().take(self.cwnd.get()) {
             let out_of_order_rt =
                 *s < self.imm_retrans_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
 
@@ -178,7 +178,7 @@ impl PacketSendSpace {
     }
 
     pub fn all_lost_packets_retransmitted(&self, now: Instant) -> bool {
-        for p in self.transmitting.values() {
+        for p in self.transmitting.values().take(self.cwnd.get()) {
             if p.rto(self.smooth_rtt, now) {
                 return false;
             }
@@ -188,7 +188,7 @@ impl PacketSendSpace {
 
     pub fn num_not_lost_transmitting_packets(&self, now: Instant) -> usize {
         let mut not_lost = 0;
-        for p in self.transmitting.values() {
+        for p in self.transmitting.values().take(self.cwnd.get()) {
             if p.rto(self.smooth_rtt, now) {
                 continue;
             }
@@ -202,21 +202,22 @@ impl PacketSendSpace {
     }
 
     pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
-        if self.transmitting.is_empty() {
+        let len = self.transmitting.iter().take(self.cwnd.get()).len();
+        if len == 0 {
             return None;
         }
         let mut lost = 0;
-        for p in self.transmitting.values() {
+        for p in self.transmitting.values().take(len) {
             if p.retransmitted || p.rto(self.smooth_rtt, now) {
                 lost += 1;
             }
         }
-        Some(lost as f64 / self.transmitting.len() as f64)
+        Some(lost as f64 / len as f64)
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {
         let mut min_next_poll_time: Option<Instant> = None;
-        for p in self.transmitting.values() {
+        for p in self.transmitting.values().take(self.cwnd.get()) {
             let t = p.next_rto_time(self.smooth_rtt);
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
