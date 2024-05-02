@@ -151,7 +151,7 @@ impl PacketSendSpace {
             let out_of_order_rt =
                 *s < self.imm_retrans_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
 
-            if !p.rto(self.smooth_rtt, now) && !out_of_order_rt {
+            if !p.tolerated_rto(self.smooth_rtt, now) && !out_of_order_rt {
                 continue;
             }
 
@@ -225,7 +225,7 @@ impl PacketSendSpace {
 
     pub fn all_lost_packets_retransmitted(&self, now: Instant) -> bool {
         for p in self.transmitting.values().take(self.cwnd.get()) {
-            if p.rto(self.smooth_rtt, now) {
+            if p.tolerated_rto(self.smooth_rtt, now) {
                 return false;
             }
         }
@@ -235,7 +235,7 @@ impl PacketSendSpace {
     pub fn num_not_lost_transmitting_packets(&self, now: Instant) -> usize {
         let mut not_lost = 0;
         for p in self.transmitting.values().take(self.cwnd.get()) {
-            if p.rto(self.smooth_rtt, now) {
+            if p.tolerated_rto(self.smooth_rtt, now) {
                 continue;
             }
             not_lost += 1;
@@ -255,7 +255,7 @@ impl PacketSendSpace {
         let mut lost = 0;
         for (_, p) in self.packets_in_pipe() {
             let retransmitted = !p.considered_new_in_cwnd && p.retransmitted;
-            if retransmitted || p.rto(self.smooth_rtt, now) {
+            if retransmitted || p.tolerated_rto(self.smooth_rtt, now) {
                 lost += 1;
             }
         }
@@ -300,9 +300,13 @@ struct TransmittingPacket {
     pub data: Vec<u8>,
 }
 impl TransmittingPacket {
-    pub fn rto(&self, smooth_rtt: Duration, now: Instant) -> bool {
+    pub fn rto(&self, timeout: Duration, now: Instant) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
-        rto_duration(smooth_rtt) <= sent_elapsed
+        timeout <= sent_elapsed
+    }
+
+    pub fn tolerated_rto(&self, smooth_rtt: Duration, now: Instant) -> bool {
+        self.rto(rto_duration(smooth_rtt), now)
     }
 
     pub fn next_rto_time(&self, smooth_rtt: Duration) -> Instant {
