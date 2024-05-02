@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::{decode, encode_ack_data, encode_kill, EncodeData, MAX_NUM_ACK},
+    codec::{decode, encode_ack_data, encode_kill, EncodeAck, EncodeData},
     reliable_layer::ReliableLayer,
-    sack::{AckBall, AckBallSequence, AckQueue},
+    sack::{AckBall, AckBallSequence},
 };
 
 const PRINT_DEBUG_MESSAGES: bool = false;
+const MAX_NUM_ACK: usize = 64;
 
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
@@ -132,7 +133,7 @@ impl TransportLayer {
                 seq: p.seq,
                 data: &data_buf[..data_written],
             };
-            let n = encode_ack_data(&AckQueue::new(), Some(data), utp_buf).unwrap();
+            let n = encode_ack_data(None, Some(data), utp_buf).unwrap();
             let Err(e) = self.utp_write.send(&utp_buf[..n]).await else {
                 continue;
             };
@@ -245,7 +246,12 @@ impl TransportLayer {
         let written_bytes = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let packet_recv_space = reliable_layer.packet_recv_space();
-            encode_ack_data(packet_recv_space.ack_history(), None, utp_buf).unwrap()
+            let ack = EncodeAck {
+                queue: packet_recv_space.ack_history(),
+                skip: 0,
+                max_take: MAX_NUM_ACK,
+            };
+            encode_ack_data(Some(ack), None, utp_buf).unwrap()
         };
         self.utp_write
             .send(&utp_buf[..written_bytes])

@@ -2,7 +2,7 @@ local NAME = "my_rtp"
 
 local rtp = Proto(NAME, NAME)
 
-local MAX_NUM_ACK = 32
+local MAX_NUM_ACK = 64
 
 local ACK_CMD = 0
 local DATA_CMD = 1

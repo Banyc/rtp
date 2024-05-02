@@ -85,7 +85,7 @@ impl PacketSendSpace {
 
     pub fn ack(&mut self, seq: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
         if let Some(seq) = seq.out_of_order_seq_end() {
-            self.out_of_order_seq_end = seq;
+            self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
         self.pipe_buf.clear();
         self.pipe_buf.extend(self.transmitting.keys());

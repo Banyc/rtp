@@ -9,8 +9,6 @@ use thiserror::Error;
 
 use crate::sack::{AckBall, AckQueue};
 
-pub const MAX_NUM_ACK: usize = 32;
-
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
 const KILL_CMD: u8 = 2;
@@ -24,15 +22,22 @@ pub fn encode_kill(buf: &mut [u8]) -> Result<usize, EncodeError> {
 }
 
 pub fn encode_ack_data(
-    ack: &AckQueue,
+    ack: Option<EncodeAck<'_>>,
     data: Option<EncodeData<'_>>,
     buf: &mut [u8],
 ) -> Result<usize, EncodeError> {
     let mut wtr = io::Cursor::new(buf);
-    for ack in ack.balls().take(MAX_NUM_ACK) {
-        wtr.write_u8(ACK_CMD)
-            .pipe(wrap_insufficient_buffer_size_err)?;
-        encode_ack(&mut wtr, ack)?;
+    if let Some(EncodeAck {
+        queue,
+        skip,
+        max_take,
+    }) = ack
+    {
+        for ack in queue.balls().skip(skip).take(max_take) {
+            wtr.write_u8(ACK_CMD)
+                .pipe(wrap_insufficient_buffer_size_err)?;
+            encode_ack(&mut wtr, ack)?;
+        }
     }
     if let Some(EncodeData { seq, data }) = data {
         wtr.write_u8(DATA_CMD)
@@ -41,6 +46,25 @@ pub fn encode_ack_data(
     }
     let pos = wtr.position();
     Ok(pos as usize)
+}
+#[derive(Debug, Clone)]
+pub struct EncodeAck<'a> {
+    pub queue: &'a AckQueue,
+    pub skip: usize,
+    pub max_take: usize,
+}
+impl<'a> EncodeAck<'a> {
+    pub fn next_page(&self) -> Option<Self> {
+        let skip = self.skip + self.max_take;
+        if self.queue.balls().count() <= skip {
+            return None;
+        }
+        Some(Self {
+            queue: self.queue,
+            skip,
+            max_take: self.max_take,
+        })
+    }
 }
 #[derive(Debug, Clone)]
 pub struct EncodeData<'a> {
