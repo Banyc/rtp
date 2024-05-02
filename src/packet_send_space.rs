@@ -5,7 +5,7 @@ use std::{
 };
 
 use dre::PacketState;
-use strict_num::NonZeroPositiveF64;
+use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
 use crate::{
     comp_option::CompOption, packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf,
@@ -231,6 +231,14 @@ impl PacketSendSpace {
         self.transmitting.len()
     }
 
+    pub fn huge_data_loss(&self, tolerant_loss_rate: NormalizedF64, now: Instant) -> bool {
+        let Some(data_loss_rate) = self.data_loss_rate(now) else {
+            return false;
+        };
+        let enough_samples_for_stats = INIT_CWND < self.packets_in_pipe().count();
+        enough_samples_for_stats && tolerant_loss_rate.get() < data_loss_rate
+    }
+
     pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
         let len = self.packets_in_pipe().count();
         if len == 0 {
@@ -244,6 +252,10 @@ impl PacketSendSpace {
             }
         }
         Some(lost as f64 / len as f64)
+    }
+
+    pub fn num_packets_in_pipe(&self) -> usize {
+        self.packets_in_pipe().count()
     }
 
     fn packets_in_pipe(&self) -> impl Iterator<Item = (&u64, &TransmittingPacket)> + '_ {

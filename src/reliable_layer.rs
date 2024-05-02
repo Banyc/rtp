@@ -3,15 +3,11 @@ use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 use dre::{ConnectionState, PacketState};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use strict_num::NonZeroPositiveF64;
+use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
 use crate::{
-    packet_recv_space::PacketRecvSpace,
-    packet_send_space::{PacketSendSpace, INIT_CWND},
-    sack::AckBallSequence,
-    shared::SharedCell,
-    timer::PollTimer,
-    token_bucket::TokenBucket,
+    packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace, sack::AckBallSequence,
+    shared::SharedCell, timer::PollTimer, token_bucket::TokenBucket,
 };
 
 const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
@@ -106,12 +102,9 @@ impl ReliableLayer {
 
         // backoff on unrecovered huge data loss
         let mut f = || {
-            let Some(data_loss_rate) = self.packet_send_space.data_loss_rate(now) else {
-                self.huge_data_loss_timer.clear();
-                return;
-            };
-            let huge_data_loss = INIT_CWND < self.packet_send_space.num_transmitting_packets()
-                && MAX_DATA_LOSS_RATE < data_loss_rate;
+            let huge_data_loss = self
+                .packet_send_space
+                .huge_data_loss(NormalizedF64::new(MAX_DATA_LOSS_RATE).unwrap(), now);
             if !huge_data_loss {
                 self.huge_data_loss_timer.clear();
                 return;
@@ -335,6 +328,7 @@ impl ReliableLayer {
             send_rate: self.send_rate.get(),
             loss_rate: self.packet_send_space.data_loss_rate(now),
             num_tx_pkts: self.packet_send_space.num_transmitting_packets(),
+            num_pkts_in_pipe: self.packet_send_space.num_packets_in_pipe(),
             num_rt_pkts: self.packet_send_space.num_retransmitted_packets(),
             send_seq: self.packet_send_space.next_seq(),
             min_rtt: min_rtt.map(|t| t.as_millis()),
@@ -366,6 +360,7 @@ pub struct Log {
     pub delivery_rate: Option<f64>,
     pub loss_rate: Option<f64>,
     pub num_tx_pkts: usize,
+    pub num_pkts_in_pipe: usize,
     pub num_rt_pkts: usize,
     pub send_seq: u64,
     pub min_rtt: Option<u128>,
