@@ -66,7 +66,7 @@ impl<'a> AckBallSequence<'a> {
         Self { balls }
     }
 
-    pub fn imm_retrans_seq_end(&self) -> Option<u64> {
+    pub fn out_of_order_seq_end(&self) -> Option<u64> {
         Some(self.balls.last()?.start)
     }
 

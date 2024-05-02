@@ -23,8 +23,9 @@ pub struct PacketSendSpace {
     smooth_rtt: Duration,
     reused_buf: Vec<Vec<u8>>,
     cwnd: NonZeroUsize,
+    /// Detect if the peer has died
     response_wait_start: Option<Instant>,
-    imm_retrans_seq_end: u64,
+    out_of_order_seq_end: u64,
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: Option<u64>,
 
@@ -42,7 +43,7 @@ impl PacketSendSpace {
             reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
-            imm_retrans_seq_end: 0,
+            out_of_order_seq_end: 0,
             max_pipe_seq: None,
             pipe_buf: vec![],
             ack_buf: vec![],
@@ -81,8 +82,8 @@ impl PacketSendSpace {
     }
 
     pub fn ack(&mut self, seq: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
-        if let Some(seq) = seq.imm_retrans_seq_end() {
-            self.imm_retrans_seq_end = seq;
+        if let Some(seq) = seq.out_of_order_seq_end() {
+            self.out_of_order_seq_end = seq;
         }
         self.pipe_buf.clear();
         self.pipe_buf.extend(self.transmitting.keys());
@@ -149,9 +150,10 @@ impl PacketSendSpace {
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
         for (s, p) in self.transmitting.iter_mut().take(self.cwnd.get()) {
             let out_of_order_rt =
-                *s < self.imm_retrans_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
+                *s < self.out_of_order_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
 
-            if !p.tolerated_rto(self.smooth_rtt, now) && !out_of_order_rt {
+            let should_retransmit = p.tolerated_rto(self.smooth_rtt, now) || out_of_order_rt;
+            if !should_retransmit {
                 continue;
             }
 
