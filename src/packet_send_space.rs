@@ -8,7 +8,8 @@ use dre::PacketState;
 use strict_num::NonZeroPositiveF64;
 
 use crate::{
-    packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf, sack::AckBallSequence,
+    comp_option::CompOption, packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf,
+    sack::AckBallSequence,
 };
 
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
@@ -28,7 +29,7 @@ pub struct PacketSendSpace {
     response_wait_start: Option<Instant>,
     out_of_order_seq_end: u64,
     /// Any sequence after this does not participate in data loss analysis.
-    max_pipe_seq: Option<u64>,
+    max_pipe_seq: CompOption<u64>,
 
     // reused buffers
     pipe_buf: Vec<u64>,
@@ -45,7 +46,7 @@ impl PacketSendSpace {
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
             out_of_order_seq_end: 0,
-            max_pipe_seq: None,
+            max_pipe_seq: CompOption::new(None),
             pipe_buf: vec![],
             ack_buf: vec![],
         }
@@ -122,7 +123,7 @@ impl PacketSendSpace {
         let s = self.next_seq;
         self.next_seq += 1;
 
-        self.max_pipe_seq = Some(s);
+        self.max_pipe_seq.set(Some(s));
 
         let p = TransmittingPacket {
             stats,
@@ -155,22 +156,11 @@ impl PacketSendSpace {
             }
 
             // fresh packet for this cwnd
-            let max_pipe_seq = self.max_pipe_seq;
-            let mut considered_first_send = || {
-                self.max_pipe_seq = Some(*s);
+            if self.max_pipe_seq < CompOption::new(Some(*s)) {
+                self.max_pipe_seq.set(Some(*s));
                 p.considered_new_in_cwnd = true;
-            };
-            match max_pipe_seq {
-                Some(max_pipe_seq) => {
-                    if max_pipe_seq < *s {
-                        considered_first_send();
-                    } else {
-                        p.considered_new_in_cwnd = false;
-                    }
-                }
-                None => {
-                    considered_first_send();
-                }
+            } else {
+                p.considered_new_in_cwnd = false;
             }
 
             p.retransmitted = true;
@@ -188,7 +178,6 @@ impl PacketSendSpace {
         self.min_rtt
     }
 
-    #[allow(clippy::redundant_closure_call)]
     pub fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64) {
         let Some(min_rtt) = self.min_rtt else {
             return;
@@ -206,15 +195,11 @@ impl PacketSendSpace {
             }
             None
         };
+        let last_seq_in_cwnd = last_seq_in_cwnd();
 
         // Retract max sequence in pipe
-        let last_seq_in_cwnd = last_seq_in_cwnd();
-        match (self.max_pipe_seq, last_seq_in_cwnd) {
-            (None, _) => (),
-            (Some(_), None) => self.max_pipe_seq = None,
-            (Some(max_pipe_seq), Some(last_seq_in_cwnd)) => {
-                self.max_pipe_seq = Some(max_pipe_seq.min(last_seq_in_cwnd));
-            }
+        if CompOption::new(last_seq_in_cwnd) < self.max_pipe_seq {
+            self.max_pipe_seq.set(last_seq_in_cwnd);
         }
     }
 
@@ -264,10 +249,7 @@ impl PacketSendSpace {
     fn packets_in_pipe(&self) -> impl Iterator<Item = (&u64, &TransmittingPacket)> + '_ {
         self.transmitting
             .iter()
-            .take_while(|(s, _)| match self.max_pipe_seq {
-                Some(max_pipe_seq) => **s <= max_pipe_seq,
-                None => false,
-            })
+            .take_while(|(s, _)| CompOption::new(Some(**s)) <= self.max_pipe_seq)
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {
