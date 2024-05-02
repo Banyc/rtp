@@ -147,8 +147,7 @@ impl PacketSendSpace {
 
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
         for (s, p) in self.transmitting.iter_mut().take(self.cwnd.get()) {
-            let out_of_order_rt =
-                *s < self.out_of_order_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
+            let out_of_order_rt = *s < self.out_of_order_seq_end && p.rto(self.smooth_rtt, now);
 
             let should_retransmit = p.tolerated_rto(self.smooth_rtt, now) || out_of_order_rt;
             if !should_retransmit {
