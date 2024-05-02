@@ -7,12 +7,13 @@ use std::{
 use dre::PacketState;
 use strict_num::NonZeroPositiveF64;
 
-use crate::sack::AckBallSequence;
+use crate::{
+    packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf, sack::AckBallSequence,
+};
 
 const SMOOTH_RTT_ALPHA: f64 = 0.1;
 const RTO_K: f64 = 1.;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
-const MAX_NUM_REUSED_BUFFERS: usize = 64;
 pub const INIT_CWND: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -21,7 +22,7 @@ pub struct PacketSendSpace {
     transmitting: BTreeMap<u64, TransmittingPacket>,
     min_rtt: Option<Duration>,
     smooth_rtt: Duration,
-    reused_buf: Vec<Vec<u8>>,
+    reused_buf: ReusedBuf<Vec<u8>>,
     cwnd: NonZeroUsize,
     /// Detect if the peer has died
     response_wait_start: Option<Instant>,
@@ -40,7 +41,7 @@ impl PacketSendSpace {
             transmitting: BTreeMap::new(),
             min_rtt: None,
             smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
-            reused_buf: Vec::with_capacity(MAX_NUM_REUSED_BUFFERS),
+            reused_buf: ReusedBuf::new(MAX_NUM_RECEIVING_PACKETS),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
             out_of_order_seq_end: 0,
@@ -73,8 +74,8 @@ impl PacketSendSpace {
         n
     }
 
-    pub fn reuse_buf(&mut self) -> Option<Vec<u8>> {
-        self.reused_buf.pop()
+    pub fn reused_buf(&mut self) -> &mut ReusedBuf<Vec<u8>> {
+        &mut self.reused_buf
     }
 
     pub fn no_response_for(&self, now: Instant) -> Option<Duration> {
@@ -103,11 +104,7 @@ impl PacketSendSpace {
                     + rtt.as_secs_f64() * SMOOTH_RTT_ALPHA;
                 self.smooth_rtt = Duration::from_secs_f64(smooth_rtt);
             }
-            if self.reused_buf.len() != self.reused_buf.capacity() {
-                let mut buf = p.data;
-                buf.clear();
-                self.reused_buf.push(buf);
-            }
+            self.reused_buf.return_buf(p.data);
             acked.push(p.stats);
         }
         if self.transmitting.is_empty() {

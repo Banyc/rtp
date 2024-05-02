@@ -162,7 +162,12 @@ impl ReliableLayer {
             .connection_stats
             .send_packet_2(now, self.packet_send_space.no_packets_in_flight());
 
-        let mut buf = self.packet_send_space.reuse_buf().unwrap_or_default();
+        let mut buf = self
+            .packet_send_space
+            .reused_buf()
+            .reuse_buf()
+            .unwrap_or_default();
+        buf.clear();
         let data = self.send_data_buf.drain(..packet_bytes);
         buf.extend(data);
         let data = buf;
@@ -262,7 +267,12 @@ impl ReliableLayer {
     ///
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
-        let mut buf = self.packet_recv_space.reuse_buf().unwrap_or_default();
+        let mut buf = self
+            .packet_recv_space
+            .reused_buf()
+            .reuse_buf()
+            .unwrap_or_default();
+        buf.clear();
         buf.extend(packet);
         if !self.packet_recv_space.recv(seq, buf) {
             return false;
@@ -284,11 +294,11 @@ impl ReliableLayer {
             let p = self.packet_recv_space.pop().unwrap();
             if p.is_empty() {
                 self.recv_fin_buf = true;
-                self.packet_recv_space.return_buf(p);
+                self.packet_recv_space.reused_buf().return_buf(p);
                 return;
             }
             self.recv_data_buf.extend(&p);
-            self.packet_recv_space.return_buf(p);
+            self.packet_recv_space.reused_buf().return_buf(p);
         }
     }
 
