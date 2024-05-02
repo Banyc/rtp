@@ -151,7 +151,7 @@ impl PacketSendSpace {
             let out_of_order_rt =
                 *s < self.imm_retrans_seq_end && p.rto(self.smooth_rtt.div_f64(2.), now);
 
-            if !p.rto(self.smooth_rtt, now) || !out_of_order_rt {
+            if !p.rto(self.smooth_rtt, now) && !out_of_order_rt {
                 continue;
             }
 
