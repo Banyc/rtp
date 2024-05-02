@@ -346,7 +346,6 @@ impl TransportLayer {
             num_rx_pkts: log.num_rx_pkts,
             recv_seq: log.recv_seq,
             delivery_rate: log.delivery_rate,
-            state: log.state,
             app_limited: log.app_limited,
         };
         logger
@@ -423,6 +422,5 @@ pub struct Log<'a> {
     pub cwnd: usize,
     pub num_rx_pkts: usize,
     pub recv_seq: u64,
-    pub state: u8,
     pub app_limited: Option<bool>,
 }

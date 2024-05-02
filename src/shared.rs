@@ -14,6 +14,7 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub fn set(&self, value: T) {
         *self.value.lock().unwrap() = value;
     }

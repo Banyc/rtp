@@ -7,6 +7,7 @@ pub enum ContActTimerOn {
     Hot,
 }
 
+#[allow(dead_code)]
 /// Only return the value if there is only the same kind of actions performed during a specific duration
 #[derive(Debug, Clone)]
 pub struct ContActTimer<T> {
@@ -14,6 +15,7 @@ pub struct ContActTimer<T> {
     value: T,
     on: ContActTimerOn,
 }
+#[allow(dead_code)]
 impl<T> ContActTimer<T> {
     pub fn new(value: T, now: Instant, on: ContActTimerOn) -> Self {
         let mut timer = PollTimer::new_cleared();
