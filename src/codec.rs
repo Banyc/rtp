@@ -21,13 +21,6 @@ pub fn encode_kill(buf: &mut [u8]) -> Result<usize, EncodeError> {
     Ok(pos as usize)
 }
 
-pub const fn data_overhead() -> usize {
-    let cmd = std::mem::size_of::<u8>();
-    let seq = std::mem::size_of::<u64>();
-    let len = std::mem::size_of::<u16>();
-    cmd + seq + len
-}
-
 pub fn encode_ack_data(
     ack: Option<EncodeAck<'_>>,
     data: Option<EncodeData<'_>>,
@@ -123,6 +116,13 @@ fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<AckBall, DecodeError> {
     let size = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
     let size = NonZeroU64::new(size).ok_or(DecodeError::Corrupted)?;
     Ok(AckBall { start, size })
+}
+
+pub const fn data_overhead() -> usize {
+    let cmd = std::mem::size_of::<u8>();
+    let seq = std::mem::size_of::<u64>();
+    let len = std::mem::size_of::<u16>();
+    cmd + seq + len
 }
 
 fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result<(), EncodeError> {
