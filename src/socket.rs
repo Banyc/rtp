@@ -10,7 +10,7 @@ use async_async_io::{
 };
 use tokio::task::JoinSet;
 
-use crate::transport_layer::{LogConfig, TransportLayer, UnreliableRead, UnreliableWrite};
+use crate::transport_layer::{LogConfig, TransportLayer, UnreliableLayer};
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
 const BUFFER_SIZE: usize = 1024 * 64;
@@ -26,14 +26,13 @@ const _: () = {
 };
 
 pub fn socket(
-    utp_read: Box<dyn UnreliableRead>,
-    utp_write: Box<dyn UnreliableWrite>,
+    unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (ReadSocket, WriteSocket) {
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
     let io_erred = tokio_util::sync::CancellationToken::new();
-    let transport_layer = Arc::new(TransportLayer::new(utp_read, utp_write, log_config));
+    let transport_layer = Arc::new(TransportLayer::new(unreliable_layer, log_config));
     let mut events = JoinSet::new();
 
     // Send timer
@@ -150,6 +149,18 @@ impl WriteSocket {
             .await
     }
 
+    pub fn is_no_data_to_send(&self) -> bool {
+        self.transport_layer
+            .reliable_layer()
+            .lock()
+            .unwrap()
+            .is_no_data_to_send()
+    }
+
+    pub async fn no_data_to_send(&self) {
+        self.transport_layer.no_data_to_send().await;
+    }
+
     pub fn into_async_write(self, no_delay: bool) -> WriteStream {
         let write = WriteSocket2 {
             write: self,
@@ -198,10 +209,14 @@ impl AsyncAsyncWrite for WriteSocket2 {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UdpSocket,
     };
+
+    use crate::udp::MSS;
 
     use super::*;
 
@@ -215,8 +230,18 @@ mod tests {
         let hello = b"hello";
         let world = b"world";
 
-        let (a_r, mut a_w) = socket(Box::new(a.clone()), Box::new(a), None);
-        let (b_r, mut b_w) = socket(Box::new(b.clone()), Box::new(b), None);
+        let a = UnreliableLayer {
+            utp_read: Box::new(a.clone()),
+            utp_write: Box::new(a),
+            mss: NonZeroUsize::new(MSS).unwrap(),
+        };
+        let b = UnreliableLayer {
+            utp_read: Box::new(b.clone()),
+            utp_write: Box::new(b),
+            mss: NonZeroUsize::new(MSS).unwrap(),
+        };
+        let (a_r, mut a_w) = socket(a, None);
+        let (b_r, mut b_w) = socket(b, None);
         a_w.send(hello, true).await.unwrap();
         b_w.send(world, true).await.unwrap();
 
@@ -233,8 +258,18 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (a_r, a_w) = socket(Box::new(a.clone()), Box::new(a), None);
-        let (b_r, b_w) = socket(Box::new(b.clone()), Box::new(b), None);
+        let a = UnreliableLayer {
+            utp_read: Box::new(a.clone()),
+            utp_write: Box::new(a),
+            mss: NonZeroUsize::new(MSS).unwrap(),
+        };
+        let b = UnreliableLayer {
+            utp_read: Box::new(b.clone()),
+            utp_write: Box::new(b),
+            mss: NonZeroUsize::new(MSS).unwrap(),
+        };
+        let (a_r, a_w) = socket(a, None);
+        let (b_r, b_w) = socket(b, None);
 
         let mut send_buf = vec![0; 2 << 17];
         let mut recv_buf = send_buf.clone();

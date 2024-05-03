@@ -6,14 +6,13 @@ use serde::{Deserialize, Serialize};
 use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
 use crate::{
-    packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace, sack::AckBallSequence,
-    shared::SharedCell, timer::PollTimer, token_bucket::TokenBucket,
+    codec::data_overhead, packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace,
+    sack::AckBallSequence, shared::SharedCell, timer::PollTimer, token_bucket::TokenBucket,
 };
 
 const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
 const RECV_DATA_BUFFER_LENGTH: usize = 2 << 16;
 const MAX_BURST_PACKETS: usize = 64;
-const MSS: usize = 1413;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 const INIT_SEND_RATE: f64 = 128.;
@@ -27,6 +26,7 @@ static GLOBAL_INIT_SEND_RATE: Lazy<SharedCell<NonZeroPositiveF64>> =
 
 #[derive(Debug, Clone)]
 pub struct ReliableLayer {
+    mss: NonZeroUsize,
     send_data_buf: VecDeque<u8>,
     /// one-element queue
     send_fin_buf: bool,
@@ -46,10 +46,11 @@ pub struct ReliableLayer {
     packet_buf: Vec<dre::Packet>,
 }
 impl ReliableLayer {
-    pub fn new(now: Instant) -> Self {
+    pub fn new(mss: NonZeroUsize, now: Instant) -> Self {
         let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
         let send_rate = init_send_rate.get();
         Self {
+            mss,
             send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
             send_fin_buf: false,
             recv_data_buf: VecDeque::with_capacity(RECV_DATA_BUFFER_LENGTH),
@@ -68,6 +69,10 @@ impl ReliableLayer {
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
+    }
+
+    pub fn is_no_data_to_send(&self) -> bool {
+        self.send_data_buf.is_empty() && self.packet_send_space.no_packets_in_flight()
     }
 
     pub fn packet_send_space(&self) -> &PacketSendSpace {
@@ -141,7 +146,10 @@ impl ReliableLayer {
             return None;
         }
 
-        let packet_bytes = packet.len().min(MSS).min(self.send_data_buf.len());
+        let packet_bytes = packet
+            .len()
+            .min(self.max_data_size_per_packet())
+            .min(self.send_data_buf.len());
         let packet_bytes = match (NonZeroUsize::new(packet_bytes), self.send_fin_buf) {
             (Some(x), _) => x.get(),
             (None, true) => {
@@ -298,7 +306,7 @@ impl ReliableLayer {
     fn detect_application_limited_phases(&mut self, now: Instant) {
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
-                few_data_to_send: self.send_data_buf.len() < MSS,
+                few_data_to_send: self.send_data_buf.len() < self.max_data_size_per_packet(),
                 not_transmitting_a_packet: true,
                 cwnd_not_full: self.packet_send_space.accepts_new_packet(),
                 all_lost_packets_retransmitted: self
@@ -318,6 +326,10 @@ impl ReliableLayer {
         self.send_rate = send_rate;
         self.packet_send_space.set_send_rate(send_rate);
         self.token_bucket.set_thruput(send_rate, now);
+    }
+
+    fn max_data_size_per_packet(&self) -> usize {
+        self.mss.get().checked_sub(data_overhead()).unwrap()
     }
 
     pub fn log(&self) -> Log {

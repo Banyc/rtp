@@ -21,6 +21,13 @@ pub fn encode_kill(buf: &mut [u8]) -> Result<usize, EncodeError> {
     Ok(pos as usize)
 }
 
+pub const fn data_overhead() -> usize {
+    let cmd = std::mem::size_of::<u8>();
+    let seq = std::mem::size_of::<u64>();
+    let len = std::mem::size_of::<u16>();
+    cmd + seq + len
+}
+
 pub fn encode_ack_data(
     ack: Option<EncodeAck<'_>>,
     data: Option<EncodeData<'_>>,

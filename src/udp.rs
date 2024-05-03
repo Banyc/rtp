@@ -7,9 +7,10 @@ use udp_listener::{AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
 
 use crate::{
     socket::{socket, ReadSocket, WriteSocket},
-    transport_layer::{self, UnreliableRead, UnreliableWrite},
+    transport_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
+pub const MSS: usize = 1424;
 const DISPATCHER_BUFFER_SIZE: usize = 1024;
 
 type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
@@ -43,7 +44,12 @@ impl Listener {
         let accepted = self.listener.accept().await?;
         let peer_addr = *accepted.dispatch_key();
         let (read, write) = accepted.split();
-        let (read, write) = socket(Box::new(read), Box::new(write), None);
+        let unreliable_layer = UnreliableLayer {
+            utp_read: Box::new(read),
+            utp_write: Box::new(write),
+            mss: NonZeroUsize::new(MSS).unwrap(),
+        };
+        let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
             write,
@@ -60,7 +66,12 @@ impl Listener {
         let (mut read, write) = accepted.split();
         let challenge = read.recv().try_recv().unwrap();
         write.send(&challenge).await?;
-        let (read, write) = socket(Box::new(read), Box::new(write), None);
+        let unreliable_layer = UnreliableLayer {
+            utp_read: Box::new(read),
+            utp_write: Box::new(write),
+            mss: NonZeroUsize::new(MSS).unwrap(),
+        };
+        let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
             write,
@@ -88,7 +99,12 @@ pub async fn connect_without_handshake(
         None => None,
     };
     let udp = Arc::new(udp);
-    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp), log_config);
+    let unreliable_layer = UnreliableLayer {
+        utp_read: Box::new(Arc::clone(&udp)),
+        utp_write: Box::new(udp),
+        mss: NonZeroUsize::new(MSS).unwrap(),
+    };
+    let (read, write) = socket(unreliable_layer, log_config);
     Ok(Connected {
         read,
         write,
@@ -118,7 +134,12 @@ pub async fn connect(
         return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
     }
     let udp = Arc::new(udp);
-    let (read, write) = socket(Box::new(Arc::clone(&udp)), Box::new(udp), log_config);
+    let unreliable_layer = UnreliableLayer {
+        utp_read: Box::new(Arc::clone(&udp)),
+        utp_write: Box::new(udp),
+        mss: NonZeroUsize::new(MSS).unwrap(),
+    };
+    let (read, write) = socket(unreliable_layer, log_config);
     Ok(Connected {
         read,
         write,

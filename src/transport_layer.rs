@@ -1,4 +1,5 @@
 use std::{
+    num::NonZeroUsize,
     path::PathBuf,
     sync::{Mutex, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -30,13 +31,9 @@ pub struct TransportLayer {
     reliable_layer_logger: Option<ReliableLayerLogger>,
 }
 impl TransportLayer {
-    pub fn new(
-        utp_read: Box<dyn UnreliableRead>,
-        utp_write: Box<dyn UnreliableWrite>,
-        log_config: Option<LogConfig>,
-    ) -> Self {
+    pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let now = Instant::now();
-        let reliable_layer = Mutex::new(ReliableLayer::new(now));
+        let reliable_layer = Mutex::new(ReliableLayer::new(unreliable_layer.mss, now));
         let sent_data_packet = tokio::sync::Notify::new();
         let recv_data_packet = tokio::sync::Notify::new();
         let recv_fin = tokio_util::sync::CancellationToken::new();
@@ -51,8 +48,8 @@ impl TransportLayer {
             Mutex::new(csv::WriterBuilder::new().from_writer(file))
         });
         Self {
-            utp_read: tokio::sync::Mutex::new(utp_read),
-            utp_write,
+            utp_read: tokio::sync::Mutex::new(unreliable_layer.utp_read),
+            utp_write: unreliable_layer.utp_write,
             reliable_layer,
             sent_data_packet,
             recv_data_packet,
@@ -64,6 +61,17 @@ impl TransportLayer {
 
     pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
         &self.reliable_layer
+    }
+
+    pub async fn no_data_to_send(&self) {
+        let mut sent_data_packet = self.sent_data_packet.notified();
+        loop {
+            if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
+                return;
+            }
+            sent_data_packet.await;
+            sent_data_packet = self.sent_data_packet.notified();
+        }
     }
 
     pub fn send_fin_buf(&self) {
@@ -361,6 +369,13 @@ impl TransportLayer {
             .serialize(&log)
             .expect("write CSV log");
     }
+}
+
+#[derive(Debug)]
+pub struct UnreliableLayer {
+    pub utp_read: Box<dyn UnreliableRead>,
+    pub utp_write: Box<dyn UnreliableWrite>,
+    pub mss: NonZeroUsize,
 }
 
 #[derive(Debug, Clone)]
