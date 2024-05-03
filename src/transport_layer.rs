@@ -63,6 +63,9 @@ impl TransportLayer {
         &self.reliable_layer
     }
 
+    /// # Cancel safety
+    ///
+    /// It is cancel safe.
     pub async fn no_data_to_send(&self) {
         let mut sent_data_packet = self.sent_data_packet.notified();
         loop {
