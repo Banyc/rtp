@@ -13,6 +13,10 @@ const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
 const KILL_CMD: u8 = 2;
 
+pub fn in_cmd_space(buf: u8) -> bool {
+    matches!(buf, ACK_CMD | DATA_CMD | KILL_CMD)
+}
+
 pub fn encode_kill(buf: &mut [u8]) -> Result<usize, EncodeError> {
     let mut wtr = io::Cursor::new(buf);
     wtr.write_u8(KILL_CMD)

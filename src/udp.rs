@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc};
+use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rand::Rng;
@@ -6,12 +6,15 @@ use tokio::net::UdpSocket;
 use udp_listener::{AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
 
 use crate::{
+    codec::in_cmd_space,
     socket::{socket, ReadSocket, WriteSocket},
     transport_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
 pub const MSS: usize = 1424;
 const DISPATCHER_BUFFER_SIZE: usize = 1024;
+const NUM_CONNECT_RETRIES: usize = 2;
+const INIT_CONNECT_RTO: Duration = Duration::from_secs(1);
 
 type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
 type IdentityAcceptedUdpRead = AcceptedUdpRead<Packet>;
@@ -126,12 +129,27 @@ pub async fn connect(
     };
     let mut challenge = [0; 1];
     let mut rng = rand::rngs::OsRng;
-    rng.fill(&mut challenge);
-    let _ = udp.send(&challenge).await?;
-    let mut response = [0; 1];
-    let _ = udp.recv(&mut response).await?;
-    if challenge != response {
-        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+    loop {
+        rng.fill(&mut challenge);
+        if !in_cmd_space(challenge[0]) {
+            break;
+        }
+    }
+    for i in 0..=NUM_CONNECT_RETRIES {
+        if i == NUM_CONNECT_RETRIES {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        let _ = udp.send(&challenge).await?;
+        let mut response = [0; 1];
+        tokio::select! {
+            res = udp.recv(&mut response) => {
+                res?;
+            }
+            () = tokio::time::sleep(INIT_CONNECT_RTO.mul_f64((i + 1) as f64)) => continue,
+        }
+        if challenge == response {
+            break;
+        }
     }
     let udp = Arc::new(udp);
     let unreliable_layer = UnreliableLayer {
