@@ -126,10 +126,30 @@ pub struct ReadSocket {
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl ReadSocket {
+    /// Return the number of bytes sent.
+    ///
+    /// You probably want to receive a fix-sized message like this:
+    ///
+    /// ```rust
+    /// use tokio::io::AsyncReadExt;
+    ///
+    /// async fn f(read_socket: rtp::socket::ReadSocket, message: &mut [u8]) -> std::io::Result<()> {
+    ///     let mut read_stream = read_socket.into_async_read();
+    ///     read_stream.read_exact(message).await?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
         self.transport_layer.recv(data).await
     }
 
+    /// Undo this method:
+    ///
+    /// ```rust
+    /// fn f(read_stream: rtp::socket::ReadStream) -> rtp::socket::ReadSocket {
+    ///     read_stream.into_inner()
+    /// }
+    /// ```
     pub fn into_async_read(self) -> ReadStream {
         PollRead::new(self)
     }
@@ -143,6 +163,20 @@ pub struct WriteSocket {
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl WriteSocket {
+    /// This method may only send partial `data`.
+    ///
+    /// Return the number of bytes sent.
+    ///
+    /// You probably want to send a message like this:
+    ///
+    /// ```rust
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// async fn f(write_socket: rtp::socket::WriteSocket, message: &[u8]) -> std::io::Result<()> {
+    ///     let mut write_stream = write_socket.into_async_write(true);
+    ///     write_stream.write_all(message).await
+    /// }
+    /// ```
     pub async fn send(&mut self, data: &[u8], no_delay: bool) -> Result<usize, std::io::ErrorKind> {
         self.transport_layer
             .send(data, no_delay, &mut self.data_buf, &mut self.utp_buf)
@@ -161,6 +195,13 @@ impl WriteSocket {
         self.transport_layer.no_data_to_send().await;
     }
 
+    /// Undo this method:
+    ///
+    /// ```rust
+    /// fn f(write_stream: rtp::socket::WriteStream) -> rtp::socket::WriteSocket {
+    ///     write_stream.into_inner().into_inner()
+    /// }
+    /// ```
     pub fn into_async_write(self, no_delay: bool) -> WriteStream {
         let write = WriteSocket2 {
             write: self,
@@ -182,6 +223,10 @@ pub struct WriteSocket2 {
 impl WriteSocket2 {
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
         self.write.send(data, self.no_delay).await
+    }
+
+    pub fn into_inner(self) -> WriteSocket {
+        self.write
     }
 }
 
