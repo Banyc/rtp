@@ -185,16 +185,16 @@ impl WriteSocket {
             .await
     }
 
-    pub fn is_no_data_to_send(&self) -> bool {
+    pub fn is_send_buf_empty(&self) -> bool {
         self.transport_layer
             .reliable_layer()
             .lock()
             .unwrap()
-            .is_no_data_to_send()
+            .is_send_buf_empty()
     }
 
-    pub async fn no_data_to_send(&self) {
-        self.transport_layer.no_data_to_send().await;
+    pub async fn send_buf_empty(&self) {
+        self.transport_layer.send_buf_empty().await;
     }
 
     /// Undo this method:

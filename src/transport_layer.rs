@@ -66,10 +66,10 @@ impl TransportLayer {
     /// # Cancel safety
     ///
     /// It is cancel safe.
-    pub async fn no_data_to_send(&self) {
+    pub async fn send_buf_empty(&self) {
         let mut sent_data_packet = self.sent_data_packet.notified();
         loop {
-            if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
+            if self.reliable_layer.lock().unwrap().is_send_buf_empty() {
                 return;
             }
             sent_data_packet.await;

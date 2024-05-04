@@ -71,8 +71,8 @@ impl ReliableLayer {
         }
     }
 
-    pub fn is_no_data_to_send(&self) -> bool {
-        self.send_data_buf.is_empty() && self.packet_send_space.no_packets_in_flight()
+    pub fn is_send_buf_empty(&self) -> bool {
+        self.send_data_buf.is_empty()
     }
 
     pub fn packet_send_space(&self) -> &PacketSendSpace {
