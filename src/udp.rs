@@ -90,10 +90,11 @@ pub struct Accepted {
 }
 
 pub async fn connect_without_handshake(
+    bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
 ) -> std::io::Result<Connected> {
-    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
@@ -116,10 +117,11 @@ pub async fn connect_without_handshake(
     })
 }
 pub async fn connect(
+    bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
 ) -> std::io::Result<Connected> {
-    let udp = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
@@ -177,21 +179,19 @@ pub struct Connected {
 #[async_trait]
 impl UnreliableRead for IdentityAcceptedUdpRead {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        let pkt = IdentityAcceptedUdpRead::recv(self)
-            .try_recv()
-            .map_err(|e| match e {
-                tokio::sync::mpsc::error::TryRecvError::Empty => std::io::ErrorKind::WouldBlock,
-                tokio::sync::mpsc::error::TryRecvError::Disconnected => {
-                    std::io::ErrorKind::UnexpectedEof
-                }
-            })?;
+        let pkt = Self::recv(self).try_recv().map_err(|e| match e {
+            tokio::sync::mpsc::error::TryRecvError::Empty => std::io::ErrorKind::WouldBlock,
+            tokio::sync::mpsc::error::TryRecvError::Disconnected => {
+                std::io::ErrorKind::UnexpectedEof
+            }
+        })?;
         let min_len = buf.len().min(pkt.len());
         buf[..min_len].copy_from_slice(&pkt[..min_len]);
         Ok(min_len)
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        let pkt = IdentityAcceptedUdpRead::recv(self)
+        let pkt = Self::recv(self)
             .recv()
             .await
             .ok_or(std::io::ErrorKind::UnexpectedEof)?;
@@ -203,9 +203,7 @@ impl UnreliableRead for IdentityAcceptedUdpRead {
 #[async_trait]
 impl UnreliableWrite for AcceptedUdpWrite {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        AcceptedUdpWrite::send(self, buf)
-            .await
-            .map_err(|e| e.kind())
+        Self::send(self, buf).await.map_err(|e| e.kind())
     }
 }
 
@@ -268,13 +266,14 @@ mod tests {
             loop {
                 let mut accepted = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    accepted.write.send(msg_1, true).await.unwrap();
+                    accepted.write.send(msg_1).await.unwrap();
                     let mut buf = [0; 1];
                     accepted.read.recv(&mut buf).await.unwrap();
                 });
             }
         });
         let connected = connect(
+            "0.0.0.0:0",
             addr,
             Some(LogConfig {
                 log_dir_path: Path::new("target/tests"),
@@ -291,6 +290,6 @@ mod tests {
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
-        require_send(connect("0.0.0.0:0", None));
+        require_send(connect("0.0.0.0:0", "0.0.0.0:0", None));
     }
 }

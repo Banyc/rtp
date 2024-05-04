@@ -36,12 +36,12 @@ async fn main() {
                 .log_dir
                 .as_ref()
                 .map(|c| rtp::udp::LogConfig { log_dir_path: c });
-            let connected = rtp::udp::connect(internet_address, log_config)
+            let connected = rtp::udp::connect("0.0.0.0:0", internet_address, log_config)
                 .await
                 .unwrap();
             (
                 Box::new(connected.read.into_async_read()),
-                Box::new(connected.write.into_async_write(true)),
+                Box::new(connected.write.into_async_write()),
             )
         }
         _ => panic!("unknown protocol `{protocol}`"),

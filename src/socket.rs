@@ -15,9 +15,9 @@ use crate::transport_layer::{LogConfig, TransportLayer, UnreliableLayer};
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
 const BUFFER_SIZE: usize = 1024 * 64;
 
-pub type WriteStream = PollWrite<WriteSocket2>;
+pub type WriteStream = PollWrite<WriteSocket>;
 pub type ReadStream = PollRead<ReadSocket>;
-pub type IoStream = PollIo<ReadSocket, WriteSocket2>;
+pub type IoStream = PollIo<ReadSocket, WriteSocket>;
 
 const _: () = {
     fn assert_send<T: Send>() {}
@@ -115,6 +115,7 @@ pub fn socket(
         transport_layer: Arc::clone(&transport_layer),
         data_buf: vec![0; BUFFER_SIZE],
         utp_buf: vec![0; BUFFER_SIZE],
+        no_delay: true,
         _shutdown_guard: write_shutdown.drop_guard(),
     };
     (read, write)
@@ -160,6 +161,7 @@ pub struct WriteSocket {
     transport_layer: Arc<TransportLayer>,
     data_buf: Vec<u8>,
     utp_buf: Vec<u8>,
+    no_delay: bool,
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl WriteSocket {
@@ -173,13 +175,13 @@ impl WriteSocket {
     /// use tokio::io::AsyncWriteExt;
     ///
     /// async fn f(write_socket: rtp::socket::WriteSocket, message: &[u8]) -> std::io::Result<()> {
-    ///     let mut write_stream = write_socket.into_async_write(true);
+    ///     let mut write_stream = write_socket.into_async_write();
     ///     write_stream.write_all(message).await
     /// }
     /// ```
-    pub async fn send(&mut self, data: &[u8], no_delay: bool) -> Result<usize, std::io::ErrorKind> {
+    pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
         self.transport_layer
-            .send(data, no_delay, &mut self.data_buf, &mut self.utp_buf)
+            .send(data, self.no_delay, &mut self.data_buf, &mut self.utp_buf)
             .await
     }
 
@@ -199,15 +201,11 @@ impl WriteSocket {
     ///
     /// ```rust
     /// fn f(write_stream: rtp::socket::WriteStream) -> rtp::socket::WriteSocket {
-    ///     write_stream.into_inner().into_inner()
+    ///     write_stream.into_inner()
     /// }
     /// ```
-    pub fn into_async_write(self, no_delay: bool) -> WriteStream {
-        let write = WriteSocket2 {
-            write: self,
-            no_delay,
-        };
-        PollWrite::new(write)
+    pub fn into_async_write(self) -> WriteStream {
+        PollWrite::new(self)
     }
 }
 
@@ -215,32 +213,14 @@ pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {
     PollIo::new(read, write)
 }
 
-#[derive(Debug)]
-pub struct WriteSocket2 {
-    write: WriteSocket,
-    no_delay: bool,
-}
-impl WriteSocket2 {
-    pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        self.write.send(data, self.no_delay).await
-    }
-
-    pub fn into_inner(self) -> WriteSocket {
-        self.write
-    }
-}
-
 impl AsyncAsyncRead for ReadSocket {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.recv(buf).await.map_err(std::io::Error::from)
     }
 }
-impl AsyncAsyncWrite for WriteSocket2 {
+impl AsyncAsyncWrite for WriteSocket {
     async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write
-            .send(buf, self.no_delay)
-            .await
-            .map_err(std::io::Error::from)
+        self.send(buf).await.map_err(std::io::Error::from)
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
@@ -287,8 +267,8 @@ mod tests {
         };
         let (a_r, mut a_w) = socket(a, None);
         let (b_r, mut b_w) = socket(b, None);
-        a_w.send(hello, true).await.unwrap();
-        b_w.send(world, true).await.unwrap();
+        a_w.send(hello).await.unwrap();
+        b_w.send(world).await.unwrap();
 
         let mut recv_buf = [0; BUFFER_SIZE];
         a_r.recv(&mut recv_buf).await.unwrap();
@@ -322,8 +302,8 @@ mod tests {
         for byte in &mut send_buf {
             *byte = rand::random();
         }
-        let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write(true));
-        let mut b = unsplit(b_r.into_async_read(), b_w.into_async_write(true));
+        let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
+        let mut b = unsplit(b_r.into_async_read(), b_w.into_async_write());
         let mut transport = JoinSet::new();
         let recv_all = Arc::new(tokio::sync::Notify::new());
         transport.spawn({

@@ -17,7 +17,7 @@ tap = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "macros", "rt"] }
 tokio-util = "0.7"
-udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.8" }
+udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.9" }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

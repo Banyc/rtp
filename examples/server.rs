@@ -40,7 +40,7 @@ async fn main() {
             });
             (
                 Box::new(accepted.read.into_async_read()),
-                Box::new(accepted.write.into_async_write(true)),
+                Box::new(accepted.write.into_async_write()),
             )
         }
         _ => panic!("unknown protocol `{protocol}`"),
