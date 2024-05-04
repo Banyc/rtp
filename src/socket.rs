@@ -73,6 +73,10 @@ pub fn socket(
             let mut ack_from_peer_buf = vec![];
             let mut ack_to_peer_buf = vec![];
             loop {
+                // Read shutdown status must be checked before moving packets to the read buf
+                //   to prevent triggering sending kill packet when the read shuts down right after the packet moving.
+                let is_read_shutdown = read_shutdown.is_cancelled();
+
                 let Ok(recv_packets) = transport_layer
                     .recv_packets(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
@@ -80,7 +84,7 @@ pub fn socket(
                     io_erred.cancel();
                     return;
                 };
-                if read_shutdown.is_cancelled() && 0 < recv_packets.num_payload_segments {
+                if is_read_shutdown && 0 < recv_packets.num_payload_segments {
                     let _ = transport_layer.send_kill_packet().await;
                 }
             }

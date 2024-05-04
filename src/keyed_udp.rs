@@ -243,7 +243,6 @@ impl DispatchKey for u128 {
 }
 
 fn dispatch<K: DispatchKey>(_addr: SocketAddr, mut packet: Packet) -> Option<(K, Packet)> {
-    println!("{:?}", &packet[..]);
     let (n, key) = K::decode(&packet)?;
     packet.advance(n);
     Some((key, packet))
