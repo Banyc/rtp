@@ -63,6 +63,7 @@ pub struct Accepted<K> {
     pub dispatch_key: K,
 }
 
+#[derive(Debug)]
 pub struct Client<K> {
     listener: UdpListener<K, Packet>,
 }
@@ -81,13 +82,14 @@ impl<K: DispatchKey> Client<K> {
         Ok(Self { listener })
     }
 
+    /// Side-effect: same as [`udp_listener::UdpListener::accept()`]
     pub async fn dispatch(&self) -> std::io::Result<()> {
         loop {
             let _ = self.listener.accept().await?;
         }
     }
 
-    pub fn open(&self, dispatch_key: K) -> Option<Connected> {
+    pub fn open_without_handshake(&self, dispatch_key: K) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedAcceptedUdpWrite::new(write, &dispatch_key);
@@ -290,7 +292,7 @@ mod tests {
                     }
                 }
             });
-            let mut accepted = client.open(key).unwrap();
+            let mut accepted = client.open_without_handshake(key).unwrap();
             accepted.write.send(msg_1).await.unwrap();
             let mut buf = vec![0; 1024];
             let n = accepted.read.recv(&mut buf).await.unwrap();
