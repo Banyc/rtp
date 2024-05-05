@@ -253,7 +253,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_connect() {
+    async fn test_key() {
         let server = Server::<u8>::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();
         let key = 42;
