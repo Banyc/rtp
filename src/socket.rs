@@ -102,10 +102,16 @@ pub fn socket(
         async move {
             let _event_guard = events;
 
-            write_shutdown.cancelled().await;
-            transport_layer.send_fin_buf();
-
-            read_shutdown.cancelled().await;
+            tokio::select! {
+                () = write_shutdown.cancelled() => {
+                    transport_layer.send_fin_buf();
+                }
+                () = io_erred.cancelled() => (),
+            }
+            tokio::select! {
+                () = read_shutdown.cancelled() => (),
+                () = io_erred.cancelled() => (),
+            }
 
             tokio::select! {
                 () = transport_layer.recv_fin().cancelled() => (),
