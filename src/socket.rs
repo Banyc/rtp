@@ -8,9 +8,13 @@ use async_async_io::{
     write::{AsyncAsyncWrite, PollWrite},
     PollIo,
 };
+use rand::Rng;
 use tokio::task::JoinSet;
 
-use crate::transport_layer::{LogConfig, TransportLayer, UnreliableLayer};
+use crate::{
+    codec::in_cmd_space,
+    transport_layer::{LogConfig, TransportLayer, UnreliableLayer},
+};
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
 const BUFFER_SIZE: usize = 1024 * 64;
@@ -234,6 +238,51 @@ impl AsyncAsyncWrite for WriteSocket {
     async fn shutdown(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+const NUM_CONNECT_RETRIES: usize = 2;
+const INIT_CONNECT_RTO: Duration = Duration::from_secs(1);
+
+pub async fn client_opening_handshake(
+    unreliable: &mut UnreliableLayer,
+) -> Result<(), std::io::Error> {
+    let mut challenge = [0; 1];
+    let mut rng = rand::rngs::OsRng;
+    loop {
+        rng.fill(&mut challenge);
+        if !in_cmd_space(challenge[0]) {
+            break;
+        }
+    }
+    for i in 0..=NUM_CONNECT_RETRIES {
+        if i == NUM_CONNECT_RETRIES {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        }
+        let _ = unreliable.utp_write.send(&challenge).await?;
+        let mut response = [0; 1];
+        tokio::select! {
+            res = unreliable.utp_read.recv(&mut response) => {
+                res?;
+            }
+            () = tokio::time::sleep(INIT_CONNECT_RTO.mul_f64((i + 1) as f64)) => continue,
+        }
+        if challenge == response {
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub async fn server_opening_handshake(
+    unreliable: &mut UnreliableLayer,
+) -> Result<(), std::io::Error> {
+    let mut challenge = [0; 1];
+    let n = unreliable.utp_read.try_recv(&mut challenge)?;
+    if n != challenge.len() {
+        return Err(std::io::ErrorKind::InvalidInput)?;
+    }
+    unreliable.utp_write.send(&challenge).await?;
+    Ok(())
 }
 
 #[cfg(test)]

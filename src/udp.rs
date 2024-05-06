@@ -1,20 +1,16 @@
-use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use rand::Rng;
 use tokio::net::UdpSocket;
 use udp_listener::{AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
 
 use crate::{
-    codec::in_cmd_space,
-    socket::{socket, ReadSocket, WriteSocket},
+    socket::{client_opening_handshake, server_opening_handshake, socket, ReadSocket, WriteSocket},
     transport_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
 pub const MSS: usize = 1424;
 const DISPATCHER_BUFFER_SIZE: usize = 1024;
-const NUM_CONNECT_RETRIES: usize = 2;
-const INIT_CONNECT_RTO: Duration = Duration::from_secs(1);
 
 type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
 type IdentityAcceptedUdpRead = AcceptedUdpRead<Packet>;
@@ -42,38 +38,32 @@ impl Listener {
         self.local_addr
     }
 
-    /// Side-effect: same as [`Self::accept()`]
+    /// [`Self::accept()`] but without handshake
     pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted> {
-        let accepted = self.listener.accept().await?;
-        let peer_addr = *accepted.dispatch_key();
-        let (read, write) = accepted.split();
-        let unreliable_layer = UnreliableLayer {
-            utp_read: Box::new(read),
-            utp_write: Box::new(write),
-            mss: NonZeroUsize::new(MSS).unwrap(),
-        };
-        let (read, write) = socket(unreliable_layer, None);
-        Ok(Accepted {
-            read,
-            write,
-            peer_addr,
-        })
+        let handshake = false;
+        self.accept_(handshake).await
     }
 
     /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
     pub async fn accept(&self) -> std::io::Result<Accepted> {
+        let handshake = true;
+        self.accept_(handshake).await
+    }
+
+    async fn accept_(&self, handshake: bool) -> std::io::Result<Accepted> {
         let accepted = self.listener.accept().await?;
         let peer_addr = *accepted.dispatch_key();
-        let (mut read, write) = accepted.split();
-        let challenge = read.recv().try_recv().unwrap();
-        write.send(&challenge).await?;
-        let unreliable_layer = UnreliableLayer {
+        let (read, write) = accepted.split();
+        let mut unreliable_layer = UnreliableLayer {
             utp_read: Box::new(read),
             utp_write: Box::new(write),
             mss: NonZeroUsize::new(MSS).unwrap(),
         };
+        if handshake {
+            server_opening_handshake(&mut unreliable_layer).await?;
+        }
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -94,32 +84,22 @@ pub async fn connect_without_handshake(
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
 ) -> std::io::Result<Connected> {
-    let udp = UdpSocket::bind(bind).await?;
-    udp.connect(addr).await?;
-    let local_addr = udp.local_addr()?;
-    let peer_addr = udp.peer_addr()?;
-    let log_config = match log_config {
-        Some(c) => Some(c.transport_layer_log_config(local_addr, peer_addr).await?),
-        None => None,
-    };
-    let udp = Arc::new(udp);
-    let unreliable_layer = UnreliableLayer {
-        utp_read: Box::new(Arc::clone(&udp)),
-        utp_write: Box::new(udp),
-        mss: NonZeroUsize::new(MSS).unwrap(),
-    };
-    let (read, write) = socket(unreliable_layer, log_config);
-    Ok(Connected {
-        read,
-        write,
-        local_addr,
-        peer_addr,
-    })
+    let handshake = false;
+    connect_(bind, addr, log_config, handshake).await
 }
 pub async fn connect(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
+) -> std::io::Result<Connected> {
+    let handshake = true;
+    connect_(bind, addr, log_config, handshake).await
+}
+async fn connect_(
+    bind: impl tokio::net::ToSocketAddrs,
+    addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
+    handshake: bool,
 ) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
@@ -129,36 +109,15 @@ pub async fn connect(
         Some(c) => Some(c.transport_layer_log_config(local_addr, peer_addr).await?),
         None => None,
     };
-    let mut challenge = [0; 1];
-    let mut rng = rand::rngs::OsRng;
-    loop {
-        rng.fill(&mut challenge);
-        if !in_cmd_space(challenge[0]) {
-            break;
-        }
-    }
-    for i in 0..=NUM_CONNECT_RETRIES {
-        if i == NUM_CONNECT_RETRIES {
-            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        }
-        let _ = udp.send(&challenge).await?;
-        let mut response = [0; 1];
-        tokio::select! {
-            res = udp.recv(&mut response) => {
-                res?;
-            }
-            () = tokio::time::sleep(INIT_CONNECT_RTO.mul_f64((i + 1) as f64)) => continue,
-        }
-        if challenge == response {
-            break;
-        }
-    }
     let udp = Arc::new(udp);
-    let unreliable_layer = UnreliableLayer {
+    let mut unreliable_layer = UnreliableLayer {
         utp_read: Box::new(Arc::clone(&udp)),
         utp_write: Box::new(udp),
         mss: NonZeroUsize::new(MSS).unwrap(),
     };
+    if handshake {
+        client_opening_handshake(&mut unreliable_layer).await?;
+    }
     let (read, write) = socket(unreliable_layer, log_config);
     Ok(Connected {
         read,

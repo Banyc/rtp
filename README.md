@@ -18,7 +18,7 @@ A userspace reliable transport protocol whose congestion window is governed only
   - gluing the unreliable layer and the reliable layer together
   - main entry: [[src/transport_layer.rs]]
 - a user-facing I/O-agnostic socket wrapper
-  - managing closing, timer, async read/write for the transport layer
+  - managing opening, closing, timer, async read/write for the transport layer
   - perk: You are allowed to wait until or check if the send buf is empty!
   - main entry: [[src/socket.rs]]
 - a user-facing over-UDP implementation
