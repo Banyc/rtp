@@ -98,13 +98,13 @@ impl TransportLayer {
         data_buf: &mut [u8],
         utp_buf: &mut [u8],
     ) -> Result<(), std::io::ErrorKind> {
-        let detect_broken_pipe_proactively = || -> Result<(), std::io::ErrorKind> {
+        let detect_broken_pipe_proactively = || {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let Some(no_response_for) = reliable_layer
                 .packet_send_space()
                 .no_response_for(Instant::now())
             else {
-                return Ok(());
+                return;
             };
             if no_response_for
                 < reliable_layer
@@ -112,15 +112,15 @@ impl TransportLayer {
                     .rto_duration()
                     .mul_f64(16.0)
             {
-                return Ok(());
+                return;
             }
             // Avoid triggering broken pipe errors during inter-process data transfer.
             if no_response_for < MIN_NO_RESPONSE_FOR {
-                return Ok(());
+                return;
             }
-            Err(std::io::ErrorKind::BrokenPipe)
+            self.first_error.set(std::io::ErrorKind::BrokenPipe);
         };
-        detect_broken_pipe_proactively()?;
+        detect_broken_pipe_proactively();
 
         let mut written_bytes = 0;
         let mut written_fin = false;
@@ -154,7 +154,6 @@ impl TransportLayer {
                 continue;
             };
             self.first_error.set(e);
-            self.sent_data_packet.notify_waiters();
             return Err(e);
         }
         if 0 < written_bytes || written_fin {
@@ -174,7 +173,6 @@ impl TransportLayer {
     ) -> Result<RecvPackets, std::io::ErrorKind> {
         let throw_error = |e: std::io::ErrorKind| {
             self.first_error.set(e);
-            self.recv_data_packet.notify_waiters();
             e
         };
         let mut recv_packets = RecvPackets {
@@ -305,7 +303,10 @@ impl TransportLayer {
             if 0 < written_bytes {
                 break written_bytes;
             }
-            sent_data_packet.await;
+            tokio::select! {
+                () = sent_data_packet => (),
+                () = self.first_error.some().cancelled() => (),
+            }
             sent_data_packet = self.sent_data_packet.notified();
         };
         Ok(written_bytes)
@@ -340,7 +341,10 @@ impl TransportLayer {
                 self.recv_fin.cancel();
                 continue;
             }
-            recv_data_packet.await;
+            tokio::select! {
+                () = recv_data_packet => (),
+                () = self.first_error.some().cancelled() => (),
+            }
             recv_data_packet = self.recv_data_packet.notified();
         };
         Ok(read_bytes)
@@ -408,18 +412,23 @@ pub trait UnreliableWrite: core::fmt::Debug + Sync + Send + 'static {
 #[derive(Debug)]
 struct FirstError {
     first_error: RwLock<Option<std::io::ErrorKind>>,
+    some: tokio_util::sync::CancellationToken,
 }
 impl FirstError {
     pub fn new() -> Self {
         let first_error = RwLock::new(None);
-        Self { first_error }
+        let some = tokio_util::sync::CancellationToken::new();
+        Self { first_error, some }
     }
 
     pub fn set(&self, err: std::io::ErrorKind) {
-        let mut first_error = self.first_error.write().unwrap();
-        if first_error.is_none() {
-            *first_error = Some(err);
+        {
+            let mut first_error = self.first_error.write().unwrap();
+            if first_error.is_none() {
+                *first_error = Some(err);
+            }
         }
+        self.some.cancel();
     }
 
     pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
@@ -428,6 +437,10 @@ impl FirstError {
             return Err(*e);
         }
         Ok(())
+    }
+
+    pub fn some(&self) -> &tokio_util::sync::CancellationToken {
+        &self.some
     }
 }
 
