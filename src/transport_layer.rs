@@ -253,6 +253,8 @@ impl TransportLayer {
             return Ok(recv_packets);
         }
 
+        self.recv_data_packet.notify_waiters();
+
         // reliable -{ACK}> UDP remote
         let written_bytes = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
@@ -272,7 +274,6 @@ impl TransportLayer {
             println!("recv_packets: ack: {ack_to_peer_buf:?}");
         }
 
-        self.recv_data_packet.notify_waiters();
         Ok(recv_packets)
     }
 
