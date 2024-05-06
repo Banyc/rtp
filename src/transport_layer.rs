@@ -2,7 +2,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{Mutex, RwLock},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ use crate::{
 
 const PRINT_DEBUG_MESSAGES: bool = false;
 const MAX_NUM_ACK: usize = 64;
+const MIN_NO_RESPONSE_FOR: Duration = Duration::from_secs(1);
 
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
@@ -111,6 +112,10 @@ impl TransportLayer {
                     .rto_duration()
                     .mul_f64(16.0)
             {
+                return Ok(());
+            }
+            // Avoid triggering broken pipe errors during inter-process data transfer.
+            if no_response_for < MIN_NO_RESPONSE_FOR {
                 return Ok(());
             }
             Err(std::io::ErrorKind::BrokenPipe)
