@@ -35,13 +35,11 @@ pub fn socket(
 ) -> (ReadSocket, WriteSocket) {
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
-    let io_erred = tokio_util::sync::CancellationToken::new();
     let transport_layer = Arc::new(TransportLayer::new(unreliable_layer, log_config));
     let mut events = JoinSet::new();
 
     // Send timer
     events.spawn({
-        let io_erred = io_erred.clone();
         let transport_layer = Arc::clone(&transport_layer);
         async move {
             let mut data_buf = vec![0; BUFFER_SIZE];
@@ -60,7 +58,6 @@ pub fn socket(
                     .await
                     .is_err()
                 {
-                    io_erred.cancel();
                     return;
                 }
             }
@@ -70,7 +67,6 @@ pub fn socket(
     // Recv
     events.spawn({
         let read_shutdown = read_shutdown.clone();
-        let io_erred = io_erred.clone();
         let transport_layer = Arc::clone(&transport_layer);
         async move {
             let mut utp_buf = vec![0; BUFFER_SIZE];
@@ -85,7 +81,6 @@ pub fn socket(
                     .recv_packets(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
                 else {
-                    io_erred.cancel();
                     return;
                 };
                 if is_read_shutdown && 0 < recv_packets.num_payload_segments {
@@ -106,16 +101,16 @@ pub fn socket(
                 () = write_shutdown.cancelled() => {
                     transport_layer.send_fin_buf();
                 }
-                () = io_erred.cancelled() => (),
+                () = transport_layer.some_error().cancelled() => (),
             }
             tokio::select! {
                 () = read_shutdown.cancelled() => (),
-                () = io_erred.cancelled() => (),
+                () = transport_layer.some_error().cancelled() => (),
             }
 
             tokio::select! {
                 () = transport_layer.recv_fin().cancelled() => (),
-                () = io_erred.cancelled() => (),
+                () = transport_layer.some_error().cancelled() => (),
                 () = tokio::time::sleep(Duration::from_secs(675)) => (),
             }
         }

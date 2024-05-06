@@ -86,6 +86,10 @@ impl TransportLayer {
         &self.recv_fin
     }
 
+    pub fn some_error(&self) -> &tokio_util::sync::CancellationToken {
+        &self.first_error.some
+    }
+
     pub async fn send_kill_packet(&self) -> Result<(), std::io::Error> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
