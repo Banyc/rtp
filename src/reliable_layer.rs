@@ -278,7 +278,6 @@ impl ReliableLayer {
         if !self.packet_recv_space.recv(seq, buf) {
             return false;
         }
-        self.packet_recv_space.save_ack(seq);
         self.move_recv_data();
         true
     }

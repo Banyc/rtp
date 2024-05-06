@@ -21,10 +21,6 @@ impl PacketRecvSpace {
         }
     }
 
-    pub fn save_ack(&mut self, seq: u64) {
-        self.ack_history.insert(seq);
-    }
-
     pub fn ack_history(&self) -> &AckQueue {
         &self.ack_history
     }
@@ -52,6 +48,7 @@ impl PacketRecvSpace {
             return true;
         }
         self.receiving.insert(seq, data);
+        self.ack_history.insert(seq);
         true
     }
 
