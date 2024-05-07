@@ -73,7 +73,10 @@ impl TransportLayer {
             if self.reliable_layer.lock().unwrap().is_send_buf_empty() {
                 return;
             }
-            sent_data_packet.await;
+            tokio::select! {
+                () = sent_data_packet => (),
+                () = self.first_error.some().cancelled() => (),
+            }
             sent_data_packet = self.sent_data_packet.notified();
         }
     }
