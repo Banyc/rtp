@@ -27,6 +27,7 @@ pub struct TransportLayer {
     reliable_layer: Mutex<ReliableLayer>,
     sent_data_packet: tokio::sync::Notify,
     recv_data_packet: tokio::sync::Notify,
+    sent_packet_acked: tokio::sync::Notify,
     recv_fin: tokio_util::sync::CancellationToken,
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
@@ -37,6 +38,7 @@ impl TransportLayer {
         let reliable_layer = Mutex::new(ReliableLayer::new(unreliable_layer.mss, now));
         let sent_data_packet = tokio::sync::Notify::new();
         let recv_data_packet = tokio::sync::Notify::new();
+        let sent_packet_acked = tokio::sync::Notify::new();
         let recv_fin = tokio_util::sync::CancellationToken::new();
         let first_error = FirstError::new();
         let reliable_layer_logger = log_config.as_ref().map(|c| {
@@ -54,6 +56,7 @@ impl TransportLayer {
             reliable_layer,
             sent_data_packet,
             recv_data_packet,
+            sent_packet_acked,
             recv_fin,
             first_error,
             reliable_layer_logger,
@@ -67,11 +70,30 @@ impl TransportLayer {
     /// # Cancel safety
     ///
     /// It is cancel safe.
-    pub async fn send_buf_empty(&self) {
+    pub async fn no_data_to_send(&self) -> Result<(), std::io::ErrorKind> {
+        let mut sent_packet_acked = self.sent_packet_acked.notified();
+        loop {
+            self.first_error.throw_error()?;
+            if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
+                return Ok(());
+            }
+            tokio::select! {
+                () = sent_packet_acked => (),
+                () = self.first_error.some().cancelled() => (),
+            }
+            sent_packet_acked = self.sent_packet_acked.notified();
+        }
+    }
+
+    /// # Cancel safety
+    ///
+    /// It is cancel safe.
+    pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
         let mut sent_data_packet = self.sent_data_packet.notified();
         loop {
+            self.first_error.throw_error()?;
             if self.reliable_layer.lock().unwrap().is_send_buf_empty() {
-                return;
+                return Ok(());
             }
             tokio::select! {
                 () = sent_data_packet => (),
@@ -234,6 +256,7 @@ impl TransportLayer {
             // UDP local -{ACK}> reliable
             reliable_layer.recv_ack_packet(AckBallSequence::new(ack_from_peer_buf), now);
             recv_packets.num_ack_segments += 1;
+            self.sent_packet_acked.notify_waiters();
 
             let Some(data) = data.data else {
                 drop(reliable_layer);

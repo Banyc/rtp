@@ -214,7 +214,7 @@ source = "git+https://github.com/Banyc/dre.git?tag=v0.0.3#8cbbb66b2ee361d90f0e25
 [[package]]
 name = "file_transfer"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/file_transfer.git?tag=v0.0.5#6705d169b6c564dbd49822a867837fba2f7d08a4"
+source = "git+https://github.com/Banyc/file_transfer.git?tag=v0.0.6#3ebc96e39e9926b81515e8656d6aa6155c66b2a8"
 dependencies = [
  "async_async_io",
  "clap",

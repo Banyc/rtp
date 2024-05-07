@@ -25,11 +25,17 @@ static GLOBAL_INIT_SEND_RATE: Lazy<SharedCell<NonZeroPositiveF64>> =
     Lazy::new(|| SharedCell::new(NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap()));
 
 #[derive(Debug, Clone)]
+enum SendFinBuf {
+    Empty,
+    Some,
+    EmptyAndBlocked,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
     send_data_buf: VecDeque<u8>,
-    /// one-element queue
-    send_fin_buf: bool,
+    send_fin_buf: SendFinBuf,
     recv_data_buf: VecDeque<u8>,
     /// set-only
     recv_fin_buf: bool,
@@ -52,7 +58,7 @@ impl ReliableLayer {
         Self {
             mss,
             send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
-            send_fin_buf: false,
+            send_fin_buf: SendFinBuf::Empty,
             recv_data_buf: VecDeque::with_capacity(RECV_DATA_BUFFER_LENGTH),
             recv_fin_buf: false,
             token_bucket: TokenBucket::new(
@@ -71,8 +77,16 @@ impl ReliableLayer {
         }
     }
 
+    pub fn is_no_data_to_send(&self) -> bool {
+        self.is_send_buf_empty() && self.packet_send_space.num_transmitting_packets() == 0
+    }
+
     pub fn is_send_buf_empty(&self) -> bool {
         self.send_data_buf.is_empty()
+            && matches!(
+                self.send_fin_buf,
+                SendFinBuf::Empty | SendFinBuf::EmptyAndBlocked
+            )
     }
 
     pub fn packet_send_space(&self) -> &PacketSendSpace {
@@ -88,7 +102,10 @@ impl ReliableLayer {
     }
 
     pub fn send_fin_buf(&mut self) {
-        self.send_fin_buf = true;
+        if matches!(self.send_fin_buf, SendFinBuf::EmptyAndBlocked) {
+            return;
+        }
+        self.send_fin_buf = SendFinBuf::Some;
     }
 
     /// Store data in the inner data buffer
@@ -150,13 +167,13 @@ impl ReliableLayer {
             .len()
             .min(self.max_data_size_per_packet())
             .min(self.send_data_buf.len());
-        let packet_bytes = match (NonZeroUsize::new(packet_bytes), self.send_fin_buf) {
+        let packet_bytes = match (NonZeroUsize::new(packet_bytes), &self.send_fin_buf) {
             (Some(x), _) => x.get(),
-            (None, true) => {
-                self.send_fin_buf = false;
+            (None, SendFinBuf::Some) => {
+                self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
                 0
             }
-            (None, false) => return None,
+            (None, _) => return None,
         };
 
         let stats = self

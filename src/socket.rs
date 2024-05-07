@@ -202,8 +202,8 @@ impl WriteSocket {
             .is_send_buf_empty()
     }
 
-    pub async fn send_buf_empty(&self) {
-        self.transport_layer.send_buf_empty().await;
+    pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
+        self.transport_layer.send_buf_empty().await
     }
 
     /// Undo this method:
@@ -237,6 +237,8 @@ impl AsyncAsyncWrite for WriteSocket {
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.transport_layer.send_fin_buf();
+        self.transport_layer.no_data_to_send().await?;
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use clap::Parser;
 use file_transfer::FileTransferCommand;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
 };
 
@@ -48,6 +48,12 @@ async fn main() {
     };
     println!("accepted");
 
-    let stats = args.file_transfer.perform(read, write).await.unwrap();
-    println!("{stats}");
+    let mut res = args.file_transfer.perform(read, write).await.unwrap();
+    res.write.shutdown().await.unwrap();
+    println!("shutdown");
+    let mut buf = [0; 1];
+    let n = res.read.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0);
+
+    println!("{}", res.stats);
 }
