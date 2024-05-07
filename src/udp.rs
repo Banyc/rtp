@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use udp_listener::{AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
+use udp_listener::{AcceptedUdp, AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
 
 use crate::{
     socket::{client_opening_handshake, server_opening_handshake, socket, ReadSocket, WriteSocket},
@@ -13,7 +13,10 @@ pub const MSS: usize = 1424;
 const DISPATCHER_BUFFER_SIZE: usize = 1024;
 
 type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
+type IdentityAcceptedUdp = AcceptedUdp<SocketAddr, Packet>;
 type IdentityAcceptedUdpRead = AcceptedUdpRead<Packet>;
+
+pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
 
 #[derive(Debug)]
 pub struct Listener {
@@ -40,36 +43,18 @@ impl Listener {
 
     /// [`Self::accept()`] but without handshake
     pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted> {
+        let accepted = self.listener.accept().await?;
         let handshake = false;
-        self.accept_(handshake).await
+        accept(accepted, handshake).await
     }
 
     /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
-    pub async fn accept(&self) -> std::io::Result<Accepted> {
-        let handshake = true;
-        self.accept_(handshake).await
-    }
-
-    async fn accept_(&self, handshake: bool) -> std::io::Result<Accepted> {
+    pub async fn accept(&self) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
-        let peer_addr = *accepted.dispatch_key();
-        let (read, write) = accepted.split();
-        let mut unreliable_layer = UnreliableLayer {
-            utp_read: Box::new(read),
-            utp_write: Box::new(write),
-            mss: NonZeroUsize::new(MSS).unwrap(),
-        };
-        if handshake {
-            server_opening_handshake(&mut unreliable_layer).await?;
-        }
-        let (read, write) = socket(unreliable_layer, None);
-        Ok(Accepted {
-            read,
-            write,
-            peer_addr,
-        })
+        let handshake = true;
+        Ok(tokio::spawn(accept(accepted, handshake)))
     }
 }
 #[derive(Debug)]
@@ -77,6 +62,24 @@ pub struct Accepted {
     pub read: ReadSocket,
     pub write: WriteSocket,
     pub peer_addr: SocketAddr,
+}
+async fn accept(accepted: IdentityAcceptedUdp, handshake: bool) -> std::io::Result<Accepted> {
+    let peer_addr = *accepted.dispatch_key();
+    let (read, write) = accepted.split();
+    let mut unreliable_layer = UnreliableLayer {
+        utp_read: Box::new(read),
+        utp_write: Box::new(write),
+        mss: NonZeroUsize::new(MSS).unwrap(),
+    };
+    if handshake {
+        server_opening_handshake(&mut unreliable_layer).await?;
+    }
+    let (read, write) = socket(unreliable_layer, None);
+    Ok(Accepted {
+        read,
+        write,
+        peer_addr,
+    })
 }
 
 pub async fn connect_without_handshake(
@@ -223,8 +226,9 @@ mod tests {
         let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                let mut accepted = listener.accept().await.unwrap();
+                let accepted = listener.accept().await.unwrap();
                 tokio::spawn(async move {
+                    let mut accepted = accepted.await.unwrap().unwrap();
                     accepted.write.send(msg_1).await.unwrap();
                     let mut buf = [0; 1];
                     accepted.read.recv(&mut buf).await.unwrap();

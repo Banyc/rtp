@@ -38,6 +38,7 @@ async fn main() {
                     }
                 }
             });
+            let accepted = accepted.await.unwrap().unwrap();
             (
                 Box::new(accepted.read.into_async_read()),
                 Box::new(accepted.write.into_async_write()),

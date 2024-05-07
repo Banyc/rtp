@@ -271,6 +271,9 @@ pub async fn client_opening_handshake(
             break;
         }
     }
+
+    neg_challenge(&mut challenge);
+    let _ = unreliable.utp_write.send(&challenge).await?;
     Ok(())
 }
 
@@ -283,7 +286,30 @@ pub async fn server_opening_handshake(
         return Err(std::io::ErrorKind::InvalidInput)?;
     }
     unreliable.utp_write.send(&challenge).await?;
+
+    neg_challenge(&mut challenge);
+    let mut response = [0; 1];
+    let due = Instant::now() + INIT_CONNECT_RTO;
+    loop {
+        tokio::select! {
+            res = unreliable.utp_read.recv(&mut response) => {
+                res?;
+            }
+            () = tokio::time::sleep_until(due.into()) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+        }
+        if challenge == response {
+            break;
+        }
+    }
     Ok(())
+}
+
+fn neg_challenge(challenge: &mut [u8]) {
+    for c in challenge.iter_mut() {
+        *c ^= u8::MAX;
+    }
 }
 
 #[cfg(test)]
