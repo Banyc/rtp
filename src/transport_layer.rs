@@ -115,7 +115,11 @@ impl TransportLayer {
         &self.first_error.some
     }
 
-    pub async fn send_kill_packet(&self) -> Result<(), std::io::Error> {
+    pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
+        self.first_error.throw_error()
+    }
+
+    pub async fn send_kill_packet(&self) -> Result<(), std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
         self.utp_write.send(&buf).await?;

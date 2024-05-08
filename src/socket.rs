@@ -233,6 +233,7 @@ impl AsyncAsyncWrite for WriteSocket {
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
+        self.transport_layer.throw_error()?;
         Ok(())
     }
 
