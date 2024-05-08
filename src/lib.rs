@@ -1,6 +1,7 @@
 pub mod codec;
 mod comp_option;
 pub mod keyed_udp;
+mod mem;
 pub mod packet_recv_space;
 pub mod packet_send_space;
 pub mod reliable_layer;
