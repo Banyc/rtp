@@ -161,6 +161,7 @@ impl PacketSendSpace {
 
             p.retransmitted = true;
             p.sent_time = now;
+            p.rto = self.rto.rto();
             let p = Packet {
                 seq: *s,
                 data: &p.data,
