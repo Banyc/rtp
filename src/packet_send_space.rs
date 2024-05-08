@@ -12,7 +12,7 @@ use crate::{
     sack::AckBallSequence,
 };
 
-const SMOOTH_RTT_ALPHA: f64 = 0.1;
+const SMOOTH_RTT_ALPHA: f64 = 1. / 8.;
 const RTO_K: f64 = 1.;
 const INIT_SMOOTH_RTT_SECS: f64 = 3.;
 pub const INIT_CWND: usize = 16;
@@ -178,11 +178,10 @@ impl PacketSendSpace {
     }
 
     pub fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64) {
-        let Some(min_rtt) = self.min_rtt else {
-            return;
-        };
-        let cwnd = min_rtt.as_secs_f64() * send_rate.get();
-        let cwnd = 1.max(cwnd.round() as usize);
+        let cwnd = self.smooth_rtt.as_secs_f64() * send_rate.get();
+        let cwnd = cwnd.round() as usize;
+        let cwnd = cwnd * 8;
+        let cwnd = 1.max(cwnd);
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
 
         let last_seq_in_cwnd = || {
@@ -308,7 +307,8 @@ impl TransmittingPacket {
 }
 
 fn rto_duration(smooth_rtt: Duration) -> Duration {
-    smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K)
+    let rto = smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K);
+    rto.max(Duration::from_secs(1))
 }
 
 #[derive(Debug, Clone)]
