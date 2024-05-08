@@ -9,12 +9,9 @@ use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
 use crate::{
     comp_option::CompOption, packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf,
-    sack::AckBallSequence,
+    rto::RetransmissionTimer, sack::AckBallSequence,
 };
 
-const SMOOTH_RTT_ALPHA: f64 = 1. / 8.;
-const RTO_K: f64 = 1.;
-const INIT_SMOOTH_RTT_SECS: f64 = 3.;
 pub const INIT_CWND: usize = 16;
 
 #[derive(Debug, Clone)]
@@ -22,7 +19,7 @@ pub struct PacketSendSpace {
     next_seq: u64,
     transmitting: BTreeMap<u64, TransmittingPacket>,
     min_rtt: Option<Duration>,
-    smooth_rtt: Duration,
+    rto: RetransmissionTimer,
     reused_buf: ReusedBuf<Vec<u8>>,
     cwnd: NonZeroUsize,
     /// Detect if the peer has died
@@ -41,7 +38,7 @@ impl PacketSendSpace {
             next_seq: 0,
             transmitting: BTreeMap::new(),
             min_rtt: None,
-            smooth_rtt: Duration::from_secs_f64(INIT_SMOOTH_RTT_SECS),
+            rto: RetransmissionTimer::new(),
             reused_buf: ReusedBuf::new(MAX_NUM_RECEIVING_PACKETS),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
@@ -61,7 +58,7 @@ impl PacketSendSpace {
     }
 
     pub fn smooth_rtt(&self) -> Duration {
-        self.smooth_rtt
+        self.rto.smooth_rtt()
     }
 
     pub fn num_retransmitted_packets(&self) -> usize {
@@ -101,9 +98,7 @@ impl PacketSendSpace {
                     Some(min_rtt) => min_rtt.min(rtt),
                     None => rtt,
                 });
-                let smooth_rtt = self.smooth_rtt.as_secs_f64() * (1. - SMOOTH_RTT_ALPHA)
-                    + rtt.as_secs_f64() * SMOOTH_RTT_ALPHA;
-                self.smooth_rtt = Duration::from_secs_f64(smooth_rtt);
+                self.rto.set(rtt);
             }
             self.reused_buf.return_buf(p.data);
             acked.push(p.stats);
@@ -131,6 +126,7 @@ impl PacketSendSpace {
             retransmitted: false,
             considered_new_in_cwnd: false,
             data,
+            rto: self.rto.rto(),
         };
 
         self.transmitting.insert(s, p);
@@ -147,9 +143,10 @@ impl PacketSendSpace {
 
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
         for (s, p) in self.transmitting.iter_mut().take(self.cwnd.get()) {
-            let out_of_order_rt = *s < self.out_of_order_seq_end && p.rto(self.smooth_rtt, now);
+            let out_of_order_rt =
+                *s < self.out_of_order_seq_end && p.hits_custom_rto(self.rto.smooth_rtt(), now);
 
-            let should_retransmit = p.tolerated_rto(self.smooth_rtt, now) || out_of_order_rt;
+            let should_retransmit = p.hits_rto(now) || out_of_order_rt;
             if !should_retransmit {
                 continue;
             }
@@ -178,7 +175,7 @@ impl PacketSendSpace {
     }
 
     pub fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64) {
-        let cwnd = self.smooth_rtt.as_secs_f64() * send_rate.get();
+        let cwnd = self.rto.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * 8;
         let cwnd = 1.max(cwnd);
@@ -207,7 +204,7 @@ impl PacketSendSpace {
 
     pub fn all_lost_packets_retransmitted(&self, now: Instant) -> bool {
         for p in self.transmitting.values().take(self.cwnd.get()) {
-            if p.tolerated_rto(self.smooth_rtt, now) {
+            if p.hits_rto(now) {
                 return false;
             }
         }
@@ -217,7 +214,7 @@ impl PacketSendSpace {
     pub fn num_not_lost_transmitting_packets(&self, now: Instant) -> usize {
         let mut not_lost = 0;
         for p in self.transmitting.values().take(self.cwnd.get()) {
-            if p.tolerated_rto(self.smooth_rtt, now) {
+            if p.hits_rto(now) {
                 continue;
             }
             not_lost += 1;
@@ -245,7 +242,7 @@ impl PacketSendSpace {
         let mut lost = 0;
         for (_, p) in self.packets_in_pipe() {
             let retransmitted = !p.considered_new_in_cwnd && p.retransmitted;
-            if retransmitted || p.tolerated_rto(self.smooth_rtt, now) {
+            if retransmitted || p.hits_rto(now) {
                 lost += 1;
             }
         }
@@ -265,7 +262,7 @@ impl PacketSendSpace {
     pub fn next_poll_time(&self) -> Option<Instant> {
         let mut min_next_poll_time: Option<Instant> = None;
         for p in self.transmitting.values().take(self.cwnd.get()) {
-            let t = p.next_rto_time(self.smooth_rtt);
+            let t = p.next_rto_time();
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
         }
@@ -273,7 +270,7 @@ impl PacketSendSpace {
     }
 
     pub fn rto_duration(&self) -> Duration {
-        rto_duration(self.smooth_rtt)
+        self.rto.rto()
     }
 }
 impl Default for PacketSendSpace {
@@ -289,26 +286,22 @@ struct TransmittingPacket {
     pub retransmitted: bool,
     pub considered_new_in_cwnd: bool,
     pub data: Vec<u8>,
+    pub rto: Duration,
 }
 impl TransmittingPacket {
-    pub fn rto(&self, timeout: Duration, now: Instant) -> bool {
+    pub fn hits_rto(&self, now: Instant) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
-        timeout <= sent_elapsed
+        self.rto <= sent_elapsed
     }
 
-    pub fn tolerated_rto(&self, smooth_rtt: Duration, now: Instant) -> bool {
-        self.rto(rto_duration(smooth_rtt), now)
+    pub fn hits_custom_rto(&self, rto: Duration, now: Instant) -> bool {
+        let sent_elapsed = now.duration_since(self.sent_time);
+        rto <= sent_elapsed
     }
 
-    pub fn next_rto_time(&self, smooth_rtt: Duration) -> Instant {
-        let rto_duration = rto_duration(smooth_rtt);
-        self.sent_time + rto_duration
+    pub fn next_rto_time(&self) -> Instant {
+        self.sent_time + self.rto
     }
-}
-
-fn rto_duration(smooth_rtt: Duration) -> Duration {
-    let rto = smooth_rtt + Duration::from_secs_f64(smooth_rtt.as_secs_f64() * RTO_K);
-    rto.max(Duration::from_secs(1))
 }
 
 #[derive(Debug, Clone)]
