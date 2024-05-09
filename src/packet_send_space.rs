@@ -159,14 +159,6 @@ impl PacketSendSpace {
                 false
             };
 
-            // p.self_assign(|p| TransmittingPacket {
-            //     stats: p.stats,
-            //     sent_time: now,
-            //     retransmitted: true,
-            //     considered_new_in_cwnd,
-            //     data: p.data,
-            //     rto: self.rto.rto(),
-            // });
             p.sent_time = now;
             p.retransmitted = true;
             p.considered_new_in_cwnd = considered_new_in_cwnd;
