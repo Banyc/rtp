@@ -336,11 +336,11 @@ impl ReliableLayer {
     }
 
     fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64, now: Instant) {
+        self.packet_send_space.set_send_rate(send_rate);
         let send_rate = NonZeroPositiveF64::new(MIN_SEND_RATE)
             .unwrap()
             .max(send_rate);
         self.send_rate = send_rate;
-        self.packet_send_space.set_send_rate(send_rate);
         self.token_bucket.set_thruput(send_rate, now);
     }
 
