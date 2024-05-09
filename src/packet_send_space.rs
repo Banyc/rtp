@@ -8,8 +8,8 @@ use dre::PacketState;
 use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
 use crate::{
-    comp_option::CompOption, mem::SelfAssignExt, packet_recv_space::MAX_NUM_RECEIVING_PACKETS,
-    reused_buf::ReusedBuf, rto::RetransmissionTimer, sack::AckBallSequence,
+    comp_option::CompOption, packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf,
+    rto::RetransmissionTimer, sack::AckBallSequence,
 };
 
 pub const INIT_CWND: usize = 16;
@@ -159,14 +159,18 @@ impl PacketSendSpace {
                 false
             };
 
-            p.self_assign(|p| TransmittingPacket {
-                stats: p.stats,
-                sent_time: now,
-                retransmitted: true,
-                considered_new_in_cwnd,
-                data: p.data,
-                rto: self.rto.rto(),
-            });
+            // p.self_assign(|p| TransmittingPacket {
+            //     stats: p.stats,
+            //     sent_time: now,
+            //     retransmitted: true,
+            //     considered_new_in_cwnd,
+            //     data: p.data,
+            //     rto: self.rto.rto(),
+            // });
+            p.sent_time = now;
+            p.retransmitted = true;
+            p.considered_new_in_cwnd = considered_new_in_cwnd;
+            p.rto = self.rto.rto();
             let p = Packet {
                 seq: *s,
                 data: &p.data,
