@@ -464,6 +464,7 @@ dependencies = [
  "file_transfer",
  "once_cell",
  "rand",
+ "self_assign",
  "serde",
  "strict-num",
  "tap",
@@ -490,6 +491,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "self_assign"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/self_assign.git?tag=v0.0.1#0f768fbaff5a61f3782356b20076e71ac0d7c589"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "serde"

@@ -159,10 +159,16 @@ impl PacketSendSpace {
                 false
             };
 
-            p.sent_time = now;
-            p.retransmitted = true;
-            p.considered_new_in_cwnd = considered_new_in_cwnd;
-            p.rto = self.rto.rto();
+            self_assign::self_assign! {
+                p = TransmittingPacket {
+                    stats: _,
+                    sent_time: now,
+                    retransmitted: true,
+                    considered_new_in_cwnd,
+                    data: _,
+                    rto: self.rto.rto(),
+                };
+            }
             let p = Packet {
                 seq: *s,
                 data: &p.data,
