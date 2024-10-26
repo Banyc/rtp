@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "primitive"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.34#6979518f4d8e8ae30c03af2abe8b83494b362913"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.35#9d93e5916723519dc18e0723c841d1f171a54196"
 dependencies = [
  "anyhow",
  "num-traits",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.10#915e530077291b4e11ee2fd277d36c0297484800"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.11#35026640ab90a863f0846fb8870dbab98fecf07e"
 dependencies = [
  "bytes",
  "primitive",
