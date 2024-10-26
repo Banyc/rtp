@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
 use tokio_util::bytes::Buf;
-use udp_listener::{AcceptedUdpWrite, Packet, UdpListener};
+use udp_listener::{ConnWrite, Packet, UdpListener};
 
 use crate::{
     socket::{socket, ReadSocket, WriteSocket},
@@ -40,9 +40,9 @@ impl<K: DispatchKey> Server<K> {
     /// Side-effect: same as [`udp_listener::UdpListener::accept()`]
     pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted<K>> {
         let accepted = self.listener.accept().await?;
-        let dispatch_key = accepted.dispatch_key().clone();
+        let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
-        let write = KeyedAcceptedUdpWrite::new(write, &dispatch_key);
+        let write = KeyedConnWrite::new(write, &conn_key);
         let unreliable_layer = UnreliableLayer {
             utp_read: Box::new(read),
             utp_write: Box::new(write),
@@ -52,7 +52,7 @@ impl<K: DispatchKey> Server<K> {
         Ok(Accepted {
             read,
             write,
-            dispatch_key,
+            dispatch_key: conn_key,
         })
     }
 }
@@ -92,7 +92,7 @@ impl<K: DispatchKey> Client<K> {
     pub fn open_without_handshake(&self, dispatch_key: K) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
-        let write = KeyedAcceptedUdpWrite::new(write, &dispatch_key);
+        let write = KeyedConnWrite::new(write, &dispatch_key);
         let unreliable_layer = UnreliableLayer {
             utp_read: Box::new(read),
             utp_write: Box::new(write),
@@ -109,18 +109,18 @@ pub struct Connected {
 }
 
 #[derive(Debug)]
-pub struct KeyedAcceptedUdpWrite {
-    write: AcceptedUdpWrite,
+pub struct KeyedConnWrite {
+    write: ConnWrite,
     buf: tokio::sync::Mutex<Vec<u8>>,
     data_offset: usize,
 }
-impl KeyedAcceptedUdpWrite {
-    pub fn new<K: DispatchKey>(write: AcceptedUdpWrite, dispatch_key: &K) -> Self {
+impl KeyedConnWrite {
+    pub fn new<K: DispatchKey>(write: ConnWrite, conn_key: &K) -> Self {
         let mut buf = vec![];
         let n = K::max_size();
         let fill = (0..n).map(|_| 0);
         buf.extend(fill);
-        let n = dispatch_key.encode(&mut buf).unwrap();
+        let n = conn_key.encode(&mut buf).unwrap();
         Self {
             write,
             buf: tokio::sync::Mutex::new(buf),
@@ -136,7 +136,7 @@ impl KeyedAcceptedUdpWrite {
     }
 }
 #[async_trait]
-impl UnreliableWrite for KeyedAcceptedUdpWrite {
+impl UnreliableWrite for KeyedConnWrite {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         Self::send(self, buf).await.map_err(|e| e.kind())
     }

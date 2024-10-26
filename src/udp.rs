@@ -2,7 +2,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use udp_listener::{AcceptedUdp, AcceptedUdpRead, AcceptedUdpWrite, Packet, UdpListener};
+use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UdpListener};
 
 use crate::{
     socket::{client_opening_handshake, server_opening_handshake, socket, ReadSocket, WriteSocket},
@@ -13,8 +13,8 @@ pub const MSS: usize = 1424;
 const DISPATCHER_BUFFER_SIZE: usize = 1024;
 
 type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
-type IdentityAcceptedUdp = AcceptedUdp<SocketAddr, Packet>;
-type IdentityAcceptedUdpRead = AcceptedUdpRead<Packet>;
+type IdentityConn = Conn<SocketAddr, Packet>;
+type IdentityConnRead = ConnRead<Packet>;
 
 pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
 
@@ -63,8 +63,8 @@ pub struct Accepted {
     pub write: WriteSocket,
     pub peer_addr: SocketAddr,
 }
-async fn accept(accepted: IdentityAcceptedUdp, handshake: bool) -> std::io::Result<Accepted> {
-    let peer_addr = *accepted.dispatch_key();
+async fn accept(accepted: IdentityConn, handshake: bool) -> std::io::Result<Accepted> {
+    let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
     let mut unreliable_layer = UnreliableLayer {
         utp_read: Box::new(read),
@@ -139,7 +139,7 @@ pub struct Connected {
 
 // Accepted socket
 #[async_trait]
-impl UnreliableRead for IdentityAcceptedUdpRead {
+impl UnreliableRead for IdentityConnRead {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
         let pkt = Self::recv(self).try_recv().map_err(|e| match e {
             tokio::sync::mpsc::error::TryRecvError::Empty => std::io::ErrorKind::WouldBlock,
@@ -163,7 +163,7 @@ impl UnreliableRead for IdentityAcceptedUdpRead {
     }
 }
 #[async_trait]
-impl UnreliableWrite for AcceptedUdpWrite {
+impl UnreliableWrite for ConnWrite {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         Self::send(self, buf).await.map_err(|e| e.kind())
     }

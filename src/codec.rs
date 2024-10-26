@@ -57,7 +57,7 @@ pub struct EncodeAck<'a> {
     pub skip: usize,
     pub max_take: usize,
 }
-impl<'a> EncodeAck<'a> {
+impl EncodeAck<'_> {
     pub fn next_page(&self) -> Option<Self> {
         let skip = self.skip + self.max_take;
         if self.queue.balls().count() <= skip {

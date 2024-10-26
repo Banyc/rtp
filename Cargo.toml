@@ -9,7 +9,6 @@ async_async_io = "0.2"
 byteorder = "1"
 csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
-once_cell = "1"
 rand = "0.8"
 self_assign = { git = "https://github.com/Banyc/self_assign.git", tag = "v0.0.3" }
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +17,7 @@ tap = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "macros", "rt"] }
 tokio-util = "0.7"
-udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.9" }
+udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.10" }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

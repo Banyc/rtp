@@ -1,7 +1,6 @@
-use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
+use std::{collections::VecDeque, num::NonZeroUsize, sync::LazyLock, time::Instant};
 
 use dre::{ConnectionState, PacketState};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
@@ -21,8 +20,8 @@ const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
-static GLOBAL_INIT_SEND_RATE: Lazy<SharedCell<NonZeroPositiveF64>> =
-    Lazy::new(|| SharedCell::new(NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap()));
+static GLOBAL_INIT_SEND_RATE: LazyLock<SharedCell<NonZeroPositiveF64>> =
+    LazyLock::new(|| SharedCell::new(NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap()));
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
