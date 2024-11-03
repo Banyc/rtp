@@ -5,7 +5,6 @@ pub mod packet_send_space;
 pub mod reliable_layer;
 mod rto;
 mod sack;
-mod shared;
 pub mod socket;
 mod timer;
 pub mod transport_layer;

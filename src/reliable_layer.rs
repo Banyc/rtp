@@ -1,15 +1,23 @@
-use std::{collections::VecDeque, num::NonZeroUsize, sync::LazyLock, time::Instant};
+use std::{
+    collections::VecDeque,
+    num::NonZeroUsize,
+    sync::{Arc, LazyLock},
+    time::Instant,
+};
 
 use dre::{ConnectionState, PacketState};
 use primitive::{
     io::token_bucket::TokenBucket,
     ops::float::{PosF, UnitF},
+    sync::mutex::SpinMutex,
+    time::timer::Timer,
+    Clear,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::data_overhead, packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace,
-    sack::AckBallSequence, shared::SharedCell, timer::PollTimer,
+    sack::AckBallSequence,
 };
 
 const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
@@ -23,8 +31,8 @@ const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
-static GLOBAL_INIT_SEND_RATE: LazyLock<SharedCell<PosF<f64>>> =
-    LazyLock::new(|| SharedCell::new(PosF::new(INIT_SEND_RATE).unwrap()));
+static GLOBAL_INIT_SEND_RATE: LazyLock<Arc<SpinMutex<PosF<f64>>>> =
+    LazyLock::new(|| Arc::new(SpinMutex::new(PosF::new(INIT_SEND_RATE).unwrap())));
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
@@ -47,7 +55,7 @@ pub struct ReliableLayer {
     packet_recv_space: PacketRecvSpace,
     send_rate: PosF<f64>,
     prev_sample_rate: Option<dre::RateSample>,
-    huge_data_loss_timer: PollTimer,
+    huge_data_loss_timer: Timer,
 
     // Reused buffers
     packet_stats_buf: Vec<PacketState>,
@@ -56,7 +64,7 @@ pub struct ReliableLayer {
 impl ReliableLayer {
     pub fn new(mss: NonZeroUsize, now: Instant) -> Self {
         let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
-        let send_rate = init_send_rate.get();
+        let send_rate = *init_send_rate.lock();
         Self {
             mss,
             send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
@@ -73,7 +81,7 @@ impl ReliableLayer {
             packet_recv_space: PacketRecvSpace::new(),
             send_rate,
             prev_sample_rate: None,
-            huge_data_loss_timer: PollTimer::new_cleared(),
+            huge_data_loss_timer: Timer::new(),
             packet_stats_buf: Vec::new(),
             packet_buf: Vec::new(),
         }
@@ -134,7 +142,10 @@ impl ReliableLayer {
                 return;
             }
             let at_least_for = self.packet_send_space.rto_duration().mul_f64(2.);
-            if !self.huge_data_loss_timer.set_and_check(at_least_for, now) {
+            let (set_off, _) = self
+                .huge_data_loss_timer
+                .ensure_started_and_check(at_least_for, now);
+            if !set_off {
                 return;
             }
             self.huge_data_loss_timer.clear();
@@ -255,7 +266,9 @@ impl ReliableLayer {
             + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
         let send_rate = PosF::new(smooth_send_rate).unwrap();
         self.set_send_rate(send_rate, now);
-        GLOBAL_INIT_SEND_RATE.try_set(send_rate);
+        if let Some(mut rate) = GLOBAL_INIT_SEND_RATE.try_lock() {
+            *rate = send_rate;
+        }
     }
 
     /// Return `true` iff received FIN
