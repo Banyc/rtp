@@ -1,12 +1,15 @@
 use std::{collections::VecDeque, num::NonZeroUsize, sync::LazyLock, time::Instant};
 
 use dre::{ConnectionState, PacketState};
+use primitive::{
+    io::token_bucket::TokenBucket,
+    ops::float::{PosF, UnitF},
+};
 use serde::{Deserialize, Serialize};
-use strict_num::{NonZeroPositiveF64, NormalizedF64};
 
 use crate::{
     codec::data_overhead, packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace,
-    sack::AckBallSequence, shared::SharedCell, timer::PollTimer, token_bucket::TokenBucket,
+    sack::AckBallSequence, shared::SharedCell, timer::PollTimer,
 };
 
 const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
@@ -20,8 +23,8 @@ const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
-static GLOBAL_INIT_SEND_RATE: LazyLock<SharedCell<NonZeroPositiveF64>> =
-    LazyLock::new(|| SharedCell::new(NonZeroPositiveF64::new(INIT_SEND_RATE).unwrap()));
+static GLOBAL_INIT_SEND_RATE: LazyLock<SharedCell<PosF<f64>>> =
+    LazyLock::new(|| SharedCell::new(PosF::new(INIT_SEND_RATE).unwrap()));
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
@@ -30,7 +33,7 @@ enum SendFinBuf {
     EmptyAndBlocked,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
     send_data_buf: VecDeque<u8>,
@@ -42,7 +45,7 @@ pub struct ReliableLayer {
     connection_stats: ConnectionState,
     packet_send_space: PacketSendSpace,
     packet_recv_space: PacketRecvSpace,
-    send_rate: NonZeroPositiveF64,
+    send_rate: PosF<f64>,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: PollTimer,
 
@@ -125,7 +128,7 @@ impl ReliableLayer {
         let mut f = || {
             let huge_data_loss = self
                 .packet_send_space
-                .huge_data_loss(NormalizedF64::new(MAX_DATA_LOSS_RATE).unwrap(), now);
+                .huge_data_loss(UnitF::new(MAX_DATA_LOSS_RATE).unwrap(), now);
             if !huge_data_loss {
                 self.huge_data_loss_timer.clear();
                 return;
@@ -136,7 +139,7 @@ impl ReliableLayer {
             }
             self.huge_data_loss_timer.clear();
             // exponential backoff
-            let send_rate = NonZeroPositiveF64::new(self.send_rate.get() / 2.).unwrap();
+            let send_rate = PosF::new(self.send_rate.get() / 2.).unwrap();
             self.set_send_rate(send_rate, now);
         };
         f();
@@ -179,12 +182,7 @@ impl ReliableLayer {
             .connection_stats
             .send_packet_2(now, self.packet_send_space.no_packets_in_flight());
 
-        let mut buf = self
-            .packet_send_space
-            .reused_buf()
-            .reuse_buf()
-            .unwrap_or_default();
-        buf.clear();
+        let mut buf = self.packet_send_space.reused_buf().take();
         let data = self.send_data_buf.drain(..packet_bytes);
         buf.extend(data);
         let data = buf;
@@ -255,7 +253,7 @@ impl ReliableLayer {
 
         let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
             + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
-        let send_rate = NonZeroPositiveF64::new(smooth_send_rate).unwrap();
+        let send_rate = PosF::new(smooth_send_rate).unwrap();
         self.set_send_rate(send_rate, now);
         GLOBAL_INIT_SEND_RATE.try_set(send_rate);
     }
@@ -284,12 +282,7 @@ impl ReliableLayer {
     ///
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
-        let mut buf = self
-            .packet_recv_space
-            .reused_buf()
-            .reuse_buf()
-            .unwrap_or_default();
-        buf.clear();
+        let mut buf = self.packet_recv_space.reused_buf().take();
         buf.extend(packet);
         if !self.packet_recv_space.recv(seq, buf) {
             return false;
@@ -310,11 +303,11 @@ impl ReliableLayer {
             let p = self.packet_recv_space.pop().unwrap();
             if p.is_empty() {
                 self.recv_fin_buf = true;
-                self.packet_recv_space.reused_buf().return_buf(p);
+                self.packet_recv_space.reused_buf().put(p);
                 return;
             }
             self.recv_data_buf.extend(&p);
-            self.packet_recv_space.reused_buf().return_buf(p);
+            self.packet_recv_space.reused_buf().put(p);
         }
     }
 
@@ -334,11 +327,9 @@ impl ReliableLayer {
         );
     }
 
-    fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64, now: Instant) {
+    fn set_send_rate(&mut self, send_rate: PosF<f64>, now: Instant) {
         self.packet_send_space.set_send_rate(send_rate);
-        let send_rate = NonZeroPositiveF64::new(MIN_SEND_RATE)
-            .unwrap()
-            .max(send_rate);
+        let send_rate = PosF::new(MIN_SEND_RATE).unwrap().max(send_rate);
         self.send_rate = send_rate;
         self.token_bucket.set_thruput(send_rate, now);
     }

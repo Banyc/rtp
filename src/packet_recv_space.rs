@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
 
-use crate::{reused_buf::ReusedBuf, sack::AckQueue};
+use primitive::arena::obj_pool::{buf_pool, ObjectPool};
+
+use crate::sack::AckQueue;
 
 pub const MAX_NUM_RECEIVING_PACKETS: usize = 2 << 12;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PacketRecvSpace {
     next_seq: u64,
     receiving: BTreeMap<u64, Vec<u8>>,
-    reused_buf: ReusedBuf<Vec<u8>>,
+    reused_buf: ObjectPool<Vec<u8>>,
     ack_history: AckQueue,
 }
 impl PacketRecvSpace {
@@ -16,7 +18,7 @@ impl PacketRecvSpace {
         Self {
             next_seq: 0,
             receiving: BTreeMap::new(),
-            reused_buf: ReusedBuf::new(MAX_NUM_RECEIVING_PACKETS),
+            reused_buf: buf_pool(Some(MAX_NUM_RECEIVING_PACKETS)),
             ack_history: AckQueue::new(),
         }
     }
@@ -33,18 +35,18 @@ impl PacketRecvSpace {
         self.receiving.len()
     }
 
-    pub fn reused_buf(&mut self) -> &mut ReusedBuf<Vec<u8>> {
+    pub fn reused_buf(&mut self) -> &mut ObjectPool<Vec<u8>> {
         &mut self.reused_buf
     }
 
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv(&mut self, seq: u64, data: Vec<u8>) -> bool {
         if self.next_seq + (MAX_NUM_RECEIVING_PACKETS as u64) < seq {
-            self.reused_buf.return_buf(data);
+            self.reused_buf.put(data);
             return false;
         }
         if seq < self.next_seq {
-            self.reused_buf.return_buf(data);
+            self.reused_buf.put(data);
             return true;
         }
         self.receiving.insert(seq, data);

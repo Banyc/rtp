@@ -5,28 +5,33 @@ use std::{
 };
 
 use dre::PacketState;
-use strict_num::{NonZeroPositiveF64, NormalizedF64};
+use primitive::{
+    arena::obj_pool::{buf_pool, ObjectPool},
+    ops::{
+        float::{PosF, UnitF},
+        opt_cmp::MinNoneOptCmp,
+    },
+};
 
 use crate::{
-    comp_option::CompOption, packet_recv_space::MAX_NUM_RECEIVING_PACKETS, reused_buf::ReusedBuf,
-    rto::RetransmissionTimer, sack::AckBallSequence,
+    packet_recv_space::MAX_NUM_RECEIVING_PACKETS, rto::RetransmissionTimer, sack::AckBallSequence,
 };
 
 pub const INIT_CWND: usize = 16;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PacketSendSpace {
     next_seq: u64,
     transmitting: BTreeMap<u64, TransmittingPacket>,
     min_rtt: Option<Duration>,
     rto: RetransmissionTimer,
-    reused_buf: ReusedBuf<Vec<u8>>,
+    reused_buf: ObjectPool<Vec<u8>>,
     cwnd: NonZeroUsize,
     /// Detect if the peer has died
     response_wait_start: Option<Instant>,
     out_of_order_seq_end: u64,
     /// Any sequence after this does not participate in data loss analysis.
-    max_pipe_seq: CompOption<u64>,
+    max_pipe_seq: MinNoneOptCmp<u64>,
 
     // reused buffers
     pipe_buf: Vec<u64>,
@@ -39,11 +44,11 @@ impl PacketSendSpace {
             transmitting: BTreeMap::new(),
             min_rtt: None,
             rto: RetransmissionTimer::new(),
-            reused_buf: ReusedBuf::new(MAX_NUM_RECEIVING_PACKETS),
+            reused_buf: buf_pool(Some(MAX_NUM_RECEIVING_PACKETS)),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             response_wait_start: None,
             out_of_order_seq_end: 0,
-            max_pipe_seq: CompOption::new(None),
+            max_pipe_seq: MinNoneOptCmp(None),
             pipe_buf: vec![],
             ack_buf: vec![],
         }
@@ -72,7 +77,7 @@ impl PacketSendSpace {
         n
     }
 
-    pub fn reused_buf(&mut self) -> &mut ReusedBuf<Vec<u8>> {
+    pub fn reused_buf(&mut self) -> &mut ObjectPool<Vec<u8>> {
         &mut self.reused_buf
     }
 
@@ -100,7 +105,7 @@ impl PacketSendSpace {
                 });
                 self.rto.set(rtt);
             }
-            self.reused_buf.return_buf(p.data);
+            self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
         if self.transmitting.is_empty() {
@@ -118,7 +123,7 @@ impl PacketSendSpace {
         let s = self.next_seq;
         self.next_seq += 1;
 
-        self.max_pipe_seq.set(Some(s));
+        self.max_pipe_seq = MinNoneOptCmp(Some(s));
 
         let p = TransmittingPacket {
             stats,
@@ -152,8 +157,8 @@ impl PacketSendSpace {
             }
 
             // fresh packet for this cwnd
-            let considered_new_in_cwnd = if self.max_pipe_seq < CompOption::new(Some(*s)) {
-                self.max_pipe_seq.set(Some(*s));
+            let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(*s)) {
+                self.max_pipe_seq = MinNoneOptCmp(Some(*s));
                 true
             } else {
                 false
@@ -182,7 +187,7 @@ impl PacketSendSpace {
         self.min_rtt
     }
 
-    pub fn set_send_rate(&mut self, send_rate: NonZeroPositiveF64) {
+    pub fn set_send_rate(&mut self, send_rate: PosF<f64>) {
         let cwnd = self.rto.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * 8;
@@ -201,8 +206,8 @@ impl PacketSendSpace {
         let last_seq_in_cwnd = last_seq_in_cwnd();
 
         // Retract max sequence in pipe
-        if CompOption::new(last_seq_in_cwnd) < self.max_pipe_seq {
-            self.max_pipe_seq.set(last_seq_in_cwnd);
+        if MinNoneOptCmp(last_seq_in_cwnd) < self.max_pipe_seq {
+            self.max_pipe_seq = MinNoneOptCmp(last_seq_in_cwnd);
         }
     }
 
@@ -234,7 +239,7 @@ impl PacketSendSpace {
         self.transmitting.len()
     }
 
-    pub fn huge_data_loss(&self, tolerant_loss_rate: NormalizedF64, now: Instant) -> bool {
+    pub fn huge_data_loss(&self, tolerant_loss_rate: UnitF<f64>, now: Instant) -> bool {
         let Some(data_loss_rate) = self.data_loss_rate(now) else {
             return false;
         };
@@ -264,7 +269,7 @@ impl PacketSendSpace {
     fn packets_in_pipe(&self) -> impl Iterator<Item = (&u64, &TransmittingPacket)> + '_ {
         self.transmitting
             .iter()
-            .take_while(|(s, _)| CompOption::new(Some(**s)) <= self.max_pipe_seq)
+            .take_while(|(s, _)| MinNoneOptCmp(Some(**s)) <= self.max_pipe_seq)
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {

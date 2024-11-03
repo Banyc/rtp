@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use strict_num::PositiveF64;
+use primitive::ops::float::NonNegF;
 
 /// ref: <https://datatracker.ietf.org/doc/html/rfc6298>
 #[derive(Debug, Clone)]
 pub struct RetransmissionTimer {
-    smooth_rtt: PositiveF64,
-    smooth_rtt_var: PositiveF64,
+    smooth_rtt: NonNegF<f64>,
+    smooth_rtt_var: NonNegF<f64>,
     first_measured: bool,
 }
 impl RetransmissionTimer {
@@ -17,8 +17,8 @@ impl RetransmissionTimer {
 
     pub fn new() -> Self {
         Self {
-            smooth_rtt: PositiveF64::new(Self::MIN_RTO.as_secs_f64()).unwrap(),
-            smooth_rtt_var: PositiveF64::new(0.0).unwrap(),
+            smooth_rtt: NonNegF::new(Self::MIN_RTO.as_secs_f64()).unwrap(),
+            smooth_rtt_var: NonNegF::new(0.0).unwrap(),
             first_measured: false,
         }
     }
@@ -26,18 +26,18 @@ impl RetransmissionTimer {
     pub fn set(&mut self, rtt: Duration) {
         if !self.first_measured {
             self.first_measured = true;
-            self.smooth_rtt = PositiveF64::new(rtt.as_secs_f64()).unwrap();
-            self.smooth_rtt_var = PositiveF64::new(rtt.as_secs_f64() / 2.).unwrap();
+            self.smooth_rtt = NonNegF::new(rtt.as_secs_f64()).unwrap();
+            self.smooth_rtt_var = NonNegF::new(rtt.as_secs_f64() / 2.).unwrap();
             return;
         }
 
         let rtt_var = (self.smooth_rtt.get() - rtt.as_secs_f64()).abs();
         let smooth_rtt_var = (1. - Self::BETA) * self.smooth_rtt_var.get() + Self::BETA * rtt_var;
-        self.smooth_rtt_var = PositiveF64::new(smooth_rtt_var).unwrap();
+        self.smooth_rtt_var = NonNegF::new(smooth_rtt_var).unwrap();
 
         let smooth_rtt =
             (1. - Self::ALPHA) * self.smooth_rtt.get() + Self::ALPHA * rtt.as_secs_f64();
-        self.smooth_rtt = PositiveF64::new(smooth_rtt).unwrap();
+        self.smooth_rtt = NonNegF::new(smooth_rtt).unwrap();
     }
 
     // pub fn rto(&self, granularity: Duration) -> Duration {
