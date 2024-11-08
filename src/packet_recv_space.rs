@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
-
-use primitive::arena::obj_pool::{buf_pool, ObjectPool};
+use primitive::{
+    arena::obj_pool::{buf_pool, ObjectPool},
+    queue::seq_queue::{BTreeSeqQueue, SeqInsertResult},
+    Len,
+};
 
 use crate::sack::AckQueue;
 
@@ -8,16 +10,16 @@ pub const MAX_NUM_RECEIVING_PACKETS: usize = 2 << 12;
 
 #[derive(Debug)]
 pub struct PacketRecvSpace {
-    next_seq: u64,
-    receiving: BTreeMap<u64, Vec<u8>>,
+    receiving: BTreeSeqQueue<u64, Vec<u8>>,
     reused_buf: ObjectPool<Vec<u8>>,
     ack_history: AckQueue,
 }
 impl PacketRecvSpace {
     pub fn new() -> Self {
+        let mut receiving = BTreeSeqQueue::new();
+        receiving.set_next(0, |_| {});
         Self {
-            next_seq: 0,
-            receiving: BTreeMap::new(),
+            receiving,
             reused_buf: buf_pool(Some(MAX_NUM_RECEIVING_PACKETS)),
             ack_history: AckQueue::new(),
         }
@@ -28,7 +30,7 @@ impl PacketRecvSpace {
     }
 
     pub fn next_seq(&self) -> u64 {
-        self.next_seq
+        *self.receiving.next().unwrap()
     }
 
     pub fn num_received_packets(&self) -> usize {
@@ -41,27 +43,31 @@ impl PacketRecvSpace {
 
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv(&mut self, seq: u64, data: Vec<u8>) -> bool {
-        if self.next_seq + (MAX_NUM_RECEIVING_PACKETS as u64) < seq {
+        if *self.receiving.next().unwrap() + (MAX_NUM_RECEIVING_PACKETS as u64) < seq {
             self.reused_buf.put(data);
             return false;
         }
-        if seq < self.next_seq {
-            self.reused_buf.put(data);
-            return true;
+        let res = self
+            .receiving
+            .insert(seq, data, |(_, data)| self.reused_buf.put(data));
+        match res {
+            SeqInsertResult::Stalled => {
+                panic!();
+            }
+            SeqInsertResult::Stale => (),
+            SeqInsertResult::InOrder | SeqInsertResult::OutOfOrder => {
+                self.ack_history.insert(seq);
+            }
         }
-        self.receiving.insert(seq, data);
-        self.ack_history.insert(seq);
         true
     }
 
-    pub fn peak(&mut self) -> Option<&Vec<u8>> {
-        self.receiving.get(&self.next_seq)
+    pub fn peak(&self) -> Option<&Vec<u8>> {
+        self.receiving.peak().map(|(_, value)| value)
     }
 
     pub fn pop(&mut self) -> Option<Vec<u8>> {
-        let p = self.receiving.remove(&self.next_seq)?;
-        self.next_seq += 1;
-        Some(p)
+        self.receiving.pop().map(|(_, value)| value)
     }
 }
 impl Default for PacketRecvSpace {
