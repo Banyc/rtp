@@ -398,6 +398,6 @@ pub struct Log {
     pub rtt: u128,
     pub cwnd: usize,
     pub num_rx_pkts: usize,
-    pub recv_seq: u64,
+    pub recv_seq: Option<u64>,
     pub app_limited: Option<bool>,
 }

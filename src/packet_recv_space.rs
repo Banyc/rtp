@@ -29,8 +29,8 @@ impl PacketRecvSpace {
         &self.ack_history
     }
 
-    pub fn next_seq(&self) -> u64 {
-        *self.receiving.next().unwrap()
+    pub fn next_seq(&self) -> Option<u64> {
+        self.receiving.next().copied()
     }
 
     pub fn num_received_packets(&self) -> usize {
@@ -43,7 +43,11 @@ impl PacketRecvSpace {
 
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv(&mut self, seq: u64, data: Vec<u8>) -> bool {
-        if *self.receiving.next().unwrap() + (MAX_NUM_RECEIVING_PACKETS as u64) < seq {
+        let Some(next) = self.receiving.next() else {
+            self.reused_buf.put(data);
+            return false;
+        };
+        if next.saturating_add(MAX_NUM_RECEIVING_PACKETS as u64) < seq {
             self.reused_buf.put(data);
             return false;
         }
