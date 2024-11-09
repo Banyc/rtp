@@ -309,7 +309,7 @@ impl ReliableLayer {
         if self.recv_fin_buf {
             return;
         }
-        while let Some(p) = self.packet_recv_space.peak() {
+        while let Some(p) = self.packet_recv_space.peek() {
             if self.recv_data_buf.capacity() - self.recv_data_buf.len() < p.len() {
                 return;
             }
