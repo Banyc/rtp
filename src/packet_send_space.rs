@@ -111,7 +111,13 @@ impl PacketSendSpace {
             let Some(p) = p.take() else {
                 continue;
             };
-            if s == *self.send_wnd.start().unwrap() {
+            loop {
+                let Some((_, send_wnd_head)) = self.send_wnd.iter().nth(0) else {
+                    break;
+                };
+                if send_wnd_head.is_some() {
+                    break;
+                }
                 self.send_wnd.pop();
             }
 
