@@ -9,7 +9,7 @@ async_async_io = "0.2"
 byteorder = "1"
 csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
-primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.46" }
+primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.47" }
 rand = "0.8"
 self_assign = { git = "https://github.com/Banyc/self_assign.git", tag = "v0.0.3" }
 serde = { version = "1", features = ["derive"] }

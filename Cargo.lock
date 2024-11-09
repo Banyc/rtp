@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "primitive"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.46#ceb3b028cc781c7a9dcb78da6de5be5cef9b36ff"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.47#96b4b8c6d9da639b8748a8d6ebaa043dc9d69016"
 dependencies = [
  "anyhow",
  "num-traits",
@@ -466,7 +466,7 @@ dependencies = [
  "csv",
  "dre",
  "file_transfer",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.46)",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.47)",
  "rand",
  "self_assign",
  "serde",

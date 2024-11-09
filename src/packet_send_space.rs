@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     num::NonZeroUsize,
     time::{Duration, Instant},
 };
@@ -9,8 +8,10 @@ use primitive::{
     arena::obj_pool::{buf_pool, ObjectPool},
     ops::{
         float::{PosF, UnitF},
+        len::{Len, LenExt},
         opt_cmp::MinNoneOptCmp,
     },
+    queue::send_wnd::SendWnd,
 };
 
 use crate::{
@@ -21,8 +22,7 @@ pub const INIT_CWND: usize = 16;
 
 #[derive(Debug)]
 pub struct PacketSendSpace {
-    next_seq: u64,
-    transmitting: BTreeMap<u64, TransmittingPacket>,
+    send_wnd: SendWnd<u64, Option<TransmittingPacket>>,
     min_rtt: Option<Duration>,
     rto: RetransmissionTimer,
     reused_buf: ObjectPool<Vec<u8>>,
@@ -40,8 +40,7 @@ pub struct PacketSendSpace {
 impl PacketSendSpace {
     pub fn new() -> Self {
         Self {
-            next_seq: 0,
-            transmitting: BTreeMap::new(),
+            send_wnd: SendWnd::new(0),
             min_rtt: None,
             rto: RetransmissionTimer::new(),
             reused_buf: buf_pool(Some(MAX_NUM_RECEIVING_PACKETS)),
@@ -54,12 +53,20 @@ impl PacketSendSpace {
         }
     }
 
+    fn unacked(
+        send_wnd: &SendWnd<u64, Option<TransmittingPacket>>,
+    ) -> impl Iterator<Item = (u64, &TransmittingPacket)> {
+        send_wnd
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+    }
+
     pub fn cwnd(&self) -> NonZeroUsize {
         self.cwnd
     }
 
     pub fn next_seq(&self) -> u64 {
-        self.next_seq
+        *self.send_wnd.next().unwrap()
     }
 
     pub fn smooth_rtt(&self) -> Duration {
@@ -68,7 +75,10 @@ impl PacketSendSpace {
 
     pub fn num_retransmitted_packets(&self) -> usize {
         let mut n = 0;
-        for p in self.transmitting.values() {
+        for (_, p) in self.send_wnd.iter() {
+            let Some(p) = p else {
+                continue;
+            };
             if !p.retransmitted {
                 continue;
             }
@@ -90,13 +100,21 @@ impl PacketSendSpace {
             self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
         self.pipe_buf.clear();
-        self.pipe_buf.extend(self.transmitting.keys());
+        self.pipe_buf
+            .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
         seq.ack(&self.pipe_buf, &mut self.ack_buf);
-        for s in &self.ack_buf {
-            let Some(p) = self.transmitting.remove(s) else {
+        for &s in &self.ack_buf {
+            let Some(p) = self.send_wnd.get_mut(&s) else {
                 continue;
             };
+            let Some(p) = p.take() else {
+                continue;
+            };
+            if s == *self.send_wnd.start().unwrap() {
+                self.send_wnd.pop();
+            }
+
             if !p.retransmitted {
                 let rtt = now - p.sent_time;
                 self.min_rtt = Some(match self.min_rtt {
@@ -108,7 +126,7 @@ impl PacketSendSpace {
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
-        if self.transmitting.is_empty() {
+        if self.send_wnd.is_empty() {
             self.response_wait_start = None;
         } else {
             self.response_wait_start = Some(now);
@@ -116,12 +134,11 @@ impl PacketSendSpace {
     }
 
     pub fn accepts_new_packet(&self) -> bool {
-        self.transmitting.len() < self.cwnd.get()
+        self.send_wnd.len() < self.cwnd.get()
     }
 
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Packet<'_> {
-        let s = self.next_seq;
-        self.next_seq += 1;
+        let s = *self.send_wnd.next().unwrap();
 
         self.max_pipe_seq = MinNoneOptCmp(Some(s));
 
@@ -134,22 +151,25 @@ impl PacketSendSpace {
             rto: self.rto.rto(),
         };
 
-        self.transmitting.insert(s, p);
+        self.send_wnd.push(Some(p));
         if self.response_wait_start.is_none() {
             self.response_wait_start = Some(now);
         }
 
         let p = Packet {
             seq: s,
-            data: &self.transmitting.get(&s).unwrap().data,
+            data: &self.send_wnd.get(&s).unwrap().as_ref().unwrap().data,
         };
         p
     }
 
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
-        for (s, p) in self.transmitting.iter_mut().take(self.cwnd.get()) {
+        for (s, p) in self.send_wnd.iter_mut().take(self.cwnd.get()) {
+            let Some(p) = p else {
+                continue;
+            };
             let out_of_order_rt =
-                *s < self.out_of_order_seq_end && p.hits_custom_rto(self.rto.smooth_rtt(), now);
+                s < self.out_of_order_seq_end && p.hits_custom_rto(self.rto.smooth_rtt(), now);
 
             let should_retransmit = p.hits_rto(now) || out_of_order_rt;
             if !should_retransmit {
@@ -157,8 +177,8 @@ impl PacketSendSpace {
             }
 
             // fresh packet for this cwnd
-            let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(*s)) {
-                self.max_pipe_seq = MinNoneOptCmp(Some(*s));
+            let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
+                self.max_pipe_seq = MinNoneOptCmp(Some(s));
                 true
             } else {
                 false
@@ -175,7 +195,7 @@ impl PacketSendSpace {
                 };
             }
             let p = Packet {
-                seq: *s,
+                seq: s,
                 data: &p.data,
             };
             return Some(p);
@@ -195,11 +215,11 @@ impl PacketSendSpace {
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
 
         let last_seq_in_cwnd = || {
-            if let Some(s) = self.transmitting.keys().nth(cwnd) {
-                return Some(*s);
+            if let Some(s) = Self::unacked(&self.send_wnd).map(|(k, _)| k).nth(cwnd) {
+                return Some(s);
             }
-            if let Some(s) = self.transmitting.keys().last() {
-                return Some(*s);
+            if let Some(s) = Self::unacked(&self.send_wnd).map(|(k, _)| k).last() {
+                return Some(s);
             }
             None
         };
@@ -212,11 +232,14 @@ impl PacketSendSpace {
     }
 
     pub fn no_packets_in_flight(&self) -> bool {
-        self.transmitting.is_empty()
+        self.send_wnd.is_empty()
     }
 
     pub fn all_lost_packets_retransmitted(&self, now: Instant) -> bool {
-        for p in self.transmitting.values().take(self.cwnd.get()) {
+        for p in Self::unacked(&self.send_wnd)
+            .map(|(_, v)| v)
+            .take(self.cwnd.get())
+        {
             if p.hits_rto(now) {
                 return false;
             }
@@ -226,7 +249,10 @@ impl PacketSendSpace {
 
     pub fn num_not_lost_transmitting_packets(&self, now: Instant) -> usize {
         let mut not_lost = 0;
-        for p in self.transmitting.values().take(self.cwnd.get()) {
+        for p in Self::unacked(&self.send_wnd)
+            .map(|(_, v)| v)
+            .take(self.cwnd.get())
+        {
             if p.hits_rto(now) {
                 continue;
             }
@@ -236,7 +262,7 @@ impl PacketSendSpace {
     }
 
     pub fn num_transmitting_packets(&self) -> usize {
-        self.transmitting.len()
+        self.send_wnd.len()
     }
 
     pub fn huge_data_loss(&self, tolerant_loss_rate: UnitF<f64>, now: Instant) -> bool {
@@ -266,15 +292,17 @@ impl PacketSendSpace {
         self.packets_in_pipe().count()
     }
 
-    fn packets_in_pipe(&self) -> impl Iterator<Item = (&u64, &TransmittingPacket)> + '_ {
-        self.transmitting
-            .iter()
-            .take_while(|(s, _)| MinNoneOptCmp(Some(**s)) <= self.max_pipe_seq)
+    fn packets_in_pipe(&self) -> impl Iterator<Item = (u64, &TransmittingPacket)> + '_ {
+        Self::unacked(&self.send_wnd)
+            .take_while(|(s, _)| MinNoneOptCmp(Some(*s)) <= self.max_pipe_seq)
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {
         let mut min_next_poll_time: Option<Instant> = None;
-        for p in self.transmitting.values().take(self.cwnd.get()) {
+        for p in Self::unacked(&self.send_wnd)
+            .map(|(_, v)| v)
+            .take(self.cwnd.get())
+        {
             let t = p.next_rto_time();
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
