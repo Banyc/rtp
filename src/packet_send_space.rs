@@ -112,16 +112,8 @@ impl PacketSendSpace {
                 continue;
             };
             if s == *self.send_wnd.start().unwrap() {
-                self.send_wnd.pop();
-                loop {
-                    let Some((_, send_wnd_head)) = self.send_wnd.iter().nth(0) else {
-                        break;
-                    };
-                    if send_wnd_head.is_some() {
-                        break;
-                    }
-                    self.send_wnd.pop();
-                }
+                self.send_wnd.pop().unwrap();
+                self.send_wnd.pop_none();
             }
 
             if !p.retransmitted {
