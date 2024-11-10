@@ -8,7 +8,7 @@ use primitive::{
     arena::obj_pool::{buf_pool, ObjectPool},
     ops::{
         float::{PosF, UnitF},
-        len::{Len, LenExt},
+        len::LenExt,
         opt_cmp::MinNoneOptCmp,
     },
     queue::send_wnd::SendWnd,
@@ -23,6 +23,7 @@ pub const INIT_CWND: usize = 16;
 #[derive(Debug)]
 pub struct PacketSendSpace {
     send_wnd: SendWnd<u64, Option<TransmittingPacket>>,
+    num_transmitting: usize,
     min_rtt: Option<Duration>,
     rto: RetransmissionTimer,
     reused_buf: ObjectPool<Vec<u8>>,
@@ -41,6 +42,7 @@ impl PacketSendSpace {
     pub fn new() -> Self {
         Self {
             send_wnd: SendWnd::new(0),
+            num_transmitting: 0,
             min_rtt: None,
             rto: RetransmissionTimer::new(),
             reused_buf: buf_pool(Some(MAX_NUM_RECEIVING_PACKETS)),
@@ -115,6 +117,7 @@ impl PacketSendSpace {
             let Some(p) = p.take() else {
                 continue;
             };
+            self.num_transmitting -= 1;
             if s == *self.send_wnd.start().unwrap() {
                 self.send_wnd.pop().unwrap();
                 self.send_wnd.pop_none();
@@ -139,7 +142,7 @@ impl PacketSendSpace {
     }
 
     pub fn accepts_new_packet(&self) -> bool {
-        self.send_wnd.len() < self.cwnd.get()
+        self.num_transmitting < self.cwnd.get()
     }
 
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Packet<'_> {
@@ -157,6 +160,7 @@ impl PacketSendSpace {
         };
 
         self.send_wnd.push(Some(p));
+        self.num_transmitting += 1;
         if self.response_wait_start.is_none() {
             self.response_wait_start = Some(now);
         }
@@ -264,7 +268,7 @@ impl PacketSendSpace {
     }
 
     pub fn num_transmitting_packets(&self) -> usize {
-        self.send_wnd.len()
+        self.num_transmitting
     }
 
     pub fn huge_data_loss(&self, tolerant_loss_rate: UnitF<f64>, now: Instant) -> bool {
