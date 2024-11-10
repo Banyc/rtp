@@ -82,10 +82,7 @@ impl PacketSendSpace {
 
     pub fn num_retransmitted_packets(&self) -> usize {
         let mut n = 0;
-        for (_, p) in self.send_wnd.iter() {
-            let Some(p) = p else {
-                continue;
-            };
+        for (_, p) in Self::unacked(&self.send_wnd) {
             if !p.retransmitted {
                 continue;
             }
