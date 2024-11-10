@@ -60,6 +60,13 @@ impl PacketSendSpace {
             .iter()
             .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
     }
+    fn unacked_mut(
+        send_wnd: &mut SendWnd<u64, Option<TransmittingPacket>>,
+    ) -> impl Iterator<Item = (u64, &mut TransmittingPacket)> {
+        send_wnd
+            .iter_mut()
+            .filter_map(|(k, v)| v.as_mut().map(|v| (k, v)))
+    }
 
     pub fn cwnd(&self) -> NonZeroUsize {
         self.cwnd
@@ -165,10 +172,7 @@ impl PacketSendSpace {
     }
 
     pub fn retransmit(&mut self, now: Instant) -> Option<Packet<'_>> {
-        for (s, p) in self.send_wnd.iter_mut().take(self.cwnd.get()) {
-            let Some(p) = p else {
-                continue;
-            };
+        for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let out_of_order_rt =
                 s < self.out_of_order_seq_end && p.hits_custom_rto(self.rto.smooth_rtt(), now);
 
