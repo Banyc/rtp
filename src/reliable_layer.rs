@@ -8,7 +8,7 @@ use std::{
 use dre::{ConnectionState, PacketState};
 use primitive::{
     io::token_bucket::TokenBucket,
-    ops::float::{PosF, UnitF},
+    ops::float::{PosR, UnitR},
     sync::mutex::SpinMutex,
     time::timer::Timer,
     Clear,
@@ -31,8 +31,8 @@ const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MESSAGES: bool = false;
 
-static GLOBAL_INIT_SEND_RATE: LazyLock<Arc<SpinMutex<PosF<f64>>>> =
-    LazyLock::new(|| Arc::new(SpinMutex::new(PosF::new(INIT_SEND_RATE).unwrap())));
+static GLOBAL_INIT_SEND_RATE: LazyLock<Arc<SpinMutex<PosR<f64>>>> =
+    LazyLock::new(|| Arc::new(SpinMutex::new(PosR::new(INIT_SEND_RATE).unwrap())));
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
@@ -53,7 +53,7 @@ pub struct ReliableLayer {
     connection_stats: ConnectionState,
     packet_send_space: PacketSendSpace,
     packet_recv_space: PacketRecvSpace,
-    send_rate: PosF<f64>,
+    send_rate: PosR<f64>,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
 
@@ -136,7 +136,7 @@ impl ReliableLayer {
         let mut f = || {
             let huge_data_loss = self
                 .packet_send_space
-                .huge_data_loss(UnitF::new(MAX_DATA_LOSS_RATE).unwrap(), now);
+                .huge_data_loss(UnitR::new(MAX_DATA_LOSS_RATE).unwrap(), now);
             if !huge_data_loss {
                 self.huge_data_loss_timer.clear();
                 return;
@@ -150,7 +150,7 @@ impl ReliableLayer {
             }
             self.huge_data_loss_timer.clear();
             // exponential backoff
-            let send_rate = PosF::new(self.send_rate.get() / 2.).unwrap();
+            let send_rate = PosR::new(self.send_rate.get() / 2.).unwrap();
             self.set_send_rate(send_rate, now);
         };
         f();
@@ -264,7 +264,7 @@ impl ReliableLayer {
 
         let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
             + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
-        let send_rate = PosF::new(smooth_send_rate).unwrap();
+        let send_rate = PosR::new(smooth_send_rate).unwrap();
         self.set_send_rate(send_rate, now);
         if let Some(mut rate) = GLOBAL_INIT_SEND_RATE.try_lock() {
             *rate = send_rate;
@@ -340,9 +340,9 @@ impl ReliableLayer {
         );
     }
 
-    fn set_send_rate(&mut self, send_rate: PosF<f64>, now: Instant) {
+    fn set_send_rate(&mut self, send_rate: PosR<f64>, now: Instant) {
         self.packet_send_space.set_send_rate(send_rate);
-        let send_rate = PosF::new(MIN_SEND_RATE).unwrap().max(send_rate);
+        let send_rate = PosR::new(MIN_SEND_RATE).unwrap().max(send_rate);
         self.send_rate = send_rate;
         self.token_bucket.set_thruput(send_rate, now);
     }

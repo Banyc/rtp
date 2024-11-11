@@ -385,11 +385,11 @@ dependencies = [
 [[package]]
 name = "primitive"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.49#d083494e71e17c4f5e096d10e85f3978bf61c054"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.51#4a0803030cc0355f294d4bfb375f04e1002cd86b"
 dependencies = [
  "anyhow",
  "num-traits",
- "thiserror 2.0.2",
+ "thiserror 2.0.3",
 ]
 
 [[package]]
@@ -466,12 +466,12 @@ dependencies = [
  "csv",
  "dre",
  "file_transfer",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.49)",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.51)",
  "rand",
  "self_assign",
  "serde",
  "tap",
- "thiserror 2.0.2",
+ "thiserror 2.0.3",
  "tokio",
  "tokio-util",
  "udp_listener",
@@ -584,11 +584,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "037e29b009aa709f293b974da5cd33b15783c049e07f8435778ce8c4871525d8"
+checksum = "c006c85c7651b3cf2ada4584faa36773bd07bac24acfb39f3c431b36d7e667aa"
 dependencies = [
- "thiserror-impl 2.0.2",
+ "thiserror-impl 2.0.3",
 ]
 
 [[package]]
@@ -604,9 +604,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.2"
+version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea4778c7e8ff768bdb32a58a2349903859fe719a320300d7d4ce8636f19a1e69"
+checksum = "f077553d607adc1caf65430528a576c757a71ed73944b66ebb58ef2bbd243568"
 dependencies = [
  "proc-macro2",
  "quote",

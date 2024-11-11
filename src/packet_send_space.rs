@@ -7,7 +7,7 @@ use dre::PacketState;
 use primitive::{
     arena::obj_pool::{buf_pool, ObjectPool},
     ops::{
-        float::{PosF, UnitF},
+        float::{PosR, UnitR},
         len::LenExt,
         opt_cmp::MinNoneOptCmp,
     },
@@ -213,7 +213,7 @@ impl PacketSendSpace {
         self.min_rtt
     }
 
-    pub fn set_send_rate(&mut self, send_rate: PosF<f64>) {
+    pub fn set_send_rate(&mut self, send_rate: PosR<f64>) {
         let cwnd = self.rto.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * 8;
@@ -271,7 +271,7 @@ impl PacketSendSpace {
         self.num_transmitting
     }
 
-    pub fn huge_data_loss(&self, tolerant_loss_rate: UnitF<f64>, now: Instant) -> bool {
+    pub fn huge_data_loss(&self, tolerant_loss_rate: UnitR<f64>, now: Instant) -> bool {
         let Some(data_loss_rate) = self.data_loss_rate(now) else {
             return false;
         };
