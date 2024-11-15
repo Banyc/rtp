@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     num::NonZeroUsize,
     sync::{Arc, LazyLock},
     time::Instant,
@@ -8,7 +7,11 @@ use std::{
 use dre::{ConnectionState, PacketState};
 use primitive::{
     io::token_bucket::TokenBucket,
-    ops::float::{PosR, UnitR},
+    ops::{
+        float::{PosR, UnitR},
+        len::{Capacity, Len, LenExt},
+    },
+    queue::fixed_queue::FixedVecQueue,
     sync::mutex::SpinMutex,
     time::timer::Timer,
     Clear,
@@ -44,9 +47,9 @@ enum SendFinBuf {
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
-    send_data_buf: VecDeque<u8>,
+    send_data_buf: FixedVecQueue<u8>,
     send_fin_buf: SendFinBuf,
-    recv_data_buf: VecDeque<u8>,
+    recv_data_buf: FixedVecQueue<u8>,
     /// set-only
     recv_fin_buf: bool,
     token_bucket: TokenBucket,
@@ -67,9 +70,9 @@ impl ReliableLayer {
         let send_rate = *init_send_rate.lock();
         Self {
             mss,
-            send_data_buf: VecDeque::with_capacity(SEND_DATA_BUFFER_LENGTH),
+            send_data_buf: FixedVecQueue::new_vec(SEND_DATA_BUFFER_LENGTH),
             send_fin_buf: SendFinBuf::Empty,
-            recv_data_buf: VecDeque::with_capacity(RECV_DATA_BUFFER_LENGTH),
+            recv_data_buf: FixedVecQueue::new_vec(RECV_DATA_BUFFER_LENGTH),
             recv_fin_buf: false,
             token_bucket: TokenBucket::new(
                 send_rate,
@@ -124,7 +127,7 @@ impl ReliableLayer {
 
         let free_bytes = self.send_data_buf.capacity() - self.send_data_buf.len();
         let write_bytes = free_bytes.min(buf.len());
-        self.send_data_buf.extend(&buf[..write_bytes]);
+        self.send_data_buf.batch_enqueue(&buf[..write_bytes]);
         write_bytes
     }
 
@@ -194,8 +197,8 @@ impl ReliableLayer {
             .send_packet_2(now, self.packet_send_space.no_packets_in_flight());
 
         let mut buf = self.packet_send_space.reused_buf().take();
-        let data = self.send_data_buf.drain(..packet_bytes);
-        buf.extend(data);
+        self.send_data_buf
+            .batch_dequeue_extend(packet_bytes, &mut buf);
         let data = buf;
 
         packet[..data.len()].copy_from_slice(&data);
@@ -281,12 +284,13 @@ impl ReliableLayer {
     /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
         let read_bytes = buf.len().min(self.recv_data_buf.len());
-        let (a, b) = self.recv_data_buf.as_slices();
-        let n_a = a.len().min(read_bytes);
-        let n_b = read_bytes - n_a;
-        buf[..n_a].copy_from_slice(&a[..n_a]);
-        buf[n_a..read_bytes].copy_from_slice(&b[..n_b]);
-        self.recv_data_buf.drain(..read_bytes);
+        let Some((a, b)) = self.recv_data_buf.batch_dequeue(read_bytes) else {
+            return 0;
+        };
+        buf[..a.len()].copy_from_slice(a);
+        if let Some(b) = b {
+            buf[a.len()..read_bytes].copy_from_slice(b);
+        }
         self.move_recv_data();
         read_bytes
     }
@@ -319,7 +323,7 @@ impl ReliableLayer {
                 self.packet_recv_space.reused_buf().put(p);
                 return;
             }
-            self.recv_data_buf.extend(&p);
+            self.recv_data_buf.batch_enqueue(&p);
             self.packet_recv_space.reused_buf().put(p);
         }
     }
