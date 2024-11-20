@@ -1,6 +1,7 @@
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use std::time::Instant;
 
-use primitive::{time::timer::Timer, Clear};
+use primitive::{ops::clear::Clear, time::timer::Timer};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]

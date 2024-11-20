@@ -1,11 +1,9 @@
-use std::{
-    num::NonZeroUsize,
-    time::{Duration, Instant},
-};
+use core::{num::NonZeroUsize, time::Duration};
+use std::time::Instant;
 
 use dre::PacketState;
 use primitive::{
-    arena::obj_pool::{buf_pool, ObjectPool},
+    arena::obj_pool::{buf_pool, ObjPool},
     ops::{
         float::{PosR, UnitR},
         len::LenExt,
@@ -26,7 +24,7 @@ pub struct PacketSendSpace {
     num_transmitting: usize,
     min_rtt: Option<Duration>,
     rto: RetransmissionTimer,
-    reused_buf: ObjectPool<Vec<u8>>,
+    reused_buf: ObjPool<Vec<u8>>,
     cwnd: NonZeroUsize,
     /// Detect if the peer has died
     response_wait_start: Option<Instant>,
@@ -93,7 +91,7 @@ impl PacketSendSpace {
         n
     }
 
-    pub fn reused_buf(&mut self) -> &mut ObjectPool<Vec<u8>> {
+    pub fn reused_buf(&mut self) -> &mut ObjPool<Vec<u8>> {
         &mut self.reused_buf
     }
 

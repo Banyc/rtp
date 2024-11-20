@@ -1,4 +1,5 @@
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc};
+use core::{net::SocketAddr, num::NonZeroUsize};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};

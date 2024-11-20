@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, num::NonZeroU64};
+use core::num::NonZeroU64;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct AckQueue {

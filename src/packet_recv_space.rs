@@ -1,7 +1,7 @@
 use core::num::NonZeroUsize;
 
 use primitive::{
-    arena::obj_pool::{buf_pool, ObjectPool},
+    arena::obj_pool::{buf_pool, ObjPool},
     ops::len::Len,
     queue::seq_queue::{SeqInsertResult, SeqQueue},
 };
@@ -13,7 +13,7 @@ pub const MAX_NUM_RECEIVING_PACKETS: usize = 2 << 12;
 #[derive(Debug)]
 pub struct PacketRecvSpace {
     receiving: SeqQueue<u64, Vec<u8>>,
-    reused_buf: ObjectPool<Vec<u8>>,
+    reused_buf: ObjPool<Vec<u8>>,
     ack_history: AckQueue,
 }
 impl PacketRecvSpace {
@@ -39,7 +39,7 @@ impl PacketRecvSpace {
         self.receiving.len()
     }
 
-    pub fn reused_buf(&mut self) -> &mut ObjectPool<Vec<u8>> {
+    pub fn reused_buf(&mut self) -> &mut ObjPool<Vec<u8>> {
         &mut self.reused_buf
     }
 

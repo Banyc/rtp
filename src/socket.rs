@@ -1,7 +1,5 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use core::time::Duration;
+use std::{sync::Arc, time::Instant};
 
 use async_async_io::{
     read::{AsyncAsyncRead, PollRead},

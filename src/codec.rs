@@ -1,7 +1,5 @@
-use std::{
-    io::{self, Write},
-    num::NonZeroU64,
-};
+use core::num::NonZeroU64;
+use std::io::{self, Write};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tap::Pipe;

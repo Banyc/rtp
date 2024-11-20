@@ -1,4 +1,5 @@
-use std::{net::SocketAddr, num::NonZeroUsize, path::Path, sync::Arc};
+use core::{net::SocketAddr, num::NonZeroUsize};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;

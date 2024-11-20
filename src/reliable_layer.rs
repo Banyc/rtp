@@ -1,5 +1,5 @@
+use core::num::NonZeroUsize;
 use std::{
-    num::NonZeroUsize,
     sync::{Arc, LazyLock},
     time::Instant,
 };
@@ -8,13 +8,13 @@ use dre::{ConnectionState, PacketState};
 use primitive::{
     io::token_bucket::TokenBucket,
     ops::{
+        clear::Clear,
         float::{PosR, UnitR},
         len::{Capacity, Len, LenExt},
     },
-    queue::fixed_queue::FixedVecQueue,
+    queue::cap_queue::CapVecQueue,
     sync::mutex::SpinMutex,
     time::timer::Timer,
-    Clear,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,9 +47,9 @@ enum SendFinBuf {
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
-    send_data_buf: FixedVecQueue<u8>,
+    send_data_buf: CapVecQueue<u8>,
     send_fin_buf: SendFinBuf,
-    recv_data_buf: FixedVecQueue<u8>,
+    recv_data_buf: CapVecQueue<u8>,
     /// set-only
     recv_fin_buf: bool,
     token_bucket: TokenBucket,
@@ -70,9 +70,9 @@ impl ReliableLayer {
         let send_rate = *init_send_rate.lock();
         Self {
             mss,
-            send_data_buf: FixedVecQueue::new_vec(SEND_DATA_BUFFER_LENGTH),
+            send_data_buf: CapVecQueue::new_vec(SEND_DATA_BUFFER_LENGTH),
             send_fin_buf: SendFinBuf::Empty,
-            recv_data_buf: FixedVecQueue::new_vec(RECV_DATA_BUFFER_LENGTH),
+            recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUFFER_LENGTH),
             recv_fin_buf: false,
             token_bucket: TokenBucket::new(
                 send_rate,
