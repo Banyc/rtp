@@ -272,16 +272,17 @@ impl PktSendSpace {
     }
 
     pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
-        let len = self.pkts_in_pipe().count();
-        if len == 0 {
-            return None;
-        }
         let mut lost = 0;
+        let mut len = 0;
         for (_, p) in self.pkts_in_pipe() {
+            len += 1;
             let rtxed = !p.considered_new_in_cwnd && p.rtxed;
             if rtxed || p.hits_rto(now) {
                 lost += 1;
             }
+        }
+        if len == 0 {
+            return None;
         }
         Some(lost as f64 / len as f64)
     }
