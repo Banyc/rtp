@@ -62,7 +62,7 @@ pub struct AckBallSequence<'a> {
     balls: &'a [AckBall],
 }
 impl<'a> AckBallSequence<'a> {
-    /// Elements in `seq` must be in increasing order.
+    /// Elements in `balls` must be in increasing order.
     pub fn new(balls: &'a [AckBall]) -> Self {
         Self { balls }
     }
@@ -71,30 +71,28 @@ impl<'a> AckBallSequence<'a> {
         Some(self.balls.last()?.start)
     }
 
-    /// `pipe` must be in increasing order.
-    ///
-    /// Return the end of immediate retransmission sequence
-    pub fn ack(&self, pipe: &[u64], ack: &mut Vec<u64>) {
+    /// `unacked` must be in increasing order.
+    pub fn ack(&self, unacked: &[u64], ack: &mut Vec<u64>) {
         if self.balls.is_empty() {
             return;
         }
-        let mut pipe_i = 0;
+        let mut unacked_i = 0;
         let mut ball_i = 0;
-        while ball_i < self.balls.len() && pipe_i < pipe.len() {
+        while ball_i < self.balls.len() && unacked_i < unacked.len() {
             let ball = self.balls[ball_i];
-            let seq = pipe[pipe_i];
+            let unacked = unacked[unacked_i];
 
-            if seq < ball.start {
-                pipe_i += 1;
+            if unacked < ball.start {
+                unacked_i += 1;
                 continue;
             }
-            if !ball.contains(seq) {
+            if !ball.contains(unacked) {
                 ball_i += 1;
                 continue;
             }
 
-            ack.push(seq);
-            pipe_i += 1;
+            ack.push(unacked);
+            unacked_i += 1;
         }
     }
 }

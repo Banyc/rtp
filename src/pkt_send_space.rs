@@ -31,7 +31,7 @@ pub struct PktSendSpace {
     max_pipe_seq: MinNoneOptCmp<u64>,
 
     // reused buffers
-    pipe_buf: Vec<u64>,
+    unacked_buf: Vec<u64>,
     ack_buf: Vec<u64>,
 }
 impl PktSendSpace {
@@ -46,7 +46,7 @@ impl PktSendSpace {
             resp_wait_start: None,
             out_of_order_seq_end: 0,
             max_pipe_seq: MinNoneOptCmp(None),
-            pipe_buf: vec![],
+            unacked_buf: vec![],
             ack_buf: vec![],
         }
     }
@@ -97,22 +97,18 @@ impl PktSendSpace {
         Some(now.duration_since(self.resp_wait_start?))
     }
 
-    pub fn ack(&mut self, seq: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
-        if let Some(seq) = seq.out_of_order_seq_end() {
+    pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+        if let Some(seq) = recved.out_of_order_seq_end() {
             self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
-        self.pipe_buf.clear();
-        self.pipe_buf
+        self.unacked_buf.clear();
+        self.unacked_buf
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
-        seq.ack(&self.pipe_buf, &mut self.ack_buf);
+        recved.ack(&self.unacked_buf, &mut self.ack_buf);
         for &s in &self.ack_buf {
-            let Some(p) = self.send_wnd.get_mut(&s) else {
-                continue;
-            };
-            let Some(p) = p.take() else {
-                continue;
-            };
+            let p = self.send_wnd.get_mut(&s).unwrap();
+            let p = p.take().unwrap();
             self.num_txing -= 1;
             if s == *self.send_wnd.start().unwrap() {
                 self.send_wnd.pop().unwrap();
