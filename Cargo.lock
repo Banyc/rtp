@@ -621,7 +621,7 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.12#500fe2651cbb4b11e93c34c0b58f25d71023322f"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
 dependencies = [
  "bytes",
  "primitive",
