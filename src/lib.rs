@@ -7,5 +7,5 @@ mod rto;
 mod sack;
 pub mod socket;
 mod timer;
-pub mod transport_layer;
+pub mod transmission_layer;
 pub mod udp;

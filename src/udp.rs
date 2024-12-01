@@ -3,18 +3,18 @@ use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UdpListener};
+use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
     socket::{client_opening_handshake, server_opening_handshake, socket, ReadSocket, WriteSocket},
-    transport_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
+    transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
 pub const MSS: usize = 1424;
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
-type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
-type IdentityConn = Conn<SocketAddr, Packet>;
+type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
+type IdentityConn = Conn<UdpSocket, SocketAddr, Packet>;
 type IdentityConnRead = ConnRead<Packet>;
 
 pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
@@ -28,7 +28,7 @@ impl Listener {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let local_addr = udp.local_addr()?;
-        let listener = UdpListener::new_identity_dispatch(
+        let listener = UtpListener::new_identity_dispatch(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
         );
@@ -110,7 +110,10 @@ async fn connect_(
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
     let log_config = match log_config {
-        Some(c) => Some(c.transport_layer_log_config(local_addr, peer_addr).await?),
+        Some(c) => Some(
+            c.transmission_layer_log_config(local_addr, peer_addr)
+                .await?,
+        ),
         None => None,
     };
     let udp = Arc::new(udp);
@@ -164,7 +167,7 @@ impl UnreliableRead for IdentityConnRead {
     }
 }
 #[async_trait]
-impl UnreliableWrite for ConnWrite {
+impl UnreliableWrite for ConnWrite<UdpSocket> {
     async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         Self::send(self, buf).await.map_err(|e| e.kind())
     }
@@ -203,14 +206,14 @@ pub struct LogConfig<'a> {
     pub log_dir_path: &'a Path,
 }
 impl LogConfig<'_> {
-    pub(crate) async fn transport_layer_log_config(
+    pub(crate) async fn transmission_layer_log_config(
         &self,
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-    ) -> std::io::Result<transport_layer::LogConfig> {
+    ) -> std::io::Result<transmission_layer::LogConfig> {
         tokio::fs::create_dir_all(&self.log_dir_path).await?;
         let file_name = format!("{local_addr}_{peer_addr}.csv");
-        Ok(transport_layer::LogConfig {
+        Ok(transmission_layer::LogConfig {
             reliable_layer_log_path: self.log_dir_path.join(file_name),
         })
     }

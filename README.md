@@ -1,6 +1,6 @@
 # `rtp`
 
-A userspace reliable transport protocol whose congestion window is governed only by the delivery rate (i.e., bandwidth/throughput) and the data loss rate.
+A userspace reliable transmission protocol whose congestion window is governed only by the delivery rate (i.e., bandwidth/throughput) and the data loss rate.
 
 ## Features
 
@@ -14,11 +14,11 @@ A userspace reliable transport protocol whose congestion window is governed only
 - a dead simple codec for packet encoding/decoding
   - main entry: [[src/codec.rs]]
   - wireshark dissector: [[wireshark/rtp.dissector.lua]]
-- an async-based I/O-agnostic transport layer
+- an async-based I/O-agnostic transmission layer
   - gluing the unreliable layer and the reliable layer together
-  - main entry: [[src/transport_layer.rs]]
+  - main entry: [[transmission_layer.rs]]
 - a user-facing I/O-agnostic socket wrapper
-  - managing opening, closing, timer, async read/write for the transport layer
+  - managing opening, closing, timer, async read/write for the transmission layer
   - perk: You are allowed to wait until or check if the send buf is empty!
   - main entry: [[src/socket.rs]]
 - a user-facing over-UDP implementation

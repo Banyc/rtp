@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::{
     codec::in_cmd_space,
-    transport_layer::{LogConfig, TransportLayer, UnreliableLayer},
+    transmission_layer::{LogConfig, TransmissionLayer, UnreliableLayer},
 };
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
@@ -33,25 +33,25 @@ pub fn socket(
 ) -> (ReadSocket, WriteSocket) {
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
-    let transport_layer = Arc::new(TransportLayer::new(unreliable_layer, log_config));
+    let transmission_layer = Arc::new(TransmissionLayer::new(unreliable_layer, log_config));
     let mut events = JoinSet::new();
 
     // Send timer
     events.spawn({
-        let transport_layer = Arc::clone(&transport_layer);
+        let transmission_layer = Arc::clone(&transmission_layer);
         async move {
             let mut data_buf = vec![0; BUF_SIZE];
             let mut utp_buf = vec![0; BUF_SIZE];
             loop {
                 // tokio::time::sleep(TIMER_INTERVAL).await;
                 let next_poll_time = {
-                    let reliable_layer = transport_layer.reliable_layer().lock().unwrap();
+                    let reliable_layer = transmission_layer.reliable_layer().lock().unwrap();
                     reliable_layer.token_bucket().next_token_time()
                 };
                 let fast_poll_time = Instant::now() + TIMER_INTERVAL;
                 let poll_time = next_poll_time.min(fast_poll_time);
                 tokio::time::sleep_until(poll_time.into()).await;
-                if transport_layer
+                if transmission_layer
                     .send_pkts(&mut data_buf, &mut utp_buf)
                     .await
                     .is_err()
@@ -65,7 +65,7 @@ pub fn socket(
     // Recv
     events.spawn({
         let read_shutdown = read_shutdown.clone();
-        let transport_layer = Arc::clone(&transport_layer);
+        let transmission_layer = Arc::clone(&transmission_layer);
         async move {
             let mut utp_buf = vec![0; BUF_SIZE];
             let mut ack_from_peer_buf = vec![];
@@ -75,14 +75,14 @@ pub fn socket(
                 //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
-                let Ok(recv_pkts) = transport_layer
+                let Ok(recv_pkts) = transmission_layer
                     .recv_pkts(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
                 else {
                     return;
                 };
                 if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
-                    let _ = transport_layer.send_kill_pkt().await;
+                    let _ = transmission_layer.send_kill_pkt().await;
                 }
             }
         }
@@ -91,35 +91,35 @@ pub fn socket(
     tokio::spawn({
         let read_shutdown = read_shutdown.clone();
         let write_shutdown = write_shutdown.clone();
-        let transport_layer = Arc::clone(&transport_layer);
+        let transmission_layer = Arc::clone(&transmission_layer);
         async move {
             let _event_guard = events;
 
             tokio::select! {
                 () = write_shutdown.cancelled() => {
-                    transport_layer.send_fin_buf();
+                    transmission_layer.send_fin_buf();
                 }
-                () = transport_layer.some_error().cancelled() => (),
+                () = transmission_layer.some_error().cancelled() => (),
             }
             tokio::select! {
                 () = read_shutdown.cancelled() => (),
-                () = transport_layer.some_error().cancelled() => (),
+                () = transmission_layer.some_error().cancelled() => (),
             }
 
             tokio::select! {
-                () = transport_layer.recv_fin().cancelled() => (),
-                () = transport_layer.some_error().cancelled() => (),
+                () = transmission_layer.recv_fin().cancelled() => (),
+                () = transmission_layer.some_error().cancelled() => (),
                 () = tokio::time::sleep(Duration::from_secs(675)) => (),
             }
         }
     });
 
     let read = ReadSocket {
-        transport_layer: Arc::clone(&transport_layer),
+        transmission_layer: Arc::clone(&transmission_layer),
         _shutdown_guard: read_shutdown.drop_guard(),
     };
     let write = WriteSocket {
-        transport_layer: Arc::clone(&transport_layer),
+        transmission_layer: Arc::clone(&transmission_layer),
         data_buf: vec![0; BUF_SIZE],
         utp_buf: vec![0; BUF_SIZE],
         no_delay: true,
@@ -130,7 +130,7 @@ pub fn socket(
 
 #[derive(Debug)]
 pub struct ReadSocket {
-    transport_layer: Arc<TransportLayer>,
+    transmission_layer: Arc<TransmissionLayer>,
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl ReadSocket {
@@ -148,7 +148,7 @@ impl ReadSocket {
     /// }
     /// ```
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        self.transport_layer.recv(data).await
+        self.transmission_layer.recv(data).await
     }
 
     /// Undo this method:
@@ -165,7 +165,7 @@ impl ReadSocket {
 
 #[derive(Debug)]
 pub struct WriteSocket {
-    transport_layer: Arc<TransportLayer>,
+    transmission_layer: Arc<TransmissionLayer>,
     data_buf: Vec<u8>,
     utp_buf: Vec<u8>,
     no_delay: bool,
@@ -187,13 +187,13 @@ impl WriteSocket {
     /// }
     /// ```
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        self.transport_layer
+        self.transmission_layer
             .send(data, self.no_delay, &mut self.data_buf, &mut self.utp_buf)
             .await
     }
 
     pub fn is_send_buf_empty(&self) -> bool {
-        self.transport_layer
+        self.transmission_layer
             .reliable_layer()
             .lock()
             .unwrap()
@@ -201,7 +201,7 @@ impl WriteSocket {
     }
 
     pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
-        self.transport_layer.send_buf_empty().await
+        self.transmission_layer.send_buf_empty().await
     }
 
     /// Undo this method:
@@ -231,13 +231,13 @@ impl AsyncAsyncWrite for WriteSocket {
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
-        self.transport_layer.throw_error()?;
+        self.transmission_layer.throw_error()?;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
-        self.transport_layer.send_fin_buf();
-        self.transport_layer.no_data_to_send().await?;
+        self.transmission_layer.send_fin_buf();
+        self.transmission_layer.no_data_to_send().await?;
         Ok(())
     }
 }
@@ -385,9 +385,9 @@ mod tests {
         }
         let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
         let mut b = unsplit(b_r.into_async_read(), b_w.into_async_write());
-        let mut transport = JoinSet::new();
+        let mut transmission = JoinSet::new();
         let recv_all = Arc::new(tokio::sync::Notify::new());
-        transport.spawn({
+        transmission.spawn({
             let send_buf = send_buf.clone();
             let recv_all = recv_all.clone();
             async move {
@@ -397,12 +397,12 @@ mod tests {
                 recv_all.await;
             }
         });
-        transport.spawn(async move {
+        transmission.spawn(async move {
             b.read_exact(&mut recv_buf).await.unwrap();
             assert_eq!(send_buf, recv_buf);
             recv_all.notify_waiters();
         });
-        while let Some(res) = transport.join_next().await {
+        while let Some(res) = transmission.join_next().await {
             res.unwrap();
         }
     }

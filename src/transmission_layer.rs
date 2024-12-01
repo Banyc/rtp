@@ -21,7 +21,7 @@ const MIN_NO_RESP_FOR: Duration = Duration::from_secs(1);
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
 #[derive(Debug)]
-pub struct TransportLayer {
+pub struct TransmissionLayer {
     utp_read: tokio::sync::Mutex<Box<dyn UnreliableRead>>,
     utp_write: Box<dyn UnreliableWrite>,
     reliable_layer: Mutex<ReliableLayer>,
@@ -32,7 +32,7 @@ pub struct TransportLayer {
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
 }
-impl TransportLayer {
+impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let now = Instant::now();
         let reliable_layer = Mutex::new(ReliableLayer::new(unreliable_layer.mss, now));
@@ -54,9 +54,9 @@ impl TransportLayer {
             utp_read: tokio::sync::Mutex::new(unreliable_layer.utp_read),
             utp_write: unreliable_layer.utp_write,
             reliable_layer,
-            sent_data_pkt: sent_data_pkt,
-            recv_data_pkt: recv_data_pkt,
-            sent_pkt_acked: sent_pkt_acked,
+            sent_data_pkt,
+            recv_data_pkt,
+            sent_pkt_acked,
             recv_fin,
             first_error,
             reliable_layer_logger,

@@ -5,25 +5,25 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
 use tokio_util::bytes::Buf;
-use udp_listener::{ConnWrite, Packet, UdpListener};
+use udp_listener::{ConnWrite, Packet, UtpListener};
 
 use crate::{
     socket::{socket, ReadSocket, WriteSocket},
-    transport_layer::{UnreliableLayer, UnreliableWrite},
+    transmission_layer::{UnreliableLayer, UnreliableWrite},
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub struct Server<K> {
-    listener: UdpListener<K, Packet>,
+    listener: UtpListener<UdpSocket, K, Packet>,
     local_addr: SocketAddr,
 }
 impl<K: DispatchKey> Server<K> {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let local_addr = udp.local_addr()?;
-        let listener = UdpListener::new(
+        let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
             Arc::new(dispatch),
@@ -38,7 +38,7 @@ impl<K: DispatchKey> Server<K> {
         self.local_addr
     }
 
-    /// Side-effect: same as [`udp_listener::UdpListener::accept()`]
+    /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
     pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted<K>> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
@@ -66,7 +66,7 @@ pub struct Accepted<K> {
 
 #[derive(Debug)]
 pub struct Client<K> {
-    listener: UdpListener<K, Packet>,
+    listener: UtpListener<UdpSocket, K, Packet>,
 }
 impl<K: DispatchKey> Client<K> {
     pub async fn connect_without_handshake(
@@ -75,7 +75,7 @@ impl<K: DispatchKey> Client<K> {
     ) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(bind).await?;
         udp.connect(server).await?;
-        let listener = UdpListener::new(
+        let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
             Arc::new(dispatch),
@@ -83,7 +83,7 @@ impl<K: DispatchKey> Client<K> {
         Ok(Self { listener })
     }
 
-    /// Side-effect: same as [`udp_listener::UdpListener::accept()`]
+    /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
     pub async fn dispatch(&self) -> std::io::Result<()> {
         loop {
             let _ = self.listener.accept().await?;
@@ -111,12 +111,12 @@ pub struct Connected {
 
 #[derive(Debug)]
 pub struct KeyedConnWrite {
-    write: ConnWrite,
+    write: ConnWrite<UdpSocket>,
     buf: tokio::sync::Mutex<Vec<u8>>,
     data_offset: usize,
 }
 impl KeyedConnWrite {
-    pub fn new<K: DispatchKey>(write: ConnWrite, conn_key: &K) -> Self {
+    pub fn new<K: DispatchKey>(write: ConnWrite<UdpSocket>, conn_key: &K) -> Self {
         let mut buf = vec![];
         let n = K::max_size();
         let fill = (0..n).map(|_| 0);
