@@ -233,6 +233,24 @@ impl PktSendSpace {
         self.send_wnd.is_empty()
     }
 
+    pub fn cwnd_stats(&self, now: Instant) -> CwndStats {
+        let mut not_lost = 0;
+        let mut all_lost_pkts_rtxed = true;
+        for p in Self::unacked(&self.send_wnd)
+            .map(|(_, v)| v)
+            .take(self.cwnd.get())
+        {
+            if p.hits_rto(now) {
+                all_lost_pkts_rtxed = false;
+            } else {
+                not_lost += 1;
+            }
+        }
+        CwndStats {
+            all_lost_pkts_rtxed,
+            num_not_lost_txing_pkts: not_lost,
+        }
+    }
     pub fn all_lost_pkts_rtxed(&self, now: Instant) -> bool {
         for p in Self::unacked(&self.send_wnd)
             .map(|(_, v)| v)
@@ -244,7 +262,6 @@ impl PktSendSpace {
         }
         true
     }
-
     pub fn num_not_lost_txing_pkts(&self, now: Instant) -> usize {
         let mut not_lost = 0;
         for p in Self::unacked(&self.send_wnd)
@@ -317,6 +334,12 @@ impl Default for PktSendSpace {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CwndStats {
+    pub all_lost_pkts_rtxed: bool,
+    pub num_not_lost_txing_pkts: usize,
 }
 
 #[derive(Debug, Clone)]

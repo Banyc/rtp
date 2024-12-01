@@ -131,7 +131,7 @@ impl ReliableLayer {
         write_bytes
     }
 
-    /// Move data from inner data buffer to inner pkt space and return one of the pkts if possible
+    /// Move data from inner data buffer to inner packet space and return one of the packets if possible
     pub fn send_data_pkt(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
 
@@ -277,7 +277,7 @@ impl ReliableLayer {
         self.recv_fin_buf
     }
 
-    /// Return data from the inner data buffer and inner pkt space
+    /// Return data from the inner data buffer and inner packet space
     ///
     /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
@@ -327,13 +327,14 @@ impl ReliableLayer {
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {
+        let cwnd_stats = self.pkt_send_space.cwnd_stats(now);
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
                 few_data_to_send: self.send_data_buf.len() < self.max_data_size_per_pkt(),
                 not_transmitting_a_packet: true,
                 cwnd_not_full: self.pkt_send_space.accepts_new_pkt(),
-                all_lost_packets_retransmitted: self.pkt_send_space.all_lost_pkts_rtxed(now),
-                pipe: self.pkt_send_space.num_not_lost_txing_pkts(now) as u64,
+                all_lost_packets_retransmitted: cwnd_stats.all_lost_pkts_rtxed,
+                pipe: cwnd_stats.num_not_lost_txing_pkts as u64,
             },
         );
     }
