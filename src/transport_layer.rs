@@ -14,9 +14,9 @@ use crate::{
     sack::{AckBall, AckBallSequence},
 };
 
-const PRINT_DEBUG_MESSAGES: bool = false;
+const PRINT_DEBUG_MSGS: bool = false;
 const MAX_NUM_ACK: usize = 64;
-const MIN_NO_RESPONSE_FOR: Duration = Duration::from_secs(1);
+const MIN_NO_RESP_FOR: Duration = Duration::from_secs(1);
 
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
@@ -25,9 +25,9 @@ pub struct TransportLayer {
     utp_read: tokio::sync::Mutex<Box<dyn UnreliableRead>>,
     utp_write: Box<dyn UnreliableWrite>,
     reliable_layer: Mutex<ReliableLayer>,
-    sent_data_packet: tokio::sync::Notify,
-    recv_data_packet: tokio::sync::Notify,
-    sent_packet_acked: tokio::sync::Notify,
+    sent_data_pkt: tokio::sync::Notify,
+    recv_data_pkt: tokio::sync::Notify,
+    sent_pkt_acked: tokio::sync::Notify,
     recv_fin: tokio_util::sync::CancellationToken,
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
@@ -36,9 +36,9 @@ impl TransportLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let now = Instant::now();
         let reliable_layer = Mutex::new(ReliableLayer::new(unreliable_layer.mss, now));
-        let sent_data_packet = tokio::sync::Notify::new();
-        let recv_data_packet = tokio::sync::Notify::new();
-        let sent_packet_acked = tokio::sync::Notify::new();
+        let sent_data_pkt = tokio::sync::Notify::new();
+        let recv_data_pkt = tokio::sync::Notify::new();
+        let sent_pkt_acked = tokio::sync::Notify::new();
         let recv_fin = tokio_util::sync::CancellationToken::new();
         let first_error = FirstError::new();
         let reliable_layer_logger = log_config.as_ref().map(|c| {
@@ -54,9 +54,9 @@ impl TransportLayer {
             utp_read: tokio::sync::Mutex::new(unreliable_layer.utp_read),
             utp_write: unreliable_layer.utp_write,
             reliable_layer,
-            sent_data_packet,
-            recv_data_packet,
-            sent_packet_acked,
+            sent_data_pkt: sent_data_pkt,
+            recv_data_pkt: recv_data_pkt,
+            sent_pkt_acked: sent_pkt_acked,
             recv_fin,
             first_error,
             reliable_layer_logger,
@@ -71,17 +71,17 @@ impl TransportLayer {
     ///
     /// It is cancel safe.
     pub async fn no_data_to_send(&self) -> Result<(), std::io::ErrorKind> {
-        let mut sent_packet_acked = self.sent_packet_acked.notified();
+        let mut sent_pkt_acked = self.sent_pkt_acked.notified();
         loop {
             self.first_error.throw_error()?;
             if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
                 return Ok(());
             }
             tokio::select! {
-                () = sent_packet_acked => (),
+                () = sent_pkt_acked => (),
                 () = self.first_error.some().cancelled() => (),
             }
-            sent_packet_acked = self.sent_packet_acked.notified();
+            sent_pkt_acked = self.sent_pkt_acked.notified();
         }
     }
 
@@ -89,17 +89,17 @@ impl TransportLayer {
     ///
     /// It is cancel safe.
     pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
-        let mut sent_data_packet = self.sent_data_packet.notified();
+        let mut sent_data_pkt = self.sent_data_pkt.notified();
         loop {
             self.first_error.throw_error()?;
             if self.reliable_layer.lock().unwrap().is_send_buf_empty() {
                 return Ok(());
             }
             tokio::select! {
-                () = sent_data_packet => (),
+                () = sent_data_pkt => (),
                 () = self.first_error.some().cancelled() => (),
             }
-            sent_data_packet = self.sent_data_packet.notified();
+            sent_data_pkt = self.sent_data_pkt.notified();
         }
     }
 
@@ -119,36 +119,29 @@ impl TransportLayer {
         self.first_error.throw_error()
     }
 
-    pub async fn send_kill_packet(&self) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_kill_pkt(&self) -> Result<(), std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
         self.utp_write.send(&buf).await?;
         Ok(())
     }
 
-    pub async fn send_packets(
+    pub async fn send_pkts(
         &self,
         data_buf: &mut [u8],
         utp_buf: &mut [u8],
     ) -> Result<(), std::io::ErrorKind> {
         let detect_broken_pipe_proactively = || {
             let reliable_layer = self.reliable_layer.lock().unwrap();
-            let Some(no_response_for) = reliable_layer
-                .packet_send_space()
-                .no_response_for(Instant::now())
+            let Some(no_resp_for) = reliable_layer.pkt_send_space().no_resp_for(Instant::now())
             else {
                 return;
             };
-            if no_response_for
-                < reliable_layer
-                    .packet_send_space()
-                    .rto_duration()
-                    .mul_f64(16.0)
-            {
+            if no_resp_for < reliable_layer.pkt_send_space().rto_duration().mul_f64(16.0) {
                 return;
             }
             // Avoid triggering broken pipe errors during inter-process data transfer.
-            if no_response_for < MIN_NO_RESPONSE_FOR {
+            if no_resp_for < MIN_NO_RESP_FOR {
                 return;
             }
             self.first_error.set(std::io::ErrorKind::BrokenPipe);
@@ -162,18 +155,18 @@ impl TransportLayer {
             // reliable -{data}> UDP remote
             let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_packet(data_buf, Instant::now())
+                reliable_layer.send_data_pkt(data_buf, Instant::now())
             };
-            self.log("send_data_packet");
+            self.log("send_data_pkt");
             let Some(p) = res else {
                 break;
             };
             let data_written = match p.data_written {
-                crate::reliable_layer::DataPacketPayload::Data(data_written) => {
+                crate::reliable_layer::DataPktPayload::Data(data_written) => {
                     written_bytes += data_written.get();
                     data_written.get()
                 }
-                crate::reliable_layer::DataPacketPayload::Fin => {
+                crate::reliable_layer::DataPktPayload::Fin => {
                     written_fin = true;
                     0
                 }
@@ -190,25 +183,25 @@ impl TransportLayer {
             return Err(e);
         }
         if 0 < written_bytes || written_fin {
-            if PRINT_DEBUG_MESSAGES {
-                println!("send_packets: {{ data: {written_bytes}; fin: {written_fin} }}");
+            if PRINT_DEBUG_MSGS {
+                println!("send_pkts: {{ data: {written_bytes}; fin: {written_fin} }}");
             }
-            self.sent_data_packet.notify_waiters();
+            self.sent_data_pkt.notify_waiters();
         }
         Ok(())
     }
 
-    pub async fn recv_packets(
+    pub async fn recv_pkts(
         &self,
         utp_buf: &mut [u8],
         ack_from_peer_buf: &mut Vec<AckBall>,
         ack_to_peer_buf: &mut Vec<u64>,
-    ) -> Result<RecvPackets, std::io::ErrorKind> {
+    ) -> Result<RecvPkts, std::io::ErrorKind> {
         let throw_error = |e: std::io::ErrorKind| {
             self.first_error.set(e);
             e
         };
-        let mut recv_packets = RecvPackets {
+        let mut recv_pkts = RecvPkts {
             num_ack_segments: 0,
             num_payload_segments: 0,
             num_fin_segments: 0,
@@ -238,8 +231,8 @@ impl TransportLayer {
                     return Err(throw_error(e));
                 }
             };
-            if PRINT_DEBUG_MESSAGES {
-                println!("recv_packets: recv: {read_bytes}");
+            if PRINT_DEBUG_MSGS {
+                println!("recv_pkts: recv: {read_bytes}");
             }
 
             ack_from_peer_buf.clear();
@@ -258,25 +251,25 @@ impl TransportLayer {
             let mut reliable_layer = self.reliable_layer.lock().unwrap();
 
             // UDP local -{ACK}> reliable
-            reliable_layer.recv_ack_packet(AckBallSequence::new(ack_from_peer_buf), now);
-            recv_packets.num_ack_segments += 1;
-            self.sent_packet_acked.notify_waiters();
+            reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now);
+            recv_pkts.num_ack_segments += 1;
+            self.sent_pkt_acked.notify_waiters();
 
             let Some(data) = data.data else {
                 drop(reliable_layer);
-                self.log("recv_ack_packet");
+                self.log("recv_ack_pkt");
                 continue;
             };
 
             // UDP local -{data}> reliable
-            let ack = reliable_layer.recv_data_packet(data.seq, &utp_buf[data.buf_range.clone()]);
+            let ack = reliable_layer.recv_data_pkt(data.seq, &utp_buf[data.buf_range.clone()]);
             drop(reliable_layer);
             if data.buf_range.is_empty() {
-                recv_packets.num_fin_segments += 1;
+                recv_pkts.num_fin_segments += 1;
             } else {
-                recv_packets.num_payload_segments += 1;
+                recv_pkts.num_payload_segments += 1;
             }
-            self.log("recv_data_packet");
+            self.log("recv_data_pkt");
             match ack {
                 true => {
                     ack_to_peer_buf.push(data.seq);
@@ -287,17 +280,17 @@ impl TransportLayer {
 
         // No new data received in the reliable layer
         if ack_to_peer_buf.is_empty() {
-            return Ok(recv_packets);
+            return Ok(recv_pkts);
         }
 
-        self.recv_data_packet.notify_waiters();
+        self.recv_data_pkt.notify_waiters();
 
         // reliable -{ACK}> UDP remote
         let written_bytes = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
-            let packet_recv_space = reliable_layer.packet_recv_space();
+            let pkt_recv_space = reliable_layer.pkt_recv_space();
             let ack = EncodeAck {
-                queue: packet_recv_space.ack_history(),
+                queue: pkt_recv_space.ack_history(),
                 skip: 0,
                 max_take: MAX_NUM_ACK,
             };
@@ -307,11 +300,11 @@ impl TransportLayer {
             .send(&utp_buf[..written_bytes])
             .await
             .map_err(throw_error)?;
-        if PRINT_DEBUG_MESSAGES {
-            println!("recv_packets: ack: {ack_to_peer_buf:?}");
+        if PRINT_DEBUG_MSGS {
+            println!("recv_pkts: ack: {ack_to_peer_buf:?}");
         }
 
-        Ok(recv_packets)
+        Ok(recv_pkts)
     }
 
     pub async fn send(
@@ -321,7 +314,7 @@ impl TransportLayer {
         data_buf: &mut [u8],
         utp_buf: &mut [u8],
     ) -> Result<usize, std::io::ErrorKind> {
-        let mut sent_data_packet = self.sent_data_packet.notified();
+        let mut sent_data_pkt = self.sent_data_pkt.notified();
         let written_bytes = loop {
             self.first_error.throw_error()?;
             let written_bytes = {
@@ -331,24 +324,24 @@ impl TransportLayer {
             self.log("send_data_buf");
 
             if no_delay {
-                self.send_packets(data_buf, utp_buf).await?;
+                self.send_pkts(data_buf, utp_buf).await?;
             }
 
             if 0 < written_bytes {
                 break written_bytes;
             }
             tokio::select! {
-                () = sent_data_packet => (),
+                () = sent_data_pkt => (),
                 () = self.first_error.some().cancelled() => (),
             }
-            sent_data_packet = self.sent_data_packet.notified();
+            sent_data_pkt = self.sent_data_pkt.notified();
         };
         Ok(written_bytes)
     }
 
     /// Return `Ok(0)` when the read stream hits EOF
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        let mut recv_data_packet = self.recv_data_packet.notified();
+        let mut recv_data_pkt = self.recv_data_pkt.notified();
         let read_bytes = loop {
             self.first_error.throw_error()?;
 
@@ -365,7 +358,7 @@ impl TransportLayer {
                 )
             };
             self.log("recv_data_buf");
-            if PRINT_DEBUG_MESSAGES {
+            if PRINT_DEBUG_MSGS {
                 println!("recv: data: {read_bytes}");
             }
             if 0 < read_bytes {
@@ -376,10 +369,10 @@ impl TransportLayer {
                 continue;
             }
             tokio::select! {
-                () = recv_data_packet => (),
+                () = recv_data_pkt => (),
                 () = self.first_error.some().cancelled() => (),
             }
-            recv_data_packet = self.recv_data_packet.notified();
+            recv_data_pkt = self.recv_data_pkt.notified();
         };
         Ok(read_bytes)
     }
@@ -426,7 +419,7 @@ pub struct UnreliableLayer {
 }
 
 #[derive(Debug, Clone)]
-pub struct RecvPackets {
+pub struct RecvPkts {
     pub num_ack_segments: usize,
     pub num_payload_segments: usize,
     pub num_fin_segments: usize,

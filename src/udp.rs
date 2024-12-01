@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub const MSS: usize = 1424;
-const DISPATCHER_BUFFER_SIZE: usize = 1024;
+const DISPATCHER_BUF_SIZE: usize = 1024;
 
 type IdentityUdpListener = UdpListener<SocketAddr, Packet>;
 type IdentityConn = Conn<SocketAddr, Packet>;
@@ -30,7 +30,7 @@ impl Listener {
         let local_addr = udp.local_addr()?;
         let listener = UdpListener::new_identity_dispatch(
             udp,
-            NonZeroUsize::new(DISPATCHER_BUFFER_SIZE).unwrap(),
+            NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
         );
         Ok(Self {
             listener,
@@ -49,7 +49,7 @@ impl Listener {
         accept(accepted, handshake).await
     }
 
-    /// Side-effect: This method also dispatches packets to all the accepted UDP sockets.
+    /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
     pub async fn accept(&self) -> std::io::Result<Handshake> {

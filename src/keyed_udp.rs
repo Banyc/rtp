@@ -12,7 +12,7 @@ use crate::{
     transport_layer::{UnreliableLayer, UnreliableWrite},
 };
 
-const DISPATCHER_BUFFER_SIZE: usize = 1024;
+const DISPATCHER_BUF_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub struct Server<K> {
@@ -25,7 +25,7 @@ impl<K: DispatchKey> Server<K> {
         let local_addr = udp.local_addr()?;
         let listener = UdpListener::new(
             udp,
-            NonZeroUsize::new(DISPATCHER_BUFFER_SIZE).unwrap(),
+            NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
             Arc::new(dispatch),
         );
         Ok(Self {
@@ -77,7 +77,7 @@ impl<K: DispatchKey> Client<K> {
         udp.connect(server).await?;
         let listener = UdpListener::new(
             udp,
-            NonZeroUsize::new(DISPATCHER_BUFFER_SIZE).unwrap(),
+            NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
             Arc::new(dispatch),
         );
         Ok(Self { listener })
@@ -243,10 +243,10 @@ impl DispatchKey for u128 {
     }
 }
 
-fn dispatch<K: DispatchKey>(_addr: SocketAddr, mut packet: Packet) -> Option<(K, Packet)> {
-    let (n, key) = K::decode(&packet)?;
-    packet.advance(n);
-    Some((key, packet))
+fn dispatch<K: DispatchKey>(_addr: SocketAddr, mut pkt: Packet) -> Option<(K, Packet)> {
+    let (n, key) = K::decode(&pkt)?;
+    pkt.advance(n);
+    Some((key, pkt))
 }
 
 #[cfg(test)]

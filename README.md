@@ -7,8 +7,8 @@ A userspace reliable transport protocol whose congestion window is governed only
 - an async-free reliable layer
   - a piece of pure algorithm
   - main entry: [[src/reliable_layer.rs]]
-  - send window: [[src/packet_send_space.rs]]
-  - recv window: [[src/packet_recv_space.rs]]
+  - send window: [[src/pkt_send_space.rs]]
+  - recv window: [[src/pkt_recv_space.rs]]
   - send rate limiter: [[src/token_bucket.rs]]
   - SACK managing: [[src/sack.rs]]
 - a dead simple codec for packet encoding/decoding

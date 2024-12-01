@@ -76,7 +76,7 @@ pub struct EncodeData<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Decoded {
-    pub data: Option<DecodedDataPacket>,
+    pub data: Option<DecodedDataPkt>,
     /// broken pipe
     pub killed: bool,
 }
@@ -137,7 +137,7 @@ fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result
     Ok(())
 }
 
-fn decode_data(rdr: &mut io::Cursor<&[u8]>) -> Result<DecodedDataPacket, DecodeError> {
+fn decode_data(rdr: &mut io::Cursor<&[u8]>) -> Result<DecodedDataPkt, DecodeError> {
     let seq = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
     let len = rdr.read_u16::<BigEndian>().pipe(wrap_corrupted_err)?;
     let end = usize::try_from(rdr.position()).unwrap() + usize::from(len);
@@ -145,13 +145,13 @@ fn decode_data(rdr: &mut io::Cursor<&[u8]>) -> Result<DecodedDataPacket, DecodeE
         return Err(DecodeError::Corrupted);
     }
     let start = rdr.position() as usize;
-    Ok(DecodedDataPacket {
+    Ok(DecodedDataPkt {
         seq,
         buf_range: start..end,
     })
 }
 #[derive(Debug, Clone)]
-pub struct DecodedDataPacket {
+pub struct DecodedDataPkt {
     pub seq: u64,
     pub buf_range: std::ops::Range<usize>,
 }

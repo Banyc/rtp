@@ -19,20 +19,20 @@ use primitive::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::data_overhead, packet_recv_space::PacketRecvSpace, packet_send_space::PacketSendSpace,
+    codec::data_overhead, pkt_recv_space::PktRecvSpace, pkt_send_space::PktSendSpace,
     sack::AckBallSequence,
 };
 
-const SEND_DATA_BUFFER_LENGTH: usize = 2 << 16;
-const RECV_DATA_BUFFER_LENGTH: usize = 2 << 16;
-const MAX_BURST_PACKETS: usize = 64;
+const SEND_DATA_BUF_LEN: usize = 2 << 16;
+const RECV_DATA_BUF_LEN: usize = 2 << 16;
+const MAX_BURST_PKTS: usize = 64;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 const INIT_SEND_RATE: f64 = 128.;
 const SEND_RATE_PROBE_RATE: f64 = 1.;
 const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
-const PRINT_DEBUG_MESSAGES: bool = false;
+const PRINT_DEBUG_MSGS: bool = false;
 
 static GLOBAL_INIT_SEND_RATE: LazyLock<Arc<SpinMutex<PosR<f64>>>> =
     LazyLock::new(|| Arc::new(SpinMutex::new(PosR::new(INIT_SEND_RATE).unwrap())));
@@ -54,15 +54,15 @@ pub struct ReliableLayer {
     recv_fin_buf: bool,
     token_bucket: TokenBucket,
     connection_stats: ConnectionState,
-    packet_send_space: PacketSendSpace,
-    packet_recv_space: PacketRecvSpace,
+    pkt_send_space: PktSendSpace,
+    pkt_recv_space: PktRecvSpace,
     send_rate: PosR<f64>,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
 
     // Reused buffers
-    packet_stats_buf: Vec<PacketState>,
-    packet_buf: Vec<dre::Packet>,
+    pkt_stats_buf: Vec<PacketState>,
+    pkt_buf: Vec<dre::Packet>,
 }
 impl ReliableLayer {
     pub fn new(mss: NonZeroUsize, now: Instant) -> Self {
@@ -70,28 +70,28 @@ impl ReliableLayer {
         let send_rate = *init_send_rate.lock();
         Self {
             mss,
-            send_data_buf: CapVecQueue::new_vec(SEND_DATA_BUFFER_LENGTH),
+            send_data_buf: CapVecQueue::new_vec(SEND_DATA_BUF_LEN),
             send_fin_buf: SendFinBuf::Empty,
-            recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUFFER_LENGTH),
+            recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUF_LEN),
             recv_fin_buf: false,
             token_bucket: TokenBucket::new(
                 send_rate,
-                NonZeroUsize::new(MAX_BURST_PACKETS).unwrap(),
+                NonZeroUsize::new(MAX_BURST_PKTS).unwrap(),
                 now,
             ),
             connection_stats: ConnectionState::new(now),
-            packet_send_space: PacketSendSpace::new(),
-            packet_recv_space: PacketRecvSpace::new(),
+            pkt_send_space: PktSendSpace::new(),
+            pkt_recv_space: PktRecvSpace::new(),
             send_rate,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
-            packet_stats_buf: Vec::new(),
-            packet_buf: Vec::new(),
+            pkt_stats_buf: Vec::new(),
+            pkt_buf: Vec::new(),
         }
     }
 
     pub fn is_no_data_to_send(&self) -> bool {
-        self.is_send_buf_empty() && self.packet_send_space.num_transmitting_packets() == 0
+        self.is_send_buf_empty() && self.pkt_send_space.num_txing_pkts() == 0
     }
 
     pub fn is_send_buf_empty(&self) -> bool {
@@ -102,12 +102,12 @@ impl ReliableLayer {
             )
     }
 
-    pub fn packet_send_space(&self) -> &PacketSendSpace {
-        &self.packet_send_space
+    pub fn pkt_send_space(&self) -> &PktSendSpace {
+        &self.pkt_send_space
     }
 
-    pub fn packet_recv_space(&self) -> &PacketRecvSpace {
-        &self.packet_recv_space
+    pub fn pkt_recv_space(&self) -> &PktRecvSpace {
+        &self.pkt_recv_space
     }
 
     pub fn token_bucket(&self) -> &TokenBucket {
@@ -131,20 +131,20 @@ impl ReliableLayer {
         write_bytes
     }
 
-    /// Move data from inner data buffer to inner packet space and return one of the packets if possible
-    pub fn send_data_packet(&mut self, packet: &mut [u8], now: Instant) -> Option<DataPacket> {
+    /// Move data from inner data buffer to inner pkt space and return one of the pkts if possible
+    pub fn send_data_pkt(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
 
         // backoff on unrecovered huge data loss
         let mut f = || {
             let huge_data_loss = self
-                .packet_send_space
+                .pkt_send_space
                 .huge_data_loss(UnitR::new(MAX_DATA_LOSS_RATE).unwrap(), now);
             if !huge_data_loss {
                 self.huge_data_loss_timer.clear();
                 return;
             }
-            let at_least_for = self.packet_send_space.rto_duration().mul_f64(2.);
+            let at_least_for = self.pkt_send_space.rto_duration().mul_f64(2.);
             let (set_off, _) = self
                 .huge_data_loss_timer
                 .ensure_started_and_check(at_least_for, now);
@@ -162,28 +162,28 @@ impl ReliableLayer {
             return None;
         }
 
-        if let Some(p) = self.packet_send_space.retransmit(now) {
-            packet[..p.data.len()].copy_from_slice(p.data);
+        if let Some(p) = self.pkt_send_space.rtx(now) {
+            pkt[..p.data.len()].copy_from_slice(p.data);
 
             let data_written = NonZeroUsize::new(p.data.len())
-                .map(DataPacketPayload::Data)
-                .unwrap_or(DataPacketPayload::Fin);
-            return Some(DataPacket {
+                .map(DataPktPayload::Data)
+                .unwrap_or(DataPktPayload::Fin);
+            return Some(DataPkt {
                 seq: p.seq,
                 data_written,
             });
         }
 
         // insufficient cwnd
-        if !self.packet_send_space.accepts_new_packet() {
+        if !self.pkt_send_space.accepts_new_pkt() {
             return None;
         }
 
-        let packet_bytes = packet
+        let pkt_bytes = pkt
             .len()
-            .min(self.max_data_size_per_packet())
+            .min(self.max_data_size_per_pkt())
             .min(self.send_data_buf.len());
-        let packet_bytes = match (NonZeroUsize::new(packet_bytes), &self.send_fin_buf) {
+        let pkt_bytes = match (NonZeroUsize::new(pkt_bytes), &self.send_fin_buf) {
             (Some(x), _) => x.get(),
             (None, SendFinBuf::Some) => {
                 self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
@@ -194,51 +194,49 @@ impl ReliableLayer {
 
         let stats = self
             .connection_stats
-            .send_packet_2(now, self.packet_send_space.no_packets_in_flight());
+            .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
 
-        let mut buf = self.packet_send_space.reused_buf().take();
-        self.send_data_buf
-            .batch_dequeue_extend(packet_bytes, &mut buf);
+        let mut buf = self.pkt_send_space.reused_buf().take();
+        self.send_data_buf.batch_dequeue_extend(pkt_bytes, &mut buf);
         let data = buf;
 
-        packet[..data.len()].copy_from_slice(&data);
-        let p = self.packet_send_space.send(data, stats, now);
+        pkt[..data.len()].copy_from_slice(&data);
+        let p = self.pkt_send_space.send(data, stats, now);
 
-        let data_written = NonZeroUsize::new(packet_bytes)
-            .map(DataPacketPayload::Data)
-            .unwrap_or(DataPacketPayload::Fin);
-        Some(DataPacket {
+        let data_written = NonZeroUsize::new(pkt_bytes)
+            .map(DataPktPayload::Data)
+            .unwrap_or(DataPktPayload::Fin);
+        Some(DataPkt {
             seq: p.seq,
             data_written,
         })
     }
 
     /// Take ACKs from the unreliable layer
-    pub fn recv_ack_packet(
+    pub fn recv_ack_pkt(
         &mut self,
         ack: AckBallSequence<'_>,
         now: Instant,
     ) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
-        self.packet_send_space
-            .ack(ack, &mut self.packet_stats_buf, now);
+        self.pkt_send_space.ack(ack, &mut self.pkt_stats_buf, now);
 
-        while let Some(p) = self.packet_stats_buf.pop() {
-            self.packet_buf.push(dre::Packet {
+        while let Some(p) = self.pkt_stats_buf.pop() {
+            self.pkt_buf.push(dre::Packet {
                 state: p,
                 data_length: 1,
             })
         }
-        let min_rtt = self.packet_send_space.min_rtt()?;
+        let min_rtt = self.pkt_send_space.min_rtt()?;
         let sr = self
             .connection_stats
-            .sample_rate(&self.packet_buf, now, min_rtt);
-        self.packet_stats_buf.clear();
-        self.packet_buf.clear();
+            .sample_rate(&self.pkt_buf, now, min_rtt);
+        self.pkt_stats_buf.clear();
+        self.pkt_buf.clear();
 
         let sr = sr?;
-        if PRINT_DEBUG_MESSAGES {
+        if PRINT_DEBUG_MSGS {
             println!("{sr:?}");
         }
         self.prev_sample_rate = Some(sr.clone());
@@ -250,7 +248,7 @@ impl ReliableLayer {
 
     fn adjust_send_rate_exponential(&mut self, sr: &dre::RateSample, now: Instant) {
         let little_data_loss = self
-            .packet_send_space
+            .pkt_send_space
             .data_loss_rate(now)
             .map(|lr| lr < CC_DATA_LOSS_RATE);
         let should_probe = little_data_loss != Some(false);
@@ -279,7 +277,7 @@ impl ReliableLayer {
         self.recv_fin_buf
     }
 
-    /// Return data from the inner data buffer and inner packet space
+    /// Return data from the inner data buffer and inner pkt space
     ///
     /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
@@ -295,82 +293,78 @@ impl ReliableLayer {
         read_bytes
     }
 
-    /// Take a packet from the unreliable layer
+    /// Take a pkt from the unreliable layer
     ///
     /// Return `false` if the data is rejected due to window capacity
-    pub fn recv_data_packet(&mut self, seq: u64, packet: &[u8]) -> bool {
-        let mut buf = self.packet_recv_space.reused_buf().take();
-        buf.extend(packet);
-        if !self.packet_recv_space.recv(seq, buf) {
+    pub fn recv_data_pkt(&mut self, seq: u64, pkt: &[u8]) -> bool {
+        let mut buf = self.pkt_recv_space.reused_buf().take();
+        buf.extend(pkt);
+        if !self.pkt_recv_space.recv(seq, buf) {
             return false;
         }
         self.move_recv_data();
         true
     }
 
-    /// Move data from packet space to data buffer
+    /// Move data from pkt space to data buffer
     fn move_recv_data(&mut self) {
         if self.recv_fin_buf {
             return;
         }
-        while let Some(p) = self.packet_recv_space.peek() {
+        while let Some(p) = self.pkt_recv_space.peek() {
             if self.recv_data_buf.capacity() - self.recv_data_buf.len() < p.len() {
                 return;
             }
-            let p = self.packet_recv_space.pop().unwrap();
+            let p = self.pkt_recv_space.pop().unwrap();
             if p.is_empty() {
                 self.recv_fin_buf = true;
-                self.packet_recv_space.reused_buf().put(p);
+                self.pkt_recv_space.reused_buf().put(p);
                 return;
             }
             self.recv_data_buf.batch_enqueue(&p);
-            self.packet_recv_space.reused_buf().put(p);
+            self.pkt_recv_space.reused_buf().put(p);
         }
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
-                few_data_to_send: self.send_data_buf.len() < self.max_data_size_per_packet(),
+                few_data_to_send: self.send_data_buf.len() < self.max_data_size_per_pkt(),
                 not_transmitting_a_packet: true,
-                cwnd_not_full: self.packet_send_space.accepts_new_packet(),
-                all_lost_packets_retransmitted: self
-                    .packet_send_space
-                    .all_lost_packets_retransmitted(now),
-                pipe: self
-                    .packet_send_space
-                    .num_not_lost_transmitting_packets(now) as u64,
+                cwnd_not_full: self.pkt_send_space.accepts_new_pkt(),
+                all_lost_packets_retransmitted: self.pkt_send_space.all_lost_pkts_rtxed(now),
+                pipe: self.pkt_send_space.num_not_lost_txing_pkts(now) as u64,
             },
         );
     }
 
     fn set_send_rate(&mut self, send_rate: PosR<f64>, now: Instant) {
-        self.packet_send_space.set_send_rate(send_rate);
+        self.pkt_send_space.set_send_rate(send_rate);
         let send_rate = PosR::new(MIN_SEND_RATE).unwrap().max(send_rate);
         self.send_rate = send_rate;
         self.token_bucket.set_thruput(send_rate, now);
     }
 
-    fn max_data_size_per_packet(&self) -> usize {
+    fn max_data_size_per_pkt(&self) -> usize {
         self.mss.get().checked_sub(data_overhead()).unwrap()
     }
 
     pub fn log(&self) -> Log {
         let now = Instant::now();
-        let min_rtt = self.packet_send_space.min_rtt();
+        let min_rtt = self.pkt_send_space.min_rtt();
         Log {
             tokens: self.token_bucket.outdated_tokens(),
             send_rate: self.send_rate.get(),
-            loss_rate: self.packet_send_space.data_loss_rate(now),
-            num_tx_pkts: self.packet_send_space.num_transmitting_packets(),
-            num_pkts_in_pipe: self.packet_send_space.num_packets_in_pipe(),
-            num_rt_pkts: self.packet_send_space.num_retransmitted_packets(),
-            send_seq: self.packet_send_space.next_seq(),
+            loss_rate: self.pkt_send_space.data_loss_rate(now),
+            num_tx_pkts: self.pkt_send_space.num_txing_pkts(),
+            num_pkts_in_pipe: self.pkt_send_space.num_pkts_in_pipe(),
+            num_rt_pkts: self.pkt_send_space.num_rtxed_pkts(),
+            send_seq: self.pkt_send_space.next_seq(),
             min_rtt: min_rtt.map(|t| t.as_millis()),
-            rtt: self.packet_send_space.smooth_rtt().as_millis(),
-            cwnd: self.packet_send_space.cwnd().get(),
-            num_rx_pkts: self.packet_recv_space.num_received_packets(),
-            recv_seq: self.packet_recv_space.next_seq(),
+            rtt: self.pkt_send_space.smooth_rtt().as_millis(),
+            cwnd: self.pkt_send_space.cwnd().get(),
+            num_rx_pkts: self.pkt_recv_space.num_recved_pkts(),
+            recv_seq: self.pkt_recv_space.next_seq(),
             delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),
             app_limited: self.prev_sample_rate.as_ref().map(|sr| sr.is_app_limited()),
         }
@@ -378,12 +372,12 @@ impl ReliableLayer {
 }
 
 #[derive(Debug, Clone)]
-pub struct DataPacket {
+pub struct DataPkt {
     pub seq: u64,
-    pub data_written: DataPacketPayload,
+    pub data_written: DataPktPayload,
 }
 #[derive(Debug, Clone)]
-pub enum DataPacketPayload {
+pub enum DataPktPayload {
     Data(NonZeroUsize),
     Fin,
 }

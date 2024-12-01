@@ -4,12 +4,12 @@ use primitive::ops::float::NonNegR;
 
 /// ref: <https://datatracker.ietf.org/doc/html/rfc6298>
 #[derive(Debug, Clone)]
-pub struct RetransmissionTimer {
+pub struct RtxTimer {
     smooth_rtt: NonNegR<f64>,
     smooth_rtt_var: NonNegR<f64>,
     first_measured: bool,
 }
-impl RetransmissionTimer {
+impl RtxTimer {
     const MIN_RTO: Duration = Duration::from_secs(1);
     const K: f64 = 4.;
     const BETA: f64 = 1. / 4.;

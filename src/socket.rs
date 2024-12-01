@@ -15,7 +15,7 @@ use crate::{
 };
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
-const BUFFER_SIZE: usize = 1024 * 64;
+const BUF_SIZE: usize = 1024 * 64;
 
 pub type WriteStream = PollWrite<WriteSocket>;
 pub type ReadStream = PollRead<ReadSocket>;
@@ -40,8 +40,8 @@ pub fn socket(
     events.spawn({
         let transport_layer = Arc::clone(&transport_layer);
         async move {
-            let mut data_buf = vec![0; BUFFER_SIZE];
-            let mut utp_buf = vec![0; BUFFER_SIZE];
+            let mut data_buf = vec![0; BUF_SIZE];
+            let mut utp_buf = vec![0; BUF_SIZE];
             loop {
                 // tokio::time::sleep(TIMER_INTERVAL).await;
                 let next_poll_time = {
@@ -52,7 +52,7 @@ pub fn socket(
                 let poll_time = next_poll_time.min(fast_poll_time);
                 tokio::time::sleep_until(poll_time.into()).await;
                 if transport_layer
-                    .send_packets(&mut data_buf, &mut utp_buf)
+                    .send_pkts(&mut data_buf, &mut utp_buf)
                     .await
                     .is_err()
                 {
@@ -67,22 +67,22 @@ pub fn socket(
         let read_shutdown = read_shutdown.clone();
         let transport_layer = Arc::clone(&transport_layer);
         async move {
-            let mut utp_buf = vec![0; BUFFER_SIZE];
+            let mut utp_buf = vec![0; BUF_SIZE];
             let mut ack_from_peer_buf = vec![];
             let mut ack_to_peer_buf = vec![];
             loop {
-                // Read shutdown status must be checked before moving packets to the read buf
-                //   to prevent triggering sending kill packet when the read shuts down right after the packet moving.
+                // Read shutdown status must be checked before moving pkts to the read buf
+                //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
-                let Ok(recv_packets) = transport_layer
-                    .recv_packets(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
+                let Ok(recv_pkts) = transport_layer
+                    .recv_pkts(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
                 else {
                     return;
                 };
-                if is_read_shutdown && 0 < recv_packets.num_payload_segments {
-                    let _ = transport_layer.send_kill_packet().await;
+                if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
+                    let _ = transport_layer.send_kill_pkt().await;
                 }
             }
         }
@@ -120,8 +120,8 @@ pub fn socket(
     };
     let write = WriteSocket {
         transport_layer: Arc::clone(&transport_layer),
-        data_buf: vec![0; BUFFER_SIZE],
-        utp_buf: vec![0; BUFFER_SIZE],
+        data_buf: vec![0; BUF_SIZE],
+        utp_buf: vec![0; BUF_SIZE],
         no_delay: true,
         _shutdown_guard: write_shutdown.drop_guard(),
     };
@@ -261,14 +261,14 @@ pub async fn client_opening_handshake(
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
         let _ = unreliable.utp_write.send(&challenge).await?;
-        let mut response = [0; 1];
+        let mut resp = [0; 1];
         tokio::select! {
-            res = unreliable.utp_read.recv(&mut response) => {
+            res = unreliable.utp_read.recv(&mut resp) => {
                 res?;
             }
             () = tokio::time::sleep(INIT_CONNECT_RTO.mul_f64((i + 1) as f64)) => continue,
         }
-        if challenge == response {
+        if challenge == resp {
             break;
         }
     }
@@ -289,18 +289,18 @@ pub async fn server_opening_handshake(
     unreliable.utp_write.send(&challenge).await?;
 
     neg_challenge(&mut challenge);
-    let mut response = [0; 1];
+    let mut resp = [0; 1];
     let due = Instant::now() + INIT_CONNECT_RTO;
     loop {
         tokio::select! {
-            res = unreliable.utp_read.recv(&mut response) => {
+            res = unreliable.utp_read.recv(&mut resp) => {
                 res?;
             }
             () = tokio::time::sleep_until(due.into()) => {
                 return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
             }
         }
-        if challenge == response {
+        if challenge == resp {
             break;
         }
     }
@@ -351,7 +351,7 @@ mod tests {
         a_w.send(hello).await.unwrap();
         b_w.send(world).await.unwrap();
 
-        let mut recv_buf = [0; BUFFER_SIZE];
+        let mut recv_buf = [0; BUF_SIZE];
         a_r.recv(&mut recv_buf).await.unwrap();
         assert_eq!(&recv_buf[..world.len()], world);
         b_r.recv(&mut recv_buf).await.unwrap();

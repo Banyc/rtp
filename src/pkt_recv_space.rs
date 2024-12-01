@@ -8,21 +8,21 @@ use primitive::{
 
 use crate::sack::AckQueue;
 
-pub const MAX_NUM_RECEIVING_PACKETS: usize = 2 << 12;
+pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
 
 #[derive(Debug)]
-pub struct PacketRecvSpace {
-    receiving: SeqQueue<u64, Vec<u8>>,
+pub struct PktRecvSpace {
+    recving: SeqQueue<u64, Vec<u8>>,
     reused_buf: ObjPool<Vec<u8>>,
     ack_history: AckQueue,
 }
-impl PacketRecvSpace {
+impl PktRecvSpace {
     pub fn new() -> Self {
-        let mut receiving = SeqQueue::new(NonZeroUsize::new(MAX_NUM_RECEIVING_PACKETS).unwrap());
-        receiving.set_next(0, |_| {});
+        let mut recving = SeqQueue::new(NonZeroUsize::new(MAX_NUM_RECVING_PKTS).unwrap());
+        recving.set_next(0, |_| {});
         Self {
-            receiving,
-            reused_buf: buf_pool(Some(MAX_NUM_RECEIVING_PACKETS)),
+            recving,
+            reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             ack_history: AckQueue::new(),
         }
     }
@@ -32,11 +32,11 @@ impl PacketRecvSpace {
     }
 
     pub fn next_seq(&self) -> Option<u64> {
-        self.receiving.next().copied()
+        self.recving.next().copied()
     }
 
-    pub fn num_received_packets(&self) -> usize {
-        self.receiving.len()
+    pub fn num_recved_pkts(&self) -> usize {
+        self.recving.len()
     }
 
     pub fn reused_buf(&mut self) -> &mut ObjPool<Vec<u8>> {
@@ -45,12 +45,12 @@ impl PacketRecvSpace {
 
     /// Return `false` if the data is rejected due to window capacity
     pub fn recv(&mut self, seq: u64, data: Vec<u8>) -> bool {
-        if self.receiving.next().is_none() {
+        if self.recving.next().is_none() {
             self.reused_buf.put(data);
             return false;
         }
         let res = self
-            .receiving
+            .recving
             .insert(seq, data, |(_, data)| self.reused_buf.put(data));
         match res {
             SeqInsertResult::Stalled => {
@@ -68,16 +68,16 @@ impl PacketRecvSpace {
     }
 
     pub fn peek(&self) -> Option<&Vec<u8>> {
-        self.receiving.peek().map(|(_, value)| value)
+        self.recving.peek().map(|(_, value)| value)
     }
 
     pub fn pop(&mut self) -> Option<Vec<u8>> {
-        self.receiving
+        self.recving
             .pop(|(_, data)| self.reused_buf.put(data))
             .map(|(_, value)| value)
     }
 }
-impl Default for PacketRecvSpace {
+impl Default for PktRecvSpace {
     fn default() -> Self {
         Self::new()
     }
