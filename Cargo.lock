@@ -310,6 +310,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpudp"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/mpudp.git?tag=v0.0.3#6788babd52a88efbfdc1a6963b9a036df1bf4bd5"
+dependencies = [
+ "bytes",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.56)",
+ "rand",
+ "tokio",
+ "udp_listener",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -369,6 +381,16 @@ dependencies = [
 name = "primitive"
 version = "0.1.0"
 source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.55#57489ef98acfcfb819e048964805ef16a386787f"
+dependencies = [
+ "anyhow",
+ "num-traits",
+ "thiserror",
+]
+
+[[package]]
+name = "primitive"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.56#3565e3dba8702f5baa3d80ce94780770b369cfc9"
 dependencies = [
  "anyhow",
  "num-traits",
@@ -449,7 +471,8 @@ dependencies = [
  "csv",
  "dre",
  "file_transfer",
- "primitive",
+ "mpudp",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.56)",
  "rand",
  "self_assign",
  "serde",
@@ -624,7 +647,7 @@ version = "0.1.0"
 source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
 dependencies = [
  "bytes",
- "primitive",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
  "tokio",
 ]
 

@@ -1,8 +1,10 @@
+use std::num::NonZeroUsize;
+
 use clap::Parser;
 use file_transfer::FileTransferCommand;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpListener,
+    net::{lookup_host, TcpListener},
 };
 
 #[derive(Debug, Parser)]
@@ -39,6 +41,18 @@ async fn main() {
                 }
             });
             let accepted = accepted.await.unwrap().unwrap();
+            (
+                Box::new(accepted.read.into_async_read()),
+                Box::new(accepted.write.into_async_write()),
+            )
+        }
+        "rtpm" => {
+            let max_session_conns = NonZeroUsize::new(16).unwrap();
+            let socket_addrs = lookup_host(internet_address).await.unwrap();
+            let mut listener = rtp::mpudp::Listener::bind(socket_addrs, max_session_conns)
+                .await
+                .unwrap();
+            let accepted = listener.accept_without_handshake().await.unwrap();
             (
                 Box::new(accepted.read.into_async_read()),
                 Box::new(accepted.write.into_async_write()),
