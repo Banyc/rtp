@@ -53,6 +53,13 @@ async fn main() {
                 .await
                 .unwrap();
             let accepted = listener.accept_without_handshake().await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    if listener.accept_without_handshake().await.is_err() {
+                        break;
+                    }
+                }
+            });
             (
                 Box::new(accepted.read.into_async_read()),
                 Box::new(accepted.write.into_async_write()),
