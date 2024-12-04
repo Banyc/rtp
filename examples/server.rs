@@ -19,19 +19,22 @@ pub struct Cli {
 async fn main() {
     let args = Cli::parse();
 
-    let (protocol, internet_address) = args.listen.split_once("://").unwrap();
+    let (protocol, internet_addresses) = args.listen.split_once("://").unwrap();
+    let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();
     let (read, write): (
         Box<dyn AsyncRead + Unpin + Sync + Send + 'static>,
         Box<dyn AsyncWrite + Unpin + Sync + Send + 'static>,
     ) = match protocol {
         "tcp" => {
-            let listener = TcpListener::bind(internet_address).await.unwrap();
+            let listener = TcpListener::bind(internet_addresses[0]).await.unwrap();
             let (stream, _) = listener.accept().await.unwrap();
             let (read, write) = stream.into_split();
             (Box::new(read), Box::new(write))
         }
         "rtp" => {
-            let listener = rtp::udp::Listener::bind(internet_address).await.unwrap();
+            let listener = rtp::udp::Listener::bind(internet_addresses[0])
+                .await
+                .unwrap();
             let accepted = listener.accept().await.unwrap();
             tokio::spawn(async move {
                 loop {
@@ -48,10 +51,15 @@ async fn main() {
         }
         "rtpm" => {
             let max_session_conns = NonZeroUsize::new(16).unwrap();
-            let socket_addrs = lookup_host(internet_address).await.unwrap();
-            let mut listener = rtp::mpudp::Listener::bind(socket_addrs, max_session_conns)
-                .await
-                .unwrap();
+            let mut all_socket_addrs = vec![];
+            for internet_address in internet_addresses {
+                let socket_addrs = lookup_host(internet_address).await.unwrap();
+                all_socket_addrs.extend(socket_addrs);
+            }
+            let mut listener =
+                rtp::mpudp::Listener::bind(all_socket_addrs.into_iter(), max_session_conns)
+                    .await
+                    .unwrap();
             let accepted = listener.accept_without_handshake().await.unwrap();
             tokio::spawn(async move {
                 loop {
