@@ -1,6 +1,7 @@
 local NAME = "my_rtp"
+local DESCRIPTION = "my reliable transmission protocol"
 
-local rtp = Proto(NAME, NAME)
+local rtp = Proto(NAME, DESCRIPTION)
 
 local MAX_NUM_ACK = 64
 
