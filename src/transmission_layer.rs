@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::{decode, encode_ack_data, encode_kill, EncodeAck, EncodeData},
-    pkt_send_space::AckError,
     reliable_layer::ReliableLayer,
     sack::{AckBall, AckBallSequence},
 };
@@ -254,17 +253,7 @@ impl TransmissionLayer {
             let mut reliable_layer = self.reliable_layer.lock().unwrap();
 
             // UDP local -{ACK}> reliable
-            if let Err(e) =
-                reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now)
-            {
-                match e {
-                    AckError::PeerWaitingForAckedPkts => {
-                        let e = std::io::ErrorKind::BrokenPipe;
-                        throw_error(e);
-                        return Err((e, SendKillPkt::Yes));
-                    }
-                }
-            }
+            reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now);
             recv_pkts.num_ack_segments += 1;
             self.sent_pkt_acked.notify_waiters();
 

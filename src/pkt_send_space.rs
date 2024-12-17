@@ -97,19 +97,10 @@ impl PktSendSpace {
         Some(now.duration_since(self.resp_wait_start?))
     }
 
-    pub fn ack(
-        &mut self,
-        recved: AckBallSequence<'_>,
-        acked: &mut Vec<PacketState>,
-        now: Instant,
-    ) -> Result<(), AckError> {
-        let peer_waiting_for_acked_pkts = self
-            .send_wnd
-            .start()
-            .is_some_and(|&send_wnd_start| recved.first_unacked() < send_wnd_start);
-        if peer_waiting_for_acked_pkts {
-            return Err(AckError::PeerWaitingForAckedPkts);
-        }
+    pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+        let next_unacked = self.send_wnd.start().or(self.send_wnd.next()).copied();
+        let peer_waiting_for_acked_pkts =
+            next_unacked.is_some_and(|next_unacked| recved.first_unacked() < next_unacked);
         if let Some(seq) = recved.out_of_order_seq_end() {
             self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
@@ -138,12 +129,14 @@ impl PktSendSpace {
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
+        if peer_waiting_for_acked_pkts {
+            return;
+        }
         if self.send_wnd.is_empty() {
             self.resp_wait_start = None;
         } else {
             self.resp_wait_start = Some(now);
         }
-        Ok(())
     }
 
     pub fn accepts_new_pkt(&self) -> bool {
@@ -347,11 +340,6 @@ impl Default for PktSendSpace {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Debug, Clone)]
-pub enum AckError {
-    PeerWaitingForAckedPkts,
 }
 
 #[derive(Debug, Clone, Copy)]

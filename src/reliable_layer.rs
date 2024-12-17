@@ -19,9 +19,7 @@ use primitive::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::data_overhead,
-    pkt_recv_space::PktRecvSpace,
-    pkt_send_space::{AckError, PktSendSpace},
+    codec::data_overhead, pkt_recv_space::PktRecvSpace, pkt_send_space::PktSendSpace,
     sack::AckBallSequence,
 };
 
@@ -219,14 +217,13 @@ impl ReliableLayer {
         &mut self,
         recved: AckBallSequence<'_>,
         now: Instant,
-    ) -> Result<Option<dre::RateSample>, AckError> {
+    ) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
         self.pkt_send_space
-            .ack(recved, &mut self.pkt_stats_buf, now)?;
+            .ack(recved, &mut self.pkt_stats_buf, now);
 
-        let rs = self.update_rate_sample_on_ack(now);
-        Ok(rs)
+        self.update_rate_sample_on_ack(now)
     }
     fn update_rate_sample_on_ack(&mut self, now: Instant) -> Option<dre::RateSample> {
         while let Some(p) = self.pkt_stats_buf.pop() {
