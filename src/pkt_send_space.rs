@@ -106,7 +106,11 @@ impl PktSendSpace {
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
         recved.ack(&self.unacked_buf, &mut self.ack_buf);
-        let no_needed_ack_recved = !self.unacked_buf.is_empty() && self.ack_buf.is_empty();
+        let head_of_line_blocking = self.unacked_buf.first().is_some_and(|&unacked_first| {
+            self.ack_buf
+                .first()
+                .is_none_or(|&ack_first| unacked_first != ack_first)
+        });
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
@@ -127,7 +131,7 @@ impl PktSendSpace {
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
-        if no_needed_ack_recved {
+        if head_of_line_blocking {
             return;
         }
         if self.send_wnd.is_empty() {
