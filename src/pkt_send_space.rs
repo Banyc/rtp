@@ -97,7 +97,19 @@ impl PktSendSpace {
         Some(now.duration_since(self.resp_wait_start?))
     }
 
-    pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+    pub fn ack(
+        &mut self,
+        recved: AckBallSequence<'_>,
+        acked: &mut Vec<PacketState>,
+        now: Instant,
+    ) -> Result<(), AckError> {
+        let peer_waiting_for_acked_pkts = self
+            .send_wnd
+            .start()
+            .is_some_and(|&send_wnd_start| recved.first_unacked() < send_wnd_start);
+        if peer_waiting_for_acked_pkts {
+            return Err(AckError::PeerWaitingForAckedPkts);
+        }
         if let Some(seq) = recved.out_of_order_seq_end() {
             self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
@@ -106,11 +118,6 @@ impl PktSendSpace {
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
         recved.ack(&self.unacked_buf, &mut self.ack_buf);
-        let head_of_line_blocking = self.unacked_buf.first().is_some_and(|&unacked_first| {
-            self.ack_buf
-                .first()
-                .is_none_or(|&ack_first| unacked_first != ack_first)
-        });
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
@@ -131,14 +138,12 @@ impl PktSendSpace {
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
-        if head_of_line_blocking {
-            return;
-        }
         if self.send_wnd.is_empty() {
             self.resp_wait_start = None;
         } else {
             self.resp_wait_start = Some(now);
         }
+        Ok(())
     }
 
     pub fn accepts_new_pkt(&self) -> bool {
@@ -342,6 +347,11 @@ impl Default for PktSendSpace {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum AckError {
+    PeerWaitingForAckedPkts,
 }
 
 #[derive(Debug, Clone, Copy)]

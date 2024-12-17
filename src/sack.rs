@@ -71,6 +71,16 @@ impl<'a> AckBallSequence<'a> {
         Some(self.balls.last()?.start)
     }
 
+    pub fn first_unacked(&self) -> u64 {
+        let Some(first_acked) = self.balls.first() else {
+            return 0;
+        };
+        if first_acked.start != 0 {
+            return 0;
+        }
+        first_acked.start + first_acked.size.get()
+    }
+
     /// `unacked` must be in increasing order.
     pub fn ack(&self, unacked: &[u64], ack: &mut Vec<u64>) {
         if self.balls.is_empty() {

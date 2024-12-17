@@ -11,7 +11,7 @@ use tokio::task::JoinSet;
 
 use crate::{
     codec::in_cmd_space,
-    transmission_layer::{LogConfig, TransmissionLayer, UnreliableLayer},
+    transmission_layer::{LogConfig, SendKillPkt, TransmissionLayer, UnreliableLayer},
 };
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
@@ -75,11 +75,20 @@ pub fn socket(
                 //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
-                let Ok(recv_pkts) = transmission_layer
+                let recv_pkts = match transmission_layer
                     .recv_pkts(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
                     .await
-                else {
-                    return;
+                {
+                    Ok(recv_pkts) => recv_pkts,
+                    Err((_e, should_send_kill_pkt)) => {
+                        match should_send_kill_pkt {
+                            SendKillPkt::Yes => {
+                                let _ = transmission_layer.send_kill_pkt().await;
+                            }
+                            SendKillPkt::No => (),
+                        }
+                        return;
+                    }
                 };
                 if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
                     let _ = transmission_layer.send_kill_pkt().await;

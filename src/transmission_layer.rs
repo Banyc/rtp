@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::{decode, encode_ack_data, encode_kill, EncodeAck, EncodeData},
+    pkt_send_space::AckError,
     reliable_layer::ReliableLayer,
     sack::{AckBall, AckBallSequence},
 };
@@ -196,7 +197,7 @@ impl TransmissionLayer {
         utp_buf: &mut [u8],
         ack_from_peer_buf: &mut Vec<AckBall>,
         ack_to_peer_buf: &mut Vec<u64>,
-    ) -> Result<RecvPkts, std::io::ErrorKind> {
+    ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
         let throw_error = |e: std::io::ErrorKind| {
             self.first_error.set(e);
             e
@@ -209,7 +210,9 @@ impl TransmissionLayer {
 
         ack_to_peer_buf.clear();
         for _ in 0..MAX_NUM_ACK {
-            self.first_error.throw_error()?;
+            self.first_error
+                .throw_error()
+                .map_err(|e| (e, SendKillPkt::No))?;
             let res = {
                 let mut utp_read = self.utp_read.lock().await;
                 match ack_to_peer_buf.is_empty() {
@@ -228,7 +231,7 @@ impl TransmissionLayer {
             let read_bytes = match res {
                 Ok(x) => x,
                 Err(e) => {
-                    return Err(throw_error(e));
+                    return Err((throw_error(e), SendKillPkt::No));
                 }
             };
             if PRINT_DEBUG_MSGS {
@@ -244,14 +247,24 @@ impl TransmissionLayer {
             if data.killed {
                 let e = std::io::ErrorKind::BrokenPipe;
                 throw_error(e);
-                return Err(e);
+                return Err((e, SendKillPkt::No));
             }
 
             let now = Instant::now();
             let mut reliable_layer = self.reliable_layer.lock().unwrap();
 
             // UDP local -{ACK}> reliable
-            reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now);
+            if let Err(e) =
+                reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now)
+            {
+                match e {
+                    AckError::PeerWaitingForAckedPkts => {
+                        let e = std::io::ErrorKind::BrokenPipe;
+                        throw_error(e);
+                        return Err((e, SendKillPkt::Yes));
+                    }
+                }
+            }
             recv_pkts.num_ack_segments += 1;
             self.sent_pkt_acked.notify_waiters();
 
@@ -299,7 +312,8 @@ impl TransmissionLayer {
         self.utp_write
             .send(&utp_buf[..written_bytes])
             .await
-            .map_err(throw_error)?;
+            .map_err(throw_error)
+            .map_err(|e| (e, SendKillPkt::No))?;
         if PRINT_DEBUG_MSGS {
             println!("recv_pkts: ack: {ack_to_peer_buf:?}");
         }
@@ -423,6 +437,12 @@ pub struct RecvPkts {
     pub num_ack_segments: usize,
     pub num_payload_segments: usize,
     pub num_fin_segments: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum SendKillPkt {
+    Yes,
+    No,
 }
 
 #[async_trait]
