@@ -1,7 +1,7 @@
 [package]
 name = "rtp"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
@@ -11,7 +11,7 @@ csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
 mpudp = { git = "https://github.com/Banyc/mpudp.git", tag = "v0.0.3" }
 primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.56" }
-rand = "0.8"
+rand = "0.9"
 self_assign = { git = "https://github.com/Banyc/self_assign.git", tag = "v0.0.3" }
 serde = { version = "1", features = ["derive"] }
 tap = "1"

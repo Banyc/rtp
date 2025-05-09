@@ -11,7 +11,7 @@ use crate::{
 };
 
 pub const MSS: usize = 1400;
-const DISPATCHER_BUF_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1024) };
+const DISPATCHER_BUF_SIZE: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 #[derive(Debug)]
 pub struct Listener {

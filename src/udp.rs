@@ -6,7 +6,7 @@ use tokio::net::UdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
-    socket::{client_opening_handshake, server_opening_handshake, socket, ReadSocket, WriteSocket},
+    socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
     transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 

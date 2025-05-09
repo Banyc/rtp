@@ -2,11 +2,11 @@ use core::time::Duration;
 use std::{sync::Arc, time::Instant};
 
 use async_async_io::{
+    PollIo,
     read::{AsyncAsyncRead, PollRead},
     write::{AsyncAsyncWrite, PollWrite},
-    PollIo,
 };
-use rand::Rng;
+use rand::TryRngCore;
 use tokio::task::JoinSet;
 
 use crate::{
@@ -257,10 +257,10 @@ const INIT_CONNECT_RTO: Duration = Duration::from_secs(1);
 pub async fn client_opening_handshake(
     unreliable: &mut UnreliableLayer,
 ) -> Result<(), std::io::Error> {
-    let mut challenge = [0; 1];
+    let mut challenge: [u8; 1] = [0; 1];
     let mut rng = rand::rngs::OsRng;
     loop {
-        rng.fill(&mut challenge);
+        rng.try_fill_bytes(&mut challenge).unwrap();
         if !in_cmd_space(challenge[0]) {
             break;
         }

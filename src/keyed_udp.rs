@@ -8,7 +8,7 @@ use tokio_util::bytes::Buf;
 use udp_listener::{ConnWrite, Packet, UtpListener};
 
 use crate::{
-    socket::{socket, ReadSocket, WriteSocket},
+    socket::{ReadSocket, WriteSocket, socket},
     transmission_layer::{UnreliableLayer, UnreliableWrite},
 };
 

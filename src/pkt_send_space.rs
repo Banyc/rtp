@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use dre::PacketState;
 use primitive::{
-    arena::obj_pool::{buf_pool, ObjPool},
+    arena::obj_pool::{ObjPool, buf_pool},
     ops::{
         float::{PosR, UnitR},
         len::LenExt,
@@ -163,11 +163,10 @@ impl PktSendSpace {
             self.resp_wait_start = Some(now);
         }
 
-        let p = Pkt {
+        Pkt {
             seq: s,
             data: &self.send_wnd.get(&s).unwrap().as_ref().unwrap().data,
-        };
-        p
+        }
     }
 
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {

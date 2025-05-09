@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::{decode, encode_ack_data, encode_kill, EncodeAck, EncodeData},
+    codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
     reliable_layer::ReliableLayer,
     sack::{AckBall, AckBallSequence},
 };

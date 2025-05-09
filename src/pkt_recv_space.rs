@@ -1,7 +1,7 @@
 use core::num::NonZeroUsize;
 
 use primitive::{
-    arena::obj_pool::{buf_pool, ObjPool},
+    arena::obj_pool::{ObjPool, buf_pool},
     ops::len::Len,
     queue::seq_queue::{SeqInsertResult, SeqQueue},
 };
