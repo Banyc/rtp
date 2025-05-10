@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use mpudp::{conn::MpUdpConn, listen::MpUdpListener, read::MpUdpRead, write::MpUdpWrite};
 
 use crate::{
-    socket::{socket, ReadSocket, WriteSocket},
+    socket::{ReadSocket, WriteSocket, socket},
     transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::LogConfig,
 };
@@ -102,7 +102,7 @@ impl AtomicMpUdpWrite {
 }
 #[async_trait]
 impl UnreliableWrite for AtomicMpUdpWrite {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         let mut w = self.write.lock().await;
         w.send(buf).await.map_err(|e| e.kind())
     }

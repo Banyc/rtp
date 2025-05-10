@@ -1,16 +1,18 @@
 use core::{net::SocketAddr, num::NonZeroUsize};
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use fec::proto::{data_mss, symbol_size};
 use tokio::net::UdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
+    fec::{FecReader, FecReaderConfig, FecWriter, FecWriterConfig},
     socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
     transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
-pub const MSS: usize = 1424;
+pub const NO_FEC_MSS: usize = 1424;
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
 type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
@@ -43,19 +45,19 @@ impl Listener {
     }
 
     /// [`Self::accept()`] but without handshake
-    pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted> {
+    pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted> {
         let accepted = self.listener.accept().await?;
         let handshake = false;
-        accept(accepted, handshake).await
+        accept(accepted, handshake, fec).await
     }
 
     /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
-    pub async fn accept(&self) -> std::io::Result<Handshake> {
+    pub async fn accept(&self, fec: bool) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
         let handshake = true;
-        Ok(tokio::spawn(accept(accepted, handshake)))
+        Ok(tokio::spawn(accept(accepted, handshake, fec)))
     }
 }
 #[derive(Debug)]
@@ -64,14 +66,10 @@ pub struct Accepted {
     pub write: WriteSocket,
     pub peer_addr: SocketAddr,
 }
-async fn accept(accepted: IdentityConn, handshake: bool) -> std::io::Result<Accepted> {
+async fn accept(accepted: IdentityConn, handshake: bool, fec: bool) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
-    let mut unreliable_layer = UnreliableLayer {
-        utp_read: Box::new(read),
-        utp_write: Box::new(write),
-        mss: NonZeroUsize::new(MSS).unwrap(),
-    };
+    let mut unreliable_layer = wrap_fec(read, write, fec);
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -87,23 +85,26 @@ pub async fn connect_without_handshake(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
+    fec: bool,
 ) -> std::io::Result<Connected> {
     let handshake = false;
-    connect_(bind, addr, log_config, handshake).await
+    connect_(bind, addr, log_config, handshake, fec).await
 }
 pub async fn connect(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
+    fec: bool,
 ) -> std::io::Result<Connected> {
     let handshake = true;
-    connect_(bind, addr, log_config, handshake).await
+    connect_(bind, addr, log_config, handshake, fec).await
 }
 async fn connect_(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
     handshake: bool,
+    fec: bool,
 ) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
@@ -117,11 +118,7 @@ async fn connect_(
         None => None,
     };
     let udp = Arc::new(udp);
-    let mut unreliable_layer = UnreliableLayer {
-        utp_read: Box::new(Arc::clone(&udp)),
-        utp_write: Box::new(udp),
-        mss: NonZeroUsize::new(MSS).unwrap(),
-    };
+    let mut unreliable_layer = wrap_fec(Arc::clone(&udp), udp, fec);
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -139,6 +136,40 @@ pub struct Connected {
     pub write: WriteSocket,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
+}
+
+pub(crate) fn wrap_fec(
+    read: impl UnreliableRead,
+    write: impl UnreliableWrite,
+    fec: bool,
+) -> UnreliableLayer {
+    let symbol_size = symbol_size(NO_FEC_MSS).unwrap();
+    let read: Box<dyn UnreliableRead> = if fec {
+        let config = FecReaderConfig { symbol_size };
+        Box::new(FecReader::new(read, config))
+    } else {
+        Box::new(read)
+    };
+    let write: Box<dyn UnreliableWrite> = if fec {
+        let config = FecWriterConfig {
+            parity_delay: Duration::from_millis(10),
+            symbol_size,
+        };
+        Box::new(FecWriter::new(write, config))
+    } else {
+        Box::new(write)
+    };
+    let mss = if fec {
+        data_mss(NO_FEC_MSS).unwrap()
+    } else {
+        NO_FEC_MSS
+    };
+    let mss = NonZeroUsize::new(mss).unwrap();
+    UnreliableLayer {
+        utp_read: read,
+        utp_write: write,
+        mss,
+    }
 }
 
 // Accepted socket
@@ -168,7 +199,7 @@ impl UnreliableRead for IdentityConnRead {
 }
 #[async_trait]
 impl UnreliableWrite for ConnWrite<UdpSocket> {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         Self::send(self, buf).await.map_err(|e| e.kind())
     }
 }
@@ -186,7 +217,7 @@ impl UnreliableRead for Arc<UdpSocket> {
 }
 #[async_trait]
 impl UnreliableWrite for Arc<UdpSocket> {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         let res = UdpSocket::send(self, buf).await;
         if let Err(e) = &res {
             if let Some(e) = e.raw_os_error() {
@@ -225,12 +256,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect() {
+        let fec = true;
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
         let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                let accepted = listener.accept().await.unwrap();
+                let accepted = listener.accept(fec).await.unwrap();
                 tokio::spawn(async move {
                     let mut accepted = accepted.await.unwrap().unwrap();
                     accepted.write.send(msg_1).await.unwrap();
@@ -245,6 +277,7 @@ mod tests {
             Some(LogConfig {
                 log_dir_path: Path::new("target/tests"),
             }),
+            fec,
         )
         .await
         .unwrap();
@@ -257,6 +290,6 @@ mod tests {
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
-        require_send(connect("0.0.0.0:0", "0.0.0.0:0", None));
+        require_send(connect("0.0.0.0:0", "0.0.0.0:0", None, false));
     }
 }

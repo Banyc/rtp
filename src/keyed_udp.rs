@@ -10,6 +10,7 @@ use udp_listener::{ConnWrite, Packet, UtpListener};
 use crate::{
     socket::{ReadSocket, WriteSocket, socket},
     transmission_layer::{UnreliableLayer, UnreliableWrite},
+    udp::wrap_fec,
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
@@ -39,15 +40,23 @@ impl<K: DispatchKey> Server<K> {
     }
 
     /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
-    pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted<K>> {
+    pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted<K>> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &conn_key);
+        let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = UnreliableLayer {
-            utp_read: Box::new(read),
-            utp_write: Box::new(write),
-            mss: NonZeroUsize::new(crate::udp::MSS.checked_sub(K::max_size()).unwrap()).unwrap(),
+            utp_read: unreliable_layer.utp_read,
+            utp_write: unreliable_layer.utp_write,
+            mss: NonZeroUsize::new(
+                unreliable_layer
+                    .mss
+                    .get()
+                    .checked_sub(K::max_size())
+                    .unwrap(),
+            )
+            .unwrap(),
         };
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -90,14 +99,22 @@ impl<K: DispatchKey> Client<K> {
         }
     }
 
-    pub fn open_without_handshake(&self, dispatch_key: K) -> Option<Connected> {
+    pub fn open_without_handshake(&self, dispatch_key: K, fec: bool) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key);
+        let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = UnreliableLayer {
-            utp_read: Box::new(read),
-            utp_write: Box::new(write),
-            mss: NonZeroUsize::new(crate::udp::MSS.checked_sub(K::max_size()).unwrap()).unwrap(),
+            utp_read: unreliable_layer.utp_read,
+            utp_write: unreliable_layer.utp_write,
+            mss: NonZeroUsize::new(
+                unreliable_layer
+                    .mss
+                    .get()
+                    .checked_sub(K::max_size())
+                    .unwrap(),
+            )
+            .unwrap(),
         };
         let (read, write) = socket(unreliable_layer, None);
         Some(Connected { read, write })
@@ -138,7 +155,7 @@ impl KeyedConnWrite {
 }
 #[async_trait]
 impl UnreliableWrite for KeyedConnWrite {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         Self::send(self, buf).await.map_err(|e| e.kind())
     }
 }
@@ -255,6 +272,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_key() {
+        let fec = true;
         let server = Server::<u8>::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();
         let key = 42;
@@ -262,13 +280,13 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             let server = Arc::new(server);
-            let mut accepted = server.accept_without_handshake().await.unwrap();
+            let mut accepted = server.accept_without_handshake(fec).await.unwrap();
             assert_eq!(accepted.dispatch_key, key);
             tokio::spawn({
                 let server = server.clone();
                 async move {
                     loop {
-                        let _ = server.accept_without_handshake().await;
+                        let _ = server.accept_without_handshake(fec).await;
                     }
                 }
             });
@@ -292,7 +310,7 @@ mod tests {
                     }
                 }
             });
-            let mut accepted = client.open_without_handshake(key).unwrap();
+            let mut accepted = client.open_without_handshake(key, fec).unwrap();
             accepted.write.send(msg_1).await.unwrap();
             let mut buf = vec![0; 1024];
             let n = accepted.read.recv(&mut buf).await.unwrap();

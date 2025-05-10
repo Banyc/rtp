@@ -324,19 +324,18 @@ fn neg_challenge(challenge: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UdpSocket,
     };
 
-    use crate::udp::MSS;
+    use crate::udp::wrap_fec;
 
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_async_io() {
+        let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
@@ -345,16 +344,8 @@ mod tests {
         let hello = b"hello";
         let world = b"world";
 
-        let a = UnreliableLayer {
-            utp_read: Box::new(a.clone()),
-            utp_write: Box::new(a),
-            mss: NonZeroUsize::new(MSS).unwrap(),
-        };
-        let b = UnreliableLayer {
-            utp_read: Box::new(b.clone()),
-            utp_write: Box::new(b),
-            mss: NonZeroUsize::new(MSS).unwrap(),
-        };
+        let a = wrap_fec(a.clone(), a, fec);
+        let b = wrap_fec(b.clone(), b, fec);
         let (a_r, mut a_w) = socket(a, None);
         let (b_r, mut b_w) = socket(b, None);
         a_w.send(hello).await.unwrap();
@@ -369,20 +360,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_async_async_io() {
+        let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a = UnreliableLayer {
-            utp_read: Box::new(a.clone()),
-            utp_write: Box::new(a),
-            mss: NonZeroUsize::new(MSS).unwrap(),
-        };
-        let b = UnreliableLayer {
-            utp_read: Box::new(b.clone()),
-            utp_write: Box::new(b),
-            mss: NonZeroUsize::new(MSS).unwrap(),
-        };
+        let a = wrap_fec(a.clone(), a, fec);
+        let b = wrap_fec(b.clone(), b, fec);
         let (a_r, a_w) = socket(a, None);
         let (b_r, b_w) = socket(b, None);
 

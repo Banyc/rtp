@@ -4,7 +4,7 @@ use clap::Parser;
 use file_transfer::FileTransferCommand;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{lookup_host, TcpListener},
+    net::{TcpListener, lookup_host},
 };
 
 #[derive(Debug, Parser)]
@@ -18,6 +18,7 @@ pub struct Cli {
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
+    let fec = true;
 
     let (protocol, internet_addresses) = args.listen.split_once("://").unwrap();
     let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();
@@ -35,10 +36,10 @@ async fn main() {
             let listener = rtp::udp::Listener::bind(internet_addresses[0])
                 .await
                 .unwrap();
-            let accepted = listener.accept().await.unwrap();
+            let accepted = listener.accept(fec).await.unwrap();
             tokio::spawn(async move {
                 loop {
-                    if listener.accept().await.is_err() {
+                    if listener.accept(fec).await.is_err() {
                         break;
                     }
                 }

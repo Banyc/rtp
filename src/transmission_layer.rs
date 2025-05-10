@@ -23,7 +23,7 @@ type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 #[derive(Debug)]
 pub struct TransmissionLayer {
     utp_read: tokio::sync::Mutex<Box<dyn UnreliableRead>>,
-    utp_write: Box<dyn UnreliableWrite>,
+    utp_write: tokio::sync::Mutex<Box<dyn UnreliableWrite>>,
     reliable_layer: Mutex<ReliableLayer>,
     sent_data_pkt: tokio::sync::Notify,
     recv_data_pkt: tokio::sync::Notify,
@@ -52,7 +52,7 @@ impl TransmissionLayer {
         });
         Self {
             utp_read: tokio::sync::Mutex::new(unreliable_layer.utp_read),
-            utp_write: unreliable_layer.utp_write,
+            utp_write: tokio::sync::Mutex::new(unreliable_layer.utp_write),
             reliable_layer,
             sent_data_pkt,
             recv_data_pkt,
@@ -122,7 +122,7 @@ impl TransmissionLayer {
     pub async fn send_kill_pkt(&self) -> Result<(), std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
-        self.utp_write.send(&buf).await?;
+        self.utp_write.lock().await.send(&buf).await?;
         Ok(())
     }
 
@@ -176,7 +176,7 @@ impl TransmissionLayer {
                 data: &data_buf[..data_written],
             };
             let n = encode_ack_data(None, Some(data), utp_buf).unwrap();
-            let Err(e) = self.utp_write.send(&utp_buf[..n]).await else {
+            let Err(e) = self.utp_write.lock().await.send(&utp_buf[..n]).await else {
                 continue;
             };
             self.first_error.set(e);
@@ -299,6 +299,8 @@ impl TransmissionLayer {
             encode_ack_data(Some(ack), None, utp_buf).unwrap()
         };
         self.utp_write
+            .lock()
+            .await
             .send(&utp_buf[..written_bytes])
             .await
             .map_err(throw_error)
@@ -442,7 +444,7 @@ pub trait UnreliableRead: core::fmt::Debug + Sync + Send + 'static {
 }
 #[async_trait]
 pub trait UnreliableWrite: core::fmt::Debug + Sync + Send + 'static {
-    async fn send(&self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
 }
 
 #[derive(Debug)]

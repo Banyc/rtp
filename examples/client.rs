@@ -4,7 +4,7 @@ use clap::Parser;
 use file_transfer::FileTransferCommand;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{lookup_host, TcpStream},
+    net::{TcpStream, lookup_host},
 };
 
 #[derive(Debug, Parser)]
@@ -20,6 +20,7 @@ pub struct Cli {
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
+    let fec = true;
 
     let (protocol, internet_addresses) = args.server.split_once("://").unwrap();
     let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();
@@ -37,7 +38,7 @@ async fn main() {
                 .log_dir
                 .as_ref()
                 .map(|c| rtp::udp::LogConfig { log_dir_path: c });
-            let connected = rtp::udp::connect("0.0.0.0:0", internet_addresses[0], log_config)
+            let connected = rtp::udp::connect("0.0.0.0:0", internet_addresses[0], log_config, fec)
                 .await
                 .unwrap();
             (
