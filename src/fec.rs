@@ -142,6 +142,7 @@ async fn run_writer<W>(
         flush_delay: config.parity_delay,
         buf: vec![0; config.symbol_size * 2],
         utp,
+        pause: true,
     };
     let err = loop {
         tokio::select! {
@@ -169,17 +170,24 @@ struct WriterState<W: UnreliableWrite> {
     pub flush_delay: Duration,
     pub buf: Vec<u8>,
     pub utp: W,
+    pub pause: bool,
 }
 impl<W: UnreliableWrite> WriterState<W> {
     pub async fn send(&mut self, data: Option<&[u8]>) -> Result<(), io::ErrorKind> {
         if let Some(data) = data {
-            let n = self.fec_encoder.encode_data(data, &mut self.buf);
-            self.utp.send(&self.buf[..n]).await?;
             let full = self.fec_encoder.group_data_count() + 1 == DATA_PARITY_RATIO.len();
             if full {
-                self.flush_parities().await?;
+                self.pause = true;
+                self.fec_encoder.skip_group();
+                return Ok(());
             }
+            let n = self.fec_encoder.encode_data(data, &mut self.buf);
+            self.utp.send(&self.buf[..n]).await?;
         } else {
+            if self.pause {
+                self.pause = false;
+                return Ok(());
+            }
             self.flush_parities().await?;
         }
         Ok(())

@@ -291,7 +291,7 @@ source = "git+https://github.com/Banyc/dre.git?tag=v0.0.3#8cbbb66b2ee361d90f0e25
 [[package]]
 name = "fec"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/fec.git?tag=v0.0.1#48b75867658c1e8ddb88f0271d39d75bd53bdfba"
+source = "git+https://github.com/Banyc/fec.git?tag=v0.0.2#890a3ebd08a713c1228e2fc30c17a82a1cd13f4b"
 dependencies = [
  "bon",
  "reed-solomon-erasure",

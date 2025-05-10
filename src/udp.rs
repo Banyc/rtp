@@ -14,6 +14,7 @@ use crate::{
 
 pub const NO_FEC_MSS: usize = 1424;
 const DISPATCHER_BUF_SIZE: usize = 1024;
+const PARITY_DELAY: Duration = Duration::from_millis(100);
 
 type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
 type IdentityConn = Conn<UdpSocket, SocketAddr, Packet>;
@@ -152,7 +153,7 @@ pub(crate) fn wrap_fec(
     };
     let write: Box<dyn UnreliableWrite> = if fec {
         let config = FecWriterConfig {
-            parity_delay: Duration::from_millis(10),
+            parity_delay: PARITY_DELAY,
             symbol_size,
         };
         Box::new(FecWriter::new(write, config))
