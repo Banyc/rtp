@@ -220,13 +220,16 @@ impl UnreliableRead for Arc<UdpSocket> {
 impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         let res = UdpSocket::send(self, buf).await;
-        if let Err(e) = &res {
-            if let Some(e) = e.raw_os_error() {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                // No buffer space available
-                if e == 55 {
-                    return Ok(0);
-                }
+        if let Err(e) = &res
+            && let Some(e) = e.raw_os_error()
+        {
+            #[cfg(target_os = "macos")]
+            if e == 55 {
+                return Err(std::io::ErrorKind::WouldBlock);
+            }
+            #[cfg(target_os = "linux")]
+            if e == 105 {
+                return Err(std::io::ErrorKind::WouldBlock);
             }
         }
         res.map_err(|e| e.kind())
