@@ -22,6 +22,9 @@ const PARITY_RATIO_NUM: usize = 1;
 const PARITY_RATIO_DEN: usize = 4;
 const MAX_PARITY_PER_GROUP: usize =
     (MAX_DATA_PER_GROUP * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
+/// Groups with at most this many data symbols get parity protection.
+/// Larger groups skip parity to avoid impacting throughput of big traffic.
+const PARITY_DATA_THRESHOLD: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct FecReaderConfig {
@@ -225,12 +228,18 @@ impl<W: UnreliableWrite> WriterState<W> {
         Ok(())
     }
     pub async fn flush_parities(&mut self) -> Result<(), io::ErrorKind> {
-        let no_data = self.fec_encoder.group_data_count() == 0;
+        let data_count = self.fec_encoder.group_data_count();
         self.next_flush = Instant::now() + self.flush_delay;
-        if no_data {
+        if data_count == 0 {
             return Ok(());
         }
-        let parity_count = parity_for(self.fec_encoder.group_data_count());
+        // Only send parities for small groups to protect small/control messages.
+        // Large groups skip parity to avoid impacting throughput of big traffic.
+        if data_count > PARITY_DATA_THRESHOLD {
+            self.fec_encoder.skip_group();
+            return Ok(());
+        }
+        let parity_count = parity_for(data_count);
         let mut parity_encoder = self.fec_encoder.flush_parities(parity_count);
         while let Some(n) = parity_encoder.encode_parity(&mut self.buf) {
             let buf = &self.buf[..n];
