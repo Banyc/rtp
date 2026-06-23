@@ -15,12 +15,14 @@ pub struct Cli {
     pub file_transfer: FileTransferCommand,
     #[clap(long)]
     pub log_dir: Option<PathBuf>,
+    #[clap(long)]
+    pub fec: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
-    let fec = true;
+    let fec = args.fec;
 
     let (protocol, internet_addresses) = args.server.split_once("://").unwrap();
     let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();

@@ -13,12 +13,14 @@ pub struct Cli {
     pub listen: String,
     #[command(subcommand)]
     pub file_transfer: FileTransferCommand,
+    #[clap(long)]
+    pub fec: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
-    let fec = true;
+    let fec = args.fec;
 
     let (protocol, internet_addresses) = args.listen.split_once("://").unwrap();
     let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();
