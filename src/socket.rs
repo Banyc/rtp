@@ -6,7 +6,7 @@ use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
     write::{AsyncAsyncWrite, PollWrite},
 };
-use rand::TryRngCore;
+use rand::TryRng;
 use tokio::task::JoinSet;
 
 use crate::{
@@ -258,7 +258,7 @@ pub async fn client_opening_handshake(
     unreliable: &mut UnreliableLayer,
 ) -> Result<(), std::io::Error> {
     let mut challenge: [u8; 1] = [0; 1];
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = rand::rngs::SysRng;
     loop {
         rng.try_fill_bytes(&mut challenge).unwrap();
         if !in_cmd_space(challenge[0]) {

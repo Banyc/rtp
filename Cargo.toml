@@ -12,7 +12,7 @@ dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
 fec = { git = "https://github.com/Banyc/fec.git", tag = "v0.0.3" }
 mpudp = { git = "https://github.com/Banyc/mpudp.git", tag = "v0.0.3" }
 primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.56" }
-rand = "0.9"
+rand = "0.10"
 self_assign = { git = "https://github.com/Banyc/self_assign.git", tag = "v0.0.3" }
 serde = { version = "1", features = ["derive"] }
 tap = "1"
