@@ -244,7 +244,10 @@ impl TransmissionLayer {
                 println!("recv_pkts: recv: {read_bytes}");
             }
             if FEC_DEBUG {
-                eprintln!("recv_pkts: read_bytes={read_bytes} first_byte={}", if read_bytes > 0 { utp_buf[0] } else { 99 });
+                eprintln!(
+                    "recv_pkts: read_bytes={read_bytes} first_byte={}",
+                    if read_bytes > 0 { utp_buf[0] } else { 99 }
+                );
             }
 
             ack_from_peer_buf.clear();
@@ -284,7 +287,12 @@ impl TransmissionLayer {
             // UDP local -{data}> reliable
             let ack = reliable_layer.recv_data_pkt(data.seq, &utp_buf[data.buf_range.clone()]);
             if FEC_DEBUG {
-                eprintln!("recv_data_pkt seq={} empty={} ack={}", data.seq, data.buf_range.is_empty(), ack);
+                eprintln!(
+                    "recv_data_pkt seq={} empty={} ack={}",
+                    data.seq,
+                    data.buf_range.is_empty(),
+                    ack
+                );
             }
             drop(reliable_layer);
             if data.buf_range.is_empty() {

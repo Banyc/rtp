@@ -293,7 +293,7 @@ pub async fn server_opening_handshake(
     let mut challenge = [0; 1];
     let n = unreliable.utp_read.try_recv(&mut challenge)?;
     if n != challenge.len() {
-        return Err(std::io::ErrorKind::InvalidInput)?;
+        return Err(std::io::ErrorKind::InvalidInput.into());
     }
     unreliable.utp_write.send(&challenge).await?;
 
@@ -386,7 +386,7 @@ mod tests {
             async move {
                 let recv_all = recv_all.notified();
                 a.write_all(&send_buf).await.unwrap();
-                println!("{:?}", &a);
+                println!("{a:?}");
                 recv_all.await;
             }
         });

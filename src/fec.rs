@@ -59,8 +59,15 @@ impl<R: UnreliableRead> FecReader<R> {
             self.recovered.push_back(data.to_vec());
         });
         if FEC_DEBUG {
-            let kind = if hdr_len.is_some() { "data" } else { "parity/none" };
-            eprintln!("FEC reader: kind={kind} pkt_len={pkt_len} hdr_len={hdr_len:?} recovered_before={before} recovered_after={}", self.recovered.len());
+            let kind = if hdr_len.is_some() {
+                "data"
+            } else {
+                "parity/none"
+            };
+            eprintln!(
+                "FEC reader: kind={kind} pkt_len={pkt_len} hdr_len={hdr_len:?} recovered_before={before} recovered_after={}",
+                self.recovered.len()
+            );
         }
         if let Some(hdr_len) = hdr_len {
             let data = &pkt[hdr_len..];
@@ -199,12 +206,19 @@ impl<W: UnreliableWrite> WriterState<W> {
             }
             let n = self.fec_encoder.encode_data(data, &mut self.buf);
             if FEC_DEBUG {
-                eprintln!("FEC writer: encode_data group_data_count={} n={}", self.fec_encoder.group_data_count(), n);
+                eprintln!(
+                    "FEC writer: encode_data group_data_count={} n={}",
+                    self.fec_encoder.group_data_count(),
+                    n
+                );
             }
             self.utp.send(&self.buf[..n]).await?;
         } else {
             if FEC_DEBUG {
-                eprintln!("FEC writer: flush tick, group_data_count={}", self.fec_encoder.group_data_count());
+                eprintln!(
+                    "FEC writer: flush tick, group_data_count={}",
+                    self.fec_encoder.group_data_count()
+                );
             }
             self.flush_parities().await?;
         }
