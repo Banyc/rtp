@@ -15,6 +15,7 @@ use crate::{
 };
 
 const PRINT_DEBUG_MSGS: bool = false;
+const FEC_DEBUG: bool = false;
 const MAX_NUM_ACK: usize = 64;
 const MIN_NO_RESP_FOR: Duration = Duration::from_secs(1);
 
@@ -159,6 +160,9 @@ impl TransmissionLayer {
             };
             self.log("send_data_pkt");
             let Some(p) = res else {
+                if FEC_DEBUG {
+                    eprintln!("send_data_pkt: no pkt to send (rtx=None, cwnd full or no tokens)");
+                }
                 break;
             };
             let data_written = match p.data_written {
@@ -176,6 +180,9 @@ impl TransmissionLayer {
                 data: &data_buf[..data_written],
             };
             let n = encode_ack_data(None, Some(data), utp_buf).unwrap();
+            if FEC_DEBUG {
+                eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
+            }
             let Err(e) = self.utp_write.lock().await.send(&utp_buf[..n]).await else {
                 continue;
             };
@@ -236,11 +243,19 @@ impl TransmissionLayer {
             if PRINT_DEBUG_MSGS {
                 println!("recv_pkts: recv: {read_bytes}");
             }
+            if FEC_DEBUG {
+                eprintln!("recv_pkts: read_bytes={read_bytes} first_byte={}", if read_bytes > 0 { utp_buf[0] } else { 99 });
+            }
 
             ack_from_peer_buf.clear();
             let data = match decode(&utp_buf[..read_bytes], ack_from_peer_buf) {
                 Ok(x) => x,
-                Err(_) => continue,
+                Err(e) => {
+                    if FEC_DEBUG {
+                        eprintln!("recv_pkts: decode error: {e:?}");
+                    }
+                    continue;
+                }
             };
 
             if data.killed {
@@ -254,6 +269,9 @@ impl TransmissionLayer {
 
             // UDP local -{ACK}> reliable
             reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now);
+            if FEC_DEBUG {
+                eprintln!("recv_ack_pkt: balls={:?}", ack_from_peer_buf);
+            }
             recv_pkts.num_ack_segments += 1;
             self.sent_pkt_acked.notify_waiters();
 
@@ -265,6 +283,9 @@ impl TransmissionLayer {
 
             // UDP local -{data}> reliable
             let ack = reliable_layer.recv_data_pkt(data.seq, &utp_buf[data.buf_range.clone()]);
+            if FEC_DEBUG {
+                eprintln!("recv_data_pkt seq={} empty={} ack={}", data.seq, data.buf_range.is_empty(), ack);
+            }
             drop(reliable_layer);
             if data.buf_range.is_empty() {
                 recv_pkts.num_fin_segments += 1;

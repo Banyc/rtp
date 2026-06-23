@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::transmission_layer::{UnreliableRead, UnreliableWrite};
 
+const FEC_DEBUG: bool = false;
+
 const WINDOW_SIZE: NonZeroU64 = NonZeroU64::new(32).unwrap();
 const MAX_GROUP_SIZE: usize = MAX_DATA_PER_GROUP + MAX_PARITY_PER_GROUP;
 /// Maximum data symbols accumulated before a group is forcibly flushed.
@@ -52,9 +54,14 @@ impl<R: UnreliableRead> FecReader<R> {
     }
     fn on_utp_read(&mut self, buf: &mut [u8], pkt_len: usize) -> Result<usize, std::io::ErrorKind> {
         let pkt = &self.buf[..pkt_len];
+        let before = self.recovered.len();
         let hdr_len = self.fec_decoder.decode(pkt, |data| {
             self.recovered.push_back(data.to_vec());
         });
+        if FEC_DEBUG {
+            let kind = if hdr_len.is_some() { "data" } else { "parity/none" };
+            eprintln!("FEC reader: kind={kind} pkt_len={pkt_len} hdr_len={hdr_len:?} recovered_before={before} recovered_after={}", self.recovered.len());
+        }
         if let Some(hdr_len) = hdr_len {
             let data = &pkt[hdr_len..];
             return Ok(max_copy(data, buf));
@@ -185,17 +192,27 @@ impl<W: UnreliableWrite> WriterState<W> {
         if let Some(data) = data {
             let full = self.fec_encoder.group_data_count() + 1 > MAX_DATA_PER_GROUP;
             if full {
+                if FEC_DEBUG {
+                    eprintln!("FEC writer: group full, flushing parities");
+                }
                 self.flush_parities().await?;
             }
             let n = self.fec_encoder.encode_data(data, &mut self.buf);
+            if FEC_DEBUG {
+                eprintln!("FEC writer: encode_data group_data_count={} n={}", self.fec_encoder.group_data_count(), n);
+            }
             self.utp.send(&self.buf[..n]).await?;
         } else {
+            if FEC_DEBUG {
+                eprintln!("FEC writer: flush tick, group_data_count={}", self.fec_encoder.group_data_count());
+            }
             self.flush_parities().await?;
         }
         Ok(())
     }
     pub async fn flush_parities(&mut self) -> Result<(), io::ErrorKind> {
         let no_data = self.fec_encoder.group_data_count() == 0;
+        self.next_flush = Instant::now() + self.flush_delay;
         if no_data {
             return Ok(());
         }
@@ -205,7 +222,6 @@ impl<W: UnreliableWrite> WriterState<W> {
             let buf = &self.buf[..n];
             self.utp.send(buf).await?;
         }
-        self.next_flush = Instant::now() + self.flush_delay;
         Ok(())
     }
 }
