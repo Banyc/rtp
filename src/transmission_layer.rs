@@ -218,10 +218,10 @@ impl TransmissionLayer {
                     true => utp_read.recv(utp_buf).await,
                     false => {
                         let res = utp_read.try_recv(utp_buf);
-                        if let Err(e) = &res {
-                            if *e == std::io::ErrorKind::WouldBlock {
-                                break;
-                            }
+                        if let Err(e) = &res
+                            && *e == std::io::ErrorKind::WouldBlock
+                        {
+                            break;
                         }
                         res
                     }

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     io,
     num::NonZeroU64,
     time::{Duration, Instant},
@@ -11,10 +12,14 @@ use tokio::sync::{mpsc, oneshot};
 use crate::transmission_layer::{UnreliableRead, UnreliableWrite};
 
 const WINDOW_SIZE: NonZeroU64 = NonZeroU64::new(32).unwrap();
-const MAX_GROUP_SIZE: usize = DATA_PARITY_RATIO.len() + *DATA_PARITY_RATIO.last().unwrap() as usize;
-const DATA_PARITY_RATIO: &[u8] = &[
-    0, 3, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10,
-];
+const MAX_GROUP_SIZE: usize = MAX_DATA_PER_GROUP + MAX_PARITY_PER_GROUP;
+/// Maximum data symbols accumulated before a group is forcibly flushed.
+const MAX_DATA_PER_GROUP: usize = 20;
+/// Parity overhead target: ~25% (1 parity per 4 data), at least 1 per group.
+const PARITY_RATIO_NUM: usize = 1;
+const PARITY_RATIO_DEN: usize = 4;
+const MAX_PARITY_PER_GROUP: usize =
+    (MAX_DATA_PER_GROUP * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
 
 #[derive(Debug, Clone)]
 pub struct FecReaderConfig {
@@ -24,7 +29,7 @@ pub struct FecReaderConfig {
 pub struct FecReader<R> {
     utp: R,
     fec_decoder: FecDecoder,
-    recovered: Vec<Vec<u8>>,
+    recovered: VecDeque<Vec<u8>>,
     buf: Vec<u8>,
 }
 impl<R: UnreliableRead> FecReader<R> {
@@ -37,18 +42,18 @@ impl<R: UnreliableRead> FecReader<R> {
         Self {
             utp,
             fec_decoder,
-            recovered: vec![],
+            recovered: VecDeque::new(),
             buf: vec![0; config.symbol_size * 2],
         }
     }
     fn pop_recovered(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let data = self.recovered.pop()?;
+        let data = self.recovered.pop_front()?;
         Some(max_copy(&data, buf))
     }
     fn on_utp_read(&mut self, buf: &mut [u8], pkt_len: usize) -> Result<usize, std::io::ErrorKind> {
         let pkt = &self.buf[..pkt_len];
         let hdr_len = self.fec_decoder.decode(pkt, |data| {
-            self.recovered.push(data.to_vec());
+            self.recovered.push_back(data.to_vec());
         });
         if let Some(hdr_len) = hdr_len {
             let data = &pkt[hdr_len..];
@@ -118,8 +123,13 @@ impl UnreliableWrite for FecWriter {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
         let len = buf.len();
         if self.data_tx.send(buf.to_vec()).await.is_err() {
-            let err = self.err_rx.recv().await.unwrap();
-            return Err(*err);
+            let err = self
+                .err_rx
+                .recv()
+                .await
+                .copied()
+                .unwrap_or(io::ErrorKind::BrokenPipe);
+            return Err(err);
         }
         Ok(len)
     }
@@ -142,7 +152,6 @@ async fn run_writer<W>(
         flush_delay: config.parity_delay,
         buf: vec![0; config.symbol_size * 2],
         utp,
-        pause: true,
     };
     let err = loop {
         tokio::select! {
@@ -170,24 +179,17 @@ struct WriterState<W: UnreliableWrite> {
     pub flush_delay: Duration,
     pub buf: Vec<u8>,
     pub utp: W,
-    pub pause: bool,
 }
 impl<W: UnreliableWrite> WriterState<W> {
     pub async fn send(&mut self, data: Option<&[u8]>) -> Result<(), io::ErrorKind> {
         if let Some(data) = data {
-            let full = self.fec_encoder.group_data_count() + 1 == DATA_PARITY_RATIO.len();
+            let full = self.fec_encoder.group_data_count() + 1 > MAX_DATA_PER_GROUP;
             if full {
-                self.pause = true;
-                self.fec_encoder.skip_group();
-                return Ok(());
+                self.flush_parities().await?;
             }
             let n = self.fec_encoder.encode_data(data, &mut self.buf);
             self.utp.send(&self.buf[..n]).await?;
         } else {
-            if self.pause {
-                self.pause = false;
-                return Ok(());
-            }
             self.flush_parities().await?;
         }
         Ok(())
@@ -197,9 +199,8 @@ impl<W: UnreliableWrite> WriterState<W> {
         if no_data {
             return Ok(());
         }
-        let mut parity_encoder = self
-            .fec_encoder
-            .flush_parities(DATA_PARITY_RATIO[self.fec_encoder.group_data_count()]);
+        let parity_count = parity_for(self.fec_encoder.group_data_count());
+        let mut parity_encoder = self.fec_encoder.flush_parities(parity_count);
         while let Some(n) = parity_encoder.encode_parity(&mut self.buf) {
             let buf = &self.buf[..n];
             self.utp.send(buf).await?;
@@ -207,6 +208,11 @@ impl<W: UnreliableWrite> WriterState<W> {
         self.next_flush = Instant::now() + self.flush_delay;
         Ok(())
     }
+}
+
+fn parity_for(data_count: usize) -> u8 {
+    let p = (data_count * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
+    p.clamp(1, MAX_PARITY_PER_GROUP).try_into().unwrap()
 }
 
 #[derive(Debug)]
