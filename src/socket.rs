@@ -46,7 +46,7 @@ pub fn socket(
                 // tokio::time::sleep(TIMER_INTERVAL).await;
                 let next_poll_time = {
                     let reliable_layer = transmission_layer.reliable_layer().lock().unwrap();
-                    reliable_layer.token_bucket().next_token_time()
+                    reliable_layer.token_bucket().lock().unwrap().next_token_time()
                 };
                 let fast_poll_time = Instant::now() + TIMER_INTERVAL;
                 let poll_time = next_poll_time.min(fast_poll_time);

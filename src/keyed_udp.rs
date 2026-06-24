@@ -58,6 +58,7 @@ impl<K: DispatchKey> Server<K> {
             )
             .unwrap(),
             fec_controller: unreliable_layer.fec_controller,
+            token_bucket: unreliable_layer.token_bucket,
         };
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -117,6 +118,7 @@ impl<K: DispatchKey> Client<K> {
             )
             .unwrap(),
             fec_controller: unreliable_layer.fec_controller,
+            token_bucket: unreliable_layer.token_bucket,
         };
         let (read, write) = socket(unreliable_layer, None);
         Some(Connected { read, write })

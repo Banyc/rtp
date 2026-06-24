@@ -2,8 +2,8 @@ use std::{
     collections::VecDeque,
     io,
     num::NonZeroU64,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use fec::{de::FecDecoder, en::FecEncoder};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::transmission_layer::{UnreliableRead, UnreliableWrite};
-use crate::reliable_layer::CC_DATA_LOSS_RATE;
+use crate::reliable_layer::{CC_DATA_LOSS_RATE, SharedTokenBucket};
 
 const FEC_DEBUG: bool = false;
 
@@ -144,7 +144,6 @@ fn max_copy(from: &[u8], to: &mut [u8]) -> usize {
 
 #[derive(Debug, Clone)]
 pub struct FecWriterConfig {
-    pub parity_delay: Duration,
     pub symbol_size: usize,
 }
 #[derive(Debug)]
@@ -154,13 +153,17 @@ pub struct FecWriter {
     controller: Arc<dyn FecController>,
 }
 impl FecWriter {
-    pub fn new<W: UnreliableWrite>(utp: W, config: FecWriterConfig) -> Self {
+    pub fn new<W: UnreliableWrite>(
+        utp: W,
+        config: FecWriterConfig,
+        token_bucket: Arc<Mutex<SharedTokenBucket>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         let (err_rx, err_tx) = SetOnce::new();
         let controller = Arc::new(LossRateStore::default());
         let writer_controller = Arc::clone(&controller);
         tokio::spawn(async move {
-            run_writer(rx, utp, config, err_tx, writer_controller).await;
+            run_writer(rx, utp, config, err_tx, writer_controller, token_bucket).await;
         });
         Self {
             data_tx: tx,
@@ -200,6 +203,7 @@ async fn run_writer<W>(
     config: FecWriterConfig,
     ret_err: oneshot::Sender<io::ErrorKind>,
     controller: Arc<dyn FecController>,
+    token_bucket: Arc<Mutex<SharedTokenBucket>>,
 ) where
     W: UnreliableWrite,
 {
@@ -208,16 +212,24 @@ async fn run_writer<W>(
         .build();
     let mut state = WriterState {
         fec_encoder,
-        next_flush: Instant::now() + config.parity_delay,
-        flush_delay: config.parity_delay,
         buf: vec![0; config.symbol_size * 2],
         utp,
         controller,
         loss_rate: None,
+        token_bucket,
+        // Deadline at which we attempt the next parity flush. `None` means
+        // no group is open / nothing to flush; it is (re)set whenever a group
+        // accumulates data or a flush is deferred waiting for tokens.
+        next_flush: None,
     };
     let err = loop {
         tokio::select! {
-            () = tokio::time::sleep_until(state.next_flush.into()) => {
+            () = async {
+                match state.next_flush {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 state.refresh_loss_rate().await;
                 if let Err(e) = state.send(None).await {
                     break e;
@@ -239,13 +251,17 @@ async fn run_writer<W>(
 #[derive(Debug)]
 struct WriterState<W: UnreliableWrite> {
     pub fec_encoder: FecEncoder,
-    pub next_flush: Instant,
-    pub flush_delay: Duration,
     pub buf: Vec<u8>,
     pub utp: W,
     pub controller: Arc<dyn FecController>,
     /// Most recent loss rate sampled from the reliable layer, in `[0, 1]`.
     pub loss_rate: Option<f64>,
+    /// Shared with the reliable layer so parity sends are rate-limited
+    /// alongside data sends.
+    pub token_bucket: Arc<Mutex<SharedTokenBucket>>,
+    /// Predicted time the token bucket will have accrued enough tokens for
+    /// the pending parity flush. `None` when no group is waiting to flush.
+    pub next_flush: Option<Instant>,
 }
 impl<W: UnreliableWrite> WriterState<W> {
     async fn refresh_loss_rate(&mut self) {
@@ -254,12 +270,23 @@ impl<W: UnreliableWrite> WriterState<W> {
     }
     pub async fn send(&mut self, data: Option<&[u8]>) -> Result<(), io::ErrorKind> {
         if let Some(data) = data {
-            let full = self.fec_encoder.group_data_count() + 1 > MAX_DATA_PER_GROUP;
-            if full {
-                if FEC_DEBUG {
-                    eprintln!("FEC writer: group full, flushing parities");
-                }
+            // Cap group growth at the parity threshold. If the current group
+            // has reached the threshold, try to flush it before adding more
+            // data. If the flush can't get tokens (deferred), abandon the
+            // group's parity protection by skipping it — the data still goes
+            // out, the reliable layer's retransmission is the backstop, and
+            // the next group starts fresh instead of growing past the threshold
+            // and silently losing protection.
+            if self.fec_encoder.group_data_count() >= PARITY_DATA_THRESHOLD {
                 self.flush_parities().await?;
+                if self.fec_encoder.group_data_count() >= PARITY_DATA_THRESHOLD {
+                    if FEC_DEBUG {
+                        eprintln!(
+                            "FEC writer: group still at threshold after flush attempt, skipping"
+                        );
+                    }
+                    self.fec_encoder.skip_group();
+                }
             }
             let n = self.fec_encoder.encode_data(data, &mut self.buf);
             if FEC_DEBUG {
@@ -270,6 +297,9 @@ impl<W: UnreliableWrite> WriterState<W> {
                 );
             }
             self.utp.send(&self.buf[..n]).await?;
+            // A new group is open; schedule its flush based on when the token
+            // bucket can afford the predicted parity burst.
+            self.schedule_next_flush();
         } else {
             if FEC_DEBUG {
                 eprintln!(
@@ -279,12 +309,38 @@ impl<W: UnreliableWrite> WriterState<W> {
                 );
             }
             self.flush_parities().await?;
+            // If the group was deferred (bucket empty), reschedule; otherwise
+            // the group is closed and there is nothing to flush.
+            self.schedule_next_flush();
         }
         Ok(())
     }
+    /// Predict when the token bucket will next have a token available and arm
+    /// that as the next flush deadline. The flush attempt takes what tokens it
+    /// can; if the bucket is still empty it reschedules here for the next token.
+    /// Clears the deadline when no group is open.
+    fn schedule_next_flush(&mut self) {
+        let data_count = self.fec_encoder.group_data_count();
+        if data_count == 0 {
+            self.next_flush = None;
+            return;
+        }
+        if data_count > PARITY_DATA_THRESHOLD {
+            // Group is too large to protect; it will be skipped on flush, so
+            // schedule immediately to reclaim the encoder promptly.
+            self.next_flush = Some(Instant::now());
+            return;
+        }
+        let deadline = self.token_bucket.lock().unwrap().next_token_time();
+        self.next_flush = Some(deadline);
+        if FEC_DEBUG {
+            eprintln!(
+                "FEC writer: scheduled flush at {deadline:?} (group_data_count={data_count})"
+            );
+        }
+    }
     pub async fn flush_parities(&mut self) -> Result<(), io::ErrorKind> {
         let data_count = self.fec_encoder.group_data_count();
-        self.next_flush = Instant::now() + self.flush_delay;
         if data_count == 0 {
             return Ok(());
         }
@@ -295,10 +351,36 @@ impl<W: UnreliableWrite> WriterState<W> {
             return Ok(());
         }
         let parity_count = parity_for(data_count, self.loss_rate);
+        // Reserve the full parity burst atomically. Reed-Solomon needs the
+        // complete parity set to reconstruct; a partial send wastes bandwidth
+        // with zero recovery value. If the bucket can't afford the whole burst,
+        // defer the entire group — `schedule_next_flush` will reschedule it for
+        // the next token availability without consuming the encoder's group.
+        let parity_count_us = parity_count as usize;
+        if !self
+            .token_bucket
+            .lock()
+            .unwrap()
+            .take_exact_tokens(parity_count_us, Instant::now())
+        {
+            if FEC_DEBUG {
+                eprintln!(
+                    "FEC writer: deferring group of {data_count} ({parity_count} parities), bucket has insufficient tokens"
+                );
+            }
+            return Ok(());
+        }
+        if FEC_DEBUG {
+            eprintln!("FEC writer: flushing {parity_count} parities for group of {data_count}");
+        }
         let mut parity_encoder = self.fec_encoder.flush_parities(parity_count);
+        let mut sent = 0;
         while let Some(n) = parity_encoder.encode_parity(&mut self.buf) {
-            let buf = &self.buf[..n];
-            self.utp.send(buf).await?;
+            self.utp.send(&self.buf[..n]).await?;
+            sent += 1;
+        }
+        if FEC_DEBUG {
+            eprintln!("FEC writer: sent {sent} parities");
         }
         Ok(())
     }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
     fec::FecController,
-    reliable_layer::ReliableLayer,
+    reliable_layer::{ReliableLayer, SharedTokenBucket},
     sack::{AckBall, AckBallSequence},
 };
 
@@ -38,7 +38,12 @@ pub struct TransmissionLayer {
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let now = Instant::now();
-        let reliable_layer = Mutex::new(ReliableLayer::new(unreliable_layer.mss, now));
+        let reliable_layer = match &unreliable_layer.token_bucket {
+            Some(token_bucket) => {
+                Mutex::new(ReliableLayer::new_shared(unreliable_layer.mss, now, Arc::clone(token_bucket)))
+            }
+            None => Mutex::new(ReliableLayer::new(unreliable_layer.mss, now)),
+        };
         let sent_data_pkt = tokio::sync::Notify::new();
         let recv_data_pkt = tokio::sync::Notify::new();
         let sent_pkt_acked = tokio::sync::Notify::new();
@@ -486,6 +491,10 @@ pub struct UnreliableLayer {
     pub utp_write: Box<dyn UnreliableWrite>,
     pub mss: NonZeroUsize,
     pub fec_controller: Option<Arc<dyn FecController>>,
+    /// Shared send-rate token bucket. Created here so the FEC writer and the
+    /// reliable layer consume from the same bucket, keeping FEC parity under
+    /// the control loop's send rate.
+    pub token_bucket: Option<Arc<Mutex<SharedTokenBucket>>>,
 }
 
 #[derive(Debug, Clone)]

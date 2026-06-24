@@ -1,5 +1,5 @@
 use core::{net::SocketAddr, num::NonZeroUsize};
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use fec::proto::{data_mss, symbol_size};
@@ -8,13 +8,13 @@ use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
     fec::{FecController, FecReader, FecReaderConfig, FecWriter, FecWriterConfig},
+    reliable_layer::ReliableLayer,
     socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
     transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
 pub const NO_FEC_MSS: usize = 1424;
 const DISPATCHER_BUF_SIZE: usize = 1024;
-const PARITY_DELAY: Duration = Duration::from_millis(100);
 
 type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
 type IdentityConn = Conn<UdpSocket, SocketAddr, Packet>;
@@ -143,6 +143,7 @@ struct FecHalves {
     read: Box<dyn UnreliableRead>,
     write: Box<dyn UnreliableWrite>,
     fec_controller: Option<Arc<dyn FecController>>,
+    token_bucket: Option<Arc<std::sync::Mutex<crate::reliable_layer::SharedTokenBucket>>>,
 }
 
 pub(crate) fn wrap_fec(
@@ -155,26 +156,30 @@ pub(crate) fn wrap_fec(
         read,
         write,
         fec_controller,
+        token_bucket,
     } = if fec {
+        let token_bucket = ReliableLayer::new_token_bucket(Instant::now());
         let reader = FecReader::new(read, FecReaderConfig { symbol_size });
         let writer = FecWriter::new(
             write,
             FecWriterConfig {
-                parity_delay: PARITY_DELAY,
                 symbol_size,
             },
+            Arc::clone(&token_bucket),
         );
         let controller = writer.controller();
         FecHalves {
             read: Box::new(reader),
             write: Box::new(writer),
             fec_controller: Some(controller),
+            token_bucket: Some(token_bucket),
         }
     } else {
         FecHalves {
             read: Box::new(read),
             write: Box::new(write),
             fec_controller: None,
+            token_bucket: None,
         }
     };
     let mss = if fec {
@@ -188,6 +193,7 @@ pub(crate) fn wrap_fec(
         utp_write: write,
         mss,
         fec_controller,
+        token_bucket,
     }
 }
 
