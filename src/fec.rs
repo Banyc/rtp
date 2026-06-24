@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io,
     num::NonZeroU64,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,6 +11,7 @@ use fec::{de::FecDecoder, en::FecEncoder};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::transmission_layer::{UnreliableRead, UnreliableWrite};
+use crate::reliable_layer::CC_DATA_LOSS_RATE;
 
 const FEC_DEBUG: bool = false;
 
@@ -25,6 +27,34 @@ const MAX_PARITY_PER_GROUP: usize =
 /// Groups with at most this many data symbols get parity protection.
 /// Larger groups skip parity to avoid impacting throughput of big traffic.
 const PARITY_DATA_THRESHOLD: usize = 4;
+
+/// Loss-rate feedback pushed from the reliable layer into the FEC writer so
+/// that parity aggressiveness can adapt to the channel the RTP control loop
+/// is actually observing.
+///
+/// The reliable layer is the only component that can measure end-to-end loss
+/// (via SACKs / RTOs), so coupling FEC to that signal makes FEC complement
+/// retransmission instead of working blind:
+///   - high loss  -> more parity, recover losses before RTO/backoff kicks in
+///   - low loss   -> skip parity, avoid wasting bandwidth on a clean channel
+#[async_trait]
+pub trait FecController: core::fmt::Debug + Sync + Send + 'static {
+    async fn set_loss_rate(&self, loss_rate: Option<f64>);
+    async fn get_loss_rate(&self) -> Option<f64>;
+}
+#[derive(Debug, Default)]
+struct LossRateStore {
+    rate: tokio::sync::RwLock<Option<f64>>,
+}
+#[async_trait]
+impl FecController for LossRateStore {
+    async fn set_loss_rate(&self, loss_rate: Option<f64>) {
+        *self.rate.write().await = loss_rate;
+    }
+    async fn get_loss_rate(&self) -> Option<f64> {
+        *self.rate.read().await
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FecReaderConfig {
@@ -119,27 +149,34 @@ pub struct FecWriterConfig {
 }
 #[derive(Debug)]
 pub struct FecWriter {
-    data_tx: mpsc::Sender<Vec<u8>>,
+    data_tx: mpsc::Sender<FecWriterMsg>,
     err_rx: SetOnce<io::ErrorKind>,
+    controller: Arc<dyn FecController>,
 }
 impl FecWriter {
     pub fn new<W: UnreliableWrite>(utp: W, config: FecWriterConfig) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         let (err_rx, err_tx) = SetOnce::new();
+        let controller = Arc::new(LossRateStore::default());
+        let writer_controller = Arc::clone(&controller);
         tokio::spawn(async move {
-            run_writer(rx, utp, config, err_tx).await;
+            run_writer(rx, utp, config, err_tx, writer_controller).await;
         });
         Self {
             data_tx: tx,
             err_rx,
+            controller,
         }
+    }
+    pub fn controller(&self) -> Arc<dyn FecController> {
+        Arc::clone(&self.controller)
     }
 }
 #[async_trait]
 impl UnreliableWrite for FecWriter {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
         let len = buf.len();
-        if self.data_tx.send(buf.to_vec()).await.is_err() {
+        if self.data_tx.send(FecWriterMsg::Data(buf.to_vec())).await.is_err() {
             let err = self
                 .err_rx
                 .recv()
@@ -152,11 +189,17 @@ impl UnreliableWrite for FecWriter {
     }
 }
 
+#[derive(Debug)]
+enum FecWriterMsg {
+    Data(Vec<u8>),
+}
+
 async fn run_writer<W>(
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    mut data_rx: mpsc::Receiver<FecWriterMsg>,
     utp: W,
     config: FecWriterConfig,
     ret_err: oneshot::Sender<io::ErrorKind>,
+    controller: Arc<dyn FecController>,
 ) where
     W: UnreliableWrite,
 {
@@ -169,18 +212,22 @@ async fn run_writer<W>(
         flush_delay: config.parity_delay,
         buf: vec![0; config.symbol_size * 2],
         utp,
+        controller,
+        loss_rate: None,
     };
     let err = loop {
         tokio::select! {
             () = tokio::time::sleep_until(state.next_flush.into()) => {
+                state.refresh_loss_rate().await;
                 if let Err(e) = state.send(None).await {
                     break e;
                 };
             }
             res = data_rx.recv() => {
-                let Some(data) = res else {
+                let Some(FecWriterMsg::Data(data)) = res else {
                     return;
                 };
+                state.refresh_loss_rate().await;
                 if let Err(e) = state.send(Some(data.as_ref())).await {
                     break e;
                 };
@@ -196,8 +243,15 @@ struct WriterState<W: UnreliableWrite> {
     pub flush_delay: Duration,
     pub buf: Vec<u8>,
     pub utp: W,
+    pub controller: Arc<dyn FecController>,
+    /// Most recent loss rate sampled from the reliable layer, in `[0, 1]`.
+    pub loss_rate: Option<f64>,
 }
 impl<W: UnreliableWrite> WriterState<W> {
+    async fn refresh_loss_rate(&mut self) {
+        let rate = self.controller.get_loss_rate().await;
+        self.loss_rate = rate;
+    }
     pub async fn send(&mut self, data: Option<&[u8]>) -> Result<(), io::ErrorKind> {
         if let Some(data) = data {
             let full = self.fec_encoder.group_data_count() + 1 > MAX_DATA_PER_GROUP;
@@ -219,8 +273,9 @@ impl<W: UnreliableWrite> WriterState<W> {
         } else {
             if FEC_DEBUG {
                 eprintln!(
-                    "FEC writer: flush tick, group_data_count={}",
-                    self.fec_encoder.group_data_count()
+                    "FEC writer: flush tick, group_data_count={} loss_rate={:?}",
+                    self.fec_encoder.group_data_count(),
+                    self.loss_rate
                 );
             }
             self.flush_parities().await?;
@@ -239,7 +294,7 @@ impl<W: UnreliableWrite> WriterState<W> {
             self.fec_encoder.skip_group();
             return Ok(());
         }
-        let parity_count = parity_for(data_count);
+        let parity_count = parity_for(data_count, self.loss_rate);
         let mut parity_encoder = self.fec_encoder.flush_parities(parity_count);
         while let Some(n) = parity_encoder.encode_parity(&mut self.buf) {
             let buf = &self.buf[..n];
@@ -249,9 +304,28 @@ impl<W: UnreliableWrite> WriterState<W> {
     }
 }
 
-fn parity_for(data_count: usize) -> u8 {
-    let p = (data_count * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
+/// Parity count for a group of `data_count` data symbols, scaled by the
+/// observed loss rate. With no loss signal we fall back to the static 1:4
+/// ratio; when the reliable layer reports high loss we add proportionally
+/// more parity so FEC can recover losses before retransmission kicks in.
+fn parity_for(data_count: usize, loss_rate: Option<f64>) -> u8 {
+    let base = (data_count * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
+    let scale = loss_rate.map(parity_scale).unwrap_or(1.0);
+    let p = (base as f64 * scale).round() as usize;
     p.clamp(1, MAX_PARITY_PER_GROUP).try_into().unwrap()
+}
+
+/// Multiplier applied to the base parity count as a function of the observed
+/// loss rate. Stays at 1x while the channel is healthy and grows up to 4x as
+/// loss approaches the reliable layer's backoff threshold, capping out to
+/// avoid runaway overhead.
+fn parity_scale(loss_rate: f64) -> f64 {
+    if loss_rate <= 0.02 {
+        return 1.0;
+    }
+    const MAX_SCALE: f64 = 4.0;
+    let t = (loss_rate / CC_DATA_LOSS_RATE).clamp(0.0, 1.0);
+    1.0 + (MAX_SCALE - 1.0) * t
 }
 
 #[derive(Debug)]

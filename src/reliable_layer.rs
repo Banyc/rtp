@@ -30,7 +30,7 @@ const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 const INIT_SEND_RATE: f64 = 128.;
 const SEND_RATE_PROBE_RATE: f64 = 1.;
-const CC_DATA_LOSS_RATE: f64 = 0.2;
+pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MSGS: bool = false;
 

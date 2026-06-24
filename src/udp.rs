@@ -7,7 +7,7 @@ use tokio::net::UdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
-    fec::{FecReader, FecReaderConfig, FecWriter, FecWriterConfig},
+    fec::{FecController, FecReader, FecReaderConfig, FecWriter, FecWriterConfig},
     socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
     transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
@@ -139,26 +139,43 @@ pub struct Connected {
     pub peer_addr: SocketAddr,
 }
 
+struct FecHalves {
+    read: Box<dyn UnreliableRead>,
+    write: Box<dyn UnreliableWrite>,
+    fec_controller: Option<Arc<dyn FecController>>,
+}
+
 pub(crate) fn wrap_fec(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
     let symbol_size = symbol_size(NO_FEC_MSS).unwrap();
-    let read: Box<dyn UnreliableRead> = if fec {
-        let config = FecReaderConfig { symbol_size };
-        Box::new(FecReader::new(read, config))
+    let FecHalves {
+        read,
+        write,
+        fec_controller,
+    } = if fec {
+        let reader = FecReader::new(read, FecReaderConfig { symbol_size });
+        let writer = FecWriter::new(
+            write,
+            FecWriterConfig {
+                parity_delay: PARITY_DELAY,
+                symbol_size,
+            },
+        );
+        let controller = writer.controller();
+        FecHalves {
+            read: Box::new(reader),
+            write: Box::new(writer),
+            fec_controller: Some(controller),
+        }
     } else {
-        Box::new(read)
-    };
-    let write: Box<dyn UnreliableWrite> = if fec {
-        let config = FecWriterConfig {
-            parity_delay: PARITY_DELAY,
-            symbol_size,
-        };
-        Box::new(FecWriter::new(write, config))
-    } else {
-        Box::new(write)
+        FecHalves {
+            read: Box::new(read),
+            write: Box::new(write),
+            fec_controller: None,
+        }
     };
     let mss = if fec {
         data_mss(NO_FEC_MSS).unwrap()
@@ -170,6 +187,7 @@ pub(crate) fn wrap_fec(
         utp_read: read,
         utp_write: write,
         mss,
+        fec_controller,
     }
 }
 
