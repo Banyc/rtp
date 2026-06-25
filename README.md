@@ -9,7 +9,6 @@ A userspace reliable transmission protocol whose congestion window is governed o
   - main entry: [[src/reliable_layer.rs]]
   - send window: [[src/pkt_send_space.rs]]
   - recv window: [[src/pkt_recv_space.rs]]
-  - send rate limiter: [[src/token_bucket.rs]]
   - SACK managing: [[src/sack.rs]]
 - a dead simple codec for packet encoding/decoding
   - main entry: [[src/codec.rs]]

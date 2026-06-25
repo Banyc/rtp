@@ -1,5 +1,5 @@
 use core::{net::SocketAddr, num::NonZeroUsize};
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use fec::proto::{data_mss, symbol_size};
@@ -7,8 +7,7 @@ use tokio::net::UdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
-    fec::{FecController, FecReader, FecReaderConfig, FecWriter, FecWriterConfig},
-    reliable_layer::ReliableLayer,
+    fec::{FecConfig, FecState},
     socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
     transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
@@ -139,48 +138,16 @@ pub struct Connected {
     pub peer_addr: SocketAddr,
 }
 
-struct FecHalves {
-    read: Box<dyn UnreliableRead>,
-    write: Box<dyn UnreliableWrite>,
-    fec_controller: Option<Arc<dyn FecController>>,
-    token_bucket: Option<Arc<std::sync::Mutex<crate::reliable_layer::SharedTokenBucket>>>,
-}
-
 pub(crate) fn wrap_fec(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
     let symbol_size = symbol_size(NO_FEC_MSS).unwrap();
-    let FecHalves {
-        read,
-        write,
-        fec_controller,
-        token_bucket,
-    } = if fec {
-        let token_bucket = ReliableLayer::new_token_bucket(Instant::now());
-        let reader = FecReader::new(read, FecReaderConfig { symbol_size });
-        let writer = FecWriter::new(
-            write,
-            FecWriterConfig {
-                symbol_size,
-            },
-            Arc::clone(&token_bucket),
-        );
-        let controller = writer.controller();
-        FecHalves {
-            read: Box::new(reader),
-            write: Box::new(writer),
-            fec_controller: Some(controller),
-            token_bucket: Some(token_bucket),
-        }
+    let fec_state = if fec {
+        Some(FecState::new(FecConfig { symbol_size }))
     } else {
-        FecHalves {
-            read: Box::new(read),
-            write: Box::new(write),
-            fec_controller: None,
-            token_bucket: None,
-        }
+        None
     };
     let mss = if fec {
         data_mss(NO_FEC_MSS).unwrap()
@@ -189,11 +156,10 @@ pub(crate) fn wrap_fec(
     };
     let mss = NonZeroUsize::new(mss).unwrap();
     UnreliableLayer {
-        utp_read: read,
-        utp_write: write,
+        utp_read: Box::new(read),
+        utp_write: Box::new(write),
         mss,
-        fec_controller,
-        token_bucket,
+        fec: fec_state,
     }
 }
 

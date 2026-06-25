@@ -11,11 +11,11 @@ use tokio::task::JoinSet;
 
 use crate::{
     codec::in_cmd_space,
-    transmission_layer::{LogConfig, SendKillPkt, TransmissionLayer, UnreliableLayer},
+    transmission_layer::{LogConfig, RecvBufs, SendBufs, SendKillPkt, TransmissionLayer, UnreliableLayer},
 };
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
-const BUF_SIZE: usize = 1024 * 64;
+
 
 pub type WriteStream = PollWrite<WriteSocket>;
 pub type ReadStream = PollRead<ReadSocket>;
@@ -40,19 +40,15 @@ pub fn socket(
     events.spawn({
         let transmission_layer = Arc::clone(&transmission_layer);
         async move {
-            let mut data_buf = vec![0; BUF_SIZE];
-            let mut utp_buf = vec![0; BUF_SIZE];
+            let mut send_bufs = SendBufs::new();
             loop {
                 // tokio::time::sleep(TIMER_INTERVAL).await;
-                let next_poll_time = {
-                    let reliable_layer = transmission_layer.reliable_layer().lock().unwrap();
-                    reliable_layer.token_bucket().lock().unwrap().next_token_time()
-                };
+                let next_poll_time = transmission_layer.next_poll_send_time();
                 let fast_poll_time = Instant::now() + TIMER_INTERVAL;
                 let poll_time = next_poll_time.min(fast_poll_time);
                 tokio::time::sleep_until(poll_time.into()).await;
                 if transmission_layer
-                    .send_pkts(&mut data_buf, &mut utp_buf)
+                    .send_pkts(&mut send_bufs)
                     .await
                     .is_err()
                 {
@@ -67,23 +63,22 @@ pub fn socket(
         let read_shutdown = read_shutdown.clone();
         let transmission_layer = Arc::clone(&transmission_layer);
         async move {
-            let mut utp_buf = vec![0; BUF_SIZE];
-            let mut ack_from_peer_buf = vec![];
-            let mut ack_to_peer_buf = vec![];
+            let mut recv_bufs = RecvBufs::new();
+            let mut send_bufs = SendBufs::new();
             loop {
                 // Read shutdown status must be checked before moving pkts to the read buf
                 //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
                 let recv_pkts = match transmission_layer
-                    .recv_pkts(&mut utp_buf, &mut ack_from_peer_buf, &mut ack_to_peer_buf)
+                    .recv_pkts(&mut recv_bufs, &mut send_bufs)
                     .await
                 {
                     Ok(recv_pkts) => recv_pkts,
                     Err((_e, should_send_kill_pkt)) => {
                         match should_send_kill_pkt {
                             SendKillPkt::Yes => {
-                                let _ = transmission_layer.send_kill_pkt().await;
+                                let _ = transmission_layer.send_kill_pkt(&mut send_bufs).await;
                             }
                             SendKillPkt::No => (),
                         }
@@ -91,7 +86,7 @@ pub fn socket(
                     }
                 };
                 if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
-                    let _ = transmission_layer.send_kill_pkt().await;
+                    let _ = transmission_layer.send_kill_pkt(&mut send_bufs).await;
                 }
             }
         }
@@ -129,8 +124,7 @@ pub fn socket(
     };
     let write = WriteSocket {
         transmission_layer: Arc::clone(&transmission_layer),
-        data_buf: vec![0; BUF_SIZE],
-        utp_buf: vec![0; BUF_SIZE],
+        send_bufs: SendBufs::new(),
         no_delay: true,
         _shutdown_guard: write_shutdown.drop_guard(),
     };
@@ -175,8 +169,7 @@ impl ReadSocket {
 #[derive(Debug)]
 pub struct WriteSocket {
     transmission_layer: Arc<TransmissionLayer>,
-    data_buf: Vec<u8>,
-    utp_buf: Vec<u8>,
+    send_bufs: SendBufs,
     no_delay: bool,
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
@@ -197,7 +190,7 @@ impl WriteSocket {
     /// ```
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
         self.transmission_layer
-            .send(data, self.no_delay, &mut self.data_buf, &mut self.utp_buf)
+            .send(data, self.no_delay, &mut self.send_bufs)
             .await
     }
 
@@ -351,7 +344,7 @@ mod tests {
         a_w.send(hello).await.unwrap();
         b_w.send(world).await.unwrap();
 
-        let mut recv_buf = [0; BUF_SIZE];
+        let mut recv_buf = [0; 1024 * 64];
         a_r.recv(&mut recv_buf).await.unwrap();
         assert_eq!(&recv_buf[..world.len()], world);
         b_r.recv(&mut recv_buf).await.unwrap();

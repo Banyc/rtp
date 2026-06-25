@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
-    fec::FecController,
+    fec::FecState,
     reliable_layer::{ReliableLayer, SharedTokenBucket},
     sack::{AckBall, AckBallSequence},
 };
@@ -19,31 +19,81 @@ const PRINT_DEBUG_MSGS: bool = false;
 const FEC_DEBUG: bool = false;
 const MAX_NUM_ACK: usize = 64;
 const MIN_NO_RESP_FOR: Duration = Duration::from_secs(1);
+const BUF_SIZE: usize = 1024 * 64;
 
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
+
+/// Reusable buffers for the send path. Allocated once and passed by `&mut`
+/// to avoid per-call allocation.
+#[derive(Debug)]
+pub struct SendBufs {
+    pub data: Vec<u8>,
+    pub utp: Vec<u8>,
+    pub fec: Vec<u8>,
+}
+
+impl SendBufs {
+    pub fn new() -> Self {
+        Self {
+            data: vec![0; BUF_SIZE],
+            utp: vec![0; BUF_SIZE],
+            fec: vec![0; BUF_SIZE],
+        }
+    }
+}
+
+impl Default for SendBufs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reusable buffers for the recv path. Allocated once and passed by `&mut`
+/// to avoid per-call allocation.
+#[derive(Debug)]
+pub struct RecvBufs {
+    pub utp: Vec<u8>,
+    pub ack_from_peer: Vec<AckBall>,
+    pub ack_to_peer: Vec<u64>,
+    pub codec_pkts: Vec<Vec<u8>>,
+}
+
+impl RecvBufs {
+    pub fn new() -> Self {
+        Self {
+            utp: vec![0; BUF_SIZE],
+            ack_from_peer: vec![],
+            ack_to_peer: vec![],
+            codec_pkts: vec![],
+        }
+    }
+}
+
+impl Default for RecvBufs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug)]
 pub struct TransmissionLayer {
     utp_read: tokio::sync::Mutex<Box<dyn UnreliableRead>>,
     utp_write: tokio::sync::Mutex<Box<dyn UnreliableWrite>>,
     reliable_layer: Mutex<ReliableLayer>,
+    send_rate_limiter: Arc<Mutex<SharedTokenBucket>>,
     sent_data_pkt: tokio::sync::Notify,
     recv_data_pkt: tokio::sync::Notify,
     sent_pkt_acked: tokio::sync::Notify,
     recv_fin: tokio_util::sync::CancellationToken,
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
-    fec_controller: Option<Arc<dyn FecController>>,
+    fec: Option<Mutex<FecState>>,
 }
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let now = Instant::now();
-        let reliable_layer = match &unreliable_layer.token_bucket {
-            Some(token_bucket) => {
-                Mutex::new(ReliableLayer::new_shared(unreliable_layer.mss, now, Arc::clone(token_bucket)))
-            }
-            None => Mutex::new(ReliableLayer::new(unreliable_layer.mss, now)),
-        };
+        let (reliable_layer, send_rate_limiter) = ReliableLayer::new(unreliable_layer.mss, now);
+        let reliable_layer = Mutex::new(reliable_layer);
         let sent_data_pkt = tokio::sync::Notify::new();
         let recv_data_pkt = tokio::sync::Notify::new();
         let sent_pkt_acked = tokio::sync::Notify::new();
@@ -62,18 +112,23 @@ impl TransmissionLayer {
             utp_read: tokio::sync::Mutex::new(unreliable_layer.utp_read),
             utp_write: tokio::sync::Mutex::new(unreliable_layer.utp_write),
             reliable_layer,
+            send_rate_limiter,
             sent_data_pkt,
             recv_data_pkt,
             sent_pkt_acked,
             recv_fin,
             first_error,
             reliable_layer_logger,
-            fec_controller: unreliable_layer.fec_controller,
+            fec: unreliable_layer.fec.map(Mutex::new),
         }
     }
 
     pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
         &self.reliable_layer
+    }
+
+    pub fn next_poll_send_time(&self) -> Instant {
+        self.send_rate_limiter.lock().unwrap().next_token_time()
     }
 
     /// # Cancel safety
@@ -128,22 +183,40 @@ impl TransmissionLayer {
         self.first_error.throw_error()
     }
 
-    pub async fn send_kill_pkt(&self) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_kill_pkt(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
-        self.utp_write.lock().await.send(&buf).await?;
+        self.send_with_fec(&buf, &mut bufs.fec).await?;
         Ok(())
     }
 
-    pub async fn send_pkts(
+    /// Wrap a codec packet with a FEC data-symbol header (if FEC is active) and
+    /// send it via `utp_write`. All outgoing codec packets (data, ACK, kill)
+    /// must go through this when FEC is active, so the receiver's FEC decoder
+    /// can process them uniformly.
+    async fn send_with_fec(
         &self,
-        data_buf: &mut [u8],
-        utp_buf: &mut [u8],
-    ) -> Result<(), std::io::ErrorKind> {
+        codec_pkt: &[u8],
+        fec_buf: &mut [u8],
+    ) -> Result<usize, std::io::ErrorKind> {
+        let send_buf: &[u8] = {
+            match self.fec.as_ref() {
+                Some(fec) => {
+                    let mut fec = fec.lock().unwrap();
+                    let n = fec.encode_data(codec_pkt, fec_buf);
+                    &fec_buf[..n]
+                }
+                None => codec_pkt,
+            }
+        };
+        self.utp_write.lock().await.send(send_buf).await
+    }
+
+    pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+        let now = Instant::now();
         let detect_broken_pipe_proactively = || {
             let reliable_layer = self.reliable_layer.lock().unwrap();
-            let Some(no_resp_for) = reliable_layer.pkt_send_space().no_resp_for(Instant::now())
-            else {
+            let Some(no_resp_for) = reliable_layer.pkt_send_space().no_resp_for(now) else {
                 return;
             };
             if no_resp_for < reliable_layer.pkt_send_space().rto_duration().mul_f64(16.0) {
@@ -164,7 +237,7 @@ impl TransmissionLayer {
             // reliable -{data}> UDP remote
             let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_pkt(data_buf, Instant::now())
+                reliable_layer.send_data_pkt(&mut bufs.data, now)
             };
             self.log("send_data_pkt");
             let Some(p) = res else {
@@ -185,13 +258,27 @@ impl TransmissionLayer {
             };
             let data = EncodeData {
                 seq: p.seq,
-                data: &data_buf[..data_written],
+                data: &bufs.data[..data_written],
             };
-            let n = encode_ack_data(None, Some(data), utp_buf).unwrap();
+            let n = encode_ack_data(None, Some(data), &mut bufs.utp).unwrap();
+            let utp_pkt = &bufs.utp[..n];
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
-            let Err(e) = self.utp_write.lock().await.send(&utp_buf[..n]).await else {
+            // Wrap the codec packet with a FEC data-symbol header (if FEC is
+            // active) before sending, so the receiver can recover it via
+            // parity if it's lost.
+            let send_buf: &[u8] = {
+                match self.fec.as_ref() {
+                    Some(fec) => {
+                        let mut fec = fec.lock().unwrap();
+                        let fec_n = fec.encode_data(utp_pkt, &mut bufs.fec);
+                        &bufs.fec[..fec_n]
+                    }
+                    None => utp_pkt,
+                }
+            };
+            let Err(e) = self.utp_write.lock().await.send(send_buf).await else {
                 continue;
             };
             self.first_error.set(e);
@@ -203,52 +290,69 @@ impl TransmissionLayer {
             }
             self.sent_data_pkt.notify_waiters();
         }
-        let loss_rate = self
-            .reliable_layer
-            .lock()
-            .unwrap()
-            .pkt_send_space()
-            .data_loss_rate(Instant::now());
-        self.push_loss_rate_to_fec(loss_rate).await;
+        // Flush FEC parities for the current group, rate-limited by the token
+        // bucket. The loss rate is read directly from the reliable layer — no
+        // cross-task channel or Arc needed.
+        self.flush_fec_parities(now).await;
         Ok(())
     }
 
-    /// Forward the reliable layer's observed loss rate to the FEC writer so its
-    /// parity aggressiveness can adapt. No-op when FEC is not in use.
-    async fn push_loss_rate_to_fec(&self, loss_rate: Option<f64>) {
-        let Some(controller) = self.fec_controller.as_ref() else {
+    /// Encode and send FEC parities for the current group, rate-limited by the
+    /// shared token bucket. No-op when FEC is not in use.
+    async fn flush_fec_parities(&self, now: Instant) {
+        let Some(fec) = self.fec.as_ref() else {
             return;
         };
-        controller.set_loss_rate(loss_rate).await;
+        let loss_rate = {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            reliable_layer.pkt_send_space().data_loss_rate(now)
+        };
+        let parity_pkts = {
+            let mut fec = fec.lock().unwrap();
+            fec.set_loss_rate(loss_rate);
+            let mut tb = self.send_rate_limiter.lock().unwrap();
+            fec.maybe_flush_parities(&mut tb, now)
+        };
+        for pkt in parity_pkts {
+            if self.utp_write.lock().await.send(&pkt).await.is_err() {
+                return;
+            }
+        }
     }
 
     pub async fn recv_pkts(
         &self,
-        utp_buf: &mut [u8],
-        ack_from_peer_buf: &mut Vec<AckBall>,
-        ack_to_peer_buf: &mut Vec<u64>,
+        bufs: &mut RecvBufs,
+        send_bufs: &mut SendBufs,
     ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
         let throw_error = |e: std::io::ErrorKind| {
             self.first_error.set(e);
             e
         };
+        let now = Instant::now();
         let mut recv_pkts = RecvPkts {
             num_ack_segments: 0,
             num_payload_segments: 0,
             num_fin_segments: 0,
         };
 
-        ack_to_peer_buf.clear();
+        bufs.ack_to_peer.clear();
         for _ in 0..MAX_NUM_ACK {
             self.first_error
                 .throw_error()
                 .map_err(|e| (e, SendKillPkt::No))?;
+
+            // Read a raw UDP packet and FEC-decode it. If FEC is active, the
+            // raw packet is a FEC data/parity symbol; `fec.decode` strips the
+            // FEC header and returns the codec payload, or returns None for a
+            // parity symbol (recovered data is queued internally). If FEC is
+            // not active, the raw packet IS the codec payload.
             let res = {
                 let mut utp_read = self.utp_read.lock().await;
-                match ack_to_peer_buf.is_empty() {
-                    true => utp_read.recv(utp_buf).await,
+                match bufs.ack_to_peer.is_empty() {
+                    true => utp_read.recv(&mut bufs.utp).await,
                     false => {
-                        let res = utp_read.try_recv(utp_buf);
+                        let res = utp_read.try_recv(&mut bufs.utp);
                         if let Err(e) = &res
                             && *e == std::io::ErrorKind::WouldBlock
                         {
@@ -264,93 +368,101 @@ impl TransmissionLayer {
                     return Err((throw_error(e), SendKillPkt::No));
                 }
             };
-            if PRINT_DEBUG_MSGS {
-                println!("recv_pkts: recv: {read_bytes}");
-            }
-            if FEC_DEBUG {
-                eprintln!(
-                    "recv_pkts: read_bytes={read_bytes} first_byte={}",
-                    if read_bytes > 0 { utp_buf[0] } else { 99 }
-                );
-            }
+            let read_pkt = &bufs.utp[..read_bytes];
 
-            ack_from_peer_buf.clear();
-            let data = match decode(&utp_buf[..read_bytes], ack_from_peer_buf) {
-                Ok(x) => x,
-                Err(e) => {
-                    if FEC_DEBUG {
-                        eprintln!("recv_pkts: decode error: {e:?}");
+            // FEC-decode the raw packet into `codec_pkts`, then process each.
+            // Also drain any packets recovered by parity.
+            bufs.codec_pkts.clear();
+            let mut orig_pkt = None;
+            match self.fec.as_ref() {
+                Some(fec) => {
+                    let mut fec = fec.lock().unwrap();
+                    if let Some(payload) = fec.decode(read_pkt) {
+                        bufs.codec_pkts.push(payload);
                     }
-                    continue;
+                    while let Some(recovered) = fec.pop_recovered() {
+                        bufs.codec_pkts.push(recovered);
+                    }
                 }
-            };
-
-            if data.killed {
-                let e = std::io::ErrorKind::BrokenPipe;
-                throw_error(e);
-                return Err((e, SendKillPkt::No));
+                None => {
+                    orig_pkt = Some(read_pkt);
+                }
             }
 
-            let now = Instant::now();
-            let RecvAckData { to_ack, loss_rate } = {
-                let mut reliable_layer = self.reliable_layer.lock().unwrap();
-
-                // UDP local -{ACK}> reliable
-                reliable_layer.recv_ack_pkt(AckBallSequence::new(ack_from_peer_buf), now);
-                if FEC_DEBUG {
-                    eprintln!("recv_ack_pkt: balls={:?}", ack_from_peer_buf);
-                }
-                // A fresh ACK/SACK can change the loss picture; capture it
-                // while we hold the lock and push it forward to FEC once
-                // released, so FEC adapts on the next flush tick rather than
-                // the next send.
-                let loss_rate = reliable_layer.pkt_send_space().data_loss_rate(now);
-
-                let to_ack = match &data.data {
-                    None => false,
-                    Some(data) => {
-                        // UDP local -{data}> reliable
-                        let to_ack = reliable_layer
-                            .recv_data_pkt(data.seq, &utp_buf[data.buf_range.clone()]);
+            let mut end_of_acks = false;
+            for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
+                bufs.ack_from_peer.clear();
+                let data = match decode(pkt, &mut bufs.ack_from_peer) {
+                    Ok(x) => x,
+                    Err(e) => {
                         if FEC_DEBUG {
-                            eprintln!(
-                                "recv_data_pkt seq={} empty={} ack={}",
-                                data.seq,
-                                data.buf_range.is_empty(),
-                                to_ack
-                            );
+                            eprintln!("recv_pkts: decode error: {e:?}");
                         }
-                        to_ack
+                        continue;
                     }
                 };
-                RecvAckData { to_ack, loss_rate }
-            };
-            recv_pkts.num_ack_segments += 1;
-            self.sent_pkt_acked.notify_waiters();
-            // Lock released; push the freshly observed loss rate to FEC.
-            self.push_loss_rate_to_fec(loss_rate).await;
 
-            let Some(data) = data.data else {
-                self.log("recv_ack_pkt");
-                continue;
-            };
-
-            if data.buf_range.is_empty() {
-                recv_pkts.num_fin_segments += 1;
-            } else {
-                recv_pkts.num_payload_segments += 1;
-            }
-            self.log("recv_data_pkt");
-            match to_ack {
-                true => {
-                    ack_to_peer_buf.push(data.seq);
+                if data.killed {
+                    let e = std::io::ErrorKind::BrokenPipe;
+                    throw_error(e);
+                    return Err((e, SendKillPkt::No));
                 }
-                false => break,
+
+                let to_ack = {
+                    let mut reliable_layer = self.reliable_layer.lock().unwrap();
+
+                    // UDP local -{ACK}> reliable
+                    reliable_layer.recv_ack_pkt(AckBallSequence::new(&bufs.ack_from_peer), now);
+                    if FEC_DEBUG {
+                        eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
+                    }
+
+                    match &data.data {
+                        None => false,
+                        Some(data) => {
+                            // UDP local -{data}> reliable
+                            let to_ack = reliable_layer
+                                .recv_data_pkt(data.seq, &pkt[data.buf_range.clone()]);
+                            if FEC_DEBUG {
+                                eprintln!(
+                                    "recv_data_pkt seq={} empty={} ack={}",
+                                    data.seq,
+                                    data.buf_range.is_empty(),
+                                    to_ack
+                                );
+                            }
+                            to_ack
+                        }
+                    }
+                };
+                recv_pkts.num_ack_segments += 1;
+                self.sent_pkt_acked.notify_waiters();
+
+                let Some(data) = data.data else {
+                    self.log("recv_ack_pkt");
+                    continue;
+                };
+
+                if data.buf_range.is_empty() {
+                    recv_pkts.num_fin_segments += 1;
+                } else {
+                    recv_pkts.num_payload_segments += 1;
+                }
+                self.log("recv_data_pkt");
+                match to_ack {
+                    true => {
+                        bufs.ack_to_peer.push(data.seq);
+                    }
+                    false => end_of_acks = true,
+                }
+            }
+            if end_of_acks {
+                break;
             }
         }
 
         // No new data received in the reliable layer
-        if ack_to_peer_buf.is_empty() {
+        if bufs.ack_to_peer.is_empty() {
             return Ok(recv_pkts);
         }
 
@@ -365,17 +477,14 @@ impl TransmissionLayer {
                 skip: 0,
                 max_take: MAX_NUM_ACK,
             };
-            encode_ack_data(Some(ack), None, utp_buf).unwrap()
+            encode_ack_data(Some(ack), None, &mut bufs.utp).unwrap()
         };
-        self.utp_write
-            .lock()
-            .await
-            .send(&utp_buf[..written_bytes])
+        self.send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
             .await
             .map_err(throw_error)
             .map_err(|e| (e, SendKillPkt::No))?;
         if PRINT_DEBUG_MSGS {
-            println!("recv_pkts: ack: {ack_to_peer_buf:?}");
+            println!("recv_pkts: ack: {:?}", bufs.ack_to_peer);
         }
 
         Ok(recv_pkts)
@@ -385,20 +494,20 @@ impl TransmissionLayer {
         &self,
         data: &[u8],
         no_delay: bool,
-        data_buf: &mut [u8],
-        utp_buf: &mut [u8],
+        bufs: &mut SendBufs,
     ) -> Result<usize, std::io::ErrorKind> {
+        let now = Instant::now();
         let mut sent_data_pkt = self.sent_data_pkt.notified();
         let written_bytes = loop {
             self.first_error.throw_error()?;
             let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_buf(data, Instant::now())
+                reliable_layer.send_data_buf(data, now)
             };
             self.log("send_data_buf");
 
             if no_delay {
-                self.send_pkts(data_buf, utp_buf).await?;
+                self.send_pkts(bufs).await?;
             }
 
             if 0 < written_bytes {
@@ -490,11 +599,7 @@ pub struct UnreliableLayer {
     pub utp_read: Box<dyn UnreliableRead>,
     pub utp_write: Box<dyn UnreliableWrite>,
     pub mss: NonZeroUsize,
-    pub fec_controller: Option<Arc<dyn FecController>>,
-    /// Shared send-rate token bucket. Created here so the FEC writer and the
-    /// reliable layer consume from the same bucket, keeping FEC parity under
-    /// the control loop's send rate.
-    pub token_bucket: Option<Arc<Mutex<SharedTokenBucket>>>,
+    pub fec: Option<FecState>,
 }
 
 #[derive(Debug, Clone)]
@@ -502,16 +607,6 @@ pub struct RecvPkts {
     pub num_ack_segments: usize,
     pub num_payload_segments: usize,
     pub num_fin_segments: usize,
-}
-
-/// Result of feeding a decoded packet's ACK and data segments into the
-/// reliable layer under a single lock hold.
-#[derive(Debug, Clone)]
-struct RecvAckData {
-    /// Whether the reliable layer accepted the data segment.
-    to_ack: bool,
-    /// Loss rate sampled while holding the lock, pushed to FEC once released.
-    loss_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

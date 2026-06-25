@@ -63,8 +63,7 @@ async fn convert_conn(conn: MpUdpConn, log_config: Option<LogConfig<'_>>) -> io:
         utp_read: Box::new(r),
         utp_write: Box::new(AtomicMpUdpWrite::new(w)),
         mss: NonZeroUsize::new(MSS).unwrap(),
-        fec_controller: None,
-        token_bucket: None,
+        fec: None,
     };
     let (read, write) = socket(unreliable_layer, log_config);
     let conn = Conn { read, write };

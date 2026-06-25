@@ -5,6 +5,7 @@ use std::{
 };
 
 use dre::{ConnectionState, PacketState};
+pub(crate) use primitive::io::token_bucket::TokenBucket as SharedTokenBucket;
 use primitive::{
     io::token_bucket::TokenBucket,
     ops::{
@@ -16,7 +17,6 @@ use primitive::{
     sync::mutex::SpinMutex,
     time::timer::Timer,
 };
-pub(crate) use primitive::io::token_bucket::TokenBucket as SharedTokenBucket;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -53,7 +53,7 @@ pub struct ReliableLayer {
     recv_data_buf: CapVecQueue<u8>,
     /// set-only
     recv_fin_buf: bool,
-    token_bucket: Arc<Mutex<TokenBucket>>,
+    send_rate_limiter: Arc<Mutex<TokenBucket>>,
     connection_stats: ConnectionState,
     pkt_send_space: PktSendSpace,
     pkt_recv_space: PktRecvSpace,
@@ -66,44 +66,21 @@ pub struct ReliableLayer {
     pkt_buf: Vec<dre::Packet>,
 }
 impl ReliableLayer {
-    /// Create a fresh shared send-rate token bucket initialized the same way
-    /// [`Self::new`] initializes its own. Used to share one bucket between the
-    /// reliable layer and the FEC writer so parity sends are rate-limited
-    /// alongside data sends.
-    pub(crate) fn new_token_bucket(now: Instant) -> Arc<Mutex<TokenBucket>> {
-        Arc::new(Mutex::new(TokenBucket::new(
+    pub fn new(mss: NonZeroUsize, now: Instant) -> (Self, Arc<Mutex<TokenBucket>>) {
+        let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
+        let send_rate = *init_send_rate.lock();
+        let send_rate_limiter = Arc::new(Mutex::new(TokenBucket::new(
             PosR::new(INIT_SEND_RATE).unwrap(),
             NonZeroUsize::new(MAX_BURST_PKTS).unwrap(),
             now,
-        )))
-    }
-
-    pub fn new(mss: NonZeroUsize, now: Instant) -> Self {
-        Self::with_token_bucket(mss, now, Self::new_token_bucket(now))
-    }
-
-    pub fn new_shared(
-        mss: NonZeroUsize,
-        now: Instant,
-        token_bucket: Arc<Mutex<TokenBucket>>,
-    ) -> Self {
-        Self::with_token_bucket(mss, now, token_bucket)
-    }
-
-    fn with_token_bucket(
-        mss: NonZeroUsize,
-        now: Instant,
-        token_bucket: Arc<Mutex<TokenBucket>>,
-    ) -> Self {
-        let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
-        let send_rate = *init_send_rate.lock();
-        Self {
+        )));
+        let this = Self {
             mss,
             send_data_buf: CapVecQueue::new_vec(SEND_DATA_BUF_LEN),
             send_fin_buf: SendFinBuf::Empty,
             recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUF_LEN),
             recv_fin_buf: false,
-            token_bucket,
+            send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new(),
             pkt_recv_space: PktRecvSpace::new(),
@@ -112,7 +89,8 @@ impl ReliableLayer {
             huge_data_loss_timer: Timer::new(),
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
-        }
+        };
+        (this, send_rate_limiter)
     }
 
     pub fn is_no_data_to_send(&self) -> bool {
@@ -133,10 +111,6 @@ impl ReliableLayer {
 
     pub fn pkt_recv_space(&self) -> &PktRecvSpace {
         &self.pkt_recv_space
-    }
-
-    pub fn token_bucket(&self) -> &Arc<Mutex<TokenBucket>> {
-        &self.token_bucket
     }
 
     pub fn send_fin_buf(&mut self) {
@@ -183,7 +157,12 @@ impl ReliableLayer {
         };
         f();
 
-        if !self.token_bucket.lock().unwrap().take_exact_tokens(1, now) {
+        if !self
+            .send_rate_limiter
+            .lock()
+            .unwrap()
+            .take_exact_tokens(1, now)
+        {
             return None;
         }
 
@@ -372,7 +351,10 @@ impl ReliableLayer {
         self.pkt_send_space.set_send_rate(send_rate);
         let send_rate = PosR::new(MIN_SEND_RATE).unwrap().max(send_rate);
         self.send_rate = send_rate;
-        self.token_bucket.lock().unwrap().set_thruput(send_rate, now);
+        self.send_rate_limiter
+            .lock()
+            .unwrap()
+            .set_thruput(send_rate, now);
     }
 
     fn max_data_size_per_pkt(&self) -> usize {
@@ -383,7 +365,7 @@ impl ReliableLayer {
         let now = Instant::now();
         let min_rtt = self.pkt_send_space.min_rtt();
         Log {
-            tokens: self.token_bucket.lock().unwrap().outdated_tokens(),
+            tokens: self.send_rate_limiter.lock().unwrap().outdated_tokens(),
             send_rate: self.send_rate.get(),
             loss_rate: self.pkt_send_space.data_loss_rate(now),
             num_tx_pkts: self.pkt_send_space.num_txing_pkts(),
