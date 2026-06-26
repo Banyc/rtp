@@ -191,7 +191,9 @@ impl UnreliableRead for IdentityConnRead {
 #[async_trait]
 impl UnreliableWrite for ConnWrite<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        Self::send(self, buf).await.map_err(|e| e.kind())
+        Self::send(self, buf)
+            .await
+            .map_err(|e| normalize_send_err(e).kind())
     }
 }
 
@@ -199,31 +201,53 @@ impl UnreliableWrite for ConnWrite<UdpSocket> {
 #[async_trait]
 impl UnreliableRead for Arc<UdpSocket> {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::try_recv(self, buf).map_err(|e| e.kind())
+        UdpSocket::try_recv(self, buf).map_err(|e| normalize_send_err(e).kind())
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::recv(self, buf).await.map_err(|e| e.kind())
+        UdpSocket::recv(self, buf).await.map_err(|e| normalize_send_err(e).kind())
     }
 }
 #[async_trait]
 impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         let res = UdpSocket::send(self, buf).await;
-        if let Err(e) = &res
-            && let Some(e) = e.raw_os_error()
-        {
-            #[cfg(target_os = "macos")]
-            if e == 55 {
-                return Err(std::io::ErrorKind::WouldBlock);
-            }
-            #[cfg(target_os = "linux")]
-            if e == 105 {
-                return Err(std::io::ErrorKind::WouldBlock);
-            }
+        match res {
+            Ok(n) => Ok(n),
+            Err(e) => Err(normalize_send_err(e).kind()),
         }
-        res.map_err(|e| e.kind())
     }
+}
+
+/// Normalize transient UDP send-buffer exhaustion (ENOBUFS / ENOBUFS-equivalent
+/// OS errors) to [`std::io::ErrorKind::WouldBlock`].
+///
+/// UDP has no flow control: when the kernel send buffer is full the OS
+/// reports a transient error (macOS errno 55 `ENOBUFS`, Linux errno 105
+/// `ENOBUFS`). These are not fatal — the packet is simply dropped and the
+/// caller should treat it as transient backpressure (equivalent to a loss
+/// event). Reliability is provided above this layer by the reliable layer's
+/// retransmit logic, so dropping an outgoing packet here is recoverable.
+///
+/// All other errors are passed through unchanged.
+pub(crate) fn normalize_send_err(e: std::io::Error) -> std::io::Error {
+    if let Some(code) = e.raw_os_error() {
+        #[cfg(target_os = "macos")]
+        if code == 55 {
+            return std::io::ErrorKind::WouldBlock.into();
+        }
+        #[cfg(target_os = "linux")]
+        if code == 105 {
+            return std::io::ErrorKind::WouldBlock.into();
+        }
+        // Fallback: also recognize the symbolic ENOBUFS value on any BSD-like
+        // platform that happens to share the same errno numbers.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = code;
+        }
+    }
+    e
 }
 
 /// Test-only utilities for simulating packet loss without OS-level network

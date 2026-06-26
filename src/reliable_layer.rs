@@ -163,20 +163,12 @@ impl ReliableLayer {
         };
         f();
 
-        // insufficient cwnd
-        if !self.pkt_send_space.accepts_new_pkt() {
-            return None;
-        }
-
-        if !self
-            .send_rate_limiter
-            .lock()
-            .unwrap()
-            .take_exact_tokens(1, now)
-        {
-            return None;
-        }
-
+        // Retransmits bypass both the new-packet cwnd gate and the send-rate
+        // token bucket. A retransmit is not a new packet entering the window;
+        // it is an already-in-flight packet being resent, so gating it on
+        // `accepts_new_pkt()` (cwnd not full) or charging a token for it would
+        // starve recovery when the window is full of lost packets and there
+        // are no tokens available — exactly the moments retransmits matter.
         if let Some(p) = self.pkt_send_space.rtx(now) {
             pkt[..p.data.len()].copy_from_slice(p.data);
 
@@ -187,6 +179,15 @@ impl ReliableLayer {
                 seq: p.seq,
                 data_written,
             });
+        }
+
+        // No retransmit to send. From here on we are sending a *new* packet,
+        // so the cwnd gate and the send-rate token bucket both apply. Charge
+        // a token only when there is actually a new packet (or a FIN) to
+        // send; an idle/cwnd-full call must not drain tokens, otherwise we
+        // steal bandwidth from a future send and skew the rate limiter.
+        if !self.pkt_send_space.accepts_new_pkt() {
+            return None;
         }
 
         let pkt_bytes = pkt
@@ -201,6 +202,22 @@ impl ReliableLayer {
             }
             (None, _) => return None,
         };
+
+        // There is a new packet (or FIN) to send: take a token now.
+        if !self
+            .send_rate_limiter
+            .lock()
+            .unwrap()
+            .take_exact_tokens(1, now)
+        {
+            // We have data/FIN to send but the rate limiter says not yet.
+            // Restore the FIN buffer state so the FIN is retried later
+            // instead of being permanently consumed.
+            if pkt_bytes == 0 {
+                self.send_fin_buf = SendFinBuf::Some;
+            }
+            return None;
+        }
 
         let stats = self
             .connection_stats

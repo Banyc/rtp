@@ -24,7 +24,7 @@ const PARITY_DATA_THRESHOLD: usize = 4;
 /// `PARITY_DATA_THRESHOLD` data symbols in `encode_data`, so the parity burst
 /// is at most `MAX_PARITY_PER_GROUP` packets — a tiny, bounded cost that the
 /// token bucket refills almost instantly.
-const PARITY_TOKEN_RESERVE: usize = 1;
+const PARITY_TOKEN_RESERVE: usize = 1 + PARITY_DATA_THRESHOLD * 2;
 const GROUP_SIZE_HIST_LEN: usize = MAX_DATA_PER_GROUP + 1;
 
 #[derive(Debug, Clone)]
@@ -232,17 +232,7 @@ impl FecState {
             self.encoder.skip_group();
             return vec![];
         }
-        if !send_rate_limiter.take_exact_tokens(usize::from(parity_count), now) {
-            // Lost a race with the data path between the surplus check and the
-            // take. Treat the same as no surplus.
-            self.stats.groups_skipped_no_surplus_tokens += 1;
-            inc_hist(
-                &mut self.stats.group_size_skipped_no_surplus_tokens,
-                data_count,
-            );
-            self.encoder.skip_group();
-            return vec![];
-        }
+        assert!(send_rate_limiter.take_exact_tokens(usize::from(parity_count), now));
         if FEC_DEBUG {
             eprintln!("FEC: flushing {parity_count} parities for group of {data_count}");
         }

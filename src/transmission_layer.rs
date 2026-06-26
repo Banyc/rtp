@@ -301,11 +301,22 @@ impl TransmissionLayer {
                     None => utp_pkt,
                 }
             };
-            let Err(e) = self.utp_write.lock().await.send(send_buf).await else {
-                continue;
-            };
-            self.first_error.set(e);
-            return Err(e);
+            match self.utp_write.lock().await.send(send_buf).await {
+                Ok(_) => continue,
+                Err(std::io::ErrorKind::WouldBlock) => {
+                    // Transient UDP send-buffer exhaustion. Treat as packet
+                    // loss/backpressure: skip this packet and keep going. The
+                    // reliable layer will retransmit if it is not acked.
+                    if FEC_DEBUG {
+                        eprintln!("send_pkts: WouldBlock on data send (transient)");
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    self.first_error.set(e);
+                    return Err(e);
+                }
+            }
         }
         if 0 < written_bytes || written_fin {
             if PRINT_DEBUG_MSGS {
@@ -369,8 +380,18 @@ impl TransmissionLayer {
             fec.maybe_flush_parities(&mut tb, now)
         };
         for pkt in parity_pkts {
-            if self.utp_write.lock().await.send(&pkt).await.is_err() {
-                return;
+            match self.utp_write.lock().await.send(&pkt).await {
+                Ok(_) => (),
+                Err(std::io::ErrorKind::WouldBlock) => {
+                    // Transient UDP send-buffer exhaustion. Treat as loss of
+                    // this parity packet; FEC parity is redundant by design,
+                    // so dropping one is recoverable.
+                    if FEC_DEBUG {
+                        eprintln!("flush_fec_parities: WouldBlock (transient)");
+                    }
+                    return;
+                }
+                Err(_) => return,
             }
         }
     }
@@ -535,13 +556,18 @@ impl TransmissionLayer {
             encode_ack_data(Some(ack), None, &mut bufs.utp).unwrap()
         };
         let fec_enabled = self.fec.is_some();
-        let res = self
-            .send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
-            .await
-            .map_err(throw_error)
-            .map_err(|e| (e, SendKillPkt::No));
+        let res = self.send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec).await;
+        // Transient UDP send-buffer exhaustion: treat the loss of this ACK
+        // packet as transient backpressure rather than a fatal connection
+        // error. ACKs are cumulative and the peer will learn of the acked
+        // sequence numbers on the next ACK we send successfully.
+        let res: Result<(), (std::io::ErrorKind, SendKillPkt)> = match res {
+            Ok(_) => Ok(()),
+            Err(std::io::ErrorKind::WouldBlock) => Ok(()),
+            Err(e) => Err((throw_error(e), SendKillPkt::No)),
+        };
         if fec_enabled {
-            match res {
+            match &res {
                 Ok(_) => {
                     let now = Instant::now();
                     let can_send_tail_fec =

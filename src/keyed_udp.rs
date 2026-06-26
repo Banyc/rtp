@@ -158,7 +158,9 @@ impl KeyedConnWrite {
 #[async_trait]
 impl UnreliableWrite for KeyedConnWrite {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        Self::send(self, buf).await.map_err(|e| e.kind())
+        Self::send(self, buf)
+            .await
+            .map_err(|e| crate::udp::normalize_send_err(e).kind())
     }
 }
 
