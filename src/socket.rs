@@ -164,6 +164,12 @@ impl ReadSocket {
     pub fn into_async_read(self) -> ReadStream {
         PollRead::new(self)
     }
+
+    /// Number of codec payloads recovered by FEC parity so far, or `None` when
+    /// FEC is not enabled. Exposed for tests asserting parity recovery.
+    pub fn fec_recovered_symbols(&self) -> Option<usize> {
+        self.transmission_layer.fec_recovered_symbols()
+    }
 }
 
 #[derive(Debug)]
@@ -325,7 +331,6 @@ mod tests {
     use crate::udp::wrap_fec;
 
     use super::*;
-
     #[tokio::test(flavor = "multi_thread")]
     async fn test_async_io() {
         let fec = true;
@@ -391,5 +396,76 @@ mod tests {
         while let Some(res) = transmission.join_next().await {
             res.unwrap();
         }
+    }
+
+    /// FEC must actually recover lost data symbols via parity under packet
+    /// loss. This transfers a sizable buffer over a lossy link with FEC
+    /// enabled and asserts `recovered_symbols > 0` on the receiver. Loss is
+    /// injected via per-instance `LossRate` + `testing::wrap_fec_lossy` — the
+    /// production `UnreliableRead`/`UnreliableWrite` impls are untouched and
+    /// there is no global state.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fec_recovers_under_loss() {
+        use crate::udp::testing::{LossRate, wrap_fec_lossy};
+
+        // 3% loss is high enough to drop ~85 of ~2800 data packets (giving FEC
+        // plenty to recover) but low enough that the reliable layer's
+        // broken-pipe heuristic does not trip and abort the transfer under
+        // concurrent test load. Each side gets its own local `LossRate`.
+        let rate_a = LossRate::new(300); // 3% loss on a's link
+        let rate_b = LossRate::new(300); // 3% loss on b's link
+
+        let fec = true;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let a = wrap_fec_lossy(a.clone(), a, fec, rate_a);
+        let b = wrap_fec_lossy(b.clone(), b, fec, rate_b);
+        let (a_r, a_w) = socket(a, None);
+        let (b_r, b_w) = socket(b, None);
+
+        // 4 MiB: large enough that ~2800 packets cross the link, so 3% loss
+        // produces ~85 dropped packets — plenty for FEC parity to recover
+        // some of them reliably, even when some parity packets are themselves
+        // lost.
+        let mut send_buf = vec![0; 4 << 20];
+        let mut recv_buf = send_buf.clone();
+        for byte in &mut send_buf {
+            *byte = rand::random();
+        }
+
+        let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
+        // Keep `b_r` as a PollRead (not unsplit) so we can still query its
+        // `ReadSocket` for FEC stats after the transfer. `PollRead` implements
+        // `tokio::io::AsyncRead`, so `read_exact` works directly.
+        let mut b_r = b_r.into_async_read();
+        let b_w = b_w.into_async_write();
+
+        let send_buf_clone = send_buf.clone();
+        let recv_done = Arc::new(tokio::sync::Notify::new());
+        let recv_done_clone = recv_done.clone();
+        let sender = tokio::spawn(async move {
+            // Keep the write side alive so the connection does not shut down
+            // before the receiver finishes reading.
+            let _b_w = b_w;
+            a.write_all(&send_buf_clone).await.unwrap();
+            recv_done_clone.notified().await;
+            a
+        });
+
+        b_r.read_exact(&mut recv_buf).await.unwrap();
+        assert_eq!(send_buf, recv_buf);
+        recv_done.notify_waiters();
+        sender.await.unwrap();
+
+        // The receiver decoded incoming packets (data + parity) and FEC should
+        // have reconstructed some lost data symbols from parity.
+        let recovered = b_r.inner().fec_recovered_symbols();
+        assert!(recovered.is_some(), "FEC should be enabled on the receiver");
+        assert!(
+            recovered.unwrap() > 0,
+            "FEC should recover >0 symbols under 3% loss, got 0"
+        );
     }
 }

@@ -105,6 +105,12 @@ impl ReliableLayer {
             )
     }
 
+    pub fn can_send_tail_fec(&self, now: Instant) -> bool {
+        self.is_send_buf_empty()
+            && self.pkt_send_space.accepts_new_pkt()
+            && !self.pkt_send_space.has_rtx(now)
+    }
+
     pub fn pkt_send_space(&self) -> &PktSendSpace {
         &self.pkt_send_space
     }

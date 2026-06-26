@@ -169,12 +169,20 @@ impl PktSendSpace {
         }
     }
 
+    pub fn has_rtx(&self, now: Instant) -> bool {
+        let out_of_order_seq_end = self.out_of_order_seq_end;
+        Self::unacked(&self.send_wnd)
+            .take(self.cwnd.get())
+            .any(|(s, p)| {
+                let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
+                p.is_rtx(is_seq_out_of_order, self.rto.smooth_rtt(), now)
+            })
+    }
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
+        let out_of_order_seq_end = self.out_of_order_seq_end;
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
-            let out_of_order_rt =
-                s < self.out_of_order_seq_end && p.hits_custom_rto(self.rto.smooth_rtt(), now);
-
-            let should_rtx = p.hits_rto(now) || out_of_order_rt;
+            let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
+            let should_rtx = p.is_rtx(is_seq_out_of_order, self.rto.smooth_rtt(), now);
             if !should_rtx {
                 continue;
             }
@@ -370,7 +378,19 @@ impl TxingPkt {
     pub fn next_rto_time(&self) -> Instant {
         self.sent_time + self.rto
     }
+
+    pub fn is_rtx(
+        &self,
+        seq_out_of_order: SeqOutOfOrder,
+        custom_rto: Duration,
+        now: Instant,
+    ) -> bool {
+        let out_of_order_rt = seq_out_of_order.0 && self.hits_custom_rto(custom_rto, now);
+        self.hits_rto(now) || out_of_order_rt
+    }
 }
+
+struct SeqOutOfOrder(pub bool);
 
 #[derive(Debug, Clone)]
 pub struct Pkt<'a> {

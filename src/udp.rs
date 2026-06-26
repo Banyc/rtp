@@ -226,6 +226,147 @@ impl UnreliableWrite for Arc<UdpSocket> {
     }
 }
 
+/// Test-only utilities for simulating packet loss without OS-level network
+/// shaping. Compiled only under `test` builds so production code is completely
+/// unaffected — there is no global drop flag on the production
+/// `UnreliableRead`/`UnreliableWrite` impls.
+///
+/// Loss is per-instance, not global: each test creates a [`LossRate`] and
+/// injects it into the wrappers it wants to be lossy, so tests never interfere
+/// with each other.
+#[cfg(test)]
+pub mod testing {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    /// A toggable loss rate in basis points (0–10_000), owned by a single test
+    /// and shared (via `Arc`) between the read and write wrappers of one
+    /// connection. 0 means no loss; 10_000 means drop every packet.
+    ///
+    /// Create one per test with [`LossRate::new`] and pass clones to
+    /// [`LossyRead::new`] / [`LossyWrite::new`].
+    #[derive(Debug, Clone)]
+    pub struct LossRate(Arc<AtomicUsize>);
+
+    impl LossRate {
+        /// New loss rate of `bps` basis points (500 = 5%). Clamped to
+        /// `[0, 10_000]`.
+        pub fn new(bps: usize) -> Self {
+            Self(Arc::new(AtomicUsize::new(bps.min(10_000))))
+        }
+
+        /// Set the loss rate to `bps` basis points. Clamped to
+        /// `[0, 10_000]`.
+        pub fn set(&self, bps: usize) {
+            self.0.store(bps.min(10_000), Ordering::Relaxed);
+        }
+
+        /// Current loss rate in basis points.
+        pub fn get(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        /// Returns `true` with probability `bps / 10_000`.
+        fn roll(&self) -> bool {
+            let bps = self.0.load(Ordering::Relaxed);
+            bps > 0 && rand::random::<u32>() % 10_000 < bps as u32
+        }
+    }
+
+    /// Wrapper around any `UnreliableRead` that drops a fraction of received
+    /// packets per the injected [`LossRate`]. Dropped packets are skipped (recv
+    /// keeps waiting for the next one); `try_recv` reports `WouldBlock`.
+    #[derive(Debug)]
+    pub struct LossyRead<R: UnreliableRead> {
+        inner: R,
+        rate: LossRate,
+    }
+
+    impl<R: UnreliableRead> LossyRead<R> {
+        pub fn new(read: R, rate: LossRate) -> Self {
+            Self { inner: read, rate }
+        }
+    }
+
+    #[async_trait]
+    impl<R: UnreliableRead + Send + Sync + 'static> UnreliableRead for LossyRead<R> {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            let n = self.inner.try_recv(buf)?;
+            if self.rate.roll() {
+                return Err(std::io::ErrorKind::WouldBlock);
+            }
+            Ok(n)
+        }
+
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            loop {
+                let n = self.inner.recv(buf).await?;
+                if !self.rate.roll() {
+                    return Ok(n);
+                }
+            }
+        }
+    }
+
+    /// Wrapper around any `UnreliableWrite` that drops a fraction of sent
+    /// packets per the injected [`LossRate`]. A dropped send reports success
+    /// (the data is "written" then silently discarded), simulating a packet
+    /// lost in flight after the sender's kernel has accepted it.
+    #[derive(Debug)]
+    pub struct LossyWrite<W: UnreliableWrite> {
+        inner: W,
+        rate: LossRate,
+    }
+
+    impl<W: UnreliableWrite> LossyWrite<W> {
+        pub fn new(write: W, rate: LossRate) -> Self {
+            Self { inner: write, rate }
+        }
+    }
+
+    #[async_trait]
+    impl<W: UnreliableWrite + Send + Sync + 'static> UnreliableWrite for LossyWrite<W> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            if self.rate.roll() {
+                return Ok(buf.len());
+            }
+            self.inner.send(buf).await
+        }
+    }
+
+    /// Like `wrap_fec` but wraps the read/write pair in lossy injectors driven
+    /// by `rate`. Each connection should get its own `LossRate` (or a shared
+    /// one if you want both directions of a single link to share loss state).
+    pub fn wrap_fec_lossy<R, W>(read: R, write: W, fec: bool, rate: LossRate) -> UnreliableLayer
+    where
+        R: UnreliableRead + Send + Sync + 'static,
+        W: UnreliableWrite + Send + Sync + 'static,
+    {
+        let symbol_size = symbol_size(NO_FEC_MSS).unwrap();
+        let fec_state = if fec {
+            Some(FecState::new(FecConfig { symbol_size }))
+        } else {
+            None
+        };
+        let mss = if fec {
+            data_mss(NO_FEC_MSS).unwrap()
+        } else {
+            NO_FEC_MSS
+        };
+        let mss = NonZeroUsize::new(mss).unwrap();
+        UnreliableLayer {
+            utp_read: Box::new(LossyRead::new(read, rate.clone())),
+            utp_write: Box::new(LossyWrite::new(write, rate)),
+            mss,
+            fec: fec_state,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogConfig<'a> {
     pub log_dir_path: &'a Path,

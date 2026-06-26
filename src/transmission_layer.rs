@@ -127,6 +127,15 @@ impl TransmissionLayer {
         &self.reliable_layer
     }
 
+    /// Number of codec payloads recovered by FEC parity so far, or `None` when
+    /// FEC is not enabled. Exposed for tests asserting that parity actually
+    /// reconstructs lost data under loss injection.
+    pub fn fec_recovered_symbols(&self) -> Option<usize> {
+        self.fec
+            .as_ref()
+            .map(|fec| fec.lock().unwrap().recovered_symbols())
+    }
+
     pub fn next_poll_send_time(&self) -> Instant {
         self.send_rate_limiter.lock().unwrap().next_token_time()
     }
@@ -186,7 +195,20 @@ impl TransmissionLayer {
     pub async fn send_kill_pkt(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
-        self.send_with_fec(&buf, &mut bufs.fec).await?;
+        let fec_enabled = self.fec.is_some();
+        let res = self.send_with_fec(&buf, &mut bufs.fec).await;
+        if fec_enabled {
+            match res {
+                Ok(_) => {
+                    let now = Instant::now();
+                    let can_send_tail_fec =
+                        { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+                    self.close_fec_burst(now, can_send_tail_fec).await;
+                }
+                Err(_) => self.skip_open_fec_group(),
+            }
+        }
+        res?;
         Ok(())
     }
 
@@ -290,11 +312,48 @@ impl TransmissionLayer {
             }
             self.sent_data_pkt.notify_waiters();
         }
-        // Flush FEC parities for the current group, rate-limited by the token
-        // bucket. The loss rate is read directly from the reliable layer — no
-        // cross-task channel or Arc needed.
-        self.flush_fec_parities(now).await;
+        // Close the FEC burst at the data tail. A tail flush is only permitted
+        // when the reliable layer has no more data/RTX to send, so parity is
+        // tail-only and never competes with data bandwidth. When blocked, the
+        // open group is skipped so no stale group carries into the next burst.
+        if self.fec.is_some() {
+            let can_send_tail_fec =
+                { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+            self.close_fec_burst(now, can_send_tail_fec).await;
+        }
         Ok(())
+    }
+
+    /// Close the current FEC burst: flush parities for the open group when a
+    /// tail flush is allowed, otherwise skip the group. No-op when FEC is not
+    /// in use. This is the sole entry point that decides flush-vs-skip at a
+    /// burst boundary; it consumes the `tail_flush_allowed` flag set by
+    /// `note_tail_flush_allowed`/`note_tail_flush_blocked`.
+    async fn close_fec_burst(&self, now: Instant, can_send_tail_fec: bool) {
+        let Some(fec) = self.fec.as_ref() else {
+            return;
+        };
+        {
+            let mut fec = fec.lock().unwrap();
+            if can_send_tail_fec {
+                fec.note_tail_flush_allowed();
+            } else {
+                fec.note_tail_flush_blocked();
+                fec.skip_open_group();
+                return;
+            }
+        }
+        self.flush_fec_parities(now).await;
+    }
+
+    /// Skip the open FEC group without flushing. Used on send errors where we
+    /// cannot flush but must still close the burst so no stale group leaks
+    /// into the next one.
+    fn skip_open_fec_group(&self) {
+        let Some(fec) = self.fec.as_ref() else {
+            return;
+        };
+        fec.lock().unwrap().skip_open_group();
     }
 
     /// Encode and send FEC parities for the current group, rate-limited by the
@@ -303,13 +362,8 @@ impl TransmissionLayer {
         let Some(fec) = self.fec.as_ref() else {
             return;
         };
-        let loss_rate = {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
-            reliable_layer.pkt_send_space().data_loss_rate(now)
-        };
         let parity_pkts = {
             let mut fec = fec.lock().unwrap();
-            fec.set_loss_rate(loss_rate);
             let mut tb = self.send_rate_limiter.lock().unwrap();
             fec.maybe_flush_parities(&mut tb, now)
         };
@@ -479,10 +533,24 @@ impl TransmissionLayer {
             };
             encode_ack_data(Some(ack), None, &mut bufs.utp).unwrap()
         };
-        self.send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
+        let fec_enabled = self.fec.is_some();
+        let res = self
+            .send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
             .await
             .map_err(throw_error)
-            .map_err(|e| (e, SendKillPkt::No))?;
+            .map_err(|e| (e, SendKillPkt::No));
+        if fec_enabled {
+            match res {
+                Ok(_) => {
+                    let now = Instant::now();
+                    let can_send_tail_fec =
+                        { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+                    self.close_fec_burst(now, can_send_tail_fec).await;
+                }
+                Err(_) => self.skip_open_fec_group(),
+            }
+        }
+        res?;
         if PRINT_DEBUG_MSGS {
             println!("recv_pkts: ack: {:?}", bufs.ack_to_peer);
         }
@@ -549,6 +617,9 @@ impl TransmissionLayer {
             }
             if read_fin {
                 self.recv_fin.cancel();
+                if let Some(fec) = self.fec.as_ref() {
+                    fec.lock().unwrap().debug_print_stats();
+                }
                 continue;
             }
             tokio::select! {
