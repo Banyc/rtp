@@ -163,6 +163,11 @@ impl ReliableLayer {
         };
         f();
 
+        // insufficient cwnd
+        if !self.pkt_send_space.accepts_new_pkt() {
+            return None;
+        }
+
         if !self
             .send_rate_limiter
             .lock()
@@ -182,11 +187,6 @@ impl ReliableLayer {
                 seq: p.seq,
                 data_written,
             });
-        }
-
-        // insufficient cwnd
-        if !self.pkt_send_space.accepts_new_pkt() {
-            return None;
         }
 
         let pkt_bytes = pkt
