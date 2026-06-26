@@ -11,11 +11,12 @@ use tokio::task::JoinSet;
 
 use crate::{
     codec::in_cmd_space,
-    transmission_layer::{LogConfig, RecvBufs, SendBufs, SendKillPkt, TransmissionLayer, UnreliableLayer},
+    transmission_layer::{
+        LogConfig, RecvBufs, SendBufs, SendKillPkt, TransmissionLayer, UnreliableLayer,
+    },
 };
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
-
 
 pub type WriteStream = PollWrite<WriteSocket>;
 pub type ReadStream = PollRead<ReadSocket>;
@@ -47,11 +48,7 @@ pub fn socket(
                 let fast_poll_time = Instant::now() + TIMER_INTERVAL;
                 let poll_time = next_poll_time.min(fast_poll_time);
                 tokio::time::sleep_until(poll_time.into()).await;
-                if transmission_layer
-                    .send_pkts(&mut send_bufs)
-                    .await
-                    .is_err()
-                {
+                if transmission_layer.send_pkts(&mut send_bufs).await.is_err() {
                     return;
                 }
             }

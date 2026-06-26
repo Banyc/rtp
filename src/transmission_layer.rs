@@ -235,8 +235,8 @@ impl TransmissionLayer {
     }
 
     pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
-        let now = Instant::now();
         let detect_broken_pipe_proactively = || {
+            let now = Instant::now();
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let Some(no_resp_for) = reliable_layer.pkt_send_space().no_resp_for(now) else {
                 return;
@@ -257,6 +257,7 @@ impl TransmissionLayer {
         loop {
             self.first_error.throw_error()?;
             // reliable -{data}> UDP remote
+            let now = Instant::now();
             let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_pkt(&mut bufs.data, now)
@@ -317,8 +318,8 @@ impl TransmissionLayer {
         // tail-only and never competes with data bandwidth. When blocked, the
         // open group is skipped so no stale group carries into the next burst.
         if self.fec.is_some() {
-            let can_send_tail_fec =
-                { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+            let now = Instant::now();
+            let can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
             self.close_fec_burst(now, can_send_tail_fec).await;
         }
         Ok(())
@@ -383,7 +384,6 @@ impl TransmissionLayer {
             self.first_error.set(e);
             e
         };
-        let now = Instant::now();
         let mut recv_pkts = RecvPkts {
             num_ack_segments: 0,
             num_payload_segments: 0,
@@ -422,6 +422,7 @@ impl TransmissionLayer {
                     return Err((throw_error(e), SendKillPkt::No));
                 }
             };
+            let now = Instant::now();
             let read_pkt = &bufs.utp[..read_bytes];
 
             // FEC-decode the raw packet into `codec_pkts`, then process each.
@@ -564,10 +565,10 @@ impl TransmissionLayer {
         no_delay: bool,
         bufs: &mut SendBufs,
     ) -> Result<usize, std::io::ErrorKind> {
-        let now = Instant::now();
         let mut sent_data_pkt = self.sent_data_pkt.notified();
         let written_bytes = loop {
             self.first_error.throw_error()?;
+            let now = Instant::now();
             let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_buf(data, now)

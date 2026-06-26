@@ -70,7 +70,7 @@ impl ReliableLayer {
         let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
         let send_rate = *init_send_rate.lock();
         let send_rate_limiter = Arc::new(Mutex::new(TokenBucket::new(
-            PosR::new(INIT_SEND_RATE).unwrap(),
+            send_rate,
             NonZeroUsize::new(MAX_BURST_PKTS).unwrap(),
             now,
         )));
