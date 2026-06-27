@@ -17,14 +17,14 @@ const MAX_PARITY_PER_GROUP: usize =
 /// Groups with at most this many data symbols get parity protection.
 /// Larger groups skip parity to avoid impacting throughput of big traffic.
 const PARITY_DATA_THRESHOLD: usize = 4;
-/// Tokens the bucket must keep in reserve (on top of the parity burst) before
-/// spending on parity. Parity is spare-bandwidth-only: it must never starve a
-/// subsequent data burst, so we only flush when the bucket has surplus. A
-/// reserve of 1 is enough now that the group is proactively trimmed to
+/// Parity must consume at most this fraction of the currently-available send
+/// budget. Parity is spare-bandwidth-only: it must never compete with data
+/// traffic, so a parity burst is only flushed when it fits within 1/3 of the
+/// tokens the bucket holds at flush time — the remaining 2/3 are left for
+/// subsequent data packets. The group is proactively trimmed to
 /// `PARITY_DATA_THRESHOLD` data symbols in `encode_data`, so the parity burst
-/// is at most `MAX_PARITY_PER_GROUP` packets — a tiny, bounded cost that the
-/// token bucket refills almost instantly.
-const PARITY_TOKEN_RESERVE: usize = 1 + PARITY_DATA_THRESHOLD * 2;
+/// is at most `MAX_PARITY_PER_GROUP` packets, a tiny, bounded cost.
+const PARITY_BUDGET_DEN: usize = 3;
 const GROUP_SIZE_HIST_LEN: usize = MAX_DATA_PER_GROUP + 1;
 
 #[derive(Debug, Clone)]
@@ -197,13 +197,15 @@ impl FecState {
 
     /// Attempt to flush parities for the current group, rate-limited by the
     /// token bucket. Returns `(parity_pkts, total_bytes)` where each entry is
-    /// a ready-to-send wire packet. If the bucket can't afford the full burst
-    /// (after reserving `PARITY_TOKEN_RESERVE`), the group is skipped — parity
-    /// is spare-bandwidth-only and must not starve a subsequent data burst.
-    /// Groups larger than `PARITY_DATA_THRESHOLD` are also skipped.
+    /// a ready-to-send wire packet. If the parity burst would exceed 1/3 of
+    /// the available send budget, the group is skipped — parity is
+    /// spare-bandwidth-only and must not compete with data traffic. Groups
+    /// larger than `PARITY_DATA_THRESHOLD` are also skipped.
     ///
     /// Reed-Solomon needs the complete parity set to reconstruct, so the full
     /// `parity_count` tokens are reserved atomically before encoding any.
+    /// Parity must fit within 1/3 of the currently-available send budget
+    /// (`PARITY_BUDGET_DEN`), leaving the rest for data traffic.
     pub fn maybe_flush_parities(
         &mut self,
         send_rate_limiter: &mut TokenBucket,
@@ -223,7 +225,8 @@ impl FecState {
         }
         let parity_count = parity_for(data_count);
         let available_tokens = send_rate_limiter.gen_tokens(now);
-        if available_tokens < usize::from(parity_count) + PARITY_TOKEN_RESERVE {
+        let parity_budget = available_tokens / PARITY_BUDGET_DEN;
+        if usize::from(parity_count) > parity_budget {
             self.stats.groups_skipped_no_surplus_tokens += 1;
             inc_hist(
                 &mut self.stats.group_size_skipped_no_surplus_tokens,
