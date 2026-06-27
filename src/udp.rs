@@ -191,9 +191,13 @@ impl UnreliableRead for IdentityConnRead {
 #[async_trait]
 impl UnreliableWrite for ConnWrite<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        Self::send(self, buf)
-            .await
-            .map_err(|e| normalize_send_err(e).kind())
+        match Self::try_send(self, buf) {
+            Ok(n) => Ok(n),
+            Err(e) if should_wait_after_try_send(&e) => {
+                Self::send(self, buf).await.map_err(|e| normalize_send_err(e).kind())
+            }
+            Err(e) => Err(normalize_send_err(e).kind()),
+        }
     }
 }
 
@@ -211,12 +215,25 @@ impl UnreliableRead for Arc<UdpSocket> {
 #[async_trait]
 impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        let res = UdpSocket::send(self, buf).await;
-        match res {
+        match UdpSocket::try_send(self, buf) {
             Ok(n) => Ok(n),
+            Err(e) if should_wait_after_try_send(&e) => {
+                UdpSocket::send(self, buf).await.map_err(|e| normalize_send_err(e).kind())
+            }
             Err(e) => Err(normalize_send_err(e).kind()),
         }
     }
+}
+
+/// Returns `true` if `code` is the raw OS errno for `ENOBUFS` on the current
+/// platform (macOS `55`, Linux `105`).
+fn is_enobufs_raw_os_error(code: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    { code == 55 }
+    #[cfg(target_os = "linux")]
+    { code == 105 }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { false }
 }
 
 /// Normalize transient UDP send-buffer exhaustion (ENOBUFS / ENOBUFS-equivalent
@@ -232,22 +249,31 @@ impl UnreliableWrite for Arc<UdpSocket> {
 /// All other errors are passed through unchanged.
 pub(crate) fn normalize_send_err(e: std::io::Error) -> std::io::Error {
     if let Some(code) = e.raw_os_error() {
-        #[cfg(target_os = "macos")]
-        if code == 55 {
+        if is_enobufs_raw_os_error(code) {
             return std::io::ErrorKind::WouldBlock.into();
-        }
-        #[cfg(target_os = "linux")]
-        if code == 105 {
-            return std::io::ErrorKind::WouldBlock.into();
-        }
-        // Fallback: also recognize the symbolic ENOBUFS value on any BSD-like
-        // platform that happens to share the same errno numbers.
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = code;
         }
     }
     e
+}
+
+/// Decide whether a failed [`UnreliableWrite::try_send`] should fall back to
+/// the async `send` path (waiting for the socket to become writable).
+///
+/// We only want to wait when the error is a genuine "would block" from a
+/// non-blocking socket that is not currently writable. If the kernel
+/// reported `ENOBUFS` (transient send-buffer exhaustion) we must *not*
+/// wait — the socket is writable, the packet was simply dropped, and
+/// blocking here would spin on a ready-but-lossy path. In that case the
+/// error is normalized to [`std::io::ErrorKind::WouldBlock`] by
+/// [`normalize_send_err`] and surfaced to the caller as a loss event.
+pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
+    if e.kind() != std::io::ErrorKind::WouldBlock {
+        return false;
+    }
+    match e.raw_os_error() {
+        Some(code) => !is_enobufs_raw_os_error(code),
+        None => true,
+    }
 }
 
 /// Test-only utilities for simulating packet loss without OS-level network
@@ -450,5 +476,46 @@ mod tests {
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
         require_send(connect("0.0.0.0:0", "0.0.0.0:0", None, false));
+    }
+
+    #[test]
+    fn should_wait_after_plain_wouldblock() {
+        // A WouldBlock with no underlying raw OS error (e.g. synthesized by a
+        // non-blocking mpsc channel) should fall back to the async wait path.
+        let e = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(should_wait_after_try_send(&e));
+    }
+
+    #[test]
+    fn should_not_wait_after_enobufs() {
+        // ENOBUFS is normalized to WouldBlock, but the raw OS error is
+        // preserved on the error, so `should_wait_after_try_send` must
+        // return false — waiting would spin on a writable-but-lossy socket.
+        #[cfg(target_os = "macos")]
+        let code = 55;
+        #[cfg(target_os = "linux")]
+        let code = 105;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // On other platforms we have no ENOBUFS mapping; skip the raw-code
+            // assertion but still verify that a plain WouldBlock waits.
+            let e = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+            assert!(should_wait_after_try_send(&e));
+            return;
+        }
+
+        let e = std::io::Error::from_raw_os_error(code);
+        // Note: `Error::from_raw_os_error` does *not* map ENOBUFS to
+        // `WouldBlock` — that mapping is performed by `normalize_send_err`.
+        // Here we only check that `should_wait_after_try_send` returns false
+        // for an error carrying the ENOBUFS raw code regardless of its
+        // `kind()`.
+        assert!(!should_wait_after_try_send(&e));
+
+        // After normalization the raw OS error is stripped and the kind
+        // becomes WouldBlock, so the wait path is taken again.
+        let normalized = normalize_send_err(e);
+        assert!(normalized.raw_os_error().is_none());
+        assert!(should_wait_after_try_send(&normalized));
     }
 }

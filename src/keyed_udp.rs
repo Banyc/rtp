@@ -10,7 +10,7 @@ use udp_listener::{ConnWrite, Packet, UtpListener};
 use crate::{
     socket::{ReadSocket, WriteSocket, socket},
     transmission_layer::{UnreliableLayer, UnreliableWrite},
-    udp::wrap_fec,
+    udp::{should_wait_after_try_send, wrap_fec},
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
@@ -152,7 +152,11 @@ impl KeyedConnWrite {
         let mut buf = self.buf.lock().await;
         buf.drain(self.data_offset..);
         buf.extend(data);
-        self.write.send(&buf).await
+        match self.write.try_send(&buf) {
+            Ok(n) => Ok(n),
+            Err(e) if should_wait_after_try_send(&e) => self.write.send(&buf).await,
+            Err(e) => Err(e),
+        }
     }
 }
 #[async_trait]
