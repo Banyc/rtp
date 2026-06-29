@@ -193,9 +193,9 @@ impl UnreliableWrite for ConnWrite<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         match Self::try_send(self, buf) {
             Ok(n) => Ok(n),
-            Err(e) if should_wait_after_try_send(&e) => {
-                Self::send(self, buf).await.map_err(|e| normalize_send_err(e).kind())
-            }
+            Err(e) if should_wait_after_try_send(&e) => Self::send(self, buf)
+                .await
+                .map_err(|e| normalize_send_err(e).kind()),
             Err(e) => Err(normalize_send_err(e).kind()),
         }
     }
@@ -209,7 +209,9 @@ impl UnreliableRead for Arc<UdpSocket> {
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::recv(self, buf).await.map_err(|e| normalize_send_err(e).kind())
+        UdpSocket::recv(self, buf)
+            .await
+            .map_err(|e| normalize_send_err(e).kind())
     }
 }
 #[async_trait]
@@ -217,9 +219,9 @@ impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         match UdpSocket::try_send(self, buf) {
             Ok(n) => Ok(n),
-            Err(e) if should_wait_after_try_send(&e) => {
-                UdpSocket::send(self, buf).await.map_err(|e| normalize_send_err(e).kind())
-            }
+            Err(e) if should_wait_after_try_send(&e) => UdpSocket::send(self, buf)
+                .await
+                .map_err(|e| normalize_send_err(e).kind()),
             Err(e) => Err(normalize_send_err(e).kind()),
         }
     }
@@ -228,12 +230,11 @@ impl UnreliableWrite for Arc<UdpSocket> {
 /// Returns `true` if `code` is the raw OS errno for `ENOBUFS` on the current
 /// platform (macOS `55`, Linux `105`).
 fn is_enobufs_raw_os_error(code: i32) -> bool {
-    #[cfg(target_os = "macos")]
-    { code == 55 }
-    #[cfg(target_os = "linux")]
-    { code == 105 }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { false }
+    cfg_select! {
+        target_os = "macos" => code == 55,
+        target_os = "linux" => code == 105,
+        _ => false,
+    }
 }
 
 /// Normalize transient UDP send-buffer exhaustion (ENOBUFS / ENOBUFS-equivalent
@@ -248,10 +249,10 @@ fn is_enobufs_raw_os_error(code: i32) -> bool {
 ///
 /// All other errors are passed through unchanged.
 pub(crate) fn normalize_send_err(e: std::io::Error) -> std::io::Error {
-    if let Some(code) = e.raw_os_error() {
-        if is_enobufs_raw_os_error(code) {
-            return std::io::ErrorKind::WouldBlock.into();
-        }
+    if let Some(code) = e.raw_os_error()
+        && is_enobufs_raw_os_error(code)
+    {
+        return std::io::ErrorKind::WouldBlock.into();
     }
     e
 }

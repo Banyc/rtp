@@ -556,7 +556,9 @@ impl TransmissionLayer {
             encode_ack_data(Some(ack), None, &mut bufs.utp).unwrap()
         };
         let fec_enabled = self.fec.is_some();
-        let res = self.send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec).await;
+        let res = self
+            .send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
+            .await;
         // Transient UDP send-buffer exhaustion: treat the loss of this ACK
         // packet as transient backpressure rather than a fatal connection
         // error. ACKs are cumulative and the peer will learn of the acked
