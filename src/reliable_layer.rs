@@ -26,7 +26,7 @@ use crate::{
     sack::AckBallSequence,
 };
 
-const SEND_DATA_BUF_LEN: usize = 2 << 16;
+const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 const RECV_DATA_BUF_LEN: usize = 2 << 16;
 const MAX_BURST_PKTS: usize = 64;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
