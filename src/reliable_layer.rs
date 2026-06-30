@@ -1,7 +1,7 @@
 use core::num::NonZeroUsize;
 use std::{
     sync::{Arc, LazyLock, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use dre::{ConnectionState, PacketState};
@@ -20,7 +20,9 @@ use primitive::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    codec::data_overhead, pkt_recv_space::PktRecvSpace, pkt_send_space::PktSendSpace,
+    codec::data_overhead,
+    pkt_recv_space::PktRecvSpace,
+    pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     sack::AckBallSequence,
 };
 
@@ -34,6 +36,7 @@ const SEND_RATE_PROBE_RATE: f64 = 1.;
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MSGS: bool = false;
+const LINEAR_BACKOFF: bool = true;
 
 static GLOBAL_INIT_SEND_RATE: LazyLock<Arc<SpinMutex<PosR<f64>>>> =
     LazyLock::new(|| Arc::new(SpinMutex::new(PosR::new(INIT_SEND_RATE).unwrap())));
@@ -140,28 +143,11 @@ impl ReliableLayer {
     pub fn send_data_pkt(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
 
-        // backoff on unrecovered huge data loss
-        let mut f = || {
-            let huge_data_loss = self
-                .pkt_send_space
-                .huge_data_loss(UnitR::new(MAX_DATA_LOSS_RATE).unwrap(), now);
-            if !huge_data_loss {
-                self.huge_data_loss_timer.clear();
-                return;
-            }
-            let at_least_for = self.pkt_send_space.rto_duration().mul_f64(2.);
-            let (set_off, _) = self
-                .huge_data_loss_timer
-                .ensure_started_and_check(at_least_for, now);
-            if !set_off {
-                return;
-            }
-            self.huge_data_loss_timer.clear();
-            // exponential backoff
-            let send_rate = PosR::new(self.send_rate.get() / 2.).unwrap();
-            self.set_send_rate(send_rate, now);
-        };
-        f();
+        if LINEAR_BACKOFF {
+            self.backoff_on_huge_data_loss_linear(now);
+        } else {
+            self.backoff_on_huge_data_loss_exponential(now);
+        }
 
         // Retransmits bypass both the new-packet cwnd gate and the send-rate
         // token bucket. A retransmit is not a new packet entering the window;
@@ -283,17 +269,40 @@ impl ReliableLayer {
             .data_loss_rate(now)
             .map(|lr| lr < CC_DATA_LOSS_RATE);
         let should_probe = little_data_loss != Some(false);
-        let target_send_rate = match should_probe {
-            true => {
-                let send_rate = sr.delivery_rate() + sr.delivery_rate() * SEND_RATE_PROBE_RATE;
-                if send_rate < self.send_rate.get() {
-                    return;
-                }
-                send_rate
-            }
-            false => sr.delivery_rate(),
-        };
+        if should_probe {
+            let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
+            let Some(target_send_rate) = probed else {
+                return;
+            };
+            self.set_smooth_send_rate(target_send_rate, now);
+            return;
+        }
 
+        if LINEAR_BACKOFF {
+            self.backoff_on_high_loss_ack_linear(sr, now);
+        } else {
+            let target_send_rate = sr.delivery_rate();
+            self.set_smooth_send_rate(target_send_rate, now);
+        }
+    }
+
+    /// Linear backoff toward the delivery rate on a high-loss ACK sample.
+    fn backoff_on_high_loss_ack_linear(&mut self, sr: &dre::RateSample, now: Instant) {
+        let control_rtt = self.control_rtt();
+        let current = self.send_rate.get();
+        let target = sr.delivery_rate().min(current).max(MIN_SEND_RATE);
+        let new_rate = backoff_send_rate_linear(current, target, sr.interval(), control_rtt);
+        let Some(new_rate) = new_rate else {
+            return;
+        };
+        let send_rate = PosR::new(new_rate).unwrap();
+        self.set_send_rate(send_rate, now);
+        if let Some(mut rate) = GLOBAL_INIT_SEND_RATE.try_lock() {
+            *rate = send_rate;
+        }
+    }
+
+    fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
         let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
             + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
         let send_rate = PosR::new(smooth_send_rate).unwrap();
@@ -301,6 +310,50 @@ impl ReliableLayer {
         if let Some(mut rate) = GLOBAL_INIT_SEND_RATE.try_lock() {
             *rate = send_rate;
         }
+    }
+
+    /// Linear backoff on unrecovered huge data loss.
+    fn backoff_on_huge_data_loss_linear(&mut self, now: Instant) {
+        let Some(elapsed) = self.huge_data_loss_gate(now) else {
+            return;
+        };
+        let control_rtt = self.control_rtt();
+        let current = self.send_rate.get();
+        let new_rate = backoff_send_rate_linear(current, MIN_SEND_RATE, elapsed, control_rtt);
+        let Some(new_rate) = new_rate else {
+            return;
+        };
+        self.set_send_rate(PosR::new(new_rate).unwrap(), now);
+    }
+
+    /// Original exponential backoff on unrecovered huge data loss.
+    fn backoff_on_huge_data_loss_exponential(&mut self, now: Instant) {
+        let Some(_) = self.huge_data_loss_gate(now) else {
+            return;
+        };
+        let send_rate = PosR::new(self.send_rate.get() / 2.).unwrap();
+        self.set_send_rate(send_rate, now);
+    }
+
+    /// Shared gate for huge-data-loss backoff. Returns the elapsed time the
+    /// loss has persisted once the `2 * RTO` threshold is reached.
+    fn huge_data_loss_gate(&mut self, now: Instant) -> Option<Duration> {
+        let huge_data_loss = self
+            .pkt_send_space
+            .huge_data_loss(UnitR::new(MAX_DATA_LOSS_RATE).unwrap(), now);
+        if !huge_data_loss {
+            self.huge_data_loss_timer.clear();
+            return None;
+        }
+        let at_least_for = self.pkt_send_space.rto_duration().mul_f64(2.);
+        let (set_off, elapsed) = self
+            .huge_data_loss_timer
+            .ensure_started_and_check(at_least_for, now);
+        if !set_off {
+            return None;
+        }
+        self.huge_data_loss_timer.clear();
+        Some(elapsed)
     }
 
     /// Return `true` iff received FIN
@@ -380,6 +433,12 @@ impl ReliableLayer {
             .set_thruput(send_rate, now);
     }
 
+    fn control_rtt(&self) -> Duration {
+        let min = self.pkt_send_space.min_rtt();
+        let smooth = self.pkt_send_space.smooth_rtt();
+        min.unwrap_or(smooth).max(Duration::from_millis(5))
+    }
+
     fn max_data_size_per_pkt(&self) -> usize {
         self.mss.get().checked_sub(data_overhead()).unwrap()
     }
@@ -415,6 +474,43 @@ pub struct DataPkt {
 pub enum DataPktPayload {
     Data(NonZeroUsize),
     Fin,
+}
+
+/// Exponential probe of the send rate on a low-loss ACK sample.
+///
+/// Returns `None` if the probed rate would not exceed the current rate.
+fn probe_send_rate_exponential(current: f64, delivery_rate: f64) -> Option<f64> {
+    let probed = delivery_rate + delivery_rate * SEND_RATE_PROBE_RATE;
+    if probed < current {
+        return None;
+    }
+    Some(probed)
+}
+
+/// Linear backoff of the send rate toward `target`.
+///
+/// Returns `None` if `current` is already at or below `target`. Otherwise steps
+/// down by at most `gap = current - target`, where the natural step is
+/// `current * interval / rtt` and a `probe_floor` of
+/// `interval / (8 * rtt^2)` guarantees at least one packet's worth of headway
+/// over the RTT window (`cwnd = send_rate * rtt * CWND_SEND_RATE_SCALE`).
+fn backoff_send_rate_linear(
+    current: f64,
+    target: f64,
+    interval: Duration,
+    control_rtt: Duration,
+) -> Option<f64> {
+    let gap = current - target;
+    if gap <= 0. {
+        return None;
+    }
+    let rtt_secs = control_rtt.as_secs_f64();
+    let interval_secs = interval.as_secs_f64();
+    let probe_floor = interval_secs / (CWND_SEND_RATE_SCALE as f64 * rtt_secs * rtt_secs);
+    let step = (current * interval_secs / rtt_secs)
+        .max(probe_floor)
+        .min(gap);
+    Some((current - step).max(target))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

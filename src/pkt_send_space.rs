@@ -15,6 +15,7 @@ use primitive::{
 use crate::{pkt_recv_space::MAX_NUM_RECVING_PKTS, rto::RtxTimer, sack::AckBallSequence};
 
 pub const INIT_CWND: usize = 16;
+pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 
 #[derive(Debug)]
 pub struct PktSendSpace {
@@ -221,7 +222,7 @@ impl PktSendSpace {
     pub fn set_send_rate(&mut self, send_rate: PosR<f64>) {
         let cwnd = self.rto.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
-        let cwnd = cwnd * 8;
+        let cwnd = cwnd * CWND_SEND_RATE_SCALE;
         let cwnd = 1.max(cwnd);
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
 
