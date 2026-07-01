@@ -1,6 +1,6 @@
 use core::num::NonZeroUsize;
 use std::{
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -14,7 +14,6 @@ use primitive::{
         len::{Capacity, Len, LenExt},
     },
     queue::cap_queue::CapVecQueue,
-    sync::mutex::SpinMutex,
     time::timer::Timer,
 };
 use serde::{Deserialize, Serialize};
@@ -37,9 +36,6 @@ pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MSGS: bool = false;
 const LINEAR_BACKOFF: bool = true;
-
-static GLOBAL_INIT_SEND_RATE: LazyLock<Arc<SpinMutex<PosR<f64>>>> =
-    LazyLock::new(|| Arc::new(SpinMutex::new(PosR::new(INIT_SEND_RATE).unwrap())));
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
@@ -70,8 +66,7 @@ pub struct ReliableLayer {
 }
 impl ReliableLayer {
     pub fn new(mss: NonZeroUsize, now: Instant) -> (Self, Arc<Mutex<TokenBucket>>) {
-        let init_send_rate = GLOBAL_INIT_SEND_RATE.clone();
-        let send_rate = *init_send_rate.lock();
+        let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let send_rate_limiter = Arc::new(Mutex::new(TokenBucket::new(
             send_rate,
             NonZeroUsize::new(MAX_BURST_PKTS).unwrap(),
@@ -297,9 +292,6 @@ impl ReliableLayer {
         };
         let send_rate = PosR::new(new_rate).unwrap();
         self.set_send_rate(send_rate, now);
-        if let Some(mut rate) = GLOBAL_INIT_SEND_RATE.try_lock() {
-            *rate = send_rate;
-        }
     }
 
     fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
@@ -307,9 +299,6 @@ impl ReliableLayer {
             + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
         let send_rate = PosR::new(smooth_send_rate).unwrap();
         self.set_send_rate(send_rate, now);
-        if let Some(mut rate) = GLOBAL_INIT_SEND_RATE.try_lock() {
-            *rate = send_rate;
-        }
     }
 
     /// Linear backoff on unrecovered huge data loss.
