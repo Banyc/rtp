@@ -125,6 +125,10 @@ impl ReliableLayer {
     }
 
     /// Store data in the inner data buffer
+    pub fn send_data_buf_capacity(&self) -> usize {
+        self.send_data_buf.capacity()
+    }
+
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> usize {
         self.detect_application_limited_phases(now);
 

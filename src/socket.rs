@@ -2,7 +2,6 @@ use core::time::Duration;
 use std::{sync::Arc, time::Instant};
 
 use async_async_io::{
-    PollIo,
     read::{AsyncAsyncRead, PollRead},
     write::{AsyncAsyncWrite, PollWrite},
 };
@@ -18,14 +17,141 @@ use crate::{
 
 const TIMER_INTERVAL: Duration = Duration::from_millis(1);
 
-pub type WriteStream = PollWrite<WriteSocket>;
 pub type ReadStream = PollRead<ReadSocket>;
-pub type IoStream = PollIo<ReadSocket, WriteSocket>;
+
+/// Async write stream that caps each staged slice at the reliable layer's
+/// send-buffer capacity, removing the O(N^2) re-copy in the underlying
+/// `PollWrite` (which otherwise buffers the entire caller slice every time it
+/// starts a new write future).
+///
+/// `AsyncWrite` permits partial writes; the returned `n` is exactly what the
+/// inner `WriteSocket` consumed. Truncating the buffer before delegating is
+/// safe because `PollWrite` ignores the incoming buffer while a write future is
+/// in flight, so we can never split an in-flight write.
+#[derive(Debug)]
+pub struct WriteStream {
+    inner: PollWrite<WriteSocket>,
+    max_stage: usize,
+}
+
+impl WriteStream {
+    pub fn into_inner(self) -> WriteSocket {
+        self.inner.into_inner()
+    }
+
+    pub fn inner(&self) -> &WriteSocket {
+        self.inner.inner()
+    }
+
+    pub fn inner_mut(&mut self) -> &mut WriteSocket {
+        self.inner.inner_mut()
+    }
+}
+
+impl std::convert::AsRef<WriteSocket> for WriteStream {
+    fn as_ref(&self) -> &WriteSocket {
+        self.inner()
+    }
+}
+
+impl std::convert::AsMut<WriteSocket> for WriteStream {
+    fn as_mut(&mut self) -> &mut WriteSocket {
+        self.inner_mut()
+    }
+}
+
+impl tokio::io::AsyncWrite for WriteStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let max_stage = self.max_stage;
+        let buf = if buf.len() > max_stage {
+            &buf[..max_stage]
+        } else {
+            buf
+        };
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl std::marker::Unpin for WriteStream {}
+
+/// Bidirectional async stream joining a read half and a [`WriteStream`].
+#[derive(Debug)]
+pub struct IoStream {
+    read: ReadStream,
+    write: WriteStream,
+}
+
+impl IoStream {
+    pub fn into_split(self) -> (ReadSocket, WriteSocket) {
+        (self.read.into_inner(), self.write.into_inner())
+    }
+
+    pub fn split(&self) -> (&ReadSocket, &WriteSocket) {
+        (self.read.inner(), self.write.inner())
+    }
+
+    pub fn split_mut(&mut self) -> (&mut ReadSocket, &mut WriteSocket) {
+        (self.read.inner_mut(), self.write.inner_mut())
+    }
+}
+
+impl tokio::io::AsyncRead for IoStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for IoStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
+    }
+}
 
 const _: () = {
     fn assert_send<T: Send>() {}
     let _ = assert_send::<WriteStream>;
     let _ = assert_send::<ReadStream>;
+    let _ = assert_send::<IoStream>;
 };
 
 pub fn socket(
@@ -229,12 +355,21 @@ impl WriteSocket {
     /// }
     /// ```
     pub fn into_async_write(self) -> WriteStream {
-        PollWrite::new(self)
+        let max_stage = self
+            .transmission_layer
+            .reliable_layer()
+            .lock()
+            .unwrap()
+            .send_data_buf_capacity();
+        WriteStream {
+            inner: PollWrite::new(self),
+            max_stage,
+        }
     }
 }
 
 pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {
-    PollIo::new(read, write)
+    IoStream { read, write }
 }
 
 impl AsyncAsyncRead for ReadSocket {
@@ -476,5 +611,61 @@ mod tests {
             recovered.unwrap() > 0,
             "FEC should recover >0 symbols under 3% loss, got 0"
         );
+    }
+
+    /// The async write stream must stage at most the reliable layer's send
+    /// data buffer capacity per `poll_write`. Writing a slice much larger than
+    /// that should consume at most that many bytes in a single poll.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_stream_stages_at_most_the_send_buf_capacity() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        use tokio::io::AsyncWrite;
+
+        let fec = false;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let a = wrap_fec(a.clone(), a, fec);
+        let b = wrap_fec(b.clone(), b, fec);
+        let (a_r, a_w) = socket(a, None);
+        let (_b_r, b_w) = socket(b, None);
+
+        // Keep the receiving read socket alive so the connection does not shut
+        // down before the assertion runs.
+        let _a_r = a_r;
+
+        let capacity = a_w
+            .transmission_layer
+            .reliable_layer()
+            .lock()
+            .unwrap()
+            .send_data_buf_capacity();
+
+        let mut write_stream = a_w.into_async_write();
+        let big = vec![0u8; capacity * 4];
+
+        // Poll exactly once. The first call may complete immediately if the
+        // buffer has free space (it does on a fresh connection). Either way,
+        // the number of bytes staged/consumed must not exceed capacity.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let pinned = Pin::new(&mut write_stream);
+        let poll = pinned.poll_write(&mut cx, &big);
+        let n = match poll {
+            Poll::Ready(Ok(n)) => n,
+            Poll::Pending => 0,
+            Poll::Ready(Err(e)) => panic!("poll_write failed: {e:?}"),
+        };
+        assert!(
+            n <= capacity,
+            "poll_write consumed {n} bytes, but capacity is {capacity}"
+        );
+
+        // Hold the write stream until after the assertion so the destructor is
+        // not mistaken for the value under test.
+        drop(write_stream);
+        drop(b_w);
     }
 }
