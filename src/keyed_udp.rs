@@ -15,6 +15,24 @@ use crate::{
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
+fn checked_keyed_mss<K: DispatchKey>(mss_after_fec: NonZeroUsize) -> NonZeroUsize {
+    let key_size = K::max_size();
+    let remaining = mss_after_fec
+        .get()
+        .checked_sub(key_size)
+        .unwrap_or_else(|| {
+            panic!(
+                "mss {mss_after_fec} leaves no room for the {key_size}-byte dispatch key"
+            )
+        });
+    let overhead = crate::codec::data_overhead();
+    assert!(
+        overhead < remaining,
+        "mss {mss_after_fec} leaves no payload room after {key_size}-byte dispatch key and {overhead}-byte codec overhead"
+    );
+    NonZeroUsize::new(remaining).unwrap()
+}
+
 #[derive(Debug)]
 pub struct Server<K> {
     listener: UtpListener<UdpSocket, K, Packet>,
@@ -49,14 +67,7 @@ impl<K: DispatchKey> Server<K> {
         let unreliable_layer = UnreliableLayer {
             utp_read: unreliable_layer.utp_read,
             utp_write: unreliable_layer.utp_write,
-            mss: NonZeroUsize::new(
-                unreliable_layer
-                    .mss
-                    .get()
-                    .checked_sub(K::max_size())
-                    .unwrap(),
-            )
-            .unwrap(),
+            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
             fec: unreliable_layer.fec,
         };
         let (read, write) = socket(unreliable_layer, None);
@@ -108,14 +119,7 @@ impl<K: DispatchKey> Client<K> {
         let unreliable_layer = UnreliableLayer {
             utp_read: unreliable_layer.utp_read,
             utp_write: unreliable_layer.utp_write,
-            mss: NonZeroUsize::new(
-                unreliable_layer
-                    .mss
-                    .get()
-                    .checked_sub(K::max_size())
-                    .unwrap(),
-            )
-            .unwrap(),
+            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
             fec: unreliable_layer.fec,
         };
         let (read, write) = socket(unreliable_layer, None);
@@ -277,6 +281,35 @@ fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<(K, P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+    struct HugeKey;
+    impl DispatchKey for HugeKey {
+        fn encode(&self, _buf: &mut [u8]) -> Option<usize> {
+            Some(0)
+        }
+
+        fn decode(_buf: &[u8]) -> Option<(usize, Self)> {
+            Some((0, HugeKey))
+        }
+
+        fn max_size() -> usize {
+            crate::udp::NO_FEC_MSS + 1
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "dispatch key")]
+    async fn test_key_too_large() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::<HugeKey>::connect_without_handshake(
+            "0.0.0.0:0",
+            server.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
+        let _ = client.open_without_handshake(HugeKey, false).unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_key() {
