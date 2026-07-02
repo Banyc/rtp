@@ -169,7 +169,11 @@ pub fn socket(
         async move {
             let mut send_bufs = SendBufs::new();
             loop {
-                // tokio::time::sleep(TIMER_INTERVAL).await;
+                // Register the resume_send notifier *before* reading the next
+                // poll time so that a notification arriving between the last
+                // send_pkts pass and this registration is stored as a permit
+                // and wakes us immediately.
+                let resume_send = transmission_layer.resume_send().notified();
                 let now = Instant::now();
                 let next_poll_time = transmission_layer.next_poll_send_time();
                 let fast_poll_time = now + TIMER_INTERVAL;
@@ -185,7 +189,10 @@ pub fn socket(
                 } else {
                     next_poll_time.min(fast_poll_time)
                 };
-                tokio::time::sleep_until(poll_time.into()).await;
+                tokio::select! {
+                    () = tokio::time::sleep_until(poll_time.into()) => (),
+                    () = resume_send => (),
+                }
                 if transmission_layer.send_pkts(&mut send_bufs).await.is_err() {
                     return;
                 }

@@ -84,6 +84,7 @@ pub struct TransmissionLayer {
     sent_data_pkt: tokio::sync::Notify,
     recv_data_pkt: tokio::sync::Notify,
     sent_pkt_acked: tokio::sync::Notify,
+    resume_send: tokio::sync::Notify,
     recv_fin: tokio_util::sync::CancellationToken,
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
@@ -97,6 +98,7 @@ impl TransmissionLayer {
         let sent_data_pkt = tokio::sync::Notify::new();
         let recv_data_pkt = tokio::sync::Notify::new();
         let sent_pkt_acked = tokio::sync::Notify::new();
+        let resume_send = tokio::sync::Notify::new();
         let recv_fin = tokio_util::sync::CancellationToken::new();
         let first_error = FirstError::new();
         let reliable_layer_logger = log_config.as_ref().map(|c| {
@@ -116,11 +118,16 @@ impl TransmissionLayer {
             sent_data_pkt,
             recv_data_pkt,
             sent_pkt_acked,
+            resume_send,
             recv_fin,
             first_error,
             reliable_layer_logger,
             fec: unreliable_layer.fec.map(Mutex::new),
         }
+    }
+
+    pub fn resume_send(&self) -> &tokio::sync::Notify {
+        &self.resume_send
     }
 
     pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
@@ -234,7 +241,10 @@ impl TransmissionLayer {
         self.utp_write.lock().await.send(send_buf).await
     }
 
-    pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_pkts(
+        &self,
+        bufs: &mut SendBufs,
+    ) -> Result<bool, std::io::ErrorKind> {
         let detect_broken_pipe_proactively = || {
             let now = Instant::now();
             let reliable_layer = self.reliable_layer.lock().unwrap();
@@ -333,7 +343,7 @@ impl TransmissionLayer {
             let can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
             self.close_fec_burst(now, can_send_tail_fec).await;
         }
-        Ok(())
+        Ok(0 < written_bytes || written_fin)
     }
 
     /// Close the current FEC burst: flush parities for the open group when a
@@ -539,6 +549,19 @@ impl TransmissionLayer {
 
         // No new data received in the reliable layer
         if bufs.ack_to_peer.is_empty() {
+            // ACK processing may have freed cwnd or drained the send buffer
+            // enough that the send pump can make progress now. Wake the send
+            // timer exactly once per batch, after dropping the reliable layer
+            // lock. notify_one stores a permit, so a wake racing with the timer
+            // registering its next notified() is not lost.
+            let should_resume_send = {
+                let reliable_layer = self.reliable_layer.lock().unwrap();
+                !reliable_layer.is_send_buf_empty()
+                    && reliable_layer.pkt_send_space().accepts_new_pkt()
+            };
+            if should_resume_send {
+                self.resume_send.notify_one();
+            }
             return Ok(recv_pkts);
         }
 
@@ -604,7 +627,10 @@ impl TransmissionLayer {
             self.log("send_data_buf");
 
             if no_delay {
-                self.send_pkts(bufs).await?;
+                let made_progress = self.send_pkts(bufs).await?;
+                if !made_progress && 0 < written_bytes {
+                    self.resume_send.notify_one();
+                }
             }
 
             if 0 < written_bytes {
