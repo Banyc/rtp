@@ -46,18 +46,38 @@ impl Listener {
 
     /// [`Self::accept()`] but without handshake
     pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted> {
-        let accepted = self.listener.accept().await?;
-        let handshake = false;
-        accept(accepted, handshake, fec).await
+        let mss = NO_FEC_MSS;
+        self.accept_without_handshake_with_mss(fec, mss).await
     }
 
     /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
     pub async fn accept(&self, fec: bool) -> std::io::Result<Handshake> {
+        let mss = NO_FEC_MSS;
+        self.accept_with_mss(fec, mss).await
+    }
+
+    /// [`Self::accept()`] but without handshake and with a custom MSS.
+    pub async fn accept_without_handshake_with_mss(
+        &self,
+        fec: bool,
+        mss: usize,
+    ) -> std::io::Result<Accepted> {
+        let accepted = self.listener.accept().await?;
+        let handshake = false;
+        accept(accepted, handshake, fec, mss).await
+    }
+
+    /// [`Self::accept()`] with a custom MSS.
+    pub async fn accept_with_mss(
+        &self,
+        fec: bool,
+        mss: usize,
+    ) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
         let handshake = true;
-        Ok(tokio::spawn(accept(accepted, handshake, fec)))
+        Ok(tokio::spawn(accept(accepted, handshake, fec, mss)))
     }
 }
 #[derive(Debug)]
@@ -66,10 +86,15 @@ pub struct Accepted {
     pub write: WriteSocket,
     pub peer_addr: SocketAddr,
 }
-async fn accept(accepted: IdentityConn, handshake: bool, fec: bool) -> std::io::Result<Accepted> {
+async fn accept(
+    accepted: IdentityConn,
+    handshake: bool,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
-    let mut unreliable_layer = wrap_fec(read, write, fec);
+    let mut unreliable_layer = wrap_fec_with_mss(read, write, fec, mss);
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -88,7 +113,8 @@ pub async fn connect_without_handshake(
     fec: bool,
 ) -> std::io::Result<Connected> {
     let handshake = false;
-    connect_(bind, addr, log_config, handshake, fec).await
+    let mss = NO_FEC_MSS;
+    connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
 }
 pub async fn connect(
     bind: impl tokio::net::ToSocketAddrs,
@@ -97,14 +123,26 @@ pub async fn connect(
     fec: bool,
 ) -> std::io::Result<Connected> {
     let handshake = true;
-    connect_(bind, addr, log_config, handshake, fec).await
+    let mss = NO_FEC_MSS;
+    connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
 }
-async fn connect_(
+pub async fn connect_without_handshake_with_mss(
+    bind: impl tokio::net::ToSocketAddrs,
+    addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
+    fec: bool,
+    mss: usize,
+) -> std::io::Result<Connected> {
+    let handshake = false;
+    connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
+}
+pub async fn connect_with_mss(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     log_config: Option<LogConfig<'_>>,
     handshake: bool,
     fec: bool,
+    mss: usize,
 ) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
@@ -118,7 +156,7 @@ async fn connect_(
         None => None,
     };
     let udp = Arc::new(udp);
-    let mut unreliable_layer = wrap_fec(Arc::clone(&udp), udp, fec);
+    let mut unreliable_layer = wrap_fec_with_mss(Arc::clone(&udp), udp, fec, mss);
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -143,17 +181,23 @@ pub(crate) fn wrap_fec(
     write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
-    let symbol_size = symbol_size(NO_FEC_MSS).unwrap();
+    let mss = NO_FEC_MSS;
+    wrap_fec_with_mss(read, write, fec, mss)
+}
+
+pub(crate) fn wrap_fec_with_mss(
+    read: impl UnreliableRead,
+    write: impl UnreliableWrite,
+    fec: bool,
+    mss: usize,
+) -> UnreliableLayer {
+    let symbol_size = symbol_size(mss).unwrap();
     let fec_state = if fec {
         Some(FecState::new(FecConfig { symbol_size }))
     } else {
         None
     };
-    let mss = if fec {
-        data_mss(NO_FEC_MSS).unwrap()
-    } else {
-        NO_FEC_MSS
-    };
+    let mss = if fec { data_mss(mss).unwrap() } else { mss };
     let mss = NonZeroUsize::new(mss).unwrap();
     UnreliableLayer {
         utp_read: Box::new(read),
@@ -397,17 +441,28 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        let symbol_size = symbol_size(NO_FEC_MSS).unwrap();
+        let mss = NO_FEC_MSS;
+        wrap_fec_lossy_with_mss(read, write, fec, mss, rate)
+    }
+
+    pub fn wrap_fec_lossy_with_mss<R, W>(
+        read: R,
+        write: W,
+        fec: bool,
+        mss: usize,
+        rate: LossRate,
+    ) -> UnreliableLayer
+    where
+        R: UnreliableRead + Send + Sync + 'static,
+        W: UnreliableWrite + Send + Sync + 'static,
+    {
+        let symbol_size = symbol_size(mss).unwrap();
         let fec_state = if fec {
             Some(FecState::new(FecConfig { symbol_size }))
         } else {
             None
         };
-        let mss = if fec {
-            data_mss(NO_FEC_MSS).unwrap()
-        } else {
-            NO_FEC_MSS
-        };
+        let mss = if fec { data_mss(mss).unwrap() } else { mss };
         let mss = NonZeroUsize::new(mss).unwrap();
         UnreliableLayer {
             utp_read: Box::new(LossyRead::new(read, rate.clone())),
