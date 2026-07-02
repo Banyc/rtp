@@ -67,9 +67,10 @@ pub struct ReliableLayer {
 impl ReliableLayer {
     pub fn new(mss: NonZeroUsize, now: Instant) -> (Self, Arc<Mutex<TokenBucket>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
-        let send_rate_limiter = Arc::new(Mutex::new(TokenBucket::new(
+        let send_rate_limiter = Arc::new(Mutex::new(token_bucket_with_tokens(
             send_rate,
             NonZeroUsize::new(MAX_BURST_PKTS).unwrap(),
+            MAX_BURST_PKTS,
             now,
         )));
         let this = Self {
@@ -425,7 +426,51 @@ impl ReliableLayer {
             .unwrap()
             .set_thruput(send_rate, now);
     }
+}
 
+/// Build a `TokenBucket` that starts with `tokens` already credited while
+/// keeping `last_update` anchored at `now` so the send-timer deadline is not
+/// stale.
+///
+/// The primitive `TokenBucket` constructor starts empty, so a fresh connection
+/// stalls waiting for the first tokens to accrue. We simulate a prefill by
+/// constructing the bucket at an earlier instant (backdated by the time it
+/// would take to earn the requested tokens) and then immediately calling
+/// `gen_tokens(now)` to credit that interval. This leaves `last_update = now`,
+/// satisfying the invariant that `next_token_time() >= now`.
+fn token_bucket_with_tokens(
+    thruput: PosR<f64>,
+    max_tokens: NonZeroUsize,
+    tokens: usize,
+    now: Instant,
+) -> TokenBucket {
+    let max_tokens = max_tokens.get();
+    let tokens = tokens.min(max_tokens);
+    let backdate = Duration::from_secs_f64((tokens as f64 + 0.5) / thruput.get());
+
+    let mut backdate = backdate;
+    let start = loop {
+        match now.checked_sub(backdate) {
+            Some(start) => break start,
+            None => {
+                backdate /= 2;
+                if backdate.is_zero() {
+                    break now;
+                }
+            }
+        }
+    };
+
+    let mut bucket = TokenBucket::new(
+        thruput,
+        NonZeroUsize::new(max_tokens).unwrap_or_else(|| NonZeroUsize::new(1).unwrap()),
+        start,
+    );
+    bucket.gen_tokens(now);
+    bucket
+}
+
+impl ReliableLayer {
     fn control_rtt(&self) -> Duration {
         let min = self.pkt_send_space.min_rtt();
         let smooth = self.pkt_send_space.smooth_rtt();
@@ -504,6 +549,40 @@ fn backoff_send_rate_linear(
         .max(probe_floor)
         .min(gap);
     Some((current - step).max(target))
+}
+
+#[cfg(test)]
+mod tests {
+    use primitive::ops::float::PosR;
+
+    use super::{token_bucket_with_tokens, MAX_BURST_PKTS};
+
+    #[test]
+    fn token_bucket_with_tokens_prefills_without_stale_deadline() {
+        let now = std::time::Instant::now();
+        let thruput = PosR::new(128.0).unwrap();
+        let max_tokens = std::num::NonZeroUsize::new(MAX_BURST_PKTS).unwrap();
+
+        let mut bucket = token_bucket_with_tokens(thruput, max_tokens, 8, now);
+
+        // All prefilled tokens are immediately available.
+        assert_eq!(bucket.gen_tokens(now), 8);
+        // The deadline is anchored at `now`, not in the past.
+        assert!(bucket.next_token_time() >= now);
+    }
+
+    #[test]
+    fn token_bucket_with_tokens_clamps_prefill_to_capacity() {
+        let now = std::time::Instant::now();
+        let thruput = PosR::new(128.0).unwrap();
+        let max_tokens = std::num::NonZeroUsize::new(4).unwrap();
+
+        let mut bucket = token_bucket_with_tokens(thruput, max_tokens, 100, now);
+
+        // The requested prefill is clamped to the bucket capacity.
+        assert_eq!(bucket.gen_tokens(now), 4);
+        assert!(bucket.next_token_time() >= now);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
