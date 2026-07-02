@@ -44,9 +44,21 @@ pub fn socket(
             let mut send_bufs = SendBufs::new();
             loop {
                 // tokio::time::sleep(TIMER_INTERVAL).await;
+                let now = Instant::now();
                 let next_poll_time = transmission_layer.next_poll_send_time();
-                let fast_poll_time = Instant::now() + TIMER_INTERVAL;
-                let poll_time = next_poll_time.min(fast_poll_time);
+                let fast_poll_time = now + TIMER_INTERVAL;
+                // When the rate limiter already has a token available (its
+                // `next_token_time` is now or in the past), honoring it would
+                // make `sleep_until` return immediately. If there is nothing
+                // to send at that moment (idle / cwnd full / no data), the loop
+                // would busy-spin on `Instant::now` + `send_pkts`. Fall back to
+                // the 1ms poll in that case so we only wake immediately when the
+                // limiter is actively pacing us.
+                let poll_time = if next_poll_time <= now {
+                    fast_poll_time
+                } else {
+                    next_poll_time.min(fast_poll_time)
+                };
                 tokio::time::sleep_until(poll_time.into()).await;
                 if transmission_layer.send_pkts(&mut send_bufs).await.is_err() {
                     return;
