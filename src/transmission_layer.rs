@@ -18,7 +18,6 @@ use crate::{
 const PRINT_DEBUG_MSGS: bool = false;
 const FEC_DEBUG: bool = false;
 const MAX_NUM_ACK: usize = 64;
-const MAX_ACK_PAGES: usize = 36;
 const MAX_ECHO_RTT: Duration = Duration::from_secs(60);
 const ACK_FLUSH_COUNT: usize = 8;
 const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
@@ -63,6 +62,10 @@ pub struct RecvBufs {
     echo_ts: Option<u32>,
     pending_acks: usize,
     last_ack_flush: Option<Instant>,
+    /// Resume offset for deep ack-history pages. Each flush sends cumulative
+    /// page 0 plus one deep page starting here. Wrapped back to MAX_NUM_ACK on
+    /// reset and when the cursor reaches the end of the history.
+    ack_page_cursor: usize,
 }
 
 impl RecvBufs {
@@ -75,6 +78,7 @@ impl RecvBufs {
             echo_ts: None,
             pending_acks: 0,
             last_ack_flush: None,
+            ack_page_cursor: MAX_NUM_ACK,
         }
     }
 }
@@ -639,37 +643,44 @@ impl TransmissionLayer {
         bufs.pending_acks = 0;
         bufs.last_ack_flush = Some(now);
 
-        // reliable -{ACK}> UDP remote, paging through the whole ack history.
-        // Echo the latest data timestamp only on the first page so each stamp
-        // is reflected at most once.
+        // reliable -{ACK}> UDP remote. Each flush sends the cumulative page-0
+        // plus one deep page resumed from `ack_page_cursor`. The cursor is
+        // advanced by MAX_NUM_ACK on each flush so the deep page rotates across
+        // the history, while page 0 always carries the latest cumulative acks
+        // (and the only echo_ts so each RTT sample is reflected once).
         let mut echo_ts = bufs.echo_ts.take();
-        let mut skip: usize = 0;
-        let mut pages = 0;
+        let mut page_0 = true;
         let mut send_res: Result<(), (std::io::ErrorKind, SendKillPkt)> = Ok(());
+        let fec_enabled = self.fec.is_some();
+
+        // Snapshot the ack history length and clamp the deep-page cursor. The
+        // cursor is >= MAX_NUM_ACK so the deep page never overlaps page 0, and
+        // <= the current history length. History does not shrink during a flush.
+        let (cursor, history_count) = {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let queue = reliable_layer.pkt_recv_space().ack_history();
+            let count = queue.balls().count();
+            (
+                bufs.ack_page_cursor.max(MAX_NUM_ACK).min(count),
+                count,
+            )
+        };
+        let mut skip = 0;
+
         'ack_pages: loop {
-            if pages >= MAX_ACK_PAGES {
-                break;
-            }
-            pages += 1;
-            let (queue_ref, more_pages) = {
+            let written_bytes = {
                 let reliable_layer = self.reliable_layer.lock().unwrap();
                 let queue = reliable_layer.pkt_recv_space().ack_history();
-                let has_more = queue.balls().count() > skip + MAX_NUM_ACK;
                 // Encode against a borrowed queue; the lock is dropped before any
                 // await point so the borrow never crosses an await.
-                let written_bytes = {
-                    let ack = EncodeAck {
-                        queue,
-                        skip,
-                        max_take: MAX_NUM_ACK,
-                    };
-                    let this_echo = echo_ts.take();
-                    encode_ack_data(Some(ack), this_echo, None, &mut bufs.utp).unwrap()
+                let ack = EncodeAck {
+                    queue,
+                    skip,
+                    max_take: MAX_NUM_ACK,
                 };
-                (written_bytes, has_more)
+                let this_echo = echo_ts.take();
+                encode_ack_data(Some(ack), this_echo, None, &mut bufs.utp).unwrap()
             };
-            let written_bytes = queue_ref;
-            let fec_enabled = self.fec.is_some();
             let res = self
                 .send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
                 .await;
@@ -700,10 +711,36 @@ impl TransmissionLayer {
             if send_res.is_err() {
                 break;
             }
-            if !more_pages {
+
+            if page_0 {
+                page_0 = false;
+                // After a successful page-0 send, decide whether the whole
+                // history already fits in page 0.
+                if history_count <= MAX_NUM_ACK {
+                    // The deep cursor is reset to the start of the non-cumulative
+                    // region for the next flush.
+                    bufs.ack_page_cursor = MAX_NUM_ACK;
+                    break;
+                }
+                // Move to the deep page. If the clamped cursor has already
+                // reached the end of the history, wrap it back to the start of
+                // the deep region and send only page 0 this flush.
+                skip = cursor;
+                if skip >= history_count {
+                    bufs.ack_page_cursor = MAX_NUM_ACK;
+                    break;
+                }
+            } else {
+                // Deep page sent successfully: advance the cursor if more deep
+                // pages remain, otherwise wrap back to the start of the deep
+                // region for the next flush.
+                if cursor + MAX_NUM_ACK < history_count {
+                    bufs.ack_page_cursor = cursor + MAX_NUM_ACK;
+                } else {
+                    bufs.ack_page_cursor = MAX_NUM_ACK;
+                }
                 break;
             }
-            skip += MAX_NUM_ACK;
         }
         if let Err(e) = send_res {
             return Err(e);
