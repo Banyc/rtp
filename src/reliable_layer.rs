@@ -124,6 +124,10 @@ impl ReliableLayer {
         &self.pkt_recv_space
     }
 
+    pub fn sample_rtt(&mut self, rtt: Duration) {
+        self.pkt_send_space.sample_rtt(rtt);
+    }
+
     pub fn send_fin_buf(&mut self) {
         if matches!(self.send_fin_buf, SendFinBuf::EmptyAndBlocked) {
             return;

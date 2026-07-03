@@ -140,6 +140,10 @@ impl PktSendSpace {
         }
     }
 
+    pub fn sample_rtt(&mut self, rtt: Duration) {
+        self.rto.set(rtt);
+    }
+
     pub fn accepts_new_pkt(&self) -> bool {
         self.num_txing < self.cwnd.get()
     }

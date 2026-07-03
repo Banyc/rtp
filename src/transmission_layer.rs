@@ -18,6 +18,10 @@ use crate::{
 const PRINT_DEBUG_MSGS: bool = false;
 const FEC_DEBUG: bool = false;
 const MAX_NUM_ACK: usize = 64;
+const MAX_ACK_PAGES: usize = 36;
+const MAX_ECHO_RTT: Duration = Duration::from_secs(60);
+const ACK_FLUSH_COUNT: usize = 8;
+const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 const MIN_NO_RESP_FOR: Duration = Duration::from_secs(1);
 const BUF_SIZE: usize = 1024 * 64;
 
@@ -56,6 +60,9 @@ pub struct RecvBufs {
     pub ack_from_peer: Vec<AckBall>,
     pub ack_to_peer: Vec<u64>,
     pub codec_pkts: Vec<Vec<u8>>,
+    echo_ts: Option<u32>,
+    pending_acks: usize,
+    last_ack_flush: Option<Instant>,
 }
 
 impl RecvBufs {
@@ -65,6 +72,9 @@ impl RecvBufs {
             ack_from_peer: vec![],
             ack_to_peer: vec![],
             codec_pkts: vec![],
+            echo_ts: None,
+            pending_acks: 0,
+            last_ack_flush: None,
         }
     }
 }
@@ -89,6 +99,7 @@ pub struct TransmissionLayer {
     first_error: FirstError,
     reliable_layer_logger: Option<ReliableLayerLogger>,
     fec: Option<Mutex<FecState>>,
+    clock_epoch: Instant,
 }
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
@@ -123,6 +134,7 @@ impl TransmissionLayer {
             first_error,
             reliable_layer_logger,
             fec: unreliable_layer.fec.map(Mutex::new),
+            clock_epoch: now,
         }
     }
 
@@ -145,6 +157,13 @@ impl TransmissionLayer {
 
     pub fn next_poll_send_time(&self) -> Instant {
         self.send_rate_limiter.lock().unwrap().next_token_time()
+    }
+
+    fn wire_ts(&self, now: Instant) -> u32 {
+        let us = now.duration_since(self.clock_epoch).as_micros();
+        // Truncate to u32; the receiver uses wrapping subtraction, so the wrap
+        // every ~71.6 minutes is harmless for RTTs below MAX_ECHO_RTT.
+        us as u32
     }
 
     /// # Cancel safety
@@ -241,10 +260,7 @@ impl TransmissionLayer {
         self.utp_write.lock().await.send(send_buf).await
     }
 
-    pub async fn send_pkts(
-        &self,
-        bufs: &mut SendBufs,
-    ) -> Result<bool, std::io::ErrorKind> {
+    pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
         let detect_broken_pipe_proactively = || {
             let now = Instant::now();
             let reliable_layer = self.reliable_layer.lock().unwrap();
@@ -291,9 +307,10 @@ impl TransmissionLayer {
             };
             let data = EncodeData {
                 seq: p.seq,
+                send_ts: Some(self.wire_ts(now)),
                 data: &bufs.data[..data_written],
             };
-            let n = encode_ack_data(None, Some(data), &mut bufs.utp).unwrap();
+            let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
             let utp_pkt = &bufs.utp[..n];
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
@@ -422,6 +439,12 @@ impl TransmissionLayer {
         };
 
         bufs.ack_to_peer.clear();
+        let ack_deadline = if 0 < bufs.pending_acks {
+            bufs.last_ack_flush.map(|last| last + ACK_FLUSH_AGE)
+        } else {
+            None
+        };
+        let mut ack_deadline_hit = false;
         for _ in 0..MAX_NUM_ACK {
             self.first_error
                 .throw_error()
@@ -435,7 +458,19 @@ impl TransmissionLayer {
             let res = {
                 let mut utp_read = self.utp_read.lock().await;
                 match bufs.ack_to_peer.is_empty() {
-                    true => utp_read.recv(&mut bufs.utp).await,
+                    true => {
+                        if let Some(deadline) = ack_deadline {
+                            tokio::select! {
+                                res = utp_read.recv(&mut bufs.utp) => res,
+                                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                                    ack_deadline_hit = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            utp_read.recv(&mut bufs.utp).await
+                        }
+                    }
                     false => {
                         let res = utp_read.try_recv(&mut bufs.utp);
                         if let Err(e) = &res
@@ -488,6 +523,15 @@ impl TransmissionLayer {
                     }
                 };
 
+                if let Some(echo_ts) = data.echo_ts {
+                    let local_ts = self.wire_ts(now);
+                    let rtt_us = local_ts.wrapping_sub(echo_ts);
+                    let rtt = Duration::from_micros(rtt_us as u64);
+                    if rtt <= MAX_ECHO_RTT {
+                        self.reliable_layer.lock().unwrap().sample_rtt(rtt);
+                    }
+                }
+
                 if data.killed {
                     let e = std::io::ErrorKind::BrokenPipe;
                     throw_error(e);
@@ -534,21 +578,25 @@ impl TransmissionLayer {
                 } else {
                     recv_pkts.num_payload_segments += 1;
                 }
-                self.log("recv_data_pkt");
-                match to_ack {
-                    true => {
-                        bufs.ack_to_peer.push(data.seq);
+                if to_ack {
+                    bufs.ack_to_peer.push(data.seq);
+                    if let Some(send_ts) = data.send_ts {
+                        bufs.echo_ts = Some(send_ts);
                     }
-                    false => end_of_acks = true,
+                } else {
+                    end_of_acks = true;
                 }
+                self.log("recv_data_pkt");
             }
             if end_of_acks {
                 break;
             }
         }
 
+        bufs.pending_acks += bufs.ack_to_peer.len();
+
         // No new data received in the reliable layer
-        if bufs.ack_to_peer.is_empty() {
+        if bufs.ack_to_peer.is_empty() && !ack_deadline_hit {
             // ACK processing may have freed cwnd or drained the send buffer
             // enough that the send pump can make progress now. Wake the send
             // timer exactly once per batch, after dropping the reliable layer
@@ -565,44 +613,101 @@ impl TransmissionLayer {
             return Ok(recv_pkts);
         }
 
-        self.recv_data_pkt.notify_waiters();
-
-        // reliable -{ACK}> UDP remote
-        let written_bytes = {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
-            let pkt_recv_space = reliable_layer.pkt_recv_space();
-            let ack = EncodeAck {
-                queue: pkt_recv_space.ack_history(),
-                skip: 0,
-                max_take: MAX_NUM_ACK,
-            };
-            encode_ack_data(Some(ack), None, &mut bufs.utp).unwrap()
-        };
-        let fec_enabled = self.fec.is_some();
-        let res = self
-            .send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
-            .await;
-        // Transient UDP send-buffer exhaustion: treat the loss of this ACK
-        // packet as transient backpressure rather than a fatal connection
-        // error. ACKs are cumulative and the peer will learn of the acked
-        // sequence numbers on the next ACK we send successfully.
-        let res: Result<(), (std::io::ErrorKind, SendKillPkt)> = match res {
-            Ok(_) => Ok(()),
-            Err(std::io::ErrorKind::WouldBlock) => Ok(()),
-            Err(e) => Err((throw_error(e), SendKillPkt::No)),
-        };
-        if fec_enabled {
-            match &res {
-                Ok(_) => {
-                    let now = Instant::now();
-                    let can_send_tail_fec =
-                        { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
-                    self.close_fec_burst(now, can_send_tail_fec).await;
-                }
-                Err(_) => self.skip_open_fec_group(),
-            }
+        if !bufs.ack_to_peer.is_empty() {
+            self.recv_data_pkt.notify_waiters();
         }
-        res?;
+
+        let now = Instant::now();
+        let should_flush = ack_deadline_hit
+            || ACK_FLUSH_COUNT <= bufs.pending_acks
+            || 0 < recv_pkts.num_fin_segments
+            || bufs
+                .last_ack_flush
+                .map_or(true, |last| ACK_FLUSH_AGE <= now.duration_since(last))
+            || {
+                let reliable_layer = self.reliable_layer.lock().unwrap();
+                reliable_layer
+                    .pkt_recv_space()
+                    .ack_history()
+                    .balls()
+                    .nth(1)
+                    .is_some()
+            };
+        if !should_flush {
+            return Ok(recv_pkts);
+        }
+        bufs.pending_acks = 0;
+        bufs.last_ack_flush = Some(now);
+
+        // reliable -{ACK}> UDP remote, paging through the whole ack history.
+        // Echo the latest data timestamp only on the first page so each stamp
+        // is reflected at most once.
+        let mut echo_ts = bufs.echo_ts.take();
+        let mut skip: usize = 0;
+        let mut pages = 0;
+        let mut send_res: Result<(), (std::io::ErrorKind, SendKillPkt)> = Ok(());
+        'ack_pages: loop {
+            if pages >= MAX_ACK_PAGES {
+                break;
+            }
+            pages += 1;
+            let (queue_ref, more_pages) = {
+                let reliable_layer = self.reliable_layer.lock().unwrap();
+                let queue = reliable_layer.pkt_recv_space().ack_history();
+                let has_more = queue.balls().count() > skip + MAX_NUM_ACK;
+                // Encode against a borrowed queue; the lock is dropped before any
+                // await point so the borrow never crosses an await.
+                let written_bytes = {
+                    let ack = EncodeAck {
+                        queue,
+                        skip,
+                        max_take: MAX_NUM_ACK,
+                    };
+                    let this_echo = echo_ts.take();
+                    encode_ack_data(Some(ack), this_echo, None, &mut bufs.utp).unwrap()
+                };
+                (written_bytes, has_more)
+            };
+            let written_bytes = queue_ref;
+            let fec_enabled = self.fec.is_some();
+            let res = self
+                .send_with_fec(&bufs.utp[..written_bytes], &mut send_bufs.fec)
+                .await;
+            send_res = match res {
+                Ok(_) => Ok(()),
+                Err(std::io::ErrorKind::WouldBlock) => {
+                    // Transient UDP send-buffer exhaustion. Stop paging for
+                    // now; the next recv batch will continue from the same ack
+                    // history.
+                    break 'ack_pages;
+                }
+                Err(e) => {
+                    let e = throw_error(e);
+                    Err((e, SendKillPkt::No))
+                }
+            };
+            if fec_enabled {
+                match &send_res {
+                    Ok(_) => {
+                        let now = Instant::now();
+                        let can_send_tail_fec =
+                            { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+                        self.close_fec_burst(now, can_send_tail_fec).await;
+                    }
+                    Err(_) => self.skip_open_fec_group(),
+                }
+            }
+            if send_res.is_err() {
+                break;
+            }
+            if !more_pages {
+                break;
+            }
+            skip += MAX_NUM_ACK;
+        }
+        if let Err(e) = send_res {
+            return Err(e);
+        }
         if PRINT_DEBUG_MSGS {
             println!("recv_pkts: ack: {:?}", bufs.ack_to_peer);
         }
@@ -799,7 +904,6 @@ pub struct Log<'a> {
 
     pub tokens: f64,
     pub send_rate: f64,
-    pub delivery_rate: Option<f64>,
     pub loss_rate: Option<f64>,
     pub num_tx_pkts: usize,
     pub num_pkts_in_pipe: usize,
@@ -810,5 +914,6 @@ pub struct Log<'a> {
     pub cwnd: usize,
     pub num_rx_pkts: usize,
     pub recv_seq: Option<u64>,
+    pub delivery_rate: Option<f64>,
     pub app_limited: Option<bool>,
 }
