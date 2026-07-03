@@ -81,6 +81,10 @@ impl PktSendSpace {
         self.rto.smooth_rtt()
     }
 
+    pub fn smooth_rtt_var(&self) -> Duration {
+        self.rto.smooth_rtt_var()
+    }
+
     pub fn num_rtxed_pkts(&self) -> usize {
         let mut n = 0;
         for (_, p) in Self::unacked(&self.send_wnd) {

@@ -40,6 +40,11 @@ const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MSGS: bool = false;
 const LINEAR_BACKOFF: bool = true;
 
+const QUEUE_RTT_FACTOR: f64 = 2.0;
+const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(25);
+const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
+const DRAIN_RATE_FRACTION: f64 = 0.85;
+
 #[derive(Debug, Clone)]
 enum SendFinBuf {
     Empty,
@@ -63,6 +68,7 @@ pub struct ReliableLayer {
     bucket_burst: NonZeroUsize,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
+    rtt_floor: WindowedRttMin,
 
     // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
@@ -92,6 +98,7 @@ impl ReliableLayer {
             bucket_burst,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
+            rtt_floor: WindowedRttMin::new(now),
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
@@ -274,15 +281,42 @@ impl ReliableLayer {
     }
 
     fn adjust_send_rate_exponential(&mut self, sr: &dre::RateSample, now: Instant) {
-        let little_loss = self
+        let smooth = self.pkt_send_space.smooth_rtt();
+        let floor = self.rtt_floor.update(now, smooth);
+        let tol = self
+            .pkt_send_space
+            .smooth_rtt_var()
+            .mul_f64(QUEUE_RTT_FACTOR)
+            .max(floor.mul_f64(QUEUE_RTT_FACTOR - 1.0))
+            .max(QUEUE_RTT_FLOOR);
+        let queue_building = smooth > floor + tol;
+
+        let little_data_loss = self
             .pkt_send_space
             .loss_event_rate(now)
             .map(|lr| lr < CC_DATA_LOSS_RATE);
-        let should_probe = little_loss != Some(false);
+        let should_probe = little_data_loss != Some(false) && !queue_building;
         if should_probe {
             let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
             let target_send_rate = probed.unwrap_or(self.send_rate.get());
             self.set_smooth_send_rate(target_send_rate, now);
+            return;
+        }
+
+        if queue_building && little_data_loss != Some(false) {
+            let control_rtt = self.control_rtt();
+            let current = self.send_rate.get();
+            let target = (sr.delivery_rate() * DRAIN_RATE_FRACTION)
+                .min(current)
+                .max(MIN_SEND_RATE);
+            let new_rate = backoff_send_rate_linear(current, target, sr.interval(), control_rtt);
+            match new_rate {
+                Some(new_rate) => self.set_send_rate(PosR::new(new_rate).unwrap(), now),
+                None => {
+                    let send_rate = PosR::new(self.send_rate.get()).unwrap();
+                    self.set_send_rate(send_rate, now);
+                }
+            }
             return;
         }
 
@@ -540,6 +574,44 @@ impl ReliableLayer {
     }
 }
 
+/// Minimum of a sliding window of RTT samples.
+///
+/// RTT rises when a queue builds, but a lifetime `min_rtt` collapses to ~0 on
+/// jittery links and never recovers. Instead, keep a short windowed minimum:
+/// the floor tracks recent baseline RTT and recovers quickly enough to let the
+/// delay-based gate close when the queue inflates and reopen when it drains.
+#[derive(Debug, Clone)]
+struct WindowedRttMin {
+    bucket_start: Instant,
+    cur: Option<Duration>,
+    prev: Option<Duration>,
+}
+
+impl WindowedRttMin {
+    fn new(now: Instant) -> Self {
+        Self {
+            bucket_start: now,
+            cur: None,
+            prev: None,
+        }
+    }
+
+    fn update(&mut self, now: Instant, rtt: Duration) -> Duration {
+        if now.duration_since(self.bucket_start) > RTT_MIN_BUCKET {
+            self.prev = self.cur.take();
+            self.bucket_start = now;
+        }
+
+        self.cur = Some(match self.cur {
+            Some(cur) => cur.min(rtt),
+            None => rtt,
+        });
+
+        let candidates = [self.cur, self.prev].into_iter().flatten();
+        candidates.min().unwrap_or(rtt)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DataPkt {
     pub seq: u64,
@@ -590,13 +662,48 @@ fn backoff_send_rate_linear(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use primitive::ops::float::PosR;
 
     use super::{
         INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN,
-        SEND_DATA_BUF_LEN, burst_pkts, send_data_buf_len, token_bucket_with_tokens,
+        RTT_MIN_BUCKET, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len,
+        token_bucket_with_tokens,
     };
     use crate::{codec::data_overhead, udp::NO_FEC_MSS};
+
+    #[test]
+    fn windowed_rtt_min_slides_and_forgets() {
+        let now = std::time::Instant::now();
+        let mut w = WindowedRttMin::new(now);
+
+        // Within the first bucket the minimum is reported immediately.
+        assert_eq!(w.update(now, Duration::from_millis(40)), Duration::from_millis(40));
+        assert_eq!(w.update(now, Duration::from_millis(100)), Duration::from_millis(40));
+
+        // First rotation: the previous bucket's 40 ms floor is still visible.
+        let t1 = now + RTT_MIN_BUCKET + Duration::from_millis(1);
+        assert_eq!(
+            w.update(t1, Duration::from_millis(90)),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            w.update(t1, Duration::from_millis(95)),
+            Duration::from_millis(40)
+        );
+
+        // Second rotation: the stale floor has aged out.
+        let t2 = t1 + RTT_MIN_BUCKET + Duration::from_millis(1);
+        assert_eq!(
+            w.update(t2, Duration::from_millis(95)),
+            Duration::from_millis(90)
+        );
+        assert_eq!(
+            w.update(t2, Duration::from_millis(110)),
+            Duration::from_millis(90)
+        );
+    }
 
     #[test]
     fn token_bucket_with_tokens_prefills_without_stale_deadline() {

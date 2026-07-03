@@ -67,6 +67,10 @@ impl RtxTimer {
     pub fn smooth_rtt(&self) -> Duration {
         Duration::from_secs_f64(self.smooth_rtt.get())
     }
+
+    pub fn smooth_rtt_var(&self) -> Duration {
+        Duration::from_secs_f64(self.smooth_rtt_var.get())
+    }
 }
 
 #[cfg(test)]
