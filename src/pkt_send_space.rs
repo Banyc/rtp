@@ -17,6 +17,12 @@ use crate::{pkt_recv_space::MAX_NUM_RECVING_PKTS, rto::RtxTimer, sack::AckBallSe
 pub const INIT_CWND: usize = 16;
 pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 
+/// Maximum number of RFC 8985 tail-loss probes (PTO) per tail episode.
+const MAX_TAIL_PROBES: u8 = 2;
+/// Floor for the PTO timer so that the first sample is not taken before the
+/// peer has had a reasonable chance to acknowledge the tail packet.
+const TAIL_PROBE_MIN_TOL: Duration = Duration::from_millis(10);
+
 #[derive(Debug)]
 pub struct PktSendSpace {
     send_wnd: SendWnd<u64, Option<TxingPkt>>,
@@ -31,6 +37,10 @@ pub struct PktSendSpace {
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: MinNoneOptCmp<u64>,
     loss_event_window: LossEventWindow,
+    /// Number of tail-loss probes (PTO) sent in the current tail episode.
+    /// Reset to 0 on ACK progress (`ack_buf` non-empty) or when a new packet is
+    /// pushed.
+    tail_probes_sent: u8,
 
     // reused buffers
     unacked_buf: Vec<u64>,
@@ -49,6 +59,7 @@ impl PktSendSpace {
             out_of_order_seq_end: 0,
             max_pipe_seq: MinNoneOptCmp(None),
             loss_event_window: LossEventWindow::new(),
+            tail_probes_sent: 0,
             unacked_buf: vec![],
             ack_buf: vec![],
         }
@@ -137,6 +148,9 @@ impl PktSendSpace {
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
+        if delivered > 0 {
+            self.tail_probes_sent = 0;
+        }
         if peer_waiting_for_acked_pkts {
             return;
         }
@@ -155,6 +169,74 @@ impl PktSendSpace {
         self.num_txing < self.cwnd.get()
     }
 
+    /// Time between consecutive tail-loss probes for the current tail episode.
+    fn tail_probe_window(&self) -> Duration {
+        let srtt = self.rto.smooth_rtt();
+        let min_rto = self.rto.rto();
+        let min_tol = TAIL_PROBE_MIN_TOL;
+        // PTO formula: max(2*srtt, 2*min_rtt) with a 10 ms floor, capped at RTO.
+        let doubled_srtt = srtt.mul_f64(2.);
+        let min_rtt_doubled = self.min_rtt.map(|r| r.mul_f64(2.)).unwrap_or(doubled_srtt);
+        doubled_srtt.max(min_rtt_doubled).max(min_tol).min(min_rto)
+    }
+
+    /// Sequence number of the current tail packet, if any.
+    fn tail_seq(&self) -> Option<u64> {
+        let next = self.send_wnd.next().copied()?;
+        if next == 0 {
+            return None;
+        }
+        Some(next - 1)
+    }
+
+    /// Whether the tail packet is still unacked and enough time has passed for
+    /// the next probe to fire.
+    pub fn has_tail_probe(&self, now: Instant) -> bool {
+        if self.tail_probes_sent >= MAX_TAIL_PROBES {
+            return false;
+        }
+        let Some(seq) = self.tail_seq() else {
+            return false;
+        };
+        let Some(p) = self.send_wnd.get(&seq) else {
+            return false;
+        };
+        let Some(p) = p.as_ref() else {
+            return false;
+        };
+        p.hits_custom_rto(self.tail_probe_window(), now)
+    }
+
+    /// Produce a tail-loss probe if it is time for one. The probe retransmits
+    /// the current tail packet with a fresh timestamp and RTO without marking
+    /// it as a loss event or clearing its congestion state.
+    pub fn tail_probe(&mut self, now: Instant) -> Option<Pkt<'_>> {
+        if !self.has_tail_probe(now) {
+            return None;
+        }
+        let seq = self.tail_seq()?;
+        let p = self.send_wnd.get_mut(&seq)?.as_mut()?;
+
+        self.tail_probes_sent += 1;
+
+        // Refresh the timestamp/RTO so the probe is tracked as a fresh packet
+        // for RTO calculation (the RTO fallback covers a lost probe).
+        self_assign::self_assign! {
+            p = TxingPkt {
+                stats: _,
+                sent_time: now,
+                rtxed: _,
+                considered_new_in_cwnd: _,
+                data: _,
+                rto: self.rto.rto(),
+            };
+        }
+        Some(Pkt {
+            seq,
+            data: &p.data,
+        })
+    }
+
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Pkt<'_> {
         let s = *self.send_wnd.next().unwrap();
 
@@ -171,6 +253,7 @@ impl PktSendSpace {
 
         self.send_wnd.push(Some(p));
         self.num_txing += 1;
+        self.tail_probes_sent = 0;
         if self.resp_wait_start.is_none() {
             self.resp_wait_start = Some(now);
         }
@@ -190,6 +273,7 @@ impl PktSendSpace {
                 p.is_rtx(is_seq_out_of_order, self.rto.reorder_window(), now)
             })
     }
+
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let reorder_window = self.rto.reorder_window();
@@ -360,6 +444,15 @@ impl PktSendSpace {
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
         }
+        if let Some(seq) = self.tail_seq() {
+            if let Some(Some(p)) = self.send_wnd.get(&seq) {
+                if self.tail_probes_sent < MAX_TAIL_PROBES {
+                    let t = p.sent_time + self.tail_probe_window();
+                    let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
+                    min_next_poll_time = Some(t);
+                }
+            }
+        }
         min_next_poll_time
     }
 
@@ -515,10 +608,35 @@ impl LossEventWindow {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::LossEventWindow;
+    use super::{LossEventWindow, PktSendSpace};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    fn settle_rtt(space: &mut PktSendSpace) {
+        // Saturate the SRTT filter so the RTO is stable and close to 100 ms.
+        for _ in 0..20 {
+            space.sample_rtt(ms(100));
+        }
+    }
+
+    fn send_packet(space: &mut PktSendSpace, now: Instant) {
+        use dre::ConnectionState;
+        let data = vec![0u8; 1];
+        let stats = ConnectionState::new(now).send_packet_2(now, space.no_pkts_in_flight());
+        space.send(data, stats, now);
+    }
+
+    fn ack_up_to(space: &mut PktSendSpace, seq: u64, now: Instant) {
+        let ball = crate::sack::AckBall {
+            start: 0,
+            size: std::num::NonZeroU64::new(seq + 1).unwrap(),
+        };
+        let balls = [ball];
+        let seq = crate::sack::AckBallSequence::new(&balls);
+        let mut acked = Vec::new();
+        space.ack(seq, &mut acked, now);
     }
 
     #[test]
@@ -583,5 +701,81 @@ mod tests {
         // After a 10-bucket idle gap the window is empty and abstains.
         let t3 = t2 + smooth * 10;
         assert!(w.rate(t3, smooth).is_none());
+    }
+
+    #[test]
+    fn tail_probe_fires_before_rto_and_respects_budget() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt(&mut space);
+
+        // Send two packets; the second is the tail.
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+
+        // No probe immediately after sending.
+        assert!(!space.has_tail_probe(t0 + ms(1)));
+
+        // First probe fires around the PTO (2*srtt = 200 ms), well before RTO.
+        let t1 = t0 + ms(150);
+        assert!(!space.has_tail_probe(t1), "probe should not fire at 150 ms");
+        let t2 = t0 + ms(250);
+        assert!(space.has_tail_probe(t2), "probe should fire by 250 ms");
+
+        let p = space.tail_probe(t2).unwrap();
+        assert_eq!(p.seq, 1);
+
+        // Second probe requires another full PTO window.
+        let t3 = t2 + ms(150);
+        assert!(!space.has_tail_probe(t3), "second probe too early");
+        let t4 = t2 + ms(250);
+        assert!(space.has_tail_probe(t4), "second probe should fire");
+        let p = space.tail_probe(t4).unwrap();
+        assert_eq!(p.seq, 1);
+
+        // Budget is exhausted after two probes.
+        let t5 = t4 + ms(500);
+        assert!(!space.has_tail_probe(t5), "no third probe");
+        assert!(space.tail_probe(t5).is_none());
+    }
+
+    #[test]
+    fn tail_probe_budget_resets_on_ack_progress_and_new_send() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt(&mut space);
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+
+        let t1 = t0 + ms(250);
+        let _ = space.tail_probe(t1);
+
+        // ACK progress resets the budget.
+        ack_up_to(&mut space, 1, t1 + ms(1));
+        // Window is now empty; no tail, so has_tail_probe is false.
+        assert!(!space.has_tail_probe(t1 + ms(1)));
+
+        // New tail after sending again starts fresh.
+        send_packet(&mut space, t1 + ms(2));
+        assert!(!space.has_tail_probe(t1 + ms(2)));
+        assert!(space.has_tail_probe(t1 + ms(252)));
+    }
+
+    #[test]
+    fn tail_probe_abstains_when_all_acked_or_before_first_rtt_sample() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+
+        // Without any RTT sample the RTO defaults to 1 s, so the PTO (capped at
+        // RTO) does not fire at 900 ms.
+        send_packet(&mut space, t0);
+        assert!(!space.has_tail_probe(t0 + ms(900)));
+        assert!(space.tail_probe(t0 + ms(900)).is_none());
+
+        // After all packets are acked there is no tail and no probe.
+        ack_up_to(&mut space, 0, t0 + ms(1));
+        assert!(!space.has_tail_probe(t0 + ms(900)));
+        assert!(space.tail_probe(t0 + ms(900)).is_none());
     }
 }

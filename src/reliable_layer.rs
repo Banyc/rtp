@@ -184,11 +184,29 @@ impl ReliableLayer {
             });
         }
 
-        // No retransmit to send. From here on we are sending a *new* packet,
-        // so the cwnd gate and the send-rate token bucket both apply. Charge
-        // a token only when there is actually a new packet (or a FIN) to
-        // send; an idle/cwnd-full call must not drain tokens, otherwise we
-        // steal bandwidth from a future send and skew the rate limiter.
+        // Tail-loss probes also bypass the cwnd gate and token bucket: like
+        // regular retransmits, they resend an already-in-flight packet and
+        // must fire during tail silence to avoid waiting the full RTO.
+        if self.is_send_buf_empty() {
+            if let Some(p) = self.pkt_send_space.tail_probe(now) {
+                pkt[..p.data.len()].copy_from_slice(p.data);
+
+                let data_written = NonZeroUsize::new(p.data.len())
+                    .map(DataPktPayload::Data)
+                    .unwrap_or(DataPktPayload::Fin);
+                return Some(DataPkt {
+                    seq: p.seq,
+                    data_written,
+                });
+            }
+        }
+
+        // No retransmit or tail probe to send. From here on we are sending a
+        // *new* packet, so the cwnd gate and the send-rate token bucket both
+        // apply. Charge a token only when there is actually a new packet (or
+        // a FIN) to send; an idle/cwnd-full call must not drain tokens,
+        // otherwise we steal bandwidth from a future send and skew the rate
+        // limiter.
         if !self.pkt_send_space.accepts_new_pkt() {
             return None;
         }
