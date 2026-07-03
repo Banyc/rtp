@@ -21,9 +21,7 @@ fn checked_keyed_mss<K: DispatchKey>(mss_after_fec: NonZeroUsize) -> NonZeroUsiz
         .get()
         .checked_sub(key_size)
         .unwrap_or_else(|| {
-            panic!(
-                "mss {mss_after_fec} leaves no room for the {key_size}-byte dispatch key"
-            )
+            panic!("mss {mss_after_fec} leaves no room for the {key_size}-byte dispatch key")
         });
     let overhead = crate::codec::data_overhead();
     assert!(
@@ -348,12 +346,10 @@ mod tests {
     #[should_panic(expected = "dispatch key")]
     async fn test_key_too_large() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = Client::<HugeKey>::connect_without_handshake(
-            "0.0.0.0:0",
-            server.local_addr().unwrap(),
-        )
-        .await
-        .unwrap();
+        let client =
+            Client::<HugeKey>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
+                .await
+                .unwrap();
         let _ = client.open_without_handshake(HugeKey, false).unwrap();
     }
 

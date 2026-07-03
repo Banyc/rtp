@@ -79,11 +79,7 @@ impl Listener {
     /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
     /// overhead. Both peers must use the same `mss`; there is no in-band
     /// negotiation.
-    pub async fn accept_with_mss(
-        &self,
-        fec: bool,
-        mss: usize,
-    ) -> std::io::Result<Handshake> {
+    pub async fn accept_with_mss(&self, fec: bool, mss: usize) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
         let handshake = true;
         Ok(tokio::spawn(accept(accepted, handshake, fec, mss)))
@@ -682,15 +678,9 @@ mod tests {
             }
         });
 
-        let mut connected = connect_without_handshake_with_mss(
-            "0.0.0.0:0",
-            addr,
-            None,
-            fec,
-            mss,
-        )
-        .await
-        .unwrap();
+        let mut connected = connect_without_handshake_with_mss("0.0.0.0:0", addr, None, fec, mss)
+            .await
+            .unwrap();
         let mut buf = [0; 1];
         connected.write.send(&msg).await.unwrap();
         connected.read.recv(&mut buf).await.unwrap();

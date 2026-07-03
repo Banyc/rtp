@@ -593,8 +593,8 @@ mod tests {
     use primitive::ops::float::PosR;
 
     use super::{
-        burst_pkts, send_data_buf_len, token_bucket_with_tokens, INIT_SEND_RATE, MAX_BURST_PKTS,
-        MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, SEND_DATA_BUF_LEN,
+        INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN,
+        SEND_DATA_BUF_LEN, burst_pkts, send_data_buf_len, token_bucket_with_tokens,
     };
     use crate::{codec::data_overhead, udp::NO_FEC_MSS};
 
@@ -640,6 +640,26 @@ mod tests {
         assert_eq!(len, expected);
         assert!(len > SEND_DATA_BUF_LEN);
         assert!(len <= MAX_SEND_DATA_BUF_LEN);
+
+        // Spot checks for the larger-overhead wire format.
+        let payload_2015 = 2015 - data_overhead();
+        assert_eq!(
+            send_data_buf_len(nz(2015)),
+            (MAX_SEND_DATA_BUF_LEN / payload_2015) * payload_2015
+        );
+        let payload_9000 = 9000 - data_overhead();
+        assert_eq!(
+            send_data_buf_len(nz(9000)),
+            (MAX_SEND_DATA_BUF_LEN / payload_9000) * payload_9000
+        );
+
+        // Sanity check for the default-MSS path.
+        let default_mss = std::num::NonZeroUsize::new(NO_FEC_MSS).unwrap();
+        assert_eq!(send_data_buf_len(default_mss), SEND_DATA_BUF_LEN);
+    }
+
+    fn nz(n: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).unwrap()
     }
 
     #[test]
