@@ -30,6 +30,7 @@ pub struct PktSendSpace {
     out_of_order_seq_end: u64,
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: MinNoneOptCmp<u64>,
+    loss_event_window: LossEventWindow,
 
     // reused buffers
     unacked_buf: Vec<u64>,
@@ -47,6 +48,7 @@ impl PktSendSpace {
             resp_wait_start: None,
             out_of_order_seq_end: 0,
             max_pipe_seq: MinNoneOptCmp(None),
+            loss_event_window: LossEventWindow::new(),
             unacked_buf: vec![],
             ack_buf: vec![],
         }
@@ -110,6 +112,7 @@ impl PktSendSpace {
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
         recved.ack(&self.unacked_buf, &mut self.ack_buf);
+        let delivered = self.ack_buf.len();
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
@@ -119,17 +122,17 @@ impl PktSendSpace {
                 self.send_wnd.pop_none();
             }
 
-            if !p.rtxed {
-                let rtt = now - p.sent_time;
-                self.min_rtt = Some(match self.min_rtt {
-                    Some(min_rtt) => min_rtt.min(rtt),
-                    None => rtt,
-                });
-                self.rto.set(rtt);
-            }
+            let rtt = now - p.sent_time;
+            self.min_rtt = Some(match self.min_rtt {
+                Some(min_rtt) => min_rtt.min(rtt),
+                None => rtt,
+            });
+            self.rto.set(rtt);
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
+        self.loss_event_window
+            .record_delivered(delivered, now, self.smooth_rtt());
         if peer_waiting_for_acked_pkts {
             return;
         }
@@ -180,17 +183,21 @@ impl PktSendSpace {
             .take(self.cwnd.get())
             .any(|(s, p)| {
                 let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
-                p.is_rtx(is_seq_out_of_order, self.rto.smooth_rtt(), now)
+                p.is_rtx(is_seq_out_of_order, self.rto.reorder_window(), now)
             })
     }
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
+        let reorder_window = self.rto.reorder_window();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
-            let should_rtx = p.is_rtx(is_seq_out_of_order, self.rto.smooth_rtt(), now);
+            let should_rtx = p.is_rtx(is_seq_out_of_order, reorder_window, now);
             if !should_rtx {
                 continue;
             }
+
+            // Count one loss event per packet the first time it is retransmitted.
+            let already_rtxed = p.rtxed;
 
             // fresh pkt for this cwnd
             let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
@@ -209,6 +216,10 @@ impl PktSendSpace {
                     data: _,
                     rto: self.rto.rto(),
                 };
+            }
+            if !already_rtxed {
+                let smooth_rtt = self.rto.smooth_rtt();
+                self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
             let p = Pkt {
                 seq: s,
@@ -322,6 +333,10 @@ impl PktSendSpace {
         Some(lost as f64 / len as f64)
     }
 
+    pub fn loss_event_rate(&mut self, now: Instant) -> Option<f64> {
+        self.loss_event_window.rate(now, self.smooth_rtt())
+    }
+
     pub fn num_pkts_in_pipe(&self) -> usize {
         self.pkts_in_pipe().count()
     }
@@ -401,4 +416,168 @@ struct SeqOutOfOrder(pub bool);
 pub struct Pkt<'a> {
     pub seq: u64,
     pub data: &'a [u8],
+}
+
+#[derive(Debug, Clone)]
+struct LossEventBucket {
+    lost: usize,
+    delivered: usize,
+    start: Option<Instant>,
+}
+
+impl LossEventBucket {
+    fn new() -> Self {
+        Self {
+            lost: 0,
+            delivered: 0,
+            start: None,
+        }
+    }
+
+    fn reset(&mut self, start: Instant) {
+        self.lost = 0;
+        self.delivered = 0;
+        self.start = Some(start);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LossEventWindow {
+    curr: LossEventBucket,
+    prev: LossEventBucket,
+}
+
+impl LossEventWindow {
+    fn new() -> Self {
+        Self {
+            curr: LossEventBucket::new(),
+            prev: LossEventBucket::new(),
+        }
+    }
+
+    fn bucket_len(smooth_rtt: Duration) -> Duration {
+        smooth_rtt.max(Duration::from_millis(1))
+    }
+
+    fn rotate(&mut self, now: Instant, smooth_rtt: Duration) {
+        let bucket_len = Self::bucket_len(smooth_rtt);
+        let curr_start = self.curr.start.unwrap_or(now);
+        let elapsed = now.duration_since(curr_start);
+        if elapsed < bucket_len {
+            return;
+        }
+
+        // Gap of 2 or more empty buckets: reset both buckets (loss event has aged out).
+        let gap_buckets = elapsed.as_millis() / bucket_len.as_millis();
+        if gap_buckets >= 2 {
+            self.curr.reset(now);
+            self.prev.reset(now);
+            return;
+        }
+
+        // Single-bucket rotation.
+        self.prev = self.curr.clone();
+        self.curr.reset(now);
+    }
+
+    fn record_delivered(&mut self, delivered: usize, now: Instant, smooth_rtt: Duration) {
+        self.rotate(now, smooth_rtt);
+        if self.curr.start.is_none() {
+            self.curr.reset(now);
+        }
+        self.curr.delivered += delivered;
+    }
+
+    fn record_lost(&mut self, lost: usize, now: Instant, smooth_rtt: Duration) {
+        self.rotate(now, smooth_rtt);
+        if self.curr.start.is_none() {
+            self.curr.reset(now);
+        }
+        self.curr.lost += lost;
+    }
+
+    fn rate(&mut self, now: Instant, smooth_rtt: Duration) -> Option<f64> {
+        self.rotate(now, smooth_rtt);
+        let total = self.curr.lost + self.curr.delivered + self.prev.lost + self.prev.delivered;
+        if total < INIT_CWND {
+            return None;
+        }
+        let lost = self.curr.lost + self.prev.lost;
+        Some(lost as f64 / total as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::LossEventWindow;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn loss_event_rate_reads_true_loss() {
+        let now = Instant::now();
+        let smooth = ms(100);
+        let mut w = LossEventWindow::new();
+        // Deliver 85, lose 15 over a single bucket worth of samples.
+        for _ in 0..85 {
+            w.record_delivered(1, now, smooth);
+        }
+        for _ in 0..15 {
+            w.record_lost(1, now, smooth);
+        }
+        let rate = w.rate(now, smooth).unwrap();
+        assert!((rate - 0.15).abs() < 0.001, "rate={rate}");
+    }
+
+    #[test]
+    fn loss_event_rate_needs_min_samples() {
+        let now = Instant::now();
+        let smooth = ms(100);
+        let mut w = LossEventWindow::new();
+        for _ in 0..15 {
+            w.record_lost(1, now, smooth);
+        }
+        assert!(w.rate(now, smooth).is_none());
+        for _ in 0..16 {
+            w.record_delivered(1, now, smooth);
+        }
+        assert!(w.rate(now, smooth).is_some());
+    }
+
+    #[test]
+    fn loss_events_age_out() {
+        let t0 = Instant::now();
+        let smooth = ms(100);
+        let mut w = LossEventWindow::new();
+        // Fill current bucket with losses.
+        for _ in 0..100 {
+            w.record_lost(1, t0, smooth);
+        }
+        let r = w.rate(t0, smooth).unwrap();
+        assert!(r > 0.9, "r={r}");
+
+        // After one bucket rotation losses move to prev and still count.
+        let t1 = t0 + smooth + ms(1);
+        for _ in 0..100 {
+            w.record_delivered(1, t1, smooth);
+        }
+        let r = w.rate(t1, smooth).unwrap();
+        assert!(r > 0.4 && r < 0.6, "r={r}");
+
+        // After a second rotation the old losses are gone.
+        let t2 = t1 + smooth + ms(1);
+        for _ in 0..100 {
+            w.record_delivered(1, t2, smooth);
+        }
+        let r = w.rate(t2, smooth).unwrap();
+        assert!(r < 0.01, "r={r}");
+
+        // After a 10-bucket idle gap the window is empty and abstains.
+        let t3 = t2 + smooth * 10;
+        assert!(w.rate(t3, smooth).is_none());
+    }
 }

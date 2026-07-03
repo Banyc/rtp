@@ -274,16 +274,14 @@ impl ReliableLayer {
     }
 
     fn adjust_send_rate_exponential(&mut self, sr: &dre::RateSample, now: Instant) {
-        let little_data_loss = self
+        let little_loss = self
             .pkt_send_space
-            .data_loss_rate(now)
+            .loss_event_rate(now)
             .map(|lr| lr < CC_DATA_LOSS_RATE);
-        let should_probe = little_data_loss != Some(false);
+        let should_probe = little_loss != Some(false);
         if should_probe {
             let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
-            let Some(target_send_rate) = probed else {
-                return;
-            };
+            let target_send_rate = probed.unwrap_or(self.send_rate.get());
             self.set_smooth_send_rate(target_send_rate, now);
             return;
         }
@@ -436,12 +434,8 @@ impl ReliableLayer {
         limiter.set_thruput(send_rate, now);
         let tokens = limiter.outdated_coined_tokens();
         let bucket_burst = burst_pkts(send_rate);
-        *limiter = token_bucket_with_tokens(
-            send_rate,
-            bucket_burst,
-            tokens.min(bucket_burst.get()),
-            now,
-        );
+        *limiter =
+            token_bucket_with_tokens(send_rate, bucket_burst, tokens.min(bucket_burst.get()), now);
         self.bucket_burst = bucket_burst;
     }
 }
@@ -515,9 +509,9 @@ fn burst_pkts(send_rate: PosR<f64>) -> NonZeroUsize {
 
 impl ReliableLayer {
     fn control_rtt(&self) -> Duration {
-        let min = self.pkt_send_space.min_rtt();
-        let smooth = self.pkt_send_space.smooth_rtt();
-        min.unwrap_or(smooth).max(Duration::from_millis(5))
+        self.pkt_send_space
+            .smooth_rtt()
+            .max(Duration::from_millis(5))
     }
 
     fn max_data_size_per_pkt(&self) -> usize {
