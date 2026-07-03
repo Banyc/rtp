@@ -10,7 +10,7 @@ use udp_listener::{ConnWrite, Packet, UtpListener};
 use crate::{
     socket::{ReadSocket, WriteSocket, socket},
     transmission_layer::{UnreliableLayer, UnreliableWrite},
-    udp::{should_wait_after_try_send, wrap_fec},
+    udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss},
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
@@ -55,6 +55,31 @@ impl<K: DispatchKey> Server<K> {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// [`Self::accept_without_handshake()`] with a custom MSS.
+    pub async fn accept_without_handshake_with_mss(
+        &self,
+        fec: bool,
+        mss: usize,
+    ) -> std::io::Result<Accepted<K>> {
+        let accepted = self.listener.accept().await?;
+        let conn_key = accepted.conn_key().clone();
+        let (read, write) = accepted.split();
+        let write = KeyedConnWrite::new(write, &conn_key);
+        let unreliable_layer = wrap_fec_with_mss(read, write, fec, mss);
+        let unreliable_layer = UnreliableLayer {
+            utp_read: unreliable_layer.utp_read,
+            utp_write: unreliable_layer.utp_write,
+            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
+            fec: unreliable_layer.fec,
+        };
+        let (read, write) = socket(unreliable_layer, None);
+        Ok(Accepted {
+            read,
+            write,
+            dispatch_key: conn_key,
+        })
     }
 
     /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
@@ -109,6 +134,27 @@ impl<K: DispatchKey> Client<K> {
         loop {
             let _ = self.listener.accept().await?;
         }
+    }
+
+    /// [`Self::open_without_handshake()`] with a custom MSS.
+    pub fn open_without_handshake_with_mss(
+        &self,
+        dispatch_key: K,
+        fec: bool,
+        mss: usize,
+    ) -> Option<Connected> {
+        let accepted = self.listener.open(dispatch_key.clone())?;
+        let (read, write) = accepted.split();
+        let write = KeyedConnWrite::new(write, &dispatch_key);
+        let unreliable_layer = wrap_fec_with_mss(read, write, fec, mss);
+        let unreliable_layer = UnreliableLayer {
+            utp_read: unreliable_layer.utp_read,
+            utp_write: unreliable_layer.utp_write,
+            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
+            fec: unreliable_layer.fec,
+        };
+        let (read, write) = socket(unreliable_layer, None);
+        Some(Connected { read, write })
     }
 
     pub fn open_without_handshake(&self, dispatch_key: K, fec: bool) -> Option<Connected> {

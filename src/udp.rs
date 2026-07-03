@@ -13,6 +13,10 @@ use crate::{
 };
 
 pub const NO_FEC_MSS: usize = 1424;
+/// Maximum user-configured MSS. Datagrams larger than this are rejected before
+/// they reach the kernel because on some platforms (notably macOS) oversized
+/// UDP sends fail with `EMSGSIZE` and are treated as fatal connection errors.
+pub const MAX_MSS: usize = 64 * 1024;
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
 type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
@@ -70,6 +74,11 @@ impl Listener {
     }
 
     /// [`Self::accept()`] with a custom MSS.
+    ///
+    /// # Panics
+    /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+    /// overhead. Both peers must use the same `mss`; there is no in-band
+    /// negotiation.
     pub async fn accept_with_mss(
         &self,
         fec: bool,
@@ -136,6 +145,17 @@ pub async fn connect_without_handshake_with_mss(
     let handshake = false;
     connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
 }
+/// Connect to `addr` with a custom MSS.
+///
+/// # Panics
+/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+/// overhead.
+///
+/// # Platform notes
+/// On macOS, datagrams larger than the kernel `net.inet.udp.maxdgram`
+/// (default 9216 bytes) fail with `EMSGSIZE`. Because the symbol size derives
+/// from the configured `mss`, both peers must use the same value; there is no
+/// in-band negotiation.
 pub async fn connect_with_mss(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
@@ -181,8 +201,7 @@ pub(crate) fn wrap_fec(
     write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
-    let mss = NO_FEC_MSS;
-    wrap_fec_with_mss(read, write, fec, mss)
+    wrap_fec_with_mss(read, write, fec, NO_FEC_MSS)
 }
 
 pub(crate) fn wrap_fec_with_mss(
@@ -191,20 +210,36 @@ pub(crate) fn wrap_fec_with_mss(
     fec: bool,
     mss: usize,
 ) -> UnreliableLayer {
-    let symbol_size = symbol_size(mss).unwrap();
-    let fec_state = if fec {
-        Some(FecState::new(FecConfig { symbol_size }))
-    } else {
-        None
-    };
-    let mss = if fec { data_mss(mss).unwrap() } else { mss };
-    let mss = NonZeroUsize::new(mss).unwrap();
+    let (mss, fec_state) = checked_mss_and_fec(fec, mss);
     UnreliableLayer {
         utp_read: Box::new(read),
         utp_write: Box::new(write),
         mss,
         fec: fec_state,
     }
+}
+
+fn checked_mss_and_fec(fec: bool, mss: usize) -> (NonZeroUsize, Option<FecState>) {
+    assert!(
+        mss <= MAX_MSS,
+        "mss {mss} exceeds the {MAX_MSS}-byte datagram ceiling"
+    );
+    let fec_state = if fec {
+        let symbol_size = symbol_size(mss).expect("mss too small for the FEC header");
+        Some(FecState::new(FecConfig { symbol_size }))
+    } else {
+        None
+    };
+    let mss = if fec {
+        data_mss(mss).expect("mss too small for the FEC header")
+    } else {
+        mss
+    };
+    assert!(
+        crate::codec::data_overhead() < mss,
+        "mss {mss} leaves no room for the codec payload"
+    );
+    (NonZeroUsize::new(mss).unwrap(), fec_state)
 }
 
 // Accepted socket
@@ -441,8 +476,7 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        let mss = NO_FEC_MSS;
-        wrap_fec_lossy_with_mss(read, write, fec, mss, rate)
+        wrap_fec_lossy_with_mss(read, write, fec, NO_FEC_MSS, rate)
     }
 
     pub fn wrap_fec_lossy_with_mss<R, W>(
@@ -456,14 +490,7 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        let symbol_size = symbol_size(mss).unwrap();
-        let fec_state = if fec {
-            Some(FecState::new(FecConfig { symbol_size }))
-        } else {
-            None
-        };
-        let mss = if fec { data_mss(mss).unwrap() } else { mss };
-        let mss = NonZeroUsize::new(mss).unwrap();
+        let (mss, fec_state) = checked_mss_and_fec(fec, mss);
         UnreliableLayer {
             utp_read: Box::new(LossyRead::new(read, rate.clone())),
             utp_write: Box::new(LossyWrite::new(write, rate)),
@@ -573,5 +600,99 @@ mod tests {
         let normalized = normalize_send_err(e);
         assert!(normalized.raw_os_error().is_none());
         assert!(should_wait_after_try_send(&normalized));
+    }
+
+    #[derive(Debug)]
+    struct Dummy;
+    #[async_trait]
+    impl UnreliableRead for Dummy {
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+    }
+    #[async_trait]
+    impl UnreliableWrite for Dummy {
+        async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn checked_mss_default_matches_legacy_derivation() {
+        let layer = wrap_fec_with_mss(Dummy, Dummy, false, NO_FEC_MSS);
+        assert_eq!(layer.mss.get(), NO_FEC_MSS);
+        assert!(layer.fec.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "datagram ceiling")]
+    fn checked_mss_rejects_oversized() {
+        let _ = wrap_fec_with_mss(Dummy, Dummy, false, MAX_MSS + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "leaves no room for the codec payload")]
+    fn checked_mss_rejects_undersized() {
+        let _ = wrap_fec_with_mss(Dummy, Dummy, false, 1);
+    }
+
+    #[test]
+    fn checked_mss_fec_default_matches_legacy_derivation() {
+        let layer = wrap_fec_with_mss(Dummy, Dummy, true, NO_FEC_MSS);
+        assert!(layer.fec.is_some());
+        // The final MSS after reserving the FEC header is smaller than the raw
+        // user-provided NO_FEC_MSS, but it must still leave room for the codec
+        // payload.
+        assert!(layer.mss.get() < NO_FEC_MSS);
+        assert!(crate::codec::data_overhead() < layer.mss.get());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connect_with_large_mss() {
+        let fec = false;
+        let mss = 8192;
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+        let msg = {
+            let mut buf = vec![0u8; 64 * 1024];
+            for byte in &mut buf {
+                *byte = rand::random();
+            }
+            buf
+        };
+        let msg_for_server = msg.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let accepted = listener
+                    .accept_without_handshake_with_mss(fec, mss)
+                    .await
+                    .unwrap();
+                let msg = msg_for_server.clone();
+                tokio::spawn(async move {
+                    let mut accepted = accepted;
+                    let mut buf = vec![0; msg.len()];
+                    let n = accepted.read.recv(&mut buf).await.unwrap();
+                    assert_eq!(msg, &buf[..n]);
+                    accepted.write.send(b"\x01").await.unwrap();
+                });
+            }
+        });
+
+        let mut connected = connect_without_handshake_with_mss(
+            "0.0.0.0:0",
+            addr,
+            None,
+            fec,
+            mss,
+        )
+        .await
+        .unwrap();
+        let mut buf = [0; 1];
+        connected.write.send(&msg).await.unwrap();
+        connected.read.recv(&mut buf).await.unwrap();
     }
 }

@@ -26,8 +26,11 @@ use crate::{
 };
 
 const SEND_DATA_BUF_LEN: usize = 8 * 1024;
+const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
 const RECV_DATA_BUF_LEN: usize = 2 << 16;
 const MAX_BURST_PKTS: usize = 64;
+const MAX_BURST_PKTS_CEIL: usize = 512;
+const SEND_TIMER_INTERVAL_SECS: f64 = 0.001;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 const INIT_SEND_RATE: f64 = 128.;
@@ -57,6 +60,7 @@ pub struct ReliableLayer {
     pkt_send_space: PktSendSpace,
     pkt_recv_space: PktRecvSpace,
     send_rate: PosR<f64>,
+    bucket_burst: NonZeroUsize,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
 
@@ -67,15 +71,16 @@ pub struct ReliableLayer {
 impl ReliableLayer {
     pub fn new(mss: NonZeroUsize, now: Instant) -> (Self, Arc<Mutex<TokenBucket>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
+        let bucket_burst = burst_pkts(send_rate);
         let send_rate_limiter = Arc::new(Mutex::new(token_bucket_with_tokens(
             send_rate,
-            NonZeroUsize::new(MAX_BURST_PKTS).unwrap(),
-            MAX_BURST_PKTS,
+            bucket_burst,
+            bucket_burst.get(),
             now,
         )));
         let this = Self {
             mss,
-            send_data_buf: CapVecQueue::new_vec(SEND_DATA_BUF_LEN),
+            send_data_buf: CapVecQueue::new_vec(send_data_buf_len(mss)),
             send_fin_buf: SendFinBuf::Empty,
             recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUF_LEN),
             recv_fin_buf: false,
@@ -84,6 +89,7 @@ impl ReliableLayer {
             pkt_send_space: PktSendSpace::new(),
             pkt_recv_space: PktRecvSpace::new(),
             send_rate,
+            bucket_burst,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             pkt_stats_buf: Vec::new(),
@@ -421,10 +427,18 @@ impl ReliableLayer {
         self.pkt_send_space.set_send_rate(send_rate);
         let send_rate = PosR::new(MIN_SEND_RATE).unwrap().max(send_rate);
         self.send_rate = send_rate;
-        self.send_rate_limiter
-            .lock()
-            .unwrap()
-            .set_thruput(send_rate, now);
+
+        let mut limiter = self.send_rate_limiter.lock().unwrap();
+        limiter.set_thruput(send_rate, now);
+        let tokens = limiter.outdated_coined_tokens();
+        let bucket_burst = burst_pkts(send_rate);
+        *limiter = token_bucket_with_tokens(
+            send_rate,
+            bucket_burst,
+            tokens.min(bucket_burst.get()),
+            now,
+        );
+        self.bucket_burst = bucket_burst;
     }
 }
 
@@ -468,6 +482,31 @@ fn token_bucket_with_tokens(
     );
     bucket.gen_tokens(now);
     bucket
+}
+
+/// Send staging buffer size for a given MSS.
+///
+/// For the default MSS we keep the historical 8 KiB staging buffer. For larger
+/// MSS values we scale the buffer to whole packets so the send-data path never
+/// refills with a sub-MSS remainder that would sit in the buffer indefinitely.
+fn send_data_buf_len(mss: NonZeroUsize) -> usize {
+    if mss.get() <= crate::udp::NO_FEC_MSS {
+        return SEND_DATA_BUF_LEN;
+    }
+    let payload = mss.get() - data_overhead();
+    let pkts = MAX_SEND_DATA_BUF_LEN / payload;
+    pkts * payload
+}
+
+/// Token-bucket burst size for a given send rate.
+///
+/// The burst is scaled with the send rate so high-rate flows can emit a larger
+/// paced window, while low-rate flows keep the historical 64-packet floor. The
+/// value is clamped to [`MAX_BURST_PKTS_CEIL`] to avoid runaway kernel buffers.
+fn burst_pkts(send_rate: PosR<f64>) -> NonZeroUsize {
+    let burst = (send_rate.get() * 2. * SEND_TIMER_INTERVAL_SECS).floor() as usize;
+    let burst = burst.clamp(MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL);
+    NonZeroUsize::new(burst).unwrap()
 }
 
 impl ReliableLayer {
@@ -555,7 +594,11 @@ fn backoff_send_rate_linear(
 mod tests {
     use primitive::ops::float::PosR;
 
-    use super::{token_bucket_with_tokens, MAX_BURST_PKTS};
+    use super::{
+        burst_pkts, send_data_buf_len, token_bucket_with_tokens, INIT_SEND_RATE, MAX_BURST_PKTS,
+        MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, SEND_DATA_BUF_LEN,
+    };
+    use crate::{codec::data_overhead, udp::NO_FEC_MSS};
 
     #[test]
     fn token_bucket_with_tokens_prefills_without_stale_deadline() {
@@ -582,6 +625,37 @@ mod tests {
         // The requested prefill is clamped to the bucket capacity.
         assert_eq!(bucket.gen_tokens(now), 4);
         assert!(bucket.next_token_time() >= now);
+    }
+
+    #[test]
+    fn send_data_buf_len_keeps_default_at_8_kib() {
+        let mss = std::num::NonZeroUsize::new(NO_FEC_MSS).unwrap();
+        assert_eq!(send_data_buf_len(mss), SEND_DATA_BUF_LEN);
+    }
+
+    #[test]
+    fn send_data_buf_len_scales_to_whole_packets_above_default() {
+        let mss = std::num::NonZeroUsize::new(8192).unwrap();
+        let len = send_data_buf_len(mss);
+        let payload = mss.get() - data_overhead();
+        let expected = (MAX_SEND_DATA_BUF_LEN / payload) * payload;
+        assert_eq!(len, expected);
+        assert!(len > SEND_DATA_BUF_LEN);
+        assert!(len <= MAX_SEND_DATA_BUF_LEN);
+    }
+
+    #[test]
+    fn burst_pkts_scales_with_send_rate() {
+        let low = PosR::new(INIT_SEND_RATE).unwrap();
+        assert_eq!(burst_pkts(low).get(), MAX_BURST_PKTS);
+
+        let mid = PosR::new(100_000.0).unwrap();
+        let mid_burst = burst_pkts(mid).get();
+        assert!(mid_burst > MAX_BURST_PKTS);
+        assert!(mid_burst < MAX_BURST_PKTS_CEIL);
+
+        let high = PosR::new(1_000_000.0).unwrap();
+        assert_eq!(burst_pkts(high).get(), MAX_BURST_PKTS_CEIL);
     }
 }
 

@@ -92,6 +92,13 @@ impl tokio::io::AsyncWrite for WriteStream {
 
 impl std::marker::Unpin for WriteStream {}
 
+#[cfg(test)]
+impl WriteStream {
+    pub fn max_stage(&self) -> usize {
+        self.max_stage
+    }
+}
+
 /// Bidirectional async stream joining a read half and a [`WriteStream`].
 #[derive(Debug)]
 pub struct IoStream {
