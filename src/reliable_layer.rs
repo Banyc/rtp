@@ -51,6 +51,21 @@ const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(5);
 const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
 const DRAIN_RATE_FRACTION: f64 = 0.85;
 
+// Gentle-mode parameters for the delay-gated congestion controller.  These are
+// intentionally conservative: they let a bulk flow drain a self-inflicted
+// droptail bottleneck without driving the delay gate so hard that interactive
+// cross-traffic keeps getting tail-dropped.
+const GENTLE_PROBE_RATE: f64 = 0.25;
+const GENTLE_DRAIN_FRAC: f64 = 0.7;
+const GENTLE_ADD_PKTS: f64 = 4.0;
+const GENTLE_ENTER_RTTS: f64 = 3.0;
+const GENTLE_ENTER_MAX_LOSS: f64 = 0.05;
+const GENTLE_EXIT_LOSS: f64 = 0.1;
+const GENTLE_DRAIN_CHECK_RTTS: f64 = 12.0;
+const GENTLE_DRAIN_GAP_SHRINK: f64 = 0.85;
+const GENTLE_ENTER_RTTVAR_FACTOR: f64 = 2.0;
+const GENTLE_REENTRY_COOLDOWN: Duration = Duration::from_secs(15);
+
 #[derive(Debug, Clone)]
 enum SendFinBuf {
     Empty,
@@ -77,6 +92,13 @@ pub struct ReliableLayer {
     rtt_floor: WindowedRttMin,
     slow_start: bool,
     slow_start_acked_pkts: usize,
+
+    // Gentle-mode state for the delay-gated congestion controller.
+    draining: bool,
+    queue_since: Option<Instant>,
+    gentle_mode: bool,
+    drain_gap0: Option<(Instant, Duration)>,
+    gentle_block_until: Option<Instant>,
 
     // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
@@ -109,6 +131,11 @@ impl ReliableLayer {
             rtt_floor: WindowedRttMin::new(now),
             slow_start: true,
             slow_start_acked_pkts: 0,
+            draining: false,
+            queue_since: None,
+            gentle_mode: false,
+            drain_gap0: None,
+            gentle_block_until: None,
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
@@ -303,6 +330,11 @@ impl ReliableLayer {
             self.rtt_floor = WindowedRttMin::new(now);
             self.slow_start = false;
             self.slow_start_acked_pkts = 0;
+            self.draining = false;
+            self.queue_since = None;
+            self.gentle_mode = false;
+            self.drain_gap0 = None;
+            self.gentle_block_until = None;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
         }
 
@@ -379,7 +411,64 @@ impl ReliableLayer {
             .mul_f64(QUEUE_RTT_FACTOR)
             .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
             .max(QUEUE_RTT_FLOOR);
-        let queue_building = smooth > floor + tol;
+
+        // ----- Gentle-mode entry/exit and gate hysteresis --------------------
+        // Enter_tol is tighter than tol: it uses a larger jitter multiplier so
+        // we only enter gentle mode after a sustained, clearly queue-building
+        // stretch.  Once the smoothed RTT drops back below this threshold,
+        // clear the stretch timer.
+        let enter_tol = self
+            .pkt_send_space
+            .smooth_rtt_var()
+            .mul_f64(GENTLE_ENTER_RTTVAR_FACTOR)
+            .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
+            .max(QUEUE_RTT_FLOOR);
+        let entering = smooth > floor + enter_tol;
+        if entering {
+            self.queue_since.get_or_insert(now);
+        } else {
+            self.queue_since = None;
+        }
+
+        // Loss exit: high loss must leave gentle mode immediately so a hostile
+        // link does not collapse throughput while stuck in the gentle guard.
+        let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
+        if self.gentle_mode
+            && loss_event_rate.is_some_and(|lr| lr >= GENTLE_EXIT_LOSS)
+        {
+            self.gentle_mode = false;
+            self.queue_since = None;
+            self.drain_gap0 = None;
+        }
+
+        // Enter gentle mode after a sustained low-loss queue-building stretch.
+        let stretch = self.queue_since.map(|start| now.saturating_duration_since(start));
+        let low_loss = loss_event_rate.map(|lr| lr < GENTLE_ENTER_MAX_LOSS);
+        let block_cleared = self
+            .gentle_block_until
+            .map(|until| now >= until)
+            .unwrap_or(true);
+        if let Some(stretch) = stretch {
+            if !self.gentle_mode
+                && stretch >= self.control_rtt().mul_f64(GENTLE_ENTER_RTTS)
+                && low_loss != Some(false)
+                && block_cleared
+            {
+                self.gentle_mode = true;
+                self.draining = false;
+                self.drain_gap0 = None;
+            }
+        }
+
+        // Gate hysteresis: while actively draining in gentle mode, reopen the
+        // delay gate once the queue shrinks back to within half the normal
+        // tolerance (tol/2).  Otherwise use the normal tol.
+        let gate_tol = if self.gentle_mode && self.draining {
+            tol.mul_f64(0.5)
+        } else {
+            tol
+        };
+        let queue_building = smooth > floor + gate_tol;
 
         let little_data_loss = self
             .pkt_send_space
@@ -393,7 +482,24 @@ impl ReliableLayer {
             }
         }
 
+        // ----- Gentle-mode probe branch --------------------------------------
+        // When gentle and the queue is gone, probe gently upward instead of the
+        // normal aggressive probe.  This is the only place we reset the drain-
+        // effectiveness guard clock, because a fresh episode must not inherit
+        // a stale gap measurement.
         let should_probe = little_data_loss != Some(false) && !queue_building;
+        if self.gentle_mode && should_probe {
+            self.draining = false;
+            self.drain_gap0 = None;
+
+            let control_rtt = self.control_rtt();
+            let probed = sr.delivery_rate() * (1. + GENTLE_PROBE_RATE);
+            let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
+            let target = (probed + additive).max(self.send_rate.get());
+            self.set_smooth_send_rate(target, now);
+            return;
+        }
+
         if should_probe {
             let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
             let target_send_rate = probed.unwrap_or(self.send_rate.get());
@@ -401,10 +507,16 @@ impl ReliableLayer {
             return;
         }
 
+        // ----- Drain branch --------------------------------------------------
         if queue_building && little_data_loss != Some(false) {
             let control_rtt = self.control_rtt();
             let current = self.send_rate.get();
-            let target = (sr.delivery_rate() * DRAIN_RATE_FRACTION)
+            let drain_frac = if self.gentle_mode {
+                GENTLE_DRAIN_FRAC
+            } else {
+                DRAIN_RATE_FRACTION
+            };
+            let target = (sr.delivery_rate() * drain_frac)
                 .min(current)
                 .max(MIN_SEND_RATE);
             let new_rate = backoff_send_rate_linear(current, target, sr.interval(), control_rtt);
@@ -413,6 +525,24 @@ impl ReliableLayer {
                 None => {
                     let send_rate = PosR::new(self.send_rate.get()).unwrap();
                     self.set_send_rate(send_rate, now);
+                }
+            }
+
+            if self.gentle_mode {
+                self.draining = true;
+                let gap = smooth.saturating_sub(floor);
+                let (t0, gap0) = self.drain_gap0.get_or_insert_with(|| (now, gap));
+                if now.saturating_duration_since(*t0)
+                    >= control_rtt.mul_f64(GENTLE_DRAIN_CHECK_RTTS)
+                    && gap > gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK)
+                {
+                    // Drain is ineffective; exit gentle mode and block
+                    // re-entry for a cooldown.
+                    self.gentle_mode = false;
+                    self.draining = false;
+                    self.queue_since = None;
+                    self.drain_gap0 = None;
+                    self.gentle_block_until = Some(now + GENTLE_REENTRY_COOLDOWN);
                 }
             }
             return;
