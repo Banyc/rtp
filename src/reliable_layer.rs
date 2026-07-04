@@ -125,6 +125,9 @@ impl ReliableLayer {
         self.is_send_buf_empty()
             && self.pkt_send_space.accepts_new_pkt()
             && !self.pkt_send_space.has_rtx(now)
+            // A due tail-loss probe is a pending (re)transmission, so the tail
+            // is not settled and the tail parity must wait.
+            && !self.pkt_send_space.has_tail_probe(now)
     }
 
     pub fn pkt_send_space(&self) -> &PktSendSpace {

@@ -631,6 +631,40 @@ mod tests {
     /// data buffer capacity per `poll_write`. Writing a slice much larger than
     /// that should consume at most that many bytes in a single poll.
     #[tokio::test(flavor = "multi_thread")]
+    async fn write_stream_max_stage_scales_with_mss() {
+        use crate::udp::wrap_fec_with_mss;
+
+        let mss = 9_000;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+
+        let a = wrap_fec_with_mss(a.clone(), a, false, mss);
+        let (_a_r, a_w) = socket(a, None);
+        let write_stream = a_w.into_async_write();
+        let max_stage = write_stream.max_stage();
+
+        let per_packet_payload = mss - crate::codec::data_overhead();
+        assert_eq!(
+            max_stage % per_packet_payload,
+            0,
+            "max_stage {max_stage} should be a multiple of per-packet payload {per_packet_payload}"
+        );
+        assert!(
+            8 * 1024 < max_stage,
+            "max_stage {max_stage} should exceed the default staging buffer of 8 KiB"
+        );
+
+        // Hold the write stream until after the assertion so the destructor is
+        // not mistaken for the value under test.
+        drop(write_stream);
+    }
+
+    /// The async write stream must stage at most the reliable layer's send
+    /// data buffer capacity per `poll_write`. Writing a slice much larger than
+    /// that should consume at most that many bytes in a single poll.
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_stages_at_most_the_send_buf_capacity() {
         use std::pin::Pin;
         use std::task::{Context, Poll};

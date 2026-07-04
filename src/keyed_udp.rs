@@ -404,4 +404,66 @@ mod tests {
             res.unwrap();
         }
     }
+
+    /// A keyed client cannot receive inbound packets on an opened connection
+    /// unless its `dispatch()` loop is polled: the dispatcher matches inbound
+    /// packets to `open`ed connections.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_open_requires_dispatch_polling_for_inbound_packets() {
+        use std::time::Duration;
+
+        let fec = false;
+        let server = Server::<u8>::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        let key = 7;
+        let ping = b"ping";
+        let pong = b"pong";
+
+        let server_task = tokio::spawn(async move {
+            let mut accepted = server.accept_without_handshake(fec).await.unwrap();
+            assert_eq!(accepted.dispatch_key, key);
+            let mut buf = [0u8; 16];
+            let n = accepted.read.recv(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], ping);
+            accepted.write.send(pong).await.unwrap();
+        });
+
+        let client = Arc::new(
+            Client::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+                .await
+                .unwrap(),
+        );
+        let mut opened = client.open_without_handshake(key, fec).unwrap();
+
+        // With dispatch unpoll, inbound delivery to the opened connection does
+        // not happen. The 50 ms timeout should elapse before any data arrives.
+        let mut buf = [0u8; 16];
+        let timeout_result = tokio::time::timeout(Duration::from_millis(50), opened.read.recv(&mut buf))
+            .await;
+        assert!(
+            timeout_result.is_err(),
+            "recv should not succeed while dispatch is unpoll"
+        );
+
+        // Start the dispatch loop on a clone. The server reply should now arrive.
+        let dispatch_client = Arc::clone(&client);
+        let dispatch_task = tokio::spawn(async move {
+            loop {
+                dispatch_client.dispatch().await.unwrap();
+            }
+        });
+
+        opened.write.send(ping).await.unwrap();
+
+        let n = tokio::time::timeout(Duration::from_secs(1), opened.read.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], pong);
+
+        // Cleanup: close the read side so the dispatch loop can exit.
+        drop(opened);
+        dispatch_task.abort();
+        server_task.await.unwrap();
+    }
 }
