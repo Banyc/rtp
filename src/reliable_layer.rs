@@ -170,31 +170,20 @@ impl ReliableLayer {
             self.backoff_on_huge_data_loss_exponential(now);
         }
 
-        // Retransmits bypass both the new-packet cwnd gate and the send-rate
-        // token bucket. A retransmit is not a new packet entering the window;
-        // it is an already-in-flight packet being resent, so gating it on
-        // `accepts_new_pkt()` (cwnd not full) or charging a token for it would
-        // starve recovery when the window is full of lost packets and there
-        // are no tokens available — exactly the moments retransmits matter.
-        //
         // During an outage-recovery epoch the whole pre-outage window is
-        // immediately eligible for retransmission. We must not let the token
-        // bucket gate those retransmits, but we also must not allow new data to
-        // bypass the rate limiter, so we only try this when there are no new
-        // packets or FIN waiting in the buffer.
+        // immediately eligible for retransmission.  We must pace these
+        // retransmits through the token bucket so a just-restored link is not
+        // flooded, but they still bypass the new-packet cwnd gate because they
+        // are already in flight.
         if self.pkt_send_space.in_outage_recovery()
-            && !self.has_unsent_data_or_fin()
-            && let Some(p) = self.pkt_send_space.rtx(now)
+            && self.pkt_send_space.has_rtx(now)
+            && !self
+                .send_rate_limiter
+                .lock()
+                .unwrap()
+                .take_exact_tokens(1, now)
         {
-            pkt[..p.data.len()].copy_from_slice(p.data);
-
-            let data_written = NonZeroUsize::new(p.data.len())
-                .map(DataPktPayload::Data)
-                .unwrap_or(DataPktPayload::Fin);
-            return Some(DataPkt {
-                seq: p.seq,
-                data_written,
-            });
+            return None;
         }
 
         if let Some(p) = self.pkt_send_space.rtx(now) {
@@ -306,13 +295,6 @@ impl ReliableLayer {
             self.slow_start = false;
             self.slow_start_acked_pkts = 0;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
-            // Because the epoch was entered from inside `ack`, any ACKed packets
-            // have already delivered their RTT samples via `sample_rtt` before we
-            // entered recovery.  Those samples were taken across the outage and
-            // would close the epoch immediately.  Treat the first ACK after the
-            // outage as a fresh start instead: clear the epoch so the next RTT
-            // sample seeds sRTT normally.
-            self.pkt_send_space.clear_outage_recovery();
         }
 
         self.update_rate_sample_on_ack(now)
@@ -542,10 +524,6 @@ impl ReliableLayer {
             self.recv_data_buf.batch_enqueue(&p);
             self.pkt_recv_space.reused_buf().put(p);
         }
-    }
-
-    fn has_unsent_data_or_fin(&self) -> bool {
-        !self.send_data_buf.is_empty() || matches!(self.send_fin_buf, SendFinBuf::Some)
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {

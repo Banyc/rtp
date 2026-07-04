@@ -212,11 +212,14 @@ impl PktSendSpace {
                 return;
             }
             // A fresh post-outage sample ends the epoch and re-seeds sRTT.
-            self.recovery_start = None;
-            self.outage_loss_cut = None;
-            self.update_min_rtt(rtt);
-            self.rto.reset_to(rtt);
-            return;
+            // outage_loss_cut intentionally stays in place until a new outage
+            // re-arms it; this prevents late echoes of pre-outage packets from
+            // corrupting the freshly seeded sRTT.
+            if self.recovery_start.take().is_some() {
+                self.update_min_rtt(rtt);
+                self.rto.reset_to(rtt);
+                return;
+            }
         }
 
         self.update_min_rtt(rtt);
@@ -451,12 +454,6 @@ impl PktSendSpace {
     }
 
     pub fn detect_outage_recovery(&mut self, now: Instant) -> bool {
-        // Already in an epoch: keep it open until a fresh post-outage sample
-        // closes it in `sample_rtt`.
-        if self.recovery_start.is_some() {
-            return false;
-        }
-
         // Outage detection is keyed on forward progress stalls, not merely the
         // absence of any ACK datagram.  Zero-progress duplicate ACKs can keep the
         // total-silence clock alive without delivering data; we require that the
@@ -485,12 +482,17 @@ impl PktSendSpace {
             return false;
         }
 
+        // Re-arming an already-closed epoch refreshes the outage cut without
+        // re-seeding sRTT; the fresh post-outage sample still owns that.
+        let rearming = self.recovery_start.is_some();
         self.recovery_start = Some(now);
         self.outage_loss_cut = Some(now);
-        // Reset congestion state: start with a seed sRTT of one RTO and clear
-        // prior loss history so the post-outage path is treated as fresh.
-        self.rto.reset_to(self.rto.rto());
-        self.loss_event_window.reset(now, self.rto.smooth_rtt());
+        if !rearming {
+            // New epoch: start with a seed sRTT of one RTO and clear prior loss
+            // history so the post-outage path is treated as fresh.
+            self.rto.reset_to(self.rto.rto());
+            self.loss_event_window.reset(now, self.rto.smooth_rtt());
+        }
         // Do not touch `cwnd` here; the epoch clamps it inside `set_send_rate`.
         true
     }
@@ -1034,6 +1036,12 @@ mod tests {
         space.sample_rtt(ms(200), fresh);
         assert!(!space.in_outage_recovery());
         assert_eq!(space.smooth_rtt(), ms(200));
+
+        // The outage_loss_cut remains after the epoch closes so that late echoes
+        // of pre-outage packets are still censored.
+        space.sample_rtt(Duration::from_secs(11), fresh + ms(100));
+        assert_eq!(space.smooth_rtt(), ms(200), "late pre-outage echo must be censored");
+
         // CWND is no longer forced to INIT_CWND; set_send_rate recomputes it.
         let _ = space.set_send_rate(PosR::new(128.0).unwrap());
         assert!(space.cwnd().get() >= INIT_CWND);
@@ -1082,6 +1090,53 @@ mod tests {
             space.cwnd().get(),
             expected_cwnd,
             "cwnd should recompute with fresh sRTT"
+        );
+    }
+
+    #[test]
+    fn outage_epoch_refreshes_while_still_open() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Enter an epoch via loss + one-RTO stall, then make a brief ack-progress
+        // blip that is shorter than one RTT.  The epoch stays open because no fresh
+        // post-cut RTT sample has arrived.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        lose_packet(&mut space, 1, t0 + ms(50));
+        let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
+        assert!(space.detect_outage_recovery(detect_at));
+        assert!(space.in_outage_recovery());
+        let first_cut = space.outage_cut().unwrap();
+
+        // Short progress blip: an immediate re-check must still require the full
+        // stall conditions, so it returns false.
+        ack_one(&mut space, 1, detect_at + ms(1));
+        assert!(
+            !space.detect_outage_recovery(detect_at + ms(2)),
+            "re-check right after progress must require full stall conditions"
+        );
+        assert!(space.in_outage_recovery());
+
+        // A second outage-length stall re-arms the epoch and refreshes the cut.
+        send_packet(&mut space, detect_at + ms(2));
+        let detect_at2 = detect_at + ms(2) + space.rto_duration() * 2 + ms(1);
+        assert!(
+            space.detect_outage_recovery(detect_at2),
+            "flapping outage should refresh while still open"
+        );
+        assert!(space.in_outage_recovery());
+        assert_eq!(
+            space.outage_cut(),
+            Some(detect_at2),
+            "cut must move to the new detect time, not the first cut"
+        );
+        assert_ne!(
+            space.outage_cut(),
+            Some(first_cut),
+            "cut must have been refreshed"
         );
     }
 
