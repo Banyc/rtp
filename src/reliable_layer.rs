@@ -62,6 +62,20 @@ const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(5);
 const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
 const DRAIN_RATE_FRACTION: f64 = 0.85;
 
+/// Fraction of the recent peak delivery rate used as a drain-floor target.
+///
+/// The floor keeps a small flow from being drained below a fair share of its own
+/// recent peak, while still allowing genuine congestion to back it off via the
+/// loss branch.  It is capped at INIT_SEND_RATE so a spike does not permanently
+/// pin a low-rate incumbent, and floored at MIN_SEND_RATE.
+const DRAIN_FLOOR_PEAK_FRACTION: f64 = 0.25;
+
+/// Window over which the delivery-rate peak is tracked.
+///
+/// Twice RTT_MIN_BUCKET so the peak reflects the recent steady state but ages
+/// out after idle gaps, mirroring WindowedRttMin.
+const DELIVERY_PEAK_BUCKET: Duration = Duration::from_secs(10);
+
 // Gentle-mode parameters for the delay-gated congestion controller.  These are
 // intentionally conservative: they let a bulk flow drain a self-inflicted
 // droptail bottleneck without driving the delay gate so hard that interactive
@@ -101,6 +115,7 @@ pub struct ReliableLayer {
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
     rtt_floor: WindowedRttMin,
+    delivery_peak: WindowedDeliveryMax,
     slow_start: bool,
     slow_start_acked_pkts: usize,
 
@@ -140,6 +155,7 @@ impl ReliableLayer {
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             rtt_floor: WindowedRttMin::new(now),
+            delivery_peak: WindowedDeliveryMax::new(now),
             slow_start: true,
             slow_start_acked_pkts: 0,
             draining: false,
@@ -342,6 +358,7 @@ impl ReliableLayer {
 
         if entered_recovery {
             self.rtt_floor = WindowedRttMin::new(now);
+            self.delivery_peak = WindowedDeliveryMax::new(now);
             self.slow_start = false;
             self.slow_start_acked_pkts = 0;
             self.draining = false;
@@ -418,6 +435,11 @@ impl ReliableLayer {
         // The raw-min alternative was measured strictly worse, so we keep the
         // smooth-fed floor and use the 2*rtvar jitter term as the safety margin.
         let floor = self.rtt_floor.update(now, smooth);
+
+        // Track the recent peak delivery rate before any branch dispatch so the
+        // drain floor is fed even when the current sample is not driving a rate
+        // change.
+        let peak_delivery = self.delivery_peak.update(now, sr.delivery_rate());
         let tol = self
             .pkt_send_space
             .smooth_rtt_var()
@@ -529,7 +551,10 @@ impl ReliableLayer {
             } else {
                 DRAIN_RATE_FRACTION
             };
+            let drain_floor =
+                (peak_delivery * DRAIN_FLOOR_PEAK_FRACTION).clamp(MIN_SEND_RATE, INIT_SEND_RATE);
             let target = (sr.delivery_rate() * drain_frac)
+                .max(drain_floor)
                 .min(current)
                 .max(MIN_SEND_RATE);
             let new_rate = backoff_send_rate_linear(current, target, sr.interval(), control_rtt);
@@ -813,6 +838,50 @@ impl ReliableLayer {
             delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),
             app_limited: self.prev_sample_rate.as_ref().map(|sr| sr.is_app_limited()),
         }
+    }
+}
+
+/// Maximum of a sliding window of delivery-rate samples.
+///
+/// Mirrors WindowedRttMin but keeps the peak instead of the minimum. The peak
+/// is used to compute a per-flow drain floor: a flow is allowed to drain down
+/// to a fraction of its own recent peak so a small incumbent is not pinned at
+/// the global MIN_SEND_RATE by a competitor's standing queue.
+#[derive(Debug, Clone)]
+pub(crate) struct WindowedDeliveryMax {
+    bucket_start: Instant,
+    cur: Option<f64>,
+    prev: Option<f64>,
+}
+
+impl WindowedDeliveryMax {
+    fn new(now: Instant) -> Self {
+        Self {
+            bucket_start: now,
+            cur: None,
+            prev: None,
+        }
+    }
+
+    fn update(&mut self, now: Instant, rate: f64) -> f64 {
+        let elapsed = now.duration_since(self.bucket_start);
+        if elapsed > DELIVERY_PEAK_BUCKET * 2 {
+            // Idle staleness: both buckets have aged out.
+            self.cur = None;
+            self.prev = None;
+            self.bucket_start = now;
+        } else if elapsed > DELIVERY_PEAK_BUCKET {
+            self.prev = self.cur.take();
+            self.bucket_start = now;
+        }
+
+        self.cur = Some(match self.cur {
+            Some(cur) => cur.max(rate),
+            None => rate,
+        });
+
+        let candidates = [self.cur, self.prev].into_iter().flatten();
+        candidates.fold(rate, f64::max)
     }
 }
 

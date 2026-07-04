@@ -230,10 +230,23 @@ impl PktSendSpace {
         self.num_txing < self.cwnd.get()
     }
 
+    /// RTO used for the current tail episode.
+    ///
+    /// Before any tail-loss probe has been sent, keep the 1 s `MIN_RTO` floor so
+    /// the first timeout signal absorbs estimator error. After a probe has been
+    /// sent, tighten the floor to `TAIL_PROBED_MIN_RTO`.
+    fn tail_rto(&self) -> Duration {
+        if self.tail_probes_sent > 0 {
+            self.rto.rto_after_tail_probe()
+        } else {
+            self.rto.rto()
+        }
+    }
+
     /// Time between consecutive tail-loss probes for the current tail episode.
     fn tail_probe_window(&self) -> Duration {
         let srtt = self.rto.smooth_rtt();
-        let min_rto = self.rto.rto();
+        let min_rto = self.tail_rto();
         let min_tol = TAIL_PROBE_MIN_TOL;
         // PTO formula: max(2*srtt, 2*min_rtt) with a 10 ms floor, capped at RTO.
         let doubled_srtt = srtt.mul_f64(2.);
@@ -276,9 +289,11 @@ impl PktSendSpace {
             return None;
         }
         let seq = self.tail_seq()?;
-        let p = self.send_wnd.get_mut(&seq)?.as_mut()?;
-
+        // Compute the tightened RTO before borrowing the send window so the
+        // immutable read does not conflict with the mutable packet borrow.
         self.tail_probes_sent += 1;
+        let rto = self.tail_rto();
+        let p = self.send_wnd.get_mut(&seq)?.as_mut()?;
 
         // Refresh the timestamp/RTO so the probe is tracked as a fresh packet
         // for RTO calculation (the RTO fallback covers a lost probe).
@@ -289,7 +304,7 @@ impl PktSendSpace {
                 rtxed: _,
                 considered_new_in_cwnd: _,
                 data: _,
-                rto: self.rto.rto(),
+                rto,
             };
         }
         Some(Pkt { seq, data: &p.data })
@@ -1040,7 +1055,11 @@ mod tests {
         // The outage_loss_cut remains after the epoch closes so that late echoes
         // of pre-outage packets are still censored.
         space.sample_rtt(Duration::from_secs(11), fresh + ms(100));
-        assert_eq!(space.smooth_rtt(), ms(200), "late pre-outage echo must be censored");
+        assert_eq!(
+            space.smooth_rtt(),
+            ms(200),
+            "late pre-outage echo must be censored"
+        );
 
         // CWND is no longer forced to INIT_CWND; set_send_rate recomputes it.
         let _ = space.set_send_rate(PosR::new(128.0).unwrap());
