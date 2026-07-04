@@ -69,6 +69,8 @@ pub struct ReliableLayer {
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
     rtt_floor: WindowedRttMin,
+    slow_start: bool,
+    slow_start_acked_pkts: usize,
 
     // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
@@ -99,6 +101,8 @@ impl ReliableLayer {
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             rtt_floor: WindowedRttMin::new(now),
+            slow_start: true,
+            slow_start_acked_pkts: 0,
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
@@ -306,6 +310,9 @@ impl ReliableLayer {
             // outage as a fresh start instead: clear the epoch so the next RTT
             // sample seeds sRTT normally.
             self.pkt_send_space.clear_outage_recovery();
+            // The outage-recovery reset also exits slow start so we don't double-
+            // restart the congestion controller.
+            self.slow_start = false;
         }
 
         self.update_rate_sample_on_ack(now)
@@ -330,6 +337,14 @@ impl ReliableLayer {
         }
         self.prev_sample_rate = Some(sr.clone());
 
+        if self.slow_start {
+            self.slow_start_acked_pkts += self.pkt_buf.len();
+            let ss_rate =
+                self.slow_start_acked_pkts as f64 / self.pkt_send_space.smooth_rtt().as_secs_f64();
+            let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
+            self.set_send_rate(ss_rate, now);
+        }
+
         self.adjust_send_rate_exponential(&sr, now);
 
         Some(sr)
@@ -352,6 +367,14 @@ impl ReliableLayer {
             .map(|lr| lr < CC_DATA_LOSS_RATE);
         let should_probe = little_data_loss != Some(false) && !queue_building;
         if should_probe {
+            if self.slow_start {
+                let probed = sr.delivery_rate() * (1. + SEND_RATE_PROBE_RATE);
+                let caught_up = self.send_rate.get() >= probed;
+                let little_data_loss_false = little_data_loss == Some(false);
+                if little_data_loss_false || queue_building || caught_up {
+                    self.slow_start = false;
+                }
+            }
             let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
             let target_send_rate = probed.unwrap_or(self.send_rate.get());
             self.set_smooth_send_rate(target_send_rate, now);
@@ -359,6 +382,7 @@ impl ReliableLayer {
         }
 
         if queue_building && little_data_loss != Some(false) {
+            self.slow_start = false;
             let control_rtt = self.control_rtt();
             let current = self.send_rate.get();
             let target = (sr.delivery_rate() * DRAIN_RATE_FRACTION)
@@ -378,6 +402,7 @@ impl ReliableLayer {
         if LINEAR_BACKOFF {
             self.backoff_on_high_loss_ack_linear(sr, now);
         } else {
+            self.slow_start = false;
             let target_send_rate = sr.delivery_rate();
             self.set_smooth_send_rate(target_send_rate, now);
         }
