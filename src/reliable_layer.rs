@@ -297,6 +297,18 @@ impl ReliableLayer {
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
         }
 
+        // ACK-clocked slow start must count *every* ACK, including those that
+        // produce no usable rate sample (e.g. zero-RTT first echoes or sparse
+        // bursts). The per-burst accumulator lives here, before the rate sample
+        // is computed and cleared.
+        if self.slow_start {
+            self.slow_start_acked_pkts += self.pkt_stats_buf.len();
+            let ss_rate = self.slow_start_acked_pkts as f64
+                / self.control_rtt().as_secs_f64();
+            let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
+            self.set_send_rate(ss_rate, now);
+        }
+
         self.update_rate_sample_on_ack(now)
     }
     fn update_rate_sample_on_ack(&mut self, now: Instant) -> Option<dre::RateSample> {
@@ -319,16 +331,10 @@ impl ReliableLayer {
         }
         self.prev_sample_rate = Some(sr.clone());
 
-        if self.slow_start {
-            self.slow_start_acked_pkts += self.pkt_buf.len();
-            let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
-            let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
-            self.set_send_rate(ss_rate, now);
-            // Per-episode accumulator: once the pipe drains, reset for the next
-            // burst so slow-start cannot grow without bound on sparse flows.
-            if self.pkt_send_space.no_pkts_in_flight() {
-                self.slow_start_acked_pkts = 0;
-            }
+        // Per-episode accumulator: once the pipe drains, reset for the next
+        // burst so slow-start cannot grow without bound on sparse flows.
+        if self.slow_start && self.pkt_send_space.no_pkts_in_flight() {
+            self.slow_start_acked_pkts = 0;
         }
 
         self.adjust_send_rate_exponential(&sr, now);
@@ -364,17 +370,16 @@ impl ReliableLayer {
             .pkt_send_space
             .loss_event_rate(now)
             .map(|lr| lr < CC_DATA_LOSS_RATE);
+        if self.slow_start {
+            let probed = sr.delivery_rate() * (1. + SEND_RATE_PROBE_RATE);
+            let caught_up = self.send_rate.get() <= probed;
+            if little_data_loss == Some(false) || queue_building || caught_up || sr.is_app_limited() {
+                self.slow_start = false;
+            }
+        }
+
         let should_probe = little_data_loss != Some(false) && !queue_building;
         if should_probe {
-            if self.slow_start {
-                let probed = sr.delivery_rate() * (1. + SEND_RATE_PROBE_RATE);
-                let caught_up = self.send_rate.get() >= probed;
-                let little_data_loss_false = little_data_loss == Some(false);
-                let app_limited_exit = sr.is_app_limited();
-                if little_data_loss_false || queue_building || caught_up || app_limited_exit {
-                    self.slow_start = false;
-                }
-            }
             let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
             let target_send_rate = probed.unwrap_or(self.send_rate.get());
             self.set_smooth_send_rate(target_send_rate, now);
@@ -382,7 +387,6 @@ impl ReliableLayer {
         }
 
         if queue_building && little_data_loss != Some(false) {
-            self.slow_start = false;
             let control_rtt = self.control_rtt();
             let current = self.send_rate.get();
             let target = (sr.delivery_rate() * DRAIN_RATE_FRACTION)
@@ -751,7 +755,9 @@ fn backoff_send_rate_linear(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use core::num::NonZeroU64;
+    use std::num::NonZeroUsize;
+    use std::time::{Duration, Instant};
 
     use primitive::ops::float::PosR;
 
@@ -759,7 +765,11 @@ mod tests {
         INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, RTT_MIN_BUCKET,
         SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len, token_bucket_with_tokens,
     };
-    use crate::{codec::data_overhead, udp::NO_FEC_MSS};
+    use crate::{
+        codec::data_overhead,
+        sack::{AckBall, AckBallSequence},
+        udp::NO_FEC_MSS,
+    };
 
     #[test]
     fn windowed_rtt_min_slides_and_forgets() {
@@ -917,6 +927,125 @@ mod tests {
 
         let high = PosR::new(1_000_000.0).unwrap();
         assert_eq!(burst_pkts(high).get(), MAX_BURST_PKTS_CEIL);
+    }
+
+    #[test]
+    fn slow_start_survives_zero_rtt_first_echo() {
+        let t0 = Instant::now();
+        let mss = NonZeroUsize::new(1200).unwrap();
+        let (mut rl, _) = super::ReliableLayer::new(mss, t0);
+
+        // Seed two packets and ACK them both with a cumulative, zero-RTT echo.
+        let mut pkt = vec![0u8; mss.get()];
+        rl.send_data_buf(&pkt, t0);
+        let _ = rl.send_data_pkt(&mut pkt, t0);
+        let _ = rl.send_data_pkt(&mut pkt, t0);
+
+        let acks = [AckBall {
+            start: 0,
+            size: NonZeroU64::new(2).unwrap(),
+        }];
+        let seq = AckBallSequence::new(&acks);
+        rl.recv_ack_pkt(seq, t0 + Duration::from_micros(1));
+
+        assert!(rl.log().send_rate.is_finite(), "send_rate must not be inf/nan after zero-rtt first echo");
+    }
+
+    #[test]
+    fn slow_start_accumulator_is_per_episode() {
+        let t0 = Instant::now();
+        let mss = NonZeroUsize::new(1200).unwrap();
+        let (mut rl, _) = super::ReliableLayer::new(mss, t0);
+
+        // Build a packet payload to fill a whole MSS.
+        let payload_len = rl.max_data_size_per_pkt();
+        let chunk = vec![0u8; payload_len];
+
+        // First burst: 8 packets.
+        rl.send_data_buf(&chunk.repeat(8), t0);
+        let mut pkt = vec![0u8; mss.get()];
+        for _ in 0..8 {
+            let _ = rl.send_data_pkt(&mut pkt, t0);
+        }
+        let acks = [AckBall {
+            start: 0,
+            size: NonZeroU64::new(8).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), t0 + Duration::from_millis(40));
+
+        // Wait long enough to create a 1960 ms idle gap between bursts.
+        let t1 = t0 + Duration::from_millis(2000);
+
+        // Second burst: 20 rounds of 4 packets, each acked after 40 ms.
+        for round in 0..20 {
+            rl.send_data_buf(&chunk.repeat(4), t1 + Duration::from_millis(round * 40));
+            for _ in 0..4 {
+                let _ = rl.send_data_pkt(&mut pkt, t1 + Duration::from_millis(round * 40));
+            }
+            let start = 8 + round * 4;
+            let acks = [AckBall {
+                start,
+                size: NonZeroU64::new(4).unwrap(),
+            }];
+            rl.recv_ack_pkt(
+                AckBallSequence::new(&acks),
+                t1 + Duration::from_millis(round * 40 + 40),
+            );
+        }
+
+        // A lifetime accumulator over all ~88 acked packets with a 40 ms control
+        // RTT would read ~88/0.04 = 2200 packets/second.  With per-episode reset
+        // it should stay bounded, around 2 * INIT_SEND_RATE.
+        assert!(
+            rl.log().send_rate <= 2.8 * INIT_SEND_RATE,
+            "per-episode accumulator should keep slow-start bounded, got {}",
+            rl.log().send_rate
+        );
+    }
+
+    #[test]
+    fn outage_restore_restarts_at_init_rate() {
+        let t0 = Instant::now();
+        let mss = NonZeroUsize::new(1200).unwrap();
+        let (mut rl, _) = super::ReliableLayer::new(mss, t0);
+
+        let payload_len = rl.max_data_size_per_pkt();
+        let chunk = vec![0u8; payload_len];
+
+        // Warm up past 2 * INIT_SEND_RATE.
+        rl.send_data_buf(&chunk.repeat(8), t0);
+        let mut pkt = vec![0u8; mss.get()];
+        for _ in 0..8 {
+            let _ = rl.send_data_pkt(&mut pkt, t0);
+        }
+        let acks = [AckBall {
+            start: 0,
+            size: NonZeroU64::new(8).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), t0 + Duration::from_millis(40));
+        assert!(
+            rl.log().send_rate >= INIT_SEND_RATE,
+            "warmup did not reach init: {}",
+            rl.log().send_rate
+        );
+
+        // Wait 10 s idle to drop min_rtt and any in-flight state, then send and
+        // ack without providing an RTT sample. The slow-start restart should land
+        // on INIT_SEND_RATE.
+        let t1 = t0 + Duration::from_secs(10);
+        rl.send_data_buf(&chunk, t1);
+        let _ = rl.send_data_pkt(&mut pkt, t1);
+        let acks = [AckBall {
+            start: 8,
+            size: NonZeroU64::new(1).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), t1 + Duration::from_secs(1));
+
+        let final_rate = rl.log().send_rate;
+        assert!(
+            final_rate <= INIT_SEND_RATE * 1.1,
+            "outage restore should restart at or near init rate, got {final_rate}"
+        );
     }
 }
 
