@@ -84,6 +84,13 @@ impl PktSendSpace {
         Some(now.duration_since(self.progress_wait_start?))
     }
 
+    fn update_min_rtt(&mut self, rtt: Duration) {
+        self.min_rtt = Some(match self.min_rtt {
+            Some(min_rtt) => min_rtt.min(rtt),
+            None => rtt,
+        });
+    }
+
     fn unacked(
         send_wnd: &SendWnd<u64, Option<TxingPkt>>,
     ) -> impl Iterator<Item = (u64, &TxingPkt)> {
@@ -162,12 +169,12 @@ impl PktSendSpace {
                 self.send_wnd.pop_none();
             }
 
-            let rtt = now - p.sent_time;
-            self.min_rtt = Some(match self.min_rtt {
-                Some(min_rtt) => min_rtt.min(rtt),
-                None => rtt,
-            });
-            self.rto.set(rtt);
+            // Do not use the ACK arrival time as an RTT sample: `sent_time` is
+            // refreshed on every retransmission, so an ACK for a retransmitted
+            // packet would be Karn-ambiguous; ACK decimation can hold ACKs for
+            // up to ACK_FLUSH_AGE, skewing the sample; and this path bypasses
+            // the outage-recovery censoring in `sample_rtt`.  All RTT samples
+            // come from peer-echoed send timestamps via `sample_rtt`.
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
@@ -207,10 +214,12 @@ impl PktSendSpace {
             // A fresh post-outage sample ends the epoch and re-seeds sRTT.
             self.recovery_start = None;
             self.outage_loss_cut = None;
+            self.update_min_rtt(rtt);
             self.rto.reset_to(rtt);
             return;
         }
 
+        self.update_min_rtt(rtt);
         self.rto.set(rtt);
     }
 
