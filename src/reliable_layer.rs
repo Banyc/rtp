@@ -27,6 +27,17 @@ use crate::{
 
 const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
+
+/// Cap on newly accepted staging bytes, in units of a pacing window.
+///
+/// Staged bytes are FIFO-committed via `batch_dequeue_extend`: once accepted
+/// they cannot be reordered, the mux's LatencyControl cannot preempt them, and
+/// the FIFO's latency cost scales inversely with the pace rate.  Capping
+/// acceptance to a small pacing window keeps the latency of a small interactive
+/// frame bounded even when the preceding bulk leaves the stage nearly full at a
+/// low send rate.  After a rate spike occupancy may sit above the cap until it
+/// drains; this is intentional and is why we gate acceptance, not eviction.
+const STAGE_WINDOW_SECS: f64 = 0.005;
 const RECV_DATA_BUF_LEN: usize = 2 << 16;
 const MAX_BURST_PKTS: usize = 64;
 const MAX_BURST_PKTS_CEIL: usize = 512;
@@ -190,7 +201,10 @@ impl ReliableLayer {
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> usize {
         self.detect_application_limited_phases(now);
 
-        let free_bytes = self.send_data_buf.capacity() - self.send_data_buf.len();
+        let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
+        let cap =
+            (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(self.send_data_buf.capacity());
+        let free_bytes = cap.saturating_sub(self.send_data_buf.len());
         let write_bytes = free_bytes.min(buf.len());
         self.send_data_buf.batch_enqueue(&buf[..write_bytes]);
         write_bytes
@@ -344,8 +358,7 @@ impl ReliableLayer {
         // is computed and cleared.
         if self.slow_start {
             self.slow_start_acked_pkts += self.pkt_stats_buf.len();
-            let ss_rate = self.slow_start_acked_pkts as f64
-                / self.control_rtt().as_secs_f64();
+            let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
             let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
             self.set_send_rate(ss_rate, now);
         }
@@ -433,31 +446,30 @@ impl ReliableLayer {
         // Loss exit: high loss must leave gentle mode immediately so a hostile
         // link does not collapse throughput while stuck in the gentle guard.
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
-        if self.gentle_mode
-            && loss_event_rate.is_some_and(|lr| lr >= GENTLE_EXIT_LOSS)
-        {
+        if self.gentle_mode && loss_event_rate.is_some_and(|lr| lr >= GENTLE_EXIT_LOSS) {
             self.gentle_mode = false;
             self.queue_since = None;
             self.drain_gap0 = None;
         }
 
         // Enter gentle mode after a sustained low-loss queue-building stretch.
-        let stretch = self.queue_since.map(|start| now.saturating_duration_since(start));
+        let stretch = self
+            .queue_since
+            .map(|start| now.saturating_duration_since(start));
         let low_loss = loss_event_rate.map(|lr| lr < GENTLE_ENTER_MAX_LOSS);
         let block_cleared = self
             .gentle_block_until
             .map(|until| now >= until)
             .unwrap_or(true);
-        if let Some(stretch) = stretch {
-            if !self.gentle_mode
-                && stretch >= self.control_rtt().mul_f64(GENTLE_ENTER_RTTS)
-                && low_loss != Some(false)
-                && block_cleared
-            {
-                self.gentle_mode = true;
-                self.draining = false;
-                self.drain_gap0 = None;
-            }
+        if let Some(stretch) = stretch
+            && !self.gentle_mode
+            && stretch >= self.control_rtt().mul_f64(GENTLE_ENTER_RTTS)
+            && low_loss != Some(false)
+            && block_cleared
+        {
+            self.gentle_mode = true;
+            self.draining = false;
+            self.drain_gap0 = None;
         }
 
         // Gate hysteresis: while actively draining in gentle mode, reopen the
@@ -477,7 +489,8 @@ impl ReliableLayer {
         if self.slow_start {
             let probed = sr.delivery_rate() * (1. + SEND_RATE_PROBE_RATE);
             let caught_up = self.send_rate.get() <= probed;
-            if little_data_loss == Some(false) || queue_building || caught_up || sr.is_app_limited() {
+            if little_data_loss == Some(false) || queue_building || caught_up || sr.is_app_limited()
+            {
                 self.slow_start = false;
             }
         }
@@ -531,7 +544,7 @@ impl ReliableLayer {
             if self.gentle_mode {
                 self.draining = true;
                 let gap = smooth.saturating_sub(floor);
-                let (t0, gap0) = self.drain_gap0.get_or_insert_with(|| (now, gap));
+                let (t0, gap0) = self.drain_gap0.get_or_insert((now, gap));
                 if now.saturating_duration_since(*t0)
                     >= control_rtt.mul_f64(GENTLE_DRAIN_CHECK_RTTS)
                     && gap > gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK)
@@ -1092,10 +1105,8 @@ mod tests {
         let mut sent = 0;
         for _ in 0..20_000 {
             let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
-            if free >= payload_len {
-                if rl.send_data_buf(&payload, now) < payload.len() {
-                    break;
-                }
+            if free >= payload_len && rl.send_data_buf(&payload, now) < payload.len() {
+                break;
             }
             if rl.send_data_pkt(&mut pkt, now).is_none() {
                 break;
