@@ -312,6 +312,13 @@ impl ReliableLayer {
             self.set_send_rate(ss_rate, now);
         }
 
+        // Per-episode accumulator: once the pipe drains, reset for the next
+        // burst so slow-start cannot grow without bound on sparse flows. This
+        // runs on every ACK, independent of slow-start state.
+        if self.pkt_send_space.no_pkts_in_flight() {
+            self.slow_start_acked_pkts = 0;
+        }
+
         self.update_rate_sample_on_ack(now)
     }
     fn update_rate_sample_on_ack(&mut self, now: Instant) -> Option<dre::RateSample> {
@@ -333,12 +340,6 @@ impl ReliableLayer {
             println!("{sr:?}");
         }
         self.prev_sample_rate = Some(sr.clone());
-
-        // Per-episode accumulator: once the pipe drains, reset for the next
-        // burst so slow-start cannot grow without bound on sparse flows.
-        if self.slow_start && self.pkt_send_space.no_pkts_in_flight() {
-            self.slow_start_acked_pkts = 0;
-        }
 
         self.adjust_send_rate_exponential(&sr, now);
 
@@ -762,12 +763,17 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
-    use primitive::ops::float::PosR;
+    use primitive::ops::{
+        float::PosR,
+        len::{Capacity, Len},
+    };
 
     use super::{
         INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, RTT_MIN_BUCKET,
         SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len, token_bucket_with_tokens,
     };
+
+    const TEST_MSS: usize = 1200;
     use crate::{
         codec::data_overhead,
         sack::{AckBall, AckBallSequence},
@@ -918,6 +924,61 @@ mod tests {
         std::num::NonZeroUsize::new(n).unwrap()
     }
 
+    fn test_layer(now: Instant) -> super::ReliableLayer {
+        super::ReliableLayer::new(NonZeroUsize::new(TEST_MSS).unwrap(), now).0
+    }
+
+    fn send_burst(rl: &mut super::ReliableLayer, n: usize, now: Instant) {
+        let payload = vec![0u8; 100];
+        let mut pkt = vec![0u8; TEST_MSS];
+        for _ in 0..n {
+            assert_eq!(
+                rl.send_data_buf(&payload, now),
+                payload.len(),
+                "send_data_buf must accept the 100-byte payload"
+            );
+            assert!(
+                rl.send_data_pkt(&mut pkt, now).is_some(),
+                "send_data_pkt must send a packet"
+            );
+        }
+    }
+
+    fn send_max(rl: &mut super::ReliableLayer, now: Instant) -> usize {
+        let payload_len = rl.max_data_size_per_pkt();
+        let payload = vec![0u8; payload_len];
+        let mut pkt = vec![0u8; TEST_MSS];
+        let mut sent = 0;
+        for _ in 0..20_000 {
+            let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
+            if free >= payload_len {
+                if rl.send_data_buf(&payload, now) < payload.len() {
+                    break;
+                }
+            }
+            if rl.send_data_pkt(&mut pkt, now).is_none() {
+                break;
+            }
+            sent += 1;
+        }
+        sent
+    }
+
+    fn ack_all(rl: &mut super::ReliableLayer, rtt: Option<Duration>, now: Instant) {
+        let next_seq = rl.pkt_send_space().next_seq();
+        if next_seq == 0 {
+            return;
+        }
+        if let Some(rtt) = rtt {
+            rl.sample_rtt(rtt, now);
+        }
+        let acks = [AckBall {
+            start: 0,
+            size: NonZeroU64::new(next_seq).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), now);
+    }
+
     #[test]
     fn burst_pkts_scales_with_send_rate() {
         let low = PosR::new(INIT_SEND_RATE).unwrap();
@@ -935,72 +996,43 @@ mod tests {
     #[test]
     fn slow_start_survives_zero_rtt_first_echo() {
         let t0 = Instant::now();
-        let mss = NonZeroUsize::new(1200).unwrap();
-        let (mut rl, _) = super::ReliableLayer::new(mss, t0);
+        let mut rl = test_layer(t0);
 
-        // Seed two packets and ACK them both with a cumulative, zero-RTT echo.
-        let mut pkt = vec![0u8; mss.get()];
-        rl.send_data_buf(&pkt, t0);
-        let _ = rl.send_data_pkt(&mut pkt, t0);
-        let _ = rl.send_data_pkt(&mut pkt, t0);
+        send_burst(&mut rl, 2, t0);
+        ack_all(&mut rl, Some(Duration::ZERO), t0 + Duration::from_micros(1));
 
-        let acks = [AckBall {
-            start: 0,
-            size: NonZeroU64::new(2).unwrap(),
-        }];
-        let seq = AckBallSequence::new(&acks);
-        rl.recv_ack_pkt(seq, t0 + Duration::from_micros(1));
-
-        assert!(rl.log().send_rate.is_finite(), "send_rate must not be inf/nan after zero-rtt first echo");
+        assert!(
+            rl.log().send_rate.is_finite(),
+            "send_rate must not be inf/nan after zero-rtt first echo"
+        );
     }
 
     #[test]
     fn slow_start_accumulator_is_per_episode() {
         let t0 = Instant::now();
-        let mss = NonZeroUsize::new(1200).unwrap();
-        let (mut rl, _) = super::ReliableLayer::new(mss, t0);
+        let mut rl = test_layer(t0);
 
-        // Build a packet payload to fill a whole MSS.
-        let payload_len = rl.max_data_size_per_pkt();
-        let chunk = vec![0u8; payload_len];
+        // First burst: 8 packets, acked after 40 ms.
+        send_burst(&mut rl, 8, t0);
+        let t1 = t0 + Duration::from_millis(40);
+        ack_all(&mut rl, Some(Duration::from_millis(40)), t1);
 
-        // First burst: 8 packets.
-        rl.send_data_buf(&chunk.repeat(8), t0);
-        let mut pkt = vec![0u8; mss.get()];
-        for _ in 0..8 {
-            let _ = rl.send_data_pkt(&mut pkt, t0);
-        }
-        let acks = [AckBall {
-            start: 0,
-            size: NonZeroU64::new(8).unwrap(),
-        }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), t0 + Duration::from_millis(40));
+        // Wait long enough to create a 1960 ms idle gap before the next episode.
+        let mut t = t1 + Duration::from_millis(1960);
 
-        // Wait long enough to create a 1960 ms idle gap between bursts.
-        let t1 = t0 + Duration::from_millis(2000);
-
-        // Second burst: 20 rounds of 4 packets, each acked after 40 ms.
-        for round in 0..20 {
-            rl.send_data_buf(&chunk.repeat(4), t1 + Duration::from_millis(round * 40));
-            for _ in 0..4 {
-                let _ = rl.send_data_pkt(&mut pkt, t1 + Duration::from_millis(round * 40));
-            }
-            let start = 8 + round * 4;
-            let acks = [AckBall {
-                start,
-                size: NonZeroU64::new(4).unwrap(),
-            }];
-            rl.recv_ack_pkt(
-                AckBallSequence::new(&acks),
-                t1 + Duration::from_millis(round * 40 + 40),
-            );
+        // 20 rounds of 4 packets, each acked after 40 ms, then idle for 1960 ms.
+        for _ in 0..20 {
+            send_burst(&mut rl, 4, t);
+            let ack_time = t + Duration::from_millis(40);
+            ack_all(&mut rl, Some(Duration::from_millis(40)), ack_time);
+            t = ack_time + Duration::from_millis(1960);
         }
 
         // A lifetime accumulator over all ~88 acked packets with a 40 ms control
         // RTT would read ~88/0.04 = 2200 packets/second.  With per-episode reset
         // it should stay bounded, around 2 * INIT_SEND_RATE.
         assert!(
-            rl.log().send_rate <= 2.8 * INIT_SEND_RATE,
+            rl.log().send_rate <= 2.0 * INIT_SEND_RATE,
             "per-episode accumulator should keep slow-start bounded, got {}",
             rl.log().send_rate
         );
@@ -1009,45 +1041,33 @@ mod tests {
     #[test]
     fn outage_restore_restarts_at_init_rate() {
         let t0 = Instant::now();
-        let mss = NonZeroUsize::new(1200).unwrap();
-        let (mut rl, _) = super::ReliableLayer::new(mss, t0);
+        let mut rl = test_layer(t0);
+        let mut t = t0;
 
-        let payload_len = rl.max_data_size_per_pkt();
-        let chunk = vec![0u8; payload_len];
-
-        // Warm up past 2 * INIT_SEND_RATE.
-        rl.send_data_buf(&chunk.repeat(8), t0);
-        let mut pkt = vec![0u8; mss.get()];
-        for _ in 0..8 {
-            let _ = rl.send_data_pkt(&mut pkt, t0);
+        // 50 rounds of filling cwnd and acking after 40 ms to warm up past
+        // 2 * INIT_SEND_RATE.
+        for _ in 0..50 {
+            send_max(&mut rl, t);
+            t += Duration::from_millis(40);
+            ack_all(&mut rl, Some(Duration::from_millis(40)), t);
+            t += Duration::from_nanos(1);
         }
-        let acks = [AckBall {
-            start: 0,
-            size: NonZeroU64::new(8).unwrap(),
-        }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), t0 + Duration::from_millis(40));
         assert!(
-            rl.log().send_rate >= INIT_SEND_RATE,
-            "warmup did not reach init: {}",
+            rl.log().send_rate > 2.0 * INIT_SEND_RATE,
+            "warm-up rate must exceed 2 * INIT_SEND_RATE, got {}",
             rl.log().send_rate
         );
 
-        // Wait 10 s idle to drop min_rtt and any in-flight state, then send and
-        // ack without providing an RTT sample. The slow-start restart should land
-        // on INIT_SEND_RATE.
-        let t1 = t0 + Duration::from_secs(10);
-        rl.send_data_buf(&chunk, t1);
-        let _ = rl.send_data_pkt(&mut pkt, t1);
-        let acks = [AckBall {
-            start: 8,
-            size: NonZeroU64::new(1).unwrap(),
-        }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), t1 + Duration::from_secs(1));
+        // Send a new flight, then let it sit unacked for 10 s so the next ACK
+        // triggers outage recovery without a fresh RTT echo.
+        let _final_sent = send_max(&mut rl, t);
+        let restore_time = t + Duration::from_secs(10);
+        ack_all(&mut rl, None, restore_time);
 
         let final_rate = rl.log().send_rate;
         assert!(
-            final_rate <= INIT_SEND_RATE * 1.1,
-            "outage restore should restart at or near init rate, got {final_rate}"
+            (final_rate - INIT_SEND_RATE).abs() < 1e-9,
+            "outage restore should restart at exactly INIT_SEND_RATE, got {final_rate}"
         );
     }
 }

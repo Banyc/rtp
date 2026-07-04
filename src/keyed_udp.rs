@@ -435,14 +435,20 @@ mod tests {
         );
         let mut opened = client.open_without_handshake(key, fec).unwrap();
 
+        // Send the ping before any dispatch loop is spawned. The server will
+        // reply, but that reply will sit undelivered in the client socket until
+        // dispatch() routes it to the opened connection.
+        opened.write.send(ping).await.unwrap();
+
         // With dispatch unpoll, inbound delivery to the opened connection does
-        // not happen. The 50 ms timeout should elapse before any data arrives.
+        // not happen. The 50 ms timeout should elapse before any data arrives,
+        // even though the server's pong is already in the socket buffer.
         let mut buf = [0u8; 16];
         let timeout_result = tokio::time::timeout(Duration::from_millis(50), opened.read.recv(&mut buf))
             .await;
         assert!(
             timeout_result.is_err(),
-            "recv should not succeed while dispatch is unpoll"
+            "inbound keyed packets must not be delivered unless dispatch is polled, even when the reply is already in the socket buffer"
         );
 
         // Start the dispatch loop on a clone. The server reply should now arrive.
@@ -452,8 +458,6 @@ mod tests {
                 dispatch_client.dispatch().await.unwrap();
             }
         });
-
-        opened.write.send(ping).await.unwrap();
 
         let n = tokio::time::timeout(Duration::from_secs(1), opened.read.recv(&mut buf))
             .await

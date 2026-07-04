@@ -632,14 +632,23 @@ mod tests {
     /// that should consume at most that many bytes in a single poll.
     #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_max_stage_scales_with_mss() {
-        use crate::udp::wrap_fec_with_mss;
+        use crate::udp::{wrap_fec, wrap_fec_with_mss};
 
-        let mss = 9_000;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
 
+        // Default-MSS case: the staging cap is exactly the fixed 8 KiB buffer.
+        let b_wrapped = wrap_fec(b.clone(), b, false);
+        let (_b_r, b_w) = socket(b_wrapped, None);
+        assert_eq!(
+            b_w.into_async_write().max_stage(),
+            8 * 1024,
+            "default-MSS staging buffer must be exactly 8 KiB"
+        );
+
+        let mss = 9_000;
         let a = wrap_fec_with_mss(a.clone(), a, false, mss);
         let (_a_r, a_w) = socket(a, None);
         let write_stream = a_w.into_async_write();
