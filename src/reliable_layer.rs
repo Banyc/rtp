@@ -302,6 +302,9 @@ impl ReliableLayer {
             .ack(recved, &mut self.pkt_stats_buf, now);
 
         if entered_recovery {
+            self.rtt_floor = WindowedRttMin::new(now);
+            self.slow_start = false;
+            self.slow_start_acked_pkts = 0;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
             // Because the epoch was entered from inside `ack`, any ACKed packets
             // have already delivered their RTT samples via `sample_rtt` before we
@@ -310,9 +313,6 @@ impl ReliableLayer {
             // outage as a fresh start instead: clear the epoch so the next RTT
             // sample seeds sRTT normally.
             self.pkt_send_space.clear_outage_recovery();
-            // The outage-recovery reset also exits slow start so we don't double-
-            // restart the congestion controller.
-            self.slow_start = false;
         }
 
         self.update_rate_sample_on_ack(now)
@@ -339,10 +339,14 @@ impl ReliableLayer {
 
         if self.slow_start {
             self.slow_start_acked_pkts += self.pkt_buf.len();
-            let ss_rate =
-                self.slow_start_acked_pkts as f64 / self.pkt_send_space.smooth_rtt().as_secs_f64();
+            let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
             let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
             self.set_send_rate(ss_rate, now);
+            // Per-episode accumulator: once the pipe drains, reset for the next
+            // burst so slow-start cannot grow without bound on sparse flows.
+            if self.pkt_send_space.no_pkts_in_flight() {
+                self.slow_start_acked_pkts = 0;
+            }
         }
 
         self.adjust_send_rate_exponential(&sr, now);
@@ -351,6 +355,19 @@ impl ReliableLayer {
     }
 
     fn adjust_send_rate_exponential(&mut self, sr: &dre::RateSample, now: Instant) {
+        // While an outage-recovery epoch is open, ignore rate samples whose prior
+        // time predates the outage cut.  A blackout-spanning sample can report a
+        // bogus delivery rate (~acked/outage-length) that would collapse the just-
+        // restarted INIT_SEND_RATE back toward zero in the same ACK handler.
+        if self.pkt_send_space.in_outage_recovery()
+            && self
+                .pkt_send_space
+                .outage_cut()
+                .is_some_and(|cut| sr.prior_time() < cut)
+        {
+            return;
+        }
+
         let smooth = self.pkt_send_space.smooth_rtt();
         let floor = self.rtt_floor.update(now, smooth);
         let tol = self
@@ -371,7 +388,8 @@ impl ReliableLayer {
                 let probed = sr.delivery_rate() * (1. + SEND_RATE_PROBE_RATE);
                 let caught_up = self.send_rate.get() >= probed;
                 let little_data_loss_false = little_data_loss == Some(false);
-                if little_data_loss_false || queue_building || caught_up {
+                let app_limited_exit = sr.is_app_limited();
+                if little_data_loss_false || queue_building || caught_up || app_limited_exit {
                     self.slow_start = false;
                 }
             }
@@ -665,11 +683,13 @@ impl ReliableLayer {
 /// the floor tracks recent baseline RTT and recovers quickly enough to let the
 /// delay-based gate close when the queue inflates and reopen when it drains.
 #[derive(Debug, Clone)]
-struct WindowedRttMin {
+pub(crate) struct WindowedRttMin {
     bucket_start: Instant,
     cur: Option<Duration>,
     prev: Option<Duration>,
 }
+
+const RTT_MIN_BUCKET_RTT_SCALE: u32 = 10;
 
 impl WindowedRttMin {
     fn new(now: Instant) -> Self {
@@ -681,7 +701,14 @@ impl WindowedRttMin {
     }
 
     fn update(&mut self, now: Instant, rtt: Duration) -> Duration {
-        if now.duration_since(self.bucket_start) > RTT_MIN_BUCKET {
+        let bucket = RTT_MIN_BUCKET.max(rtt.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
+        let elapsed = now.duration_since(self.bucket_start);
+        if elapsed > bucket * 2 {
+            // Idle staleness: both buckets have aged out, mirror LossEventWindow::rotate.
+            self.cur = None;
+            self.prev = None;
+            self.bucket_start = now;
+        } else if elapsed > bucket {
             self.prev = self.cur.take();
             self.bucket_start = now;
         }
@@ -761,7 +788,7 @@ mod tests {
         let now = std::time::Instant::now();
         let mut w = WindowedRttMin::new(now);
 
-        // Within the first bucket the minimum is reported immediately.
+        // Bucket is max(5 s, 10 * rtt).  Use a 40 ms sample so bucket = 5 s.
         assert_eq!(
             w.update(now, Duration::from_millis(40)),
             Duration::from_millis(40)
@@ -791,6 +818,48 @@ mod tests {
         assert_eq!(
             w.update(t2, Duration::from_millis(110)),
             Duration::from_millis(90)
+        );
+    }
+
+    #[test]
+    fn windowed_rtt_min_bucket_scales_with_long_rtt() {
+        let now = std::time::Instant::now();
+        let mut w = WindowedRttMin::new(now);
+
+        // With a 1 s sample the bucket should be 10 s, not the fixed 5 s floor.
+        assert_eq!(
+            w.update(now, Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        let t1 = now + Duration::from_secs(5) + Duration::from_millis(1);
+        // Inside the 10 s bucket, the floor is still the first sample.
+        assert_eq!(
+            w.update(t1, Duration::from_millis(900)),
+            Duration::from_millis(900)
+        );
+
+        // After >10 s of staleness both buckets clear, mirroring LossEventWindow.
+        let t2 = now + Duration::from_secs(11);
+        assert_eq!(
+            w.update(t2, Duration::from_millis(800)),
+            Duration::from_millis(800)
+        );
+    }
+
+    #[test]
+    fn windowed_rtt_min_clears_after_idle_gap() {
+        let now = std::time::Instant::now();
+        let mut w = WindowedRttMin::new(now);
+
+        assert_eq!(
+            w.update(now, Duration::from_millis(40)),
+            Duration::from_millis(40)
+        );
+        // Idle for more than twice the 5 s bucket.
+        let t1 = now + RTT_MIN_BUCKET * 2 + Duration::from_millis(1);
+        assert_eq!(
+            w.update(t1, Duration::from_millis(100)),
+            Duration::from_millis(100)
         );
     }
 

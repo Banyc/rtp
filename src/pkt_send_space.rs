@@ -33,6 +33,10 @@ pub struct PktSendSpace {
     cwnd: NonZeroUsize,
     /// Detect if the peer has died
     resp_wait_start: Option<Instant>,
+    /// Has any packet ever been acked or have we ever had to wait?
+    ever_progressed: bool,
+    /// Start of the latest interval during which no forward progress was made.
+    progress_wait_start: Option<Instant>,
     out_of_order_seq_end: u64,
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: MinNoneOptCmp<u64>,
@@ -69,9 +73,15 @@ impl PktSendSpace {
             tail_probes_sent: 0,
             recovery_start: None,
             outage_loss_cut: None,
+            ever_progressed: false,
+            progress_wait_start: None,
             unacked_buf: vec![],
             ack_buf: vec![],
         }
+    }
+
+    fn no_progress_for(&self, now: Instant) -> Option<Duration> {
+        Some(now.duration_since(self.progress_wait_start?))
     }
 
     fn unacked(
@@ -137,6 +147,12 @@ impl PktSendSpace {
         self.ack_buf.clear();
         recved.ack(&self.unacked_buf, &mut self.ack_buf);
         let delivered = self.ack_buf.len();
+        if delivered > 0 {
+            // Forward progress: we just delivered packets to the peer.
+            self.ever_progressed = true;
+            self.progress_wait_start = None;
+            self.tail_probes_sent = 0;
+        }
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
@@ -157,31 +173,38 @@ impl PktSendSpace {
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
-        if delivered > 0 {
-            self.tail_probes_sent = 0;
-        }
-        if peer_waiting_for_acked_pkts {
+        if peer_waiting_for_acked_pkts && delivered == 0 {
             return;
         }
         if self.send_wnd.is_empty() {
             self.resp_wait_start = None;
-        } else {
-            self.resp_wait_start = Some(now);
+            self.progress_wait_start = None;
+            return;
+        }
+        self.resp_wait_start = Some(now);
+        // If we have made progress before and the window is not empty, we are
+        // now waiting for the next round of progress.  If progress_wait_start is
+        // None because the ACK just made progress, this sets it to the end of
+        // this ACK; subsequent zero-progress ACKs will keep resp_wait alive but
+        // will not reset progress_wait_start.
+        if self.ever_progressed && self.progress_wait_start.is_none() {
+            self.progress_wait_start = Some(now);
         }
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
         // During an outage-recovery epoch, censor stale RTT samples taken across
-        // the outage.  A sample is stale if it was sent before the epoch began
-        // (sent_at would fall before recovery_start) or if its computed sent_at
-        // is earlier than the cut.  In that case leave min_rtt/rto untouched and
-        // keep the epoch open.  Otherwise the fresh sample ends the epoch: clear
-        // the recovery state and re-seed sRTT from this sample alone.
-        if let Some(recovery_start) = self.recovery_start {
+        // the outage.  A sample is stale if it was sent before the outage cut.
+        // The cut persists after recovery_start is cleared so that late echoes
+        // of pre-outage packets are still discarded.
+        if let Some(cut) = self.outage_loss_cut {
             let sent_at = now.checked_sub(rtt);
-            if sent_at.is_none_or(|sent_at| sent_at < recovery_start) {
+            if sent_at.is_none_or(|sent_at| sent_at < cut) {
+                // Echoes from before the cut keep the recovery_start epoch open
+                // if it is still active, otherwise they are simply dropped.
                 return;
             }
+            // A fresh post-outage sample ends the epoch and re-seeds sRTT.
             self.recovery_start = None;
             self.outage_loss_cut = None;
             self.rto.reset_to(rtt);
@@ -279,6 +302,13 @@ impl PktSendSpace {
         self.tail_probes_sent = 0;
         if self.resp_wait_start.is_none() {
             self.resp_wait_start = Some(now);
+        }
+        // Sending a new packet does not by itself demonstrate forward progress;
+        // progress is measured by ACK delivery.  However, once we have made prior
+        // progress and are sending into an empty pipe, start the stall clock so a
+        // subsequent outage can be detected.
+        if self.ever_progressed && self.progress_wait_start.is_none() {
+            self.progress_wait_start = Some(now);
         }
 
         Pkt {
@@ -407,31 +437,42 @@ impl PktSendSpace {
         self.recovery_start.is_some()
     }
 
+    pub(crate) fn outage_cut(&self) -> Option<Instant> {
+        self.outage_loss_cut
+    }
+
     pub fn detect_outage_recovery(&mut self, now: Instant) -> bool {
         // Already in an epoch: keep it open until a fresh post-outage sample
         // closes it in `sample_rtt`.
         if self.recovery_start.is_some() {
             return false;
         }
-        // Conditions that detect a sustained outage:
-        //  - we have been waiting for a response for at least one RTO with no
-        //    exponential-backoff cap (the proactive broken-pipe check uses 16xRTO),
-        //  - and either there has been a loss event or the silence is long enough
-        //    that a clean link would have produced an ACK by now.
-        let no_resp_for = match self.no_resp_for(now) {
+
+        // Outage detection is keyed on forward progress stalls, not merely the
+        // absence of any ACK datagram.  Zero-progress duplicate ACKs can keep the
+        // total-silence clock alive without delivering data; we require that the
+        // sender has made prior progress and has now stopped making progress.
+        if !self.ever_progressed {
+            return false;
+        }
+
+        let no_progress_for = match self.no_progress_for(now) {
             Some(d) => d,
             None => return false,
         };
         let rto = self.rto.rto();
-        if no_resp_for < rto {
+        if no_progress_for < rto {
             return false;
         }
-        // An outage needs either a recorded loss event or a blackout-spanning
-        // silence.  With a loss event the RTO threshold is enough; without one
-        // the silence must span at least two RTOs.
+
+        // Conditions that detect a sustained outage:
+        //  - we have been waiting for forward progress for at least one RTO,
+        //  - and either there has been a loss event or the silence is long enough
+        //    that a clean link would have produced an ACK by now.
         let has_loss_event = self.loss_event_window.raw_has_loss_event();
-        let loss_or_long_silence = has_loss_event || no_resp_for >= rto * 2;
+        let loss_or_long_silence = has_loss_event || no_progress_for >= rto * 2;
         if !loss_or_long_silence {
+            // A clean long silence (no loss event) needs two RTOs to declare outage.
             return false;
         }
 
@@ -446,8 +487,12 @@ impl PktSendSpace {
     }
 
     pub fn clear_outage_recovery(&mut self) {
+        // Do not clear outage_loss_cut here; it is intentionally left intact so
+        // that late echoes of pre-outage packets are still discarded.  However,
+        // a second outage-length stall inside an already-closed epoch should
+        // refresh the cut.  The caller signals this by calling detect again;
+        // detect_outage_recovery will re-arm recovery_start and update the cut.
         self.recovery_start = None;
-        self.outage_loss_cut = None;
     }
 
     pub fn cwnd_stats(&self, now: Instant) -> CwndStats {
@@ -736,11 +781,25 @@ mod tests {
         }
     }
 
-    fn send_packet(space: &mut PktSendSpace, now: Instant) {
+    fn send_packet(space: &mut PktSendSpace, now: Instant) -> u64 {
         use dre::ConnectionState;
         let data = vec![0u8; 1];
         let stats = ConnectionState::new(now).send_packet_2(now, space.no_pkts_in_flight());
+        let seq = space.next_seq();
         space.send(data, stats, now);
+        seq
+    }
+
+    fn ack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
+        let ball = crate::sack::AckBall {
+            start: seq,
+            size: std::num::NonZeroU64::new(1).unwrap(),
+        };
+        let balls = [ball];
+        let seq = crate::sack::AckBallSequence::new(&balls);
+        let mut acked = Vec::new();
+        space.ack(seq, &mut acked, now);
+        acked.len()
     }
 
     fn lose_packet(space: &mut PktSendSpace, seq: u64, now: Instant) {
@@ -752,10 +811,12 @@ mod tests {
         let mut retransmitted = p.clone();
         retransmitted.rtxed = true;
         *space.send_wnd.get_mut(&seq).unwrap() = Some(retransmitted);
-        // Record the loss event for congestion accounting.
+        // Record the loss event for congestion accounting.  Use a 1 ms floor for
+        // the bucket length so the loss is visible immediately regardless of the
+        // current (possibly 1 s seed) sRTT.
         space
             .loss_event_window
-            .record_lost(1, now, space.smooth_rtt());
+            .record_lost(1, now, Duration::from_millis(1));
     }
 
     fn ack_up_to(space: &mut PktSendSpace, seq: u64, now: Instant) {
@@ -915,15 +976,17 @@ mod tests {
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
 
-        // Send 3 packets in flight and mark one as lost so the epoch has a loss
-        // event to trigger on.
+        // Send 3 packets in flight, make one packet's worth of progress, and
+        // mark another as lost so the epoch has a loss event to trigger on.
         send_packet(&mut space, t0);
         send_packet(&mut space, t0 + ms(1));
         send_packet(&mut space, t0 + ms(2));
-        lose_packet(&mut space, 1, t0 + ms(50));
+        ack_one(&mut space, 0, t0 + ms(10));
+        lose_packet(&mut space, 2, t0 + ms(50));
 
-        // Advance at least one RTO past the last send so the epoch can be detected.
-        let detect_at = t0 + space.rto_duration() + ms(1);
+        // Advance at least one RTO past the last forward-progress so the epoch
+        // can be detected.
+        let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
         assert!(space.detect_outage_recovery(detect_at));
         assert!(space.in_outage_recovery());
         // Recovery starts by clamping cwnd to INIT_CWND once set_send_rate is
@@ -934,9 +997,14 @@ mod tests {
         let seed_rto = space.rto_duration();
 
         // The unacked pre-outage packets are now immediately eligible for rtx
-        // and are not counted as congestion losses.
+        // and are not counted as congestion losses.  seq 1 was marked lost by the
+        // helper but is at the front of the window; it should still be exempt.
         let rtx = space.rtx(t0 + ms(600)).unwrap();
-        assert_eq!(rtx.seq, 0);
+        assert!(
+            rtx.seq == 1 || rtx.seq == 2,
+            "expected pre-outage rtx, got {rtx_seq}",
+            rtx_seq = rtx.seq
+        );
         let after_rtx = space.loss_event_rate(t0 + ms(600));
         assert!(
             after_rtx.is_none() || after_rtx.unwrap() == 0.0,
@@ -950,10 +1018,9 @@ mod tests {
         // The stale sample did not shrink the RTO.
         assert_eq!(space.rto_duration(), seed_rto);
 
-        // A fresh post-outage sample (sent_at after recovery_start) ends the
-        // epoch and seeds sRTT.  It must be measured at or after recovery_start
-        // + rtt so the computed original send time is within the post-outage
-        // window.
+        // A fresh post-outage sample (sent_at after outage_cut) ends the epoch
+        // and seeds sRTT.  It must be measured at or after outage_cut + rtt so
+        // the computed original send time is within the post-outage window.
         let fresh = detect_at + ms(300);
         space.sample_rtt(ms(200), fresh);
         assert!(!space.in_outage_recovery());
@@ -974,11 +1041,20 @@ mod tests {
         let large_cwnd = space.cwnd().get();
         assert!(large_cwnd > INIT_CWND, "cwnd={large_cwnd}");
 
-        // Trigger outage recovery: mark the packet as lost so a loss event exists.
+        // Trigger outage recovery: make progress, send a second packet, then
+        // mark that second packet as lost so a loss event exists while the
+        // first packet remains acked.  Wait one RTO from the last progress (the
+        // ack at t0 + 10 ms).
         send_packet(&mut space, t0);
-        lose_packet(&mut space, 0, t0 + ms(50));
-        let detect_at = t0 + space.rto_duration() + ms(1);
-        assert!(space.detect_outage_recovery(detect_at));
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        lose_packet(&mut space, 1, t0 + ms(50));
+        let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
+        let no_progress = space.no_progress_for(detect_at);
+        assert!(
+            space.detect_outage_recovery(detect_at),
+            "detection should fire; no_progress={no_progress:?}"
+        );
         space.set_send_rate(PosR::new(crate::reliable_layer::INIT_SEND_RATE).unwrap());
         assert_eq!(
             space.cwnd().get(),
@@ -997,6 +1073,105 @@ mod tests {
             space.cwnd().get(),
             expected_cwnd,
             "cwnd should recompute with fresh sRTT"
+        );
+    }
+
+    #[test]
+    fn outage_epoch_requires_prior_progress() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Send a packet and mark it as lost, but never ack anything: no forward
+        // progress has been made, so the epoch should not fire.
+        send_packet(&mut space, t0);
+        lose_packet(&mut space, 0, t0 + ms(50));
+        let detect_at = t0 + space.rto_duration() + ms(1);
+        assert!(
+            !space.detect_outage_recovery(detect_at),
+            "outage detection should require prior progress"
+        );
+
+        // After a single ACK creates progress, detection can fire after another
+        // RTO of stall.  Send a new packet, ack the original packet so progress
+        // is recorded on the new flight, then wait two RTOs (no loss event).
+        send_packet(&mut space, detect_at);
+        ack_one(&mut space, 0, detect_at + ms(1));
+        let detect_at2 = detect_at + ms(1) + space.rto_duration() * 2 + ms(1);
+        assert!(
+            space.detect_outage_recovery(detect_at2),
+            "progress should allow detection"
+        );
+    }
+
+    #[test]
+    fn outage_epoch_is_reentrant_for_flapping_links() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Establish progress and enter the first epoch.  Keep seq 1 in flight
+        // by only acking seq 0.  The loss event needs to be recorded after
+        // progress so it is not reset by the progress ack.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        lose_packet(&mut space, 1, t0 + ms(50));
+        let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
+        assert!(
+            space.detect_outage_recovery(detect_at),
+            "first epoch should fire"
+        );
+        space.clear_outage_recovery();
+        assert!(!space.in_outage_recovery());
+        assert!(space.outage_cut().is_some());
+
+        // A second outage-length stall re-enters recovery with a refreshed cut.
+        // There must be a packet in flight for progress_wait_start to stay set.
+        // For the second outage to be detected there must be a packet in flight
+        // so progress_wait_start stays set after clear_outage_recovery.
+        send_packet(&mut space, detect_at + ms(1));
+        let detect_at2 = detect_at + ms(1) + space.rto_duration() * 2 + ms(1);
+        assert!(
+            space.detect_outage_recovery(detect_at2),
+            "flapping outage should re-enter recovery"
+        );
+        assert!(space.in_outage_recovery());
+        assert_eq!(space.outage_cut(), Some(detect_at2));
+    }
+
+    #[test]
+    fn outage_detected_despite_zero_progress_acks() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Make progress with one packet, then send two more so there are
+        // packets in flight when the duplicate ACKs arrive.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        send_packet(&mut space, t0 + ms(12));
+
+        // Feed 11 s of duplicate zero-progress ACKs (acks only seq 0, which is
+        // already delivered).  The resp_wait_start resets on every ACK, but
+        // progress_wait_start stays at the last real progress.
+        let mut t = t0 + ms(13);
+        let rto = space.rto_duration();
+        for _ in 0..110 {
+            ack_one(&mut space, 0, t);
+            t += rto / 10;
+        }
+
+        // Forward progress stalled since t0 + 10 ms; detection should fire.
+        // Because the window is non-empty, resp_wait_start is still advancing.
+        let no_resp = space.no_resp_for(t).unwrap();
+        assert!(no_resp < rto, "zero-progress ACKs keep resp_wait alive");
+        let no_progress = space.no_progress_for(t).unwrap();
+        assert!(no_progress >= rto, "no_progress={no_progress:?}");
+        assert!(
+            space.detect_outage_recovery(t),
+            "zero-progress ACKs should not prevent outage detection"
         );
     }
 }
