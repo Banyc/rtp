@@ -21,7 +21,7 @@ const MAX_NUM_ACK: usize = 64;
 const MAX_ECHO_RTT: Duration = Duration::from_secs(60);
 const ACK_FLUSH_COUNT: usize = 8;
 const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
-const MIN_NO_RESP_FOR: Duration = Duration::from_secs(1);
+const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
 const BUF_SIZE: usize = 1024 * 64;
 
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
@@ -532,7 +532,7 @@ impl TransmissionLayer {
                     let rtt_us = local_ts.wrapping_sub(echo_ts);
                     let rtt = Duration::from_micros(rtt_us as u64);
                     if rtt <= MAX_ECHO_RTT {
-                        self.reliable_layer.lock().unwrap().sample_rtt(rtt);
+                        self.reliable_layer.lock().unwrap().sample_rtt(rtt, now);
                     }
                 }
 
@@ -660,10 +660,7 @@ impl TransmissionLayer {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let queue = reliable_layer.pkt_recv_space().ack_history();
             let count = queue.balls().count();
-            (
-                bufs.ack_page_cursor.max(MAX_NUM_ACK).min(count),
-                count,
-            )
+            (bufs.ack_page_cursor.max(MAX_NUM_ACK).min(count), count)
         };
         let mut skip = 0;
 

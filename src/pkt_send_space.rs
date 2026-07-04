@@ -42,6 +42,13 @@ pub struct PktSendSpace {
     /// pushed.
     tail_probes_sent: u8,
 
+    // outage recovery epoch
+    /// Start of the current outage-recovery epoch, if one is open.
+    recovery_start: Option<Instant>,
+    /// Packets originally sent before this instant are considered pre-outage.
+    /// Their retransmission losses do not mark a congestion event.
+    outage_loss_cut: Option<Instant>,
+
     // reused buffers
     unacked_buf: Vec<u64>,
     ack_buf: Vec<u64>,
@@ -60,6 +67,8 @@ impl PktSendSpace {
             max_pipe_seq: MinNoneOptCmp(None),
             loss_event_window: LossEventWindow::new(),
             tail_probes_sent: 0,
+            recovery_start: None,
+            outage_loss_cut: None,
             unacked_buf: vec![],
             ack_buf: vec![],
         }
@@ -161,7 +170,24 @@ impl PktSendSpace {
         }
     }
 
-    pub fn sample_rtt(&mut self, rtt: Duration) {
+    pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
+        // During an outage-recovery epoch, censor stale RTT samples taken across
+        // the outage.  A sample is stale if it was sent before the epoch began
+        // (sent_at would fall before recovery_start) or if its computed sent_at
+        // is earlier than the cut.  In that case leave min_rtt/rto untouched and
+        // keep the epoch open.  Otherwise the fresh sample ends the epoch: clear
+        // the recovery state and re-seed sRTT from this sample alone.
+        if let Some(recovery_start) = self.recovery_start {
+            let sent_at = now.checked_sub(rtt);
+            if sent_at.is_none_or(|sent_at| sent_at < recovery_start) {
+                return;
+            }
+            self.recovery_start = None;
+            self.outage_loss_cut = None;
+            self.rto.reset_to(rtt);
+            return;
+        }
+
         self.rto.set(rtt);
     }
 
@@ -231,10 +257,7 @@ impl PktSendSpace {
                 rto: self.rto.rto(),
             };
         }
-        Some(Pkt {
-            seq,
-            data: &p.data,
-        })
+        Some(Pkt { seq, data: &p.data })
     }
 
     pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Pkt<'_> {
@@ -266,26 +289,38 @@ impl PktSendSpace {
 
     pub fn has_rtx(&self, now: Instant) -> bool {
         let out_of_order_seq_end = self.out_of_order_seq_end;
+        let outage_loss_cut = self.outage_loss_cut;
         Self::unacked(&self.send_wnd)
             .take(self.cwnd.get())
             .any(|(s, p)| {
                 let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
-                p.is_rtx(is_seq_out_of_order, self.rto.reorder_window(), now)
+                let is_pre_outage_loss = Self::is_pre_outage_loss(p, outage_loss_cut);
+                p.is_rtx(
+                    is_seq_out_of_order,
+                    is_pre_outage_loss,
+                    self.rto.reorder_window(),
+                    now,
+                )
             })
     }
 
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let reorder_window = self.rto.reorder_window();
+        let outage_loss_cut = self.outage_loss_cut;
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
-            let should_rtx = p.is_rtx(is_seq_out_of_order, reorder_window, now);
+            let is_pre_outage_loss = Self::is_pre_outage_loss(p, outage_loss_cut);
+            let should_rtx = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, reorder_window, now);
             if !should_rtx {
                 continue;
             }
 
-            // Count one loss event per packet the first time it is retransmitted.
+            // Count one loss event per packet the first time it is retransmitted,
+            // unless the loss happened before the outage-recovery cut: those losses
+            // are caused by the link going away, not by congestion.
             let already_rtxed = p.rtxed;
+            let pre_outage_loss = !already_rtxed && is_pre_outage_loss;
 
             // fresh pkt for this cwnd
             let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
@@ -305,7 +340,7 @@ impl PktSendSpace {
                     rto: self.rto.rto(),
                 };
             }
-            if !already_rtxed {
+            if !already_rtxed && !pre_outage_loss {
                 let smooth_rtt = self.rto.smooth_rtt();
                 self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
@@ -318,6 +353,16 @@ impl PktSendSpace {
         None
     }
 
+    fn is_pre_outage_loss(p: &TxingPkt, outage_loss_cut: Option<Instant>) -> bool {
+        let Some(cut) = outage_loss_cut else {
+            return false;
+        };
+        // The original transmission must have happened before the cut.  A later
+        // retransmission naturally expires the exemption because `sent_time` is
+        // overwritten each time we rtx.
+        p.sent_time < cut
+    }
+
     pub fn min_rtt(&self) -> Option<Duration> {
         self.min_rtt
     }
@@ -327,6 +372,14 @@ impl PktSendSpace {
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * CWND_SEND_RATE_SCALE;
         let cwnd = 1.max(cwnd);
+        // While an outage-recovery epoch is open, clamp cwnd to INIT_CWND so a
+        // just-restored path is not flooded before fresh RTT samples can seed
+        // the congestion state.
+        let cwnd = if self.recovery_start.is_some() {
+            cwnd.min(INIT_CWND)
+        } else {
+            cwnd
+        };
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
 
         let last_seq_in_cwnd = || {
@@ -348,6 +401,53 @@ impl PktSendSpace {
 
     pub fn no_pkts_in_flight(&self) -> bool {
         self.send_wnd.is_empty()
+    }
+
+    pub fn in_outage_recovery(&self) -> bool {
+        self.recovery_start.is_some()
+    }
+
+    pub fn detect_outage_recovery(&mut self, now: Instant) -> bool {
+        // Already in an epoch: keep it open until a fresh post-outage sample
+        // closes it in `sample_rtt`.
+        if self.recovery_start.is_some() {
+            return false;
+        }
+        // Conditions that detect a sustained outage:
+        //  - we have been waiting for a response for at least one RTO with no
+        //    exponential-backoff cap (the proactive broken-pipe check uses 16xRTO),
+        //  - and either there has been a loss event or the silence is long enough
+        //    that a clean link would have produced an ACK by now.
+        let no_resp_for = match self.no_resp_for(now) {
+            Some(d) => d,
+            None => return false,
+        };
+        let rto = self.rto.rto();
+        if no_resp_for < rto {
+            return false;
+        }
+        // An outage needs either a recorded loss event or a blackout-spanning
+        // silence.  With a loss event the RTO threshold is enough; without one
+        // the silence must span at least two RTOs.
+        let has_loss_event = self.loss_event_window.raw_has_loss_event();
+        let loss_or_long_silence = has_loss_event || no_resp_for >= rto * 2;
+        if !loss_or_long_silence {
+            return false;
+        }
+
+        self.recovery_start = Some(now);
+        self.outage_loss_cut = Some(now);
+        // Reset congestion state: start with a seed sRTT of one RTO and clear
+        // prior loss history so the post-outage path is treated as fresh.
+        self.rto.reset_to(self.rto.rto());
+        self.loss_event_window.reset(now, self.rto.smooth_rtt());
+        // Do not touch `cwnd` here; the epoch clamps it inside `set_send_rate`.
+        true
+    }
+
+    pub fn clear_outage_recovery(&mut self) {
+        self.recovery_start = None;
+        self.outage_loss_cut = None;
     }
 
     pub fn cwnd_stats(&self, now: Instant) -> CwndStats {
@@ -444,14 +544,13 @@ impl PktSendSpace {
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
         }
-        if let Some(seq) = self.tail_seq() {
-            if let Some(Some(p)) = self.send_wnd.get(&seq) {
-                if self.tail_probes_sent < MAX_TAIL_PROBES {
-                    let t = p.sent_time + self.tail_probe_window();
-                    let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
-                    min_next_poll_time = Some(t);
-                }
-            }
+        if let Some(seq) = self.tail_seq()
+            && let Some(Some(p)) = self.send_wnd.get(&seq)
+            && self.tail_probes_sent < MAX_TAIL_PROBES
+        {
+            let t = p.sent_time + self.tail_probe_window();
+            let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
+            min_next_poll_time = Some(t);
         }
         min_next_poll_time
     }
@@ -499,11 +598,16 @@ impl TxingPkt {
     pub fn is_rtx(
         &self,
         seq_out_of_order: SeqOutOfOrder,
+        pre_outage_loss: bool,
         custom_rto: Duration,
         now: Instant,
     ) -> bool {
         let out_of_order_rt = seq_out_of_order.0 && self.hits_custom_rto(custom_rto, now);
-        self.hits_rto(now) || out_of_order_rt
+        // Pre-outage packets that are still unacked after the link recovers are
+        // treated as already lost: retransmit them immediately so the first ACK
+        // after the outage can make progress.
+        let pre_outage = pre_outage_loss;
+        self.hits_rto(now) || out_of_order_rt || pre_outage
     }
 }
 
@@ -602,22 +706,33 @@ impl LossEventWindow {
         let lost = self.curr.lost + self.prev.lost;
         Some(lost as f64 / total as f64)
     }
+
+    /// Directly inspect the buckets without rotating.
+    fn raw_has_loss_event(&self) -> bool {
+        self.curr.lost > 0 || self.prev.lost > 0
+    }
+
+    fn reset(&mut self, now: Instant, smooth_rtt: Duration) {
+        self.curr.reset(now);
+        self.prev.reset(now + Self::bucket_len(smooth_rtt));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{LossEventWindow, PktSendSpace};
+    use super::{CWND_SEND_RATE_SCALE, INIT_CWND, LossEventWindow, PktSendSpace};
+    use primitive::ops::float::PosR;
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
     }
 
-    fn settle_rtt(space: &mut PktSendSpace) {
+    fn settle_rtt_at(space: &mut PktSendSpace, now: Instant) {
         // Saturate the SRTT filter so the RTO is stable and close to 100 ms.
-        for _ in 0..20 {
-            space.sample_rtt(ms(100));
+        for i in 0..20 {
+            space.sample_rtt(ms(100), now + ms(i));
         }
     }
 
@@ -626,6 +741,21 @@ mod tests {
         let data = vec![0u8; 1];
         let stats = ConnectionState::new(now).send_packet_2(now, space.no_pkts_in_flight());
         space.send(data, stats, now);
+    }
+
+    fn lose_packet(space: &mut PktSendSpace, seq: u64, now: Instant) {
+        // Record a loss event for the packet without actually transmitting it.
+        // We do this by pulling the packet out, marking it as already retransmitted,
+        // and then putting it back as a retransmitted copy.  The original send time
+        // is preserved so it still looks like a pre-outage packet.
+        let p = space.send_wnd.get_mut(&seq).unwrap().take().unwrap();
+        let mut retransmitted = p.clone();
+        retransmitted.rtxed = true;
+        *space.send_wnd.get_mut(&seq).unwrap() = Some(retransmitted);
+        // Record the loss event for congestion accounting.
+        space
+            .loss_event_window
+            .record_lost(1, now, space.smooth_rtt());
     }
 
     fn ack_up_to(space: &mut PktSendSpace, seq: u64, now: Instant) {
@@ -707,7 +837,7 @@ mod tests {
     fn tail_probe_fires_before_rto_and_respects_budget() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
-        settle_rtt(&mut space);
+        settle_rtt_at(&mut space, t0);
 
         // Send two packets; the second is the tail.
         send_packet(&mut space, t0);
@@ -743,7 +873,7 @@ mod tests {
     fn tail_probe_budget_resets_on_ack_progress_and_new_send() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
-        settle_rtt(&mut space);
+        settle_rtt_at(&mut space, t0);
 
         send_packet(&mut space, t0);
         send_packet(&mut space, t0 + ms(1));
@@ -777,5 +907,96 @@ mod tests {
         ack_up_to(&mut space, 0, t0 + ms(1));
         assert!(!space.has_tail_probe(t0 + ms(900)));
         assert!(space.tail_probe(t0 + ms(900)).is_none());
+    }
+
+    #[test]
+    fn outage_recovery_resets_state_and_censors_stale_samples() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Send 3 packets in flight and mark one as lost so the epoch has a loss
+        // event to trigger on.
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        lose_packet(&mut space, 1, t0 + ms(50));
+
+        // Advance at least one RTO past the last send so the epoch can be detected.
+        let detect_at = t0 + space.rto_duration() + ms(1);
+        assert!(space.detect_outage_recovery(detect_at));
+        assert!(space.in_outage_recovery());
+        // Recovery starts by clamping cwnd to INIT_CWND once set_send_rate is
+        // recomputed with the epoch active.
+        space.set_send_rate(PosR::new(crate::reliable_layer::INIT_SEND_RATE).unwrap());
+        assert_eq!(space.cwnd().get(), INIT_CWND);
+        // RTO is reset to the prior RTO value (acts as the seed).
+        let seed_rto = space.rto_duration();
+
+        // The unacked pre-outage packets are now immediately eligible for rtx
+        // and are not counted as congestion losses.
+        let rtx = space.rtx(t0 + ms(600)).unwrap();
+        assert_eq!(rtx.seq, 0);
+        let after_rtx = space.loss_event_rate(t0 + ms(600));
+        assert!(
+            after_rtx.is_none() || after_rtx.unwrap() == 0.0,
+            "pre-outage loss should not count"
+        );
+
+        // A stale RTT sample (computed sent_at would be before recovery_start)
+        // is ignored and the epoch stays open.
+        space.sample_rtt(ms(300), detect_at + ms(100));
+        assert!(space.in_outage_recovery());
+        // The stale sample did not shrink the RTO.
+        assert_eq!(space.rto_duration(), seed_rto);
+
+        // A fresh post-outage sample (sent_at after recovery_start) ends the
+        // epoch and seeds sRTT.  It must be measured at or after recovery_start
+        // + rtt so the computed original send time is within the post-outage
+        // window.
+        let fresh = detect_at + ms(300);
+        space.sample_rtt(ms(200), fresh);
+        assert!(!space.in_outage_recovery());
+        assert_eq!(space.smooth_rtt(), ms(200));
+        // CWND is no longer forced to INIT_CWND; set_send_rate recomputes it.
+        let _ = space.set_send_rate(PosR::new(128.0).unwrap());
+        assert!(space.cwnd().get() >= INIT_CWND);
+    }
+
+    #[test]
+    fn outage_recovery_clamps_cwnd_until_fresh_sample() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Establish a large cwnd by setting a high send rate.
+        space.set_send_rate(PosR::new(1_000_000.0).unwrap());
+        let large_cwnd = space.cwnd().get();
+        assert!(large_cwnd > INIT_CWND, "cwnd={large_cwnd}");
+
+        // Trigger outage recovery: mark the packet as lost so a loss event exists.
+        send_packet(&mut space, t0);
+        lose_packet(&mut space, 0, t0 + ms(50));
+        let detect_at = t0 + space.rto_duration() + ms(1);
+        assert!(space.detect_outage_recovery(detect_at));
+        space.set_send_rate(PosR::new(crate::reliable_layer::INIT_SEND_RATE).unwrap());
+        assert_eq!(
+            space.cwnd().get(),
+            INIT_CWND,
+            "cwnd should clamp to INIT_CWND"
+        );
+
+        // After a fresh sample, cwnd returns to the rate-based formula using the
+        // newly seeded sRTT (200 ms), not the pre-outage 100 ms baseline.
+        space.sample_rtt(ms(200), detect_at + ms(300));
+        assert!(!space.in_outage_recovery());
+        space.set_send_rate(PosR::new(1_000_000.0).unwrap());
+        let expected_cwnd =
+            (ms(200).as_secs_f64() * 1_000_000.0).round() as usize * CWND_SEND_RATE_SCALE;
+        assert_eq!(
+            space.cwnd().get(),
+            expected_cwnd,
+            "cwnd should recompute with fresh sRTT"
+        );
     }
 }

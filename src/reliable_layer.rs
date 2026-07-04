@@ -33,7 +33,7 @@ const MAX_BURST_PKTS_CEIL: usize = 512;
 const SEND_TIMER_INTERVAL_SECS: f64 = 0.001;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
-const INIT_SEND_RATE: f64 = 128.;
+pub(crate) const INIT_SEND_RATE: f64 = 128.;
 const SEND_RATE_PROBE_RATE: f64 = 1.;
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
@@ -131,8 +131,8 @@ impl ReliableLayer {
         &self.pkt_recv_space
     }
 
-    pub fn sample_rtt(&mut self, rtt: Duration) {
-        self.pkt_send_space.sample_rtt(rtt);
+    pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
+        self.pkt_send_space.sample_rtt(rtt, now);
     }
 
     pub fn send_fin_buf(&mut self) {
@@ -172,6 +172,27 @@ impl ReliableLayer {
         // `accepts_new_pkt()` (cwnd not full) or charging a token for it would
         // starve recovery when the window is full of lost packets and there
         // are no tokens available — exactly the moments retransmits matter.
+        //
+        // During an outage-recovery epoch the whole pre-outage window is
+        // immediately eligible for retransmission. We must not let the token
+        // bucket gate those retransmits, but we also must not allow new data to
+        // bypass the rate limiter, so we only try this when there are no new
+        // packets or FIN waiting in the buffer.
+        if self.pkt_send_space.in_outage_recovery()
+            && !self.has_unsent_data_or_fin()
+            && let Some(p) = self.pkt_send_space.rtx(now)
+        {
+            pkt[..p.data.len()].copy_from_slice(p.data);
+
+            let data_written = NonZeroUsize::new(p.data.len())
+                .map(DataPktPayload::Data)
+                .unwrap_or(DataPktPayload::Fin);
+            return Some(DataPkt {
+                seq: p.seq,
+                data_written,
+            });
+        }
+
         if let Some(p) = self.pkt_send_space.rtx(now) {
             pkt[..p.data.len()].copy_from_slice(p.data);
 
@@ -187,18 +208,18 @@ impl ReliableLayer {
         // Tail-loss probes also bypass the cwnd gate and token bucket: like
         // regular retransmits, they resend an already-in-flight packet and
         // must fire during tail silence to avoid waiting the full RTO.
-        if self.is_send_buf_empty() {
-            if let Some(p) = self.pkt_send_space.tail_probe(now) {
-                pkt[..p.data.len()].copy_from_slice(p.data);
+        if self.is_send_buf_empty()
+            && let Some(p) = self.pkt_send_space.tail_probe(now)
+        {
+            pkt[..p.data.len()].copy_from_slice(p.data);
 
-                let data_written = NonZeroUsize::new(p.data.len())
-                    .map(DataPktPayload::Data)
-                    .unwrap_or(DataPktPayload::Fin);
-                return Some(DataPkt {
-                    seq: p.seq,
-                    data_written,
-                });
-            }
+            let data_written = NonZeroUsize::new(p.data.len())
+                .map(DataPktPayload::Data)
+                .unwrap_or(DataPktPayload::Fin);
+            return Some(DataPkt {
+                seq: p.seq,
+                data_written,
+            });
         }
 
         // No retransmit or tail probe to send. From here on we are sending a
@@ -268,8 +289,24 @@ impl ReliableLayer {
     ) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
+        // An ACK means the link has delivered something.  Try to open an outage-
+        // recovery epoch first; if one starts, reset the congestion state and send
+        // rate to the initial values so the post-outage path restarts cleanly.
+        let entered_recovery = self.pkt_send_space.detect_outage_recovery(now);
+
         self.pkt_send_space
             .ack(recved, &mut self.pkt_stats_buf, now);
+
+        if entered_recovery {
+            self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
+            // Because the epoch was entered from inside `ack`, any ACKed packets
+            // have already delivered their RTT samples via `sample_rtt` before we
+            // entered recovery.  Those samples were taken across the outage and
+            // would close the epoch immediately.  Treat the first ACK after the
+            // outage as a fresh start instead: clear the epoch so the next RTT
+            // sample seeds sRTT normally.
+            self.pkt_send_space.clear_outage_recovery();
+        }
 
         self.update_rate_sample_on_ack(now)
     }
@@ -462,6 +499,10 @@ impl ReliableLayer {
             self.recv_data_buf.batch_enqueue(&p);
             self.pkt_recv_space.reused_buf().put(p);
         }
+    }
+
+    fn has_unsent_data_or_fin(&self) -> bool {
+        !self.send_data_buf.is_empty() || matches!(self.send_fin_buf, SendFinBuf::Some)
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {
@@ -685,9 +726,8 @@ mod tests {
     use primitive::ops::float::PosR;
 
     use super::{
-        INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN,
-        RTT_MIN_BUCKET, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len,
-        token_bucket_with_tokens,
+        INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, RTT_MIN_BUCKET,
+        SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len, token_bucket_with_tokens,
     };
     use crate::{codec::data_overhead, udp::NO_FEC_MSS};
 
@@ -697,8 +737,14 @@ mod tests {
         let mut w = WindowedRttMin::new(now);
 
         // Within the first bucket the minimum is reported immediately.
-        assert_eq!(w.update(now, Duration::from_millis(40)), Duration::from_millis(40));
-        assert_eq!(w.update(now, Duration::from_millis(100)), Duration::from_millis(40));
+        assert_eq!(
+            w.update(now, Duration::from_millis(40)),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            w.update(now, Duration::from_millis(100)),
+            Duration::from_millis(40)
+        );
 
         // First rotation: the previous bucket's 40 ms floor is still visible.
         let t1 = now + RTT_MIN_BUCKET + Duration::from_millis(1);

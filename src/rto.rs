@@ -51,6 +51,15 @@ impl RtxTimer {
         Duration::from_secs_f64(rto).max(Self::MIN_RTO)
     }
 
+    /// Reset the SRTT filter to a fixed value, keeping the same RTO calculation.
+    ///
+    /// Used when starting an outage-recovery epoch: the first post-outage RTT
+    /// sample should seed the congestion state as if the connection were fresh.
+    pub fn reset_to(&mut self, rtt: Duration) {
+        self.first_measured = false;
+        self.set(rtt);
+    }
+
     /// Reordering window used by the fast-retransmit path.
     ///
     /// RACK-style: `srtt + max(K * rttvar, srtt / 4)`, capped at the full RTO.
