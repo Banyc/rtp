@@ -70,6 +70,12 @@ const DRAIN_RATE_FRACTION: f64 = 0.85;
 /// pin a low-rate incumbent, and floored at MIN_SEND_RATE.
 const DRAIN_FLOOR_PEAK_FRACTION: f64 = 0.25;
 
+/// Grace period, in control RTTs, before a continuously binding drain floor
+/// starts to decay.  This prevents transient capacity dips from collapsing the
+/// floor, while allowing a genuine long-term capacity drop to drain past a
+/// stale windowed peak.
+const DRAIN_FLOOR_GRACE_RTTS: f64 = 3.0;
+
 /// Window over which the delivery-rate peak is tracked.
 ///
 /// Twice RTT_MIN_BUCKET so the peak reflects the recent steady state but ages
@@ -90,6 +96,12 @@ const GENTLE_DRAIN_CHECK_RTTS: f64 = 12.0;
 const GENTLE_DRAIN_GAP_SHRINK: f64 = 0.85;
 const GENTLE_ENTER_RTTVAR_FACTOR: f64 = 2.0;
 const GENTLE_REENTRY_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Multiplier for the gentle-mode re-entry cooldown on high-RTT paths.
+///
+/// The cooldown is the larger of the fixed 15 s floor and 25 control RTTs so
+/// that 600 ms+ links are not majority-gentle.
+const GENTLE_REENTRY_COOLDOWN_RTTS: f64 = 25.0;
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
@@ -123,8 +135,17 @@ pub struct ReliableLayer {
     draining: bool,
     queue_since: Option<Instant>,
     gentle_mode: bool,
-    drain_gap0: Option<(Instant, Duration)>,
+    drain_episode: Option<DrainEpisode>,
     gentle_block_until: Option<Instant>,
+
+    /// How long the drain floor has been continuously binding while the queue
+    /// builds.  Used to decay a stale peak delivery-rate floor after a genuine
+    /// capacity drop.
+    drain_floor_binding_since: Option<Instant>,
+
+    /// How long the delay gate has been continuously open in gentle mode.  Used
+    /// to exit gentle mode on a clean link once the queue has stayed drained.
+    gentle_gate_open_since: Option<Instant>,
 
     // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
@@ -161,8 +182,10 @@ impl ReliableLayer {
             draining: false,
             queue_since: None,
             gentle_mode: false,
-            drain_gap0: None,
+            drain_episode: None,
             gentle_block_until: None,
+            drain_floor_binding_since: None,
+            gentle_gate_open_since: None,
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
@@ -364,8 +387,10 @@ impl ReliableLayer {
             self.draining = false;
             self.queue_since = None;
             self.gentle_mode = false;
-            self.drain_gap0 = None;
+            self.drain_episode = None;
             self.gentle_block_until = None;
+            self.drain_floor_binding_since = None;
+            self.gentle_gate_open_since = None;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
         }
 
@@ -467,11 +492,14 @@ impl ReliableLayer {
 
         // Loss exit: high loss must leave gentle mode immediately so a hostile
         // link does not collapse throughput while stuck in the gentle guard.
+        // The drain-episode guard clock is intentionally NOT reset here: a brief
+        // high-loss blip during an otherwise effective gentle drain must not
+        // restart the gap-shrinking measurement.
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
         if self.gentle_mode && loss_event_rate.is_some_and(|lr| lr >= GENTLE_EXIT_LOSS) {
             self.gentle_mode = false;
             self.queue_since = None;
-            self.drain_gap0 = None;
+            self.gentle_gate_open_since = None;
         }
 
         // Enter gentle mode after a sustained low-loss queue-building stretch.
@@ -491,7 +519,7 @@ impl ReliableLayer {
         {
             self.gentle_mode = true;
             self.draining = false;
-            self.drain_gap0 = None;
+            self.drain_episode = None;
         }
 
         // Gate hysteresis: while actively draining in gentle mode, reopen the
@@ -517,22 +545,39 @@ impl ReliableLayer {
             }
         }
 
-        // ----- Gentle-mode probe branch --------------------------------------
+        // ----- Gate-open / probe branch ---------------------------------------
         // When gentle and the queue is gone, probe gently upward instead of the
-        // normal aggressive probe.  This is the only place we reset the drain-
-        // effectiveness guard clock, because a fresh episode must not inherit
-        // a stale gap measurement.
+        // normal aggressive probe.  A continuously open gate is the only place
+        // we reset the drain guard clocks, so a brief high-loss blip cannot
+        // restart them.
         let should_probe = little_data_loss != Some(false) && !queue_building;
+        if !should_probe {
+            self.gentle_gate_open_since = None;
+        }
+
         if self.gentle_mode && should_probe {
             self.draining = false;
-            self.drain_gap0 = None;
+            self.drain_episode = None;
+            self.drain_floor_binding_since = None;
 
-            let control_rtt = self.control_rtt();
-            let probed = sr.delivery_rate() * (1. + GENTLE_PROBE_RATE);
-            let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
-            let target = (probed + additive).max(self.send_rate.get());
-            self.set_smooth_send_rate(target, now);
-            return;
+            let open_since = self.gentle_gate_open_since.get_or_insert(now);
+            let open_for = now.saturating_duration_since(*open_since);
+            let open_threshold =
+                RTT_MIN_BUCKET.max(smooth.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
+            if open_for >= open_threshold {
+                // The gate has been open long enough on a clean link: leave
+                // gentle mode and let normal probing take over.
+                self.gentle_mode = false;
+                self.queue_since = None;
+                self.gentle_gate_open_since = None;
+            } else {
+                let control_rtt = self.control_rtt();
+                let probed = sr.delivery_rate() * (1. + GENTLE_PROBE_RATE);
+                let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
+                let target = (probed + additive).max(self.send_rate.get());
+                self.set_smooth_send_rate(target, now);
+                return;
+            }
         }
 
         if should_probe {
@@ -551,8 +596,37 @@ impl ReliableLayer {
             } else {
                 DRAIN_RATE_FRACTION
             };
-            let drain_floor =
+            let base =
                 (peak_delivery * DRAIN_FLOOR_PEAK_FRACTION).clamp(MIN_SEND_RATE, INIT_SEND_RATE);
+
+            // Drain-floor decay: if the floor keeps binding while the queue
+            // builds, the windowed delivery peak is probably stale (the path
+            // capacity has dropped).  Decay the floor exponentially after a grace
+            // period so the delay gate can actually drain the standing queue.
+            let binding = sr.delivery_rate() * drain_frac < base;
+            if binding {
+                self.drain_floor_binding_since.get_or_insert(now);
+            } else {
+                self.drain_floor_binding_since = None;
+            }
+            let binding_for = self
+                .drain_floor_binding_since
+                .map(|s| now.saturating_duration_since(s));
+            let closed_for = self.queue_since.map(|s| now.saturating_duration_since(s));
+            let pinned_for = binding_for.zip(closed_for).map(|(b, c)| b.min(c));
+            let grace = control_rtt.mul_f64(DRAIN_FLOOR_GRACE_RTTS);
+            let drain_floor =
+                if loss_event_rate.is_none() || pinned_for.is_none_or(|pinned| pinned <= grace) {
+                    // Blind (not enough loss samples) or not-yet-pinned flows keep
+                    // the full floor so a squeezed small incumbent is not drained dry.
+                    base
+                } else {
+                    let pinned = pinned_for.unwrap();
+                    let excess_rtts =
+                        (pinned.as_secs_f64() - grace.as_secs_f64()) / control_rtt.as_secs_f64();
+                    (base * 0.5f64.powf(excess_rtts)).max(MIN_SEND_RATE)
+                };
+
             let target = (sr.delivery_rate() * drain_frac)
                 .max(drain_floor)
                 .min(current)
@@ -568,19 +642,30 @@ impl ReliableLayer {
 
             if self.gentle_mode {
                 self.draining = true;
-                let gap = smooth.saturating_sub(floor);
-                let (t0, gap0) = self.drain_gap0.get_or_insert((now, gap));
-                if now.saturating_duration_since(*t0)
+                let episode = self.drain_episode.get_or_insert(DrainEpisode {
+                    start: now,
+                    floor0: floor,
+                    gap0: smooth.saturating_sub(floor),
+                });
+                // Compare against the snapshot floor taken at episode start, not
+                // the live floor, so a ratcheting rtt_floor cannot fake gap
+                // shrinkage and make an effective drain look ineffective.
+                let gap = smooth.saturating_sub(episode.floor0);
+                if now.saturating_duration_since(episode.start)
                     >= control_rtt.mul_f64(GENTLE_DRAIN_CHECK_RTTS)
-                    && gap > gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK)
+                    && gap > episode.gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK)
                 {
                     // Drain is ineffective; exit gentle mode and block
                     // re-entry for a cooldown.
                     self.gentle_mode = false;
                     self.draining = false;
                     self.queue_since = None;
-                    self.drain_gap0 = None;
-                    self.gentle_block_until = Some(now + GENTLE_REENTRY_COOLDOWN);
+                    self.drain_episode = None;
+                    self.gentle_gate_open_since = None;
+                    self.gentle_block_until = Some(
+                        now + GENTLE_REENTRY_COOLDOWN
+                            .max(control_rtt.mul_f64(GENTLE_REENTRY_COOLDOWN_RTTS)),
+                    );
                 }
             }
             return;
@@ -841,6 +926,19 @@ impl ReliableLayer {
     }
 }
 
+/// Snapshot of a single gentle-mode drain episode.
+///
+/// The guard records the RTT floor and queue gap at the start of the episode
+/// and compares later gaps against that snapshot, rather than against the live
+/// floor.  This prevents a smoothly-ratcheting floor from racing ahead of the
+/// guard and making an effective drain look ineffective.
+#[derive(Debug, Clone)]
+struct DrainEpisode {
+    start: Instant,
+    floor0: Duration,
+    gap0: Duration,
+}
+
 /// Maximum of a sliding window of delivery-rate samples.
 ///
 /// Mirrors WindowedRttMin but keeps the peak instead of the minimum. The peak
@@ -992,8 +1090,10 @@ mod tests {
     };
 
     use super::{
+        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS,
         INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, RTT_MIN_BUCKET,
-        SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len, token_bucket_with_tokens,
+        RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len,
+        token_bucket_with_tokens,
     };
 
     const TEST_MSS: usize = 1200;
@@ -1200,6 +1300,42 @@ mod tests {
         rl.recv_ack_pkt(AckBallSequence::new(&acks), now);
     }
 
+    fn send_one(rl: &mut super::ReliableLayer, now: Instant) -> u64 {
+        let payload = vec![0u8; 100];
+        let mut pkt = vec![0u8; TEST_MSS];
+        assert_eq!(
+            rl.send_data_buf(&payload, now),
+            payload.len(),
+            "send_data_buf must accept the 100-byte payload"
+        );
+        let p = rl
+            .send_data_pkt(&mut pkt, now)
+            .expect("send_data_pkt must send");
+        match p.data_written {
+            super::DataPktPayload::Data(_) => p.seq,
+            _ => panic!("expected data packet"),
+        }
+    }
+
+    fn ack_seq(rl: &mut super::ReliableLayer, seq: u64, rtt: Duration, now: Instant) {
+        rl.sample_rtt(rtt, now);
+        let acks = [AckBall {
+            start: seq,
+            size: NonZeroU64::new(1).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), now);
+    }
+
+    /// Feed `count` identical RTT samples in rapid succession to converge the
+    /// SRTT filter.  This lets tests establish a stable high RTT while the
+    /// WindowedRttMin bucket is still the warm-up floor.
+    fn feed_rtt(rl: &mut super::ReliableLayer, count: usize, rtt: Duration, start: Instant) {
+        for i in 0..count {
+            let t = start + Duration::from_micros(i as u64 * 100);
+            rl.sample_rtt(rtt, t);
+        }
+    }
+
     #[test]
     fn burst_pkts_scales_with_send_rate() {
         let low = PosR::new(INIT_SEND_RATE).unwrap();
@@ -1289,6 +1425,274 @@ mod tests {
         assert!(
             (final_rate - INIT_SEND_RATE).abs() < 1e-9,
             "outage restore should restart at exactly INIT_SEND_RATE, got {final_rate}"
+        );
+    }
+
+    #[test]
+    fn capacity_drop_drain_follows_delivery_past_stale_peak_floor() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let mut t = t0;
+
+        // Warm up at high rate so the delivery peak is large and the drain floor
+        // clamps at INIT_SEND_RATE.
+        for _ in 0..20 {
+            send_max(&mut rl, t);
+            t += Duration::from_millis(40);
+            ack_all(&mut rl, Some(Duration::from_millis(40)), t);
+        }
+        let warm_rate = rl.log().send_rate;
+        assert!(
+            warm_rate > INIT_SEND_RATE,
+            "warm-up rate must exceed INIT_SEND_RATE, got {warm_rate}"
+        );
+        let peak = rl.delivery_peak.update(t, 0.0);
+        assert!(
+            peak * DRAIN_FLOOR_PEAK_FRACTION > INIT_SEND_RATE,
+            "windowed peak must push the base floor to the INIT_SEND_RATE cap"
+        );
+
+        // Capacity drops: send long-RTT bursts so the delivery rate collapses,
+        // the delay gate opens, and the drain floor starts binding.  Inject a
+        // low-rate loss event so loss_event_rate is measured and the decay grace
+        // can expire; without this the blind-flow rule keeps the full floor.
+        let drop_t = t + Duration::from_millis(1);
+        rl.pkt_send_space.inject_loss_event(drop_t);
+        for i in 0..20 {
+            let send_t = drop_t + Duration::from_millis(1200) * i;
+            send_burst(&mut rl, 20, send_t);
+            t = send_t + Duration::from_millis(1200);
+            ack_all(&mut rl, Some(Duration::from_millis(1200)), t);
+        }
+
+        // After the decay grace, the send rate must have drained below the stale
+        // INIT_SEND_RATE floor and be trending toward the new low delivery rate.
+        let final_rate = rl.log().send_rate;
+        assert!(
+            final_rate < INIT_SEND_RATE,
+            "stale peak floor must decay so rate can drain below INIT_SEND_RATE, got {final_rate}"
+        );
+    }
+
+    #[test]
+    fn gentle_drain_guard_survives_rtt_floor_ratchet_and_scales_cooldown() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+
+        // Settle the RTT floor around 600 ms by feeding long-RTT samples.
+        let mut t = t0;
+        for _ in 0..8 {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(700);
+            ack_seq(&mut rl, seq, Duration::from_millis(600), t);
+        }
+        assert!(
+            rl.pkt_send_space.smooth_rtt() >= Duration::from_millis(500),
+            "sRTT must settle high, got {:?}",
+            rl.pkt_send_space.smooth_rtt()
+        );
+
+        // Quickly converge SRTT to 1 s while the snapshot window is still the
+        // warm-up 600 ms floor, then keep the queue building at a normal pace
+        // until gentle mode enters.  The floor will not ratchet for at least 5 s.
+        feed_rtt(&mut rl, 20, Duration::from_millis(1000), t);
+        t += Duration::from_millis(1);
+        let enter_start = t;
+        loop {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(1100);
+            ack_seq(&mut rl, seq, Duration::from_millis(1000), t);
+            if rl.gentle_mode {
+                break;
+            }
+            assert!(
+                t < enter_start + Duration::from_secs(6),
+                "gentle mode must enter within a few seconds"
+            );
+        }
+        let episode = rl.drain_episode.clone().expect("drain episode must exist");
+        assert!(
+            episode.floor0 <= Duration::from_millis(650),
+            "episode floor snapshot must be taken before the ratchet, got {:?}",
+            episode.floor0
+        );
+        let gap0 = episode.gap0;
+        assert!(gap0 > Duration::ZERO, "initial gap must be positive");
+
+        // Mid-episode, ratchet the live rtt_floor upward by feeding an even higher
+        // RTT.  Without the snapshot the live gap would collapse as the floor
+        // catches up, but the guard compares against floor0, so it still fires.
+        let ratchet_start = t;
+        let mut guard_fired = false;
+        for _ in 0..60 {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(1700);
+            ack_seq(&mut rl, seq, Duration::from_millis(1600), t);
+            if !rl.gentle_mode {
+                guard_fired = true;
+                break;
+            }
+            assert!(
+                t < ratchet_start + Duration::from_secs(70),
+                "guard must fire before the test times out"
+            );
+        }
+        assert!(
+            guard_fired,
+            "gentle drain guard must fire despite rtt_floor ratchet"
+        );
+
+        // The scaled cooldown must dominate the fixed 15 s floor on this path.
+        let control_rtt = rl.control_rtt();
+        let expected_cooldown =
+            GENTLE_REENTRY_COOLDOWN.max(control_rtt.mul_f64(GENTLE_REENTRY_COOLDOWN_RTTS));
+        let block_until = rl.gentle_block_until.expect("cooldown must be set");
+        let cooldown = block_until.saturating_duration_since(t);
+        assert!(
+            cooldown >= expected_cooldown - Duration::from_millis(50),
+            "cooldown must scale with RTT, got {:?} expected {:?}",
+            cooldown,
+            expected_cooldown
+        );
+    }
+
+    #[test]
+    fn gentle_mode_exits_after_full_floor_window_on_clean_link() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let mut t = t0;
+
+        // Warm up and enter gentle mode via a sustained queue-building stretch.
+        // Converge SRTT quickly with a burst of identical high-RTT samples while
+        // the floor is still the warm-up 200 ms value, then sustain the queue.
+        for _ in 0..6 {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(250);
+            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+        }
+        feed_rtt(&mut rl, 20, Duration::from_millis(800), t);
+        t += Duration::from_millis(1);
+        let enter_start = t;
+        loop {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(900);
+            ack_seq(&mut rl, seq, Duration::from_millis(800), t);
+            if rl.gentle_mode {
+                break;
+            }
+            assert!(
+                t < enter_start + Duration::from_secs(6),
+                "gentle mode must enter within a few seconds"
+            );
+        }
+
+        // The link is now clean: RTT drops back to the floor and the gate opens.
+        // Wait until the gate actually opens, then keep it open for the full floor
+        // window (max(5 s, 10 * smooth)) before exiting gentle mode.
+        let clean_start = t;
+        let threshold =
+            RTT_MIN_BUCKET.max(Duration::from_millis(200).saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
+
+        // Wait for the gate to open (queue_building becomes false).
+        let gate_open_start = loop {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(250);
+            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+            if let Some(open_since) = rl.gentle_gate_open_since {
+                break open_since;
+            }
+            assert!(
+                t < clean_start + Duration::from_secs(3),
+                "gate must open after RTT drops"
+            );
+        };
+
+        // Continue on the clean link until gentle mode exits.
+        loop {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(250);
+            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+            if !rl.gentle_mode {
+                break;
+            }
+            assert!(
+                t < gate_open_start + threshold + Duration::from_secs(2),
+                "gentle mode must exit after the floor window"
+            );
+        }
+        let open_for = t.saturating_duration_since(gate_open_start);
+        assert!(
+            open_for >= threshold - Duration::from_millis(100),
+            "gentle mode must stay active until the open threshold elapses, got {:?}",
+            open_for
+        );
+    }
+
+    #[test]
+    fn outage_reset_clears_gentle_reentry_cooldown() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let mut t = t0;
+
+        // Trigger the gentle-mode drain guard to set a re-entry cooldown.
+        // Converge SRTT quickly with a burst of identical high-RTT samples
+        // while the floor is still the warm-up 200 ms value.
+        for _ in 0..6 {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(250);
+            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+        }
+        feed_rtt(&mut rl, 20, Duration::from_millis(800), t);
+        t += Duration::from_millis(1);
+        let enter_start = t;
+        loop {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(900);
+            ack_seq(&mut rl, seq, Duration::from_millis(800), t);
+            if rl.gentle_mode {
+                break;
+            }
+            assert!(
+                t < enter_start + Duration::from_secs(6),
+                "gentle mode must enter"
+            );
+        }
+        let guard_start = t;
+        loop {
+            let seq = send_one(&mut rl, t);
+            t += Duration::from_millis(900);
+            ack_seq(&mut rl, seq, Duration::from_millis(800), t);
+            if !rl.gentle_mode {
+                break;
+            }
+            assert!(t < guard_start + Duration::from_secs(14), "guard must fire");
+        }
+        assert!(
+            rl.gentle_block_until
+                .is_some_and(|u| u > t + Duration::from_secs(10)),
+            "guard must set a long cooldown"
+        );
+
+        // Make forward progress so outage detection is eligible, then let the
+        // next packet stall for two RTOs and trigger an outage reset.
+        let progress_seq = send_one(&mut rl, t);
+        t += Duration::from_millis(50);
+        ack_seq(&mut rl, progress_seq, Duration::from_millis(50), t);
+
+        let stall_seq = send_one(&mut rl, t);
+        let _ = stall_seq;
+        let rto = rl.pkt_send_space.rto_duration();
+        let detect_t = t + rto * 2 + Duration::from_millis(1);
+        let acks = [AckBall {
+            start: 0,
+            size: NonZeroU64::new(progress_seq + 1).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), detect_t);
+
+        // Outage recovery must clear the gentle re-entry cooldown.
+        assert!(
+            rl.gentle_block_until.is_none(),
+            "outage recovery must clear gentle re-entry cooldown"
         );
     }
 }

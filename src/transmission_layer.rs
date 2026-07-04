@@ -627,7 +627,7 @@ impl TransmissionLayer {
             || 0 < recv_pkts.num_fin_segments
             || bufs
                 .last_ack_flush
-                .map_or(true, |last| ACK_FLUSH_AGE <= now.duration_since(last))
+                .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
             || {
                 let reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer
@@ -739,9 +739,7 @@ impl TransmissionLayer {
                 break;
             }
         }
-        if let Err(e) = send_res {
-            return Err(e);
-        }
+        send_res?;
         if PRINT_DEBUG_MSGS {
             println!("recv_pkts: ack: {:?}", bufs.ack_to_peer);
         }

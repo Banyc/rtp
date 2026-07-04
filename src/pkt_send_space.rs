@@ -305,6 +305,7 @@ impl PktSendSpace {
                 considered_new_in_cwnd: _,
                 data: _,
                 rto,
+                rto_from_tail_probe: true,
             };
         }
         Some(Pkt { seq, data: &p.data })
@@ -322,6 +323,7 @@ impl PktSendSpace {
             considered_new_in_cwnd: false,
             data,
             rto: self.rto.rto(),
+            rto_from_tail_probe: false,
         };
 
         self.send_wnd.push(Some(p));
@@ -374,10 +376,12 @@ impl PktSendSpace {
             }
 
             // Count one loss event per packet the first time it is retransmitted,
-            // unless the loss happened before the outage-recovery cut: those losses
-            // are caused by the link going away, not by congestion.
+            // unless the loss happened before the outage-recovery cut (those losses
+            // are caused by the link going away) or the packet was already sent as
+            // a tail-loss probe (the probe itself owns the tail-latency signal).
             let already_rtxed = p.rtxed;
             let pre_outage_loss = !already_rtxed && is_pre_outage_loss;
+            let tail_probe_loss = p.rto_from_tail_probe;
 
             // fresh pkt for this cwnd
             let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
@@ -395,9 +399,10 @@ impl PktSendSpace {
                     considered_new_in_cwnd,
                     data: _,
                     rto: self.rto.rto(),
+                    rto_from_tail_probe: false,
                 };
             }
-            if !already_rtxed && !pre_outage_loss {
+            if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
                 let smooth_rtt = self.rto.smooth_rtt();
                 self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
@@ -596,6 +601,14 @@ impl PktSendSpace {
         self.loss_event_window.rate(now, self.smooth_rtt())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_loss_event(&mut self, now: Instant) {
+        // Test-only: record a single loss event using a 1 ms bucket floor so it
+        // is visible immediately regardless of the current sRTT.
+        self.loss_event_window
+            .record_lost(1, now, Duration::from_millis(1));
+    }
+
     pub fn num_pkts_in_pipe(&self) -> usize {
         self.pkts_in_pipe().count()
     }
@@ -650,6 +663,11 @@ struct TxingPkt {
     pub considered_new_in_cwnd: bool,
     pub data: Vec<u8>,
     pub rto: Duration,
+    /// True only if this packet's RTO was last re-armed by a tail-loss probe
+    /// using the tightened post-probe floor.  A subsequent full-RTO retransmit
+    /// still fires, but it must not record a congestion loss event because the
+    /// probe itself already signalled the tail episode.
+    pub rto_from_tail_probe: bool,
 }
 impl TxingPkt {
     pub fn hits_rto(&self, now: Instant) -> bool {
@@ -1062,7 +1080,7 @@ mod tests {
         );
 
         // CWND is no longer forced to INIT_CWND; set_send_rate recomputes it.
-        let _ = space.set_send_rate(PosR::new(128.0).unwrap());
+        space.set_send_rate(PosR::new(128.0).unwrap());
         assert!(space.cwnd().get() >= INIT_CWND);
     }
 
@@ -1255,6 +1273,85 @@ mod tests {
         assert!(
             space.detect_outage_recovery(t),
             "zero-progress ACKs should not prevent outage detection"
+        );
+    }
+
+    #[test]
+    fn post_tlp_rtx_does_not_arm_spurious_outage_on_delay_spike() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Make forward progress so outage detection is eligible, then send a
+        // new tail packet whose episode we will probe and eventually retransmit.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+
+        // First tail-loss probe fires around 2*srtt (~200 ms) and rearms with
+        // the tightened post-probe RTO floor.
+        let t1 = t0 + ms(210);
+        assert!(space.has_tail_probe(t1), "first probe should be due");
+        let p1 = space.tail_probe(t1).unwrap();
+        assert_eq!(p1.seq, 1);
+
+        // Second probe fires after another PTO window.
+        let t2 = t1 + ms(210);
+        assert!(space.has_tail_probe(t2), "second probe should be due");
+        let p2 = space.tail_probe(t2).unwrap();
+        assert_eq!(p2.seq, 1);
+
+        // Full-RTO retransmit off the lowered floor fires around 300 ms after the
+        // second probe.  It must not record a congestion loss event because the
+        // tail probe already owns the tail-latency signal.
+        let t3 = t2 + ms(330);
+        let rtx = space
+            .rtx(t3)
+            .expect("full RTO should fire after tail probes");
+        assert_eq!(rtx.seq, 1);
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "post-TLP full-RTO rtx must not arm a loss event"
+        );
+
+        // A single RTO of stall is not enough to declare outage because there is
+        // no loss event and the silence has not yet reached 2*RTO.
+        let t4 = t0 + ms(1200);
+        assert!(
+            !space.detect_outage_recovery(t4),
+            "delay spike after tail probes must not trigger spurious outage"
+        );
+
+        // After two RTOs of silence the clean-link path still declares outage.
+        let t5 = t0 + ms(2010);
+        assert!(
+            space.detect_outage_recovery(t5),
+            "genuine long stall should still declare outage"
+        );
+    }
+
+    #[test]
+    fn full_rto_rtx_still_records_loss_event() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Make progress so outage detection is eligible, then let the next packet
+        // time out and retransmit on the full RTO.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+
+        // Wait for the full RTO (1 s floor on steady low-RTT path) and retransmit.
+        let rtx_t = t0 + ms(2) + space.rto_duration() + ms(1);
+        let rtx = space.rtx(rtx_t).expect("RTO should fire");
+        assert_eq!(rtx.seq, 1);
+
+        // A non-tail-probe retransmit must record the loss event for congestion
+        // accounting and outage detection.
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "plain RTO rtx must record a loss event"
         );
     }
 }
