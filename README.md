@@ -15,7 +15,7 @@ A userspace reliable transmission protocol whose congestion window is governed o
   - wireshark dissector: [[wireshark/rtp.dissector.lua]]
 - an async-based I/O-agnostic transmission layer
   - gluing the unreliable layer and the reliable layer together
-  - main entry: [[transmission_layer.rs]]
+  - main entry: [[src/transmission_layer.rs]]
 - a user-facing I/O-agnostic socket wrapper
   - managing opening, closing, timer, async read/write for the transmission layer
   - perk: You are allowed to wait until or check if the send buf is empty!
@@ -29,5 +29,11 @@ A userspace reliable transmission protocol whose congestion window is governed o
 
 ## How to use
 
-- as a high-level socket user: Refer to [[examples]] directory and the test sections in [[src/udp.rs]] and [[src/keyed_udp.rs]].
+Run the test suite:
+
+```bash
+cargo test
+```
+
+- as a high-level socket user: Refer to the [[examples]] directory and the test sections in [[src/udp.rs]] and [[src/keyed_udp.rs]].
 - as a low-level reliable layer user: Refer to the test sections in [[src/socket.rs]].
