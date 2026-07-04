@@ -41,7 +41,13 @@ const PRINT_DEBUG_MSGS: bool = false;
 const LINEAR_BACKOFF: bool = true;
 
 const QUEUE_RTT_FACTOR: f64 = 2.0;
-const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(25);
+// RTT-proportional queue-tolerance term.  Previously this was one full
+// min-RTT (QUEUE_RTT_FACTOR - 1.0 = 1.0).  We now allow only a small fraction
+// of the smoothed floor so rate-capped links stop carrying a permanent
+// standing queue.  Jitter protection remains the separate 2*rtvar term
+// controlled by QUEUE_RTT_FACTOR, not this fraction.
+const QUEUE_TOL_RTT_FRACTION: f64 = 0.25;
+const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(5);
 const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
 const DRAIN_RATE_FRACTION: f64 = 0.85;
 
@@ -361,12 +367,17 @@ impl ReliableLayer {
         }
 
         let smooth = self.pkt_send_space.smooth_rtt();
+        // The floor is fed by a WindowedRttMin over the smoothed RTT, so it can
+        // ratchet upward across consecutive WindowedRttMin buckets (self-
+        // pollution) when the path keeps delivering slower than prior minima.
+        // The raw-min alternative was measured strictly worse, so we keep the
+        // smooth-fed floor and use the 2*rtvar jitter term as the safety margin.
         let floor = self.rtt_floor.update(now, smooth);
         let tol = self
             .pkt_send_space
             .smooth_rtt_var()
             .mul_f64(QUEUE_RTT_FACTOR)
-            .max(floor.mul_f64(QUEUE_RTT_FACTOR - 1.0))
+            .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
             .max(QUEUE_RTT_FLOOR);
         let queue_building = smooth > floor + tol;
 
