@@ -6,16 +6,16 @@ A userspace reliable transmission protocol whose congestion window is governed o
 
 - an async-free reliable layer
   - a piece of pure algorithm
-  - main entry: [[src/reliable_layer.rs]]
-  - send window: [[src/pkt_send_space.rs]]
-  - recv window: [[src/pkt_recv_space.rs]]
+  - main entry: [[src/reliable/reliable_layer.rs]]
+  - send window: [[src/send_queue/pkt_send_space.rs]]
+  - recv window: [[src/recv_queue/pkt_recv_space.rs]]
   - SACK managing: [[src/sack.rs]]
 - a dead simple codec for packet encoding/decoding
   - main entry: [[src/codec.rs]]
   - wireshark dissector: [[wireshark/rtp.dissector.lua]]
 - an async-based I/O-agnostic transmission layer
   - gluing the unreliable layer and the reliable layer together
-  - main entry: [[src/transmission_layer.rs]]
+  - main entry: [[src/transmission/transmission_layer.rs]]
 - a user-facing I/O-agnostic socket wrapper
   - managing opening, closing, timer, async read/write for the transmission layer
   - perk: You are allowed to wait until or check if the send buf is empty!
