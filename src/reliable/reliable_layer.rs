@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::data_overhead,
-    pkt_recv_space::PktRecvSpace,
-    pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
+    recv_queue::pkt_recv_space::PktRecvSpace,
     sack::AckBallSequence,
+    send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
 };
 
 const SEND_DATA_BUF_LEN: usize = 8 * 1024;
@@ -82,9 +82,9 @@ const DRAIN_FLOOR_GRACE_RTTS: f64 = 3.0;
 /// out after idle gaps, mirroring WindowedRttMin.
 const DELIVERY_PEAK_BUCKET: Duration = Duration::from_secs(10);
 
-// Gentle-mode parameters are defined in crate::gentle and re-exported here
+// Gentle-mode parameters are defined in super::gentle and re-exported here
 // so the test imports via `super::` continue to work.
-pub(crate) use crate::gentle::*;
+pub(crate) use super::gentle::*;
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {

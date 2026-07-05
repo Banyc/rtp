@@ -72,6 +72,7 @@ impl GentleMode {
 
     /// Gentle-mode entry preamble: track whether the smoothed RTT is building a
     /// queue above the enter tolerance, check loss-exit, and try to enter.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn preamble(
         &mut self,
         smooth: Duration,
@@ -84,8 +85,8 @@ impl GentleMode {
     ) {
         let enter_tol = rttvar
             .mul_f64(enter_coefficient)
-            .max(floor.mul_f64(crate::reliable_layer::QUEUE_TOL_RTT_FRACTION))
-            .max(crate::reliable_layer::QUEUE_RTT_FLOOR);
+            .max(floor.mul_f64(super::reliable_layer::QUEUE_TOL_RTT_FRACTION))
+            .max(super::reliable_layer::QUEUE_RTT_FLOOR);
 
         let entering = smooth > floor + enter_tol;
         if entering {
@@ -160,8 +161,9 @@ impl GentleMode {
 
         let open_since = self.gentle_gate_open_since.get_or_insert(now);
         let open_for = now.saturating_duration_since(*open_since);
-        let open_threshold = crate::reliable_layer::RTT_MIN_BUCKET
-            .max(smooth_rtt.saturating_mul(crate::reliable_layer::RTT_MIN_BUCKET_RTT_SCALE));
+        let open_threshold = crate::reliable::reliable_layer::RTT_MIN_BUCKET.max(
+            smooth_rtt.saturating_mul(crate::reliable::reliable_layer::RTT_MIN_BUCKET_RTT_SCALE),
+        );
         if open_for >= open_threshold {
             // The gate has been open long enough on a clean link: leave gentle
             // mode and let normal probing take over.
@@ -182,7 +184,7 @@ impl GentleMode {
         if self.gentle_mode {
             GENTLE_DRAIN_FRAC
         } else {
-            crate::reliable_layer::DRAIN_RATE_FRACTION
+            crate::reliable::reliable_layer::DRAIN_RATE_FRACTION
         }
     }
 

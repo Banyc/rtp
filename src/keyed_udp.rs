@@ -9,7 +9,7 @@ use udp_listener::{ConnWrite, Packet, UtpListener};
 
 use crate::{
     socket::{ReadSocket, WriteSocket, socket},
-    transmission_layer::{UnreliableLayer, UnreliableWrite},
+    transmission::transmission_layer::{UnreliableLayer, UnreliableWrite},
     udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss},
 };
 

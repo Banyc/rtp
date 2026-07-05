@@ -9,7 +9,7 @@ use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 use crate::{
     fec::{FecConfig, FecState},
     socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
-    transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
+    transmission::transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
 pub const NO_FEC_MSS: usize = 1424;

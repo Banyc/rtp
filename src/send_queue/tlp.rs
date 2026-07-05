@@ -1,7 +1,7 @@
 use core::time::Duration;
 use std::time::Instant;
 
-use crate::rto::RtxTimer;
+use super::rtt_stats::RttStats;
 
 /// RFC 8985 tail-loss-probe (TLP / PTO) engine.
 ///
@@ -46,30 +46,30 @@ impl TailLossProber {
     /// Before any tail-loss probe has been sent, uses the standard `MIN_RTO`
     /// floor (1 s). After a probe has been sent, tightens to
     /// `TAIL_PROBED_MIN_RTO` (300 ms) so subsequent recovery is faster.
-    pub fn rto(&self, rto: &RtxTimer) -> Duration {
+    pub fn rto(&self, rtt_stats: &RttStats) -> Duration {
         if self.probes_sent == 0 {
-            return rto.rto();
+            return rtt_stats.rto_duration();
         }
-        rto.raw_rto().max(Self::TAIL_PROBED_MIN_RTO)
+        rtt_stats.raw_rto().max(Self::TAIL_PROBED_MIN_RTO)
     }
 
     /// Time between consecutive tail-loss probes for the current tail episode.
     ///
     /// The PTO formula: `max(2*srtt, 2*min_rtt)` with a 10 ms floor, capped at
     /// the RTO currently in use.
-    pub fn probe_window(&self, rto: &RtxTimer, min_rtt: Option<Duration>) -> Duration {
-        let srtt = rto.smooth_rtt();
+    pub fn probe_window(&self, rtt_stats: &RttStats) -> Duration {
+        let srtt = rtt_stats.smooth_rtt();
         let min_tol = Self::MIN_TOL;
         let doubled_srtt = srtt.mul_f64(2.);
-        let min_rtt_doubled = min_rtt.map(|r| r.mul_f64(2.)).unwrap_or(doubled_srtt);
-        let cap = self.rto(rto);
+        let min_rtt_doubled = rtt_stats.min_rtt().map(|r| r.mul_f64(2.)).unwrap_or(doubled_srtt);
+        let cap = self.rto(rtt_stats);
         doubled_srtt.max(min_rtt_doubled).max(min_tol).min(cap)
     }
 
     /// Whether enough time has passed since `sent_time` for a probe to fire.
-    pub fn is_due(&self, sent_time: Instant, rto: &RtxTimer, min_rtt: Option<Duration>, now: Instant) -> bool {
+    pub fn is_due(&self, sent_time: Instant, rtt_stats: &RttStats, now: Instant) -> bool {
         let sent_elapsed = now.duration_since(sent_time);
-        self.probe_window(rto, min_rtt) <= sent_elapsed
+        self.probe_window(rtt_stats) <= sent_elapsed
     }
 
     /// Record that a probe was sent, consuming one budget slot.
@@ -81,13 +81,12 @@ impl TailLossProber {
     pub fn next_probe_time(
         &self,
         sent_time: Instant,
-        rto: &RtxTimer,
-        min_rtt: Option<Duration>,
+        rtt_stats: &RttStats,
     ) -> Option<Instant> {
         if !self.can_probe() {
             return None;
         }
-        Some(sent_time + self.probe_window(rto, min_rtt))
+        Some(sent_time + self.probe_window(rtt_stats))
     }
 
     #[cfg(test)]
@@ -106,7 +105,7 @@ impl Default for TailLossProber {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::rto::RtxTimer;
+    use crate::send_queue::rtt_stats::RttStats;
 
     use super::TailLossProber;
 
@@ -114,28 +113,28 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    fn settled_rto() -> RtxTimer {
-        let mut rto = RtxTimer::new();
+    fn settled_rtt_stats() -> RttStats {
+        let mut stats = RttStats::new();
         for i in 0..20 {
-            rto.set(ms(100 + i));
+            stats.record_rtt(ms(100 + i));
         }
-        rto
+        stats
     }
 
     #[test]
     fn pre_probe_rto_uses_1s_floor() {
-        let rto = settled_rto();
+        let rtt_stats = settled_rtt_stats();
         let tlp = TailLossProber::new();
-        let r = tlp.rto(&rto);
+        let r = tlp.rto(&rtt_stats);
         assert!(r >= Duration::from_secs(1), "r={r:?}");
     }
 
     #[test]
     fn post_probe_rto_uses_300ms_floor() {
-        let rto = settled_rto();
+        let rtt_stats = settled_rtt_stats();
         let mut tlp = TailLossProber::new();
         tlp.sent();
-        let r = tlp.rto(&rto);
+        let r = tlp.rto(&rtt_stats);
         assert!(
             r >= ms(300) && r < ms(500),
             "post-probe RTO should be 300-500ms, got {r:?}"
@@ -144,15 +143,15 @@ mod tests {
 
     #[test]
     fn post_probe_rto_unchanged_on_jittery_link() {
-        let mut rto = RtxTimer::new();
+        let mut stats = RttStats::new();
         for _ in 0..10 {
-            rto.set(ms(100));
-            rto.set(ms(900));
+            stats.record_rtt(ms(100));
+            stats.record_rtt(ms(900));
         }
         let mut tlp = TailLossProber::new();
-        let first = tlp.rto(&rto);
+        let first = tlp.rto(&stats);
         tlp.sent();
-        let post = tlp.rto(&rto);
+        let post = tlp.rto(&stats);
         assert_eq!(
             first, post,
             "jitter-dominated RTO must not change after tail probe"
@@ -161,10 +160,10 @@ mod tests {
 
     #[test]
     fn probe_window_fires_between_2srtt_and_rto() {
-        let rto = settled_rto();
+        let rtt_stats = settled_rtt_stats();
         let tlp = TailLossProber::new();
         let sent = Instant::now();
-        let window = tlp.probe_window(&rto, Some(ms(100)));
+        let window = tlp.probe_window(&rtt_stats);
 
         // 2*srtt ~= 200ms, should be at least that.
         assert!(window >= ms(10), "window={window:?}");
@@ -172,10 +171,10 @@ mod tests {
         assert!(window <= Duration::from_secs(1), "window={window:?}");
 
         let just_before = sent + window - ms(1);
-        assert!(!tlp.is_due(sent, &rto, Some(ms(100)), just_before));
+        assert!(!tlp.is_due(sent, &rtt_stats, just_before));
 
         let just_after = sent + window + ms(1);
-        assert!(tlp.is_due(sent, &rto, Some(ms(100)), just_after));
+        assert!(tlp.is_due(sent, &rtt_stats, just_after));
     }
 
     #[test]
@@ -187,7 +186,7 @@ mod tests {
         tlp.sent();
         assert!(!tlp.can_probe());
         // next_probe_time returns None when budget exhausted
-        assert!(tlp.next_probe_time(Instant::now(), &settled_rto(), Some(ms(100))).is_none());
+        assert!(tlp.next_probe_time(Instant::now(), &settled_rtt_stats()).is_none());
     }
 
     #[test]

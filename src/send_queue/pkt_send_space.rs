@@ -13,11 +13,14 @@ use primitive::{
 };
 
 use crate::{
-    outage::{OutageDetection, OutageEpoch},
-    pkt_recv_space::MAX_NUM_RECVING_PKTS,
-    rto::RtxTimer,
+    recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
     sack::AckBallSequence,
-    tlp::TailLossProber,
+    send_queue::{
+        liveness::PeerLiveness,
+        outage::{OutageDetection, OutageEpoch},
+        rtt_stats::RttStats,
+        tlp::TailLossProber,
+    },
 };
 
 pub const INIT_CWND: usize = 16;
@@ -27,16 +30,8 @@ pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 pub struct PktSendSpace {
     send_wnd: SendWnd<u64, Option<TxingPkt>>,
     num_txing: usize,
-    min_rtt: Option<Duration>,
-    rto: RtxTimer,
     reused_buf: ObjPool<Vec<u8>>,
     cwnd: NonZeroUsize,
-    /// Detect if the peer has died
-    resp_wait_start: Option<Instant>,
-    /// Has any packet ever been acked or have we ever had to wait?
-    ever_progressed: bool,
-    /// Start of the latest interval during which no forward progress was made.
-    progress_wait_start: Option<Instant>,
     out_of_order_seq_end: u64,
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: MinNoneOptCmp<u64>,
@@ -44,8 +39,12 @@ pub struct PktSendSpace {
     /// RFC 8985 tail-loss-probe engine.
     tlp: TailLossProber,
 
-    // outage recovery epoch
+    /// Peer-liveness monitor: progress tracking.
+    liveness: PeerLiveness,
+    /// Outage-recovery epoch state machine.
     outage: OutageEpoch,
+    /// RTT statistics: smoothed RTT, RTO, and lifetime minimum.
+    rtt_stats: RttStats,
 
     // reused buffers
     unacked_buf: Vec<u64>,
@@ -56,32 +55,26 @@ impl PktSendSpace {
         Self {
             send_wnd: SendWnd::new(0),
             num_txing: 0,
-            min_rtt: None,
-            rto: RtxTimer::new(),
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
-            resp_wait_start: None,
             out_of_order_seq_end: 0,
             max_pipe_seq: MinNoneOptCmp(None),
             loss_event_window: LossEventWindow::new(),
             tlp: TailLossProber::new(),
+            liveness: PeerLiveness::new(),
             outage: OutageEpoch::new(),
-            ever_progressed: false,
-            progress_wait_start: None,
+            rtt_stats: RttStats::new(),
             unacked_buf: vec![],
             ack_buf: vec![],
         }
     }
 
-    fn no_progress_for(&self, now: Instant) -> Option<Duration> {
-        Some(now.duration_since(self.progress_wait_start?))
+    pub fn smooth_rtt(&self) -> Duration {
+        self.rtt_stats.smooth_rtt()
     }
 
-    fn update_min_rtt(&mut self, rtt: Duration) {
-        self.min_rtt = Some(match self.min_rtt {
-            Some(min_rtt) => min_rtt.min(rtt),
-            None => rtt,
-        });
+    pub fn smooth_rtt_var(&self) -> Duration {
+        self.rtt_stats.smooth_rtt_var()
     }
 
     fn unacked(
@@ -107,14 +100,6 @@ impl PktSendSpace {
         *self.send_wnd.next().unwrap()
     }
 
-    pub fn smooth_rtt(&self) -> Duration {
-        self.rto.smooth_rtt()
-    }
-
-    pub fn smooth_rtt_var(&self) -> Duration {
-        self.rto.smooth_rtt_var()
-    }
-
     pub fn num_rtxed_pkts(&self) -> usize {
         let mut n = 0;
         for (_, p) in Self::unacked(&self.send_wnd) {
@@ -131,7 +116,12 @@ impl PktSendSpace {
     }
 
     pub fn no_resp_for(&self, now: Instant) -> Option<Duration> {
-        Some(now.duration_since(self.resp_wait_start?))
+        self.liveness.no_resp_for(now)
+    }
+
+    #[cfg(test)]
+    fn no_progress_for(&self, now: Instant) -> Option<Duration> {
+        self.liveness.no_progress_for(now)
     }
 
     pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
@@ -149,8 +139,7 @@ impl PktSendSpace {
         let delivered = self.ack_buf.len();
         if delivered > 0 {
             // Forward progress: we just delivered packets to the peer.
-            self.ever_progressed = true;
-            self.progress_wait_start = None;
+            self.liveness.record_progress();
             self.tlp.reset();
         }
         for &s in &self.ack_buf {
@@ -177,19 +166,10 @@ impl PktSendSpace {
             return;
         }
         if self.send_wnd.is_empty() {
-            self.resp_wait_start = None;
-            self.progress_wait_start = None;
+            self.liveness.reset_waits();
             return;
         }
-        self.resp_wait_start = Some(now);
-        // If we have made progress before and the window is not empty, we are
-        // now waiting for the next round of progress.  If progress_wait_start is
-        // None because the ACK just made progress, this sets it to the end of
-        // this ACK; subsequent zero-progress ACKs will keep resp_wait alive but
-        // will not reset progress_wait_start.
-        if self.ever_progressed && self.progress_wait_start.is_none() {
-            self.progress_wait_start = Some(now);
-        }
+        self.liveness.refresh_waits(now);
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
@@ -197,13 +177,12 @@ impl PktSendSpace {
             return;
         }
         if self.outage.try_close_epoch_with_fresh_sample() {
-            self.update_min_rtt(rtt);
-            self.rto.reset_to(rtt);
+            self.rtt_stats.record_rtt(rtt);
+            self.rtt_stats.reset_rto(rtt);
             return;
         }
 
-        self.update_min_rtt(rtt);
-        self.rto.set(rtt);
+        self.rtt_stats.record_rtt(rtt);
     }
 
     pub fn accepts_new_pkt(&self) -> bool {
@@ -234,7 +213,7 @@ impl PktSendSpace {
         let Some(p) = p.as_ref() else {
             return false;
         };
-        self.tlp.is_due(p.sent_time, &self.rto, self.min_rtt, now)
+        self.tlp.is_due(p.sent_time, &self.rtt_stats, now)
     }
 
     /// Produce a tail-loss probe if it is time for one. The probe retransmits
@@ -246,7 +225,7 @@ impl PktSendSpace {
         }
         let seq = self.tail_seq()?;
         self.tlp.sent();
-        let rto = self.tlp.rto(&self.rto);
+        let rto = self.tlp.rto(&self.rtt_stats);
         let p = self.send_wnd.get_mut(&seq)?.as_mut()?;
 
         // Refresh the timestamp/RTO so the probe is tracked as a fresh packet
@@ -276,23 +255,14 @@ impl PktSendSpace {
             rtxed: false,
             considered_new_in_cwnd: false,
             data,
-            rto: self.rto.rto(),
+            rto: self.rtt_stats.rto_duration(),
             rto_from_tail_probe: false,
         };
 
         self.send_wnd.push(Some(p));
         self.num_txing += 1;
         self.tlp.reset();
-        if self.resp_wait_start.is_none() {
-            self.resp_wait_start = Some(now);
-        }
-        // Sending a new packet does not by itself demonstrate forward progress;
-        // progress is measured by ACK delivery.  However, once we have made prior
-        // progress and are sending into an empty pipe, start the stall clock so a
-        // subsequent outage can be detected.
-        if self.ever_progressed && self.progress_wait_start.is_none() {
-            self.progress_wait_start = Some(now);
-        }
+        self.liveness.on_send(now);
 
         Pkt {
             seq: s,
@@ -310,7 +280,7 @@ impl PktSendSpace {
                 p.is_rtx(
                     is_seq_out_of_order,
                     is_pre_outage_loss,
-                    self.rto.reorder_window(),
+                    self.rtt_stats.reorder_window(),
                     now,
                 )
             })
@@ -318,7 +288,7 @@ impl PktSendSpace {
 
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
-        let reorder_window = self.rto.reorder_window();
+        let reorder_window = self.rtt_stats.reorder_window();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
             let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
@@ -350,12 +320,12 @@ impl PktSendSpace {
                     rtxed: true,
                     considered_new_in_cwnd,
                     data: _,
-                    rto: self.rto.rto(),
+                    rto: self.rtt_stats.rto_duration(),
                     rto_from_tail_probe: false,
                 };
             }
             if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
-                let smooth_rtt = self.rto.smooth_rtt();
+                let smooth_rtt = self.rtt_stats.smooth_rtt();
                 self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
             let p = Pkt {
@@ -368,11 +338,11 @@ impl PktSendSpace {
     }
 
     pub fn min_rtt(&self) -> Option<Duration> {
-        self.min_rtt
+        self.rtt_stats.min_rtt()
     }
 
     pub fn set_send_rate(&mut self, send_rate: PosR<f64>) {
-        let cwnd = self.rto.smooth_rtt().as_secs_f64() * send_rate.get();
+        let cwnd = self.rtt_stats.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * CWND_SEND_RATE_SCALE;
         let cwnd = 1.max(cwnd);
@@ -421,20 +391,20 @@ impl PktSendSpace {
     }
 
     pub fn detect_outage_recovery(&mut self, now: Instant) -> bool {
-        let no_progress_for = self.no_progress_for(now);
-        let rto = self.rto.rto();
+        let no_progress_for = self.liveness.no_progress_for(now);
+        let rto = self.rtt_stats.rto_duration();
         let has_loss_event = self.loss_event_window.raw_has_loss_event();
 
         match self.outage.detect(
             now,
-            self.ever_progressed,
+            self.liveness.ever_progressed(),
             no_progress_for,
             rto,
             has_loss_event,
         ) {
             OutageDetection::NewEpoch => {
-                self.rto.reset_to(rto);
-                self.loss_event_window.reset(now, self.rto.smooth_rtt());
+                self.rtt_stats.reset_rto(rto);
+                self.loss_event_window.reset(now, self.rtt_stats.smooth_rtt());
                 true
             }
             OutageDetection::Rearming => true,
@@ -552,16 +522,17 @@ impl PktSendSpace {
         }
         if let Some(seq) = self.tail_seq()
             && let Some(Some(p)) = self.send_wnd.get(&seq)
+            && let Some(t) = self
+                .tlp
+                .next_probe_time(p.sent_time, &self.rtt_stats)
         {
-            if let Some(t) = self.tlp.next_probe_time(p.sent_time, &self.rto, self.min_rtt) {
-                min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
-            }
+            min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
         }
         min_next_poll_time
     }
 
     pub fn rto_duration(&self) -> Duration {
-        self.rto.rto()
+        self.rtt_stats.rto_duration()
     }
 }
 impl Default for PktSendSpace {
@@ -956,7 +927,7 @@ mod tests {
         assert!(space.in_outage_recovery());
         // Recovery starts by clamping cwnd to INIT_CWND once set_send_rate is
         // recomputed with the epoch active.
-        space.set_send_rate(PosR::new(crate::reliable_layer::INIT_SEND_RATE).unwrap());
+        space.set_send_rate(PosR::new(crate::reliable::reliable_layer::INIT_SEND_RATE).unwrap());
         assert_eq!(space.cwnd().get(), INIT_CWND);
         // RTO is reset to the prior RTO value (acts as the seed).
         let seed_rto = space.rto_duration();
@@ -1030,7 +1001,7 @@ mod tests {
             space.detect_outage_recovery(detect_at),
             "detection should fire; no_progress={no_progress:?}"
         );
-        space.set_send_rate(PosR::new(crate::reliable_layer::INIT_SEND_RATE).unwrap());
+        space.set_send_rate(PosR::new(crate::reliable::reliable_layer::INIT_SEND_RATE).unwrap());
         assert_eq!(
             space.cwnd().get(),
             INIT_CWND,

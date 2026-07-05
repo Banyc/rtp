@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
     fec::FecState,
-    reliable_layer::{ReliableLayer, SharedTokenBucket},
+    reliable::reliable_layer::{ReliableLayer, SharedTokenBucket},
     sack::{AckBall, AckBallSequence},
+    ts_echo::TsEcho,
 };
 
 const PRINT_DEBUG_MSGS: bool = false;
 const FEC_DEBUG: bool = false;
 const MAX_NUM_ACK: usize = 64;
-const MAX_ECHO_RTT: Duration = Duration::from_secs(60);
 const ACK_FLUSH_COUNT: usize = 8;
 const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
@@ -59,7 +59,7 @@ pub struct RecvBufs {
     pub ack_from_peer: Vec<AckBall>,
     pub ack_to_peer: Vec<u64>,
     pub codec_pkts: Vec<Vec<u8>>,
-    echo_ts: Option<u32>,
+    ts_echo: TsEcho,
     pending_acks: usize,
     last_ack_flush: Option<Instant>,
     /// Resume offset for deep ack-history pages. Each flush sends cumulative
@@ -75,7 +75,7 @@ impl RecvBufs {
             ack_from_peer: vec![],
             ack_to_peer: vec![],
             codec_pkts: vec![],
-            echo_ts: None,
+            ts_echo: TsEcho::new(),
             pending_acks: 0,
             last_ack_flush: None,
             ack_page_cursor: MAX_NUM_ACK,
@@ -166,7 +166,7 @@ impl TransmissionLayer {
     fn wire_ts(&self, now: Instant) -> u32 {
         let us = now.duration_since(self.clock_epoch).as_micros();
         // Truncate to u32; the receiver uses wrapping subtraction, so the wrap
-        // every ~71.6 minutes is harmless for RTTs below MAX_ECHO_RTT.
+        // every ~71.6 minutes is harmless for RTTs below the max echo age.
         us as u32
     }
 
@@ -300,11 +300,11 @@ impl TransmissionLayer {
                 break;
             };
             let data_written = match p.data_written {
-                crate::reliable_layer::DataPktPayload::Data(data_written) => {
+                crate::reliable::reliable_layer::DataPktPayload::Data(data_written) => {
                     written_bytes += data_written.get();
                     data_written.get()
                 }
-                crate::reliable_layer::DataPktPayload::Fin => {
+                crate::reliable::reliable_layer::DataPktPayload::Fin => {
                     written_fin = true;
                     0
                 }
@@ -529,9 +529,7 @@ impl TransmissionLayer {
 
                 if let Some(echo_ts) = data.echo_ts {
                     let local_ts = self.wire_ts(now);
-                    let rtt_us = local_ts.wrapping_sub(echo_ts);
-                    let rtt = Duration::from_micros(rtt_us as u64);
-                    if rtt <= MAX_ECHO_RTT {
+                    if let Some(rtt) = TsEcho::rtt_from_echo(local_ts, echo_ts) {
                         self.reliable_layer.lock().unwrap().sample_rtt(rtt, now);
                     }
                 }
@@ -585,7 +583,7 @@ impl TransmissionLayer {
                 if to_ack {
                     bufs.ack_to_peer.push(data.seq);
                     if let Some(send_ts) = data.send_ts {
-                        bufs.echo_ts = Some(send_ts);
+                        bufs.ts_echo.set(send_ts);
                     }
                 } else {
                     end_of_acks = true;
@@ -648,7 +646,7 @@ impl TransmissionLayer {
         // advanced by MAX_NUM_ACK on each flush so the deep page rotates across
         // the history, while page 0 always carries the latest cumulative acks
         // (and the only echo_ts so each RTT sample is reflected once).
-        let mut echo_ts = bufs.echo_ts.take();
+        let mut echo_ts = bufs.ts_echo.take();
         let mut page_0 = true;
         let mut send_res: Result<(), (std::io::ErrorKind, SendKillPkt)> = Ok(());
         let fec_enabled = self.fec.is_some();
