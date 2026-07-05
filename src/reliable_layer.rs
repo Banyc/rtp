@@ -480,7 +480,7 @@ impl ReliableLayer {
         let enter_tol = self
             .pkt_send_space
             .smooth_rtt_var()
-            .mul_f64(GENTLE_ENTER_RTTVAR_FACTOR)
+            .mul_f64(QUEUE_RTT_FACTOR * GENTLE_ENTER_RTTVAR_FACTOR)
             .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
             .max(QUEUE_RTT_FLOOR);
         let entering = smooth > floor + enter_tol;
@@ -1090,10 +1090,11 @@ mod tests {
     };
 
     use super::{
-        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS,
-        INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN, RTT_MIN_BUCKET,
-        RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len,
-        token_bucket_with_tokens,
+        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_ENTER_RTTS, GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN,
+        GENTLE_REENTRY_COOLDOWN_RTTS, INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL,
+        MAX_SEND_DATA_BUF_LEN, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
+        RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts,
+        send_data_buf_len, token_bucket_with_tokens,
     };
 
     const TEST_MSS: usize = 1200;
@@ -1694,6 +1695,82 @@ mod tests {
             rl.gentle_block_until.is_none(),
             "outage recovery must clear gentle re-entry cooldown"
         );
+    }
+
+    #[test]
+    fn high_jitter_without_standing_queue_stays_out_of_gentle_mode() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let mut t = t0;
+
+        let prime_rtt = Duration::from_millis(100);
+        for _ in 0..4 {
+            let seq = send_one(&mut rl, t);
+            t += prime_rtt;
+            ack_seq(&mut rl, seq, prime_rtt, t);
+        }
+        assert!(
+            rl.pkt_send_space().smooth_rtt() <= Duration::from_millis(120),
+            "primed smooth RTT must be ~100 ms, got {:?}",
+            rl.pkt_send_space().smooth_rtt()
+        );
+
+        let rtt_lo = Duration::from_millis(200);
+        let rtt_hi = Duration::from_millis(300);
+        let target_smooth = Duration::from_millis(250);
+        for i in 0..48 {
+            let rtt = if i % 2 == 0 { rtt_lo } else { rtt_hi };
+            rl.sample_rtt(rtt, t);
+            t += Duration::from_micros(100);
+        }
+
+        {
+            let seq = send_one(&mut rl, t);
+            t += rtt_hi;
+            ack_seq(&mut rl, seq, rtt_hi, t);
+        }
+
+        let smooth = rl.pkt_send_space().smooth_rtt();
+        let rttvar = rl.pkt_send_space().smooth_rtt_var();
+        let floor_est = prime_rtt;
+        let tol = rttvar
+            .mul_f64(QUEUE_RTT_FACTOR)
+            .max(floor_est.mul_f64(QUEUE_TOL_RTT_FRACTION))
+            .max(QUEUE_RTT_FLOOR);
+        let enter_tol = rttvar
+            .mul_f64(QUEUE_RTT_FACTOR * GENTLE_ENTER_RTTVAR_FACTOR)
+            .max(floor_est.mul_f64(QUEUE_TOL_RTT_FRACTION))
+            .max(QUEUE_RTT_FLOOR);
+        let gap = smooth.saturating_sub(floor_est);
+
+        let margin_above_tol = gap.saturating_sub(tol);
+        let margin_below_enter = enter_tol.saturating_sub(gap);
+        assert!(
+            margin_above_tol >= Duration::from_millis(40),
+            "gap {gap:?} must exceed tol {tol:?} by >= 40 ms, margin {margin_above_tol:?}"
+        );
+        assert!(
+            margin_below_enter >= Duration::from_millis(40),
+            "enter_tol {enter_tol:?} must exceed gap {gap:?} by >= 40 ms, margin {margin_below_enter:?}"
+        );
+
+        let sustain_rtts = GENTLE_ENTER_RTTS * 2.0 + 1.0;
+        let sustain_until = t + target_smooth.mul_f64(sustain_rtts);
+        let rtts = [rtt_lo, rtt_hi];
+        let mut sample_idx = 0;
+        while t < sustain_until {
+            let rtt = rtts[sample_idx % 2];
+            sample_idx += 1;
+            let seq = send_one(&mut rl, t);
+            t += rtt;
+            ack_seq(&mut rl, seq, rtt, t);
+            assert!(
+                !rl.gentle_mode,
+                "gentle_mode must stay false at sample {} (t={:?})",
+                sample_idx,
+                t.saturating_duration_since(t0)
+            );
+        }
     }
 }
 
