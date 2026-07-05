@@ -177,8 +177,7 @@ impl PktSendSpace {
             return;
         }
         if self.outage.try_close_epoch_with_fresh_sample() {
-            self.rtt_stats.record_rtt(rtt);
-            self.rtt_stats.reset_rto(rtt);
+            self.rtt_stats.record_min_and_reseed_rto(rtt);
             return;
         }
 

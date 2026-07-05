@@ -27,6 +27,19 @@ impl RttStats {
         });
     }
 
+    /// Record the lifetime minimum and re-seed the SRTT filter from scratch.
+    ///
+    /// Used when an outage-recovery epoch closes: the fresh post-outage RTT
+    /// reflects a new network state, so we must not merge it with the stale
+    /// pre-outage EWMA via `record_rtt`.
+    pub(crate) fn record_min_and_reseed_rto(&mut self, rtt: Duration) {
+        self.min_rtt = Some(match self.min_rtt {
+            Some(m) => m.min(rtt),
+            None => rtt,
+        });
+        self.rto.reset_to(rtt);
+    }
+
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
         self.min_rtt
     }
