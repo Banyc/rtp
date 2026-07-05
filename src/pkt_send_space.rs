@@ -603,10 +603,12 @@ impl PktSendSpace {
 
     #[cfg(test)]
     pub(crate) fn inject_loss_event(&mut self, now: Instant) {
-        // Test-only: record a single loss event using a 1 ms bucket floor so it
-        // is visible immediately regardless of the current sRTT.
+        // Use the current smooth-RTT bucket so the loss entry does not age out
+        // before the next round of deliveries can accumulate.  A 1 ms bucket
+        // causes a ≥2-bucket gap on the very next ack when sRTT ≫ 2 ms,
+        // resetting the entire loss window and making loss_event_rate always None.
         self.loss_event_window
-            .record_lost(1, now, Duration::from_millis(1));
+            .record_lost(1, now, self.smooth_rtt());
     }
 
     pub fn num_pkts_in_pipe(&self) -> usize {

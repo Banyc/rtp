@@ -1090,7 +1090,7 @@ mod tests {
     };
 
     use super::{
-        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_ENTER_RTTS, GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN,
+        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN,
         GENTLE_REENTRY_COOLDOWN_RTTS, INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL,
         MAX_SEND_DATA_BUF_LEN, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
         RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts,
@@ -1337,6 +1337,36 @@ mod tests {
         }
     }
 
+    fn try_send(rl: &mut super::ReliableLayer, n: usize, now: Instant) -> usize {
+        let payload_len = rl.max_data_size_per_pkt();
+        let payload = vec![0u8; payload_len];
+        let mut pkt = vec![0u8; TEST_MSS];
+        let mut sent = 0;
+        for _ in 0..n {
+            let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
+            if free >= payload_len {
+                rl.send_data_buf(&payload, now);
+            }
+            if rl.send_data_pkt(&mut pkt, now).is_none() {
+                break;
+            }
+            sent += 1;
+        }
+        sent
+    }
+
+    fn ack_prefix(rl: &mut super::ReliableLayer, hi: u64, rtt: Duration, now: Instant) -> bool {
+        if hi == 0 {
+            return false;
+        }
+        rl.sample_rtt(rtt, now);
+        let acks = [AckBall {
+            start: 0,
+            size: NonZeroU64::new(hi).unwrap(),
+        }];
+        rl.recv_ack_pkt(AckBallSequence::new(&acks), now).is_some()
+    }
+
     #[test]
     fn burst_pkts_scales_with_send_rate() {
         let low = PosR::new(INIT_SEND_RATE).unwrap();
@@ -1435,43 +1465,68 @@ mod tests {
         let mut rl = test_layer(t0);
         let mut t = t0;
 
-        // Warm up at high rate so the delivery peak is large and the drain floor
-        // clamps at INIT_SEND_RATE.
-        for _ in 0..20 {
+        // Ramp delivery at a brisk 10 ms RTT so the slow-start rate climbs
+        // quickly.  send_max respects the cwnd limit, sending as many packets
+        // as the cwnd and token bucket allow.  After one round the ACK-clocked
+        // slow start pushes the rate well above 4× INIT_SEND_RATE; subsequent
+        // rounds produce DRE rate samples that exit slow start and let the CC
+        // probe branch take over.
+        let ramp_rtt = Duration::from_millis(10);
+        for _ in 0..40 {
             send_max(&mut rl, t);
-            t += Duration::from_millis(40);
-            ack_all(&mut rl, Some(Duration::from_millis(40)), t);
+            t += ramp_rtt;
+            ack_all(&mut rl, Some(ramp_rtt), t);
         }
-        let warm_rate = rl.log().send_rate;
+        let peak_rate = rl.log().send_rate;
         assert!(
-            warm_rate > INIT_SEND_RATE,
-            "warm-up rate must exceed INIT_SEND_RATE, got {warm_rate}"
+            peak_rate > INIT_SEND_RATE * 4.0,
+            "peak send rate {peak_rate} must exceed 4× INIT_SEND_RATE ({})",
+            INIT_SEND_RATE * 4.0
         );
-        let peak = rl.delivery_peak.update(t, 0.0);
         assert!(
-            peak * DRAIN_FLOOR_PEAK_FRACTION > INIT_SEND_RATE,
-            "windowed peak must push the base floor to the INIT_SEND_RATE cap"
+            (peak_rate * DRAIN_FLOOR_PEAK_FRACTION).min(INIT_SEND_RATE)
+                >= INIT_SEND_RATE - f64::EPSILON,
+            "base drain floor must clamp at INIT_SEND_RATE"
+        );
+        assert!(
+            !rl.slow_start,
+            "slow start must have exited during the ramp"
         );
 
-        // Capacity drops: send long-RTT bursts so the delivery rate collapses,
-        // the delay gate opens, and the drain floor starts binding.  Inject a
-        // low-rate loss event so loss_event_rate is measured and the decay grace
-        // can expire; without this the blind-flow rule keeps the full floor.
-        let drop_t = t + Duration::from_millis(1);
-        rl.pkt_send_space.inject_loss_event(drop_t);
-        for i in 0..20 {
-            let send_t = drop_t + Duration::from_millis(1200) * i;
-            send_burst(&mut rl, 20, send_t);
-            t = send_t + Duration::from_millis(1200);
-            ack_all(&mut rl, Some(Duration::from_millis(1200)), t);
+        // Feed the drop-path RTT through `sample_rtt` so the SRTT and rttvar
+        // filters settle before the first real send-ack cycle.
+        let drop_rtt = Duration::from_millis(1000);
+        feed_rtt(&mut rl, 30, drop_rtt, t);
+        t += Duration::from_millis(1);
+
+        // Capacity drops to a deep-buffered ~60 pkt/s path.  Inject a single
+        // synthetic loss event so loss_event_rate returns a value and the
+        // decay-grace clock can start; without this the blind-flow rule keeps
+        // the floor at the full cap.  Keep flight shallow with spread-out
+        // try_send so the DRE produces a meaningful interval for linear
+        // backoff.  The inject_loss_event now uses smooth_rtt so the loss
+        // entry persists long enough for deliveries to accumulate.
+        rl.pkt_send_space.inject_loss_event(t);
+        for _ in 0..10 {
+            let round_start = t;
+            for _ in 0..8 {
+                try_send(&mut rl, 1, t);
+                t += Duration::from_millis(100);
+            }
+            t = round_start + drop_rtt;
+            let next_seq = rl.pkt_send_space().next_seq();
+            ack_prefix(&mut rl, next_seq, drop_rtt, t);
         }
 
-        // After the decay grace, the send rate must have drained below the stale
-        // INIT_SEND_RATE floor and be trending toward the new low delivery rate.
+        // After ~10 s (3 s grace + 7 excess RTTs) the floor has decayed well
+        // below 100 pkt/s and the send rate must follow.  The original
+        // delivery peak is at most 10 s old (DELIVERY_PEAK_BUCKET = 10 s),
+        // so it is still in the window and contributes a genuine cap — the
+        // decay comes from the clocked grace path, not from the peak aging out.
         let final_rate = rl.log().send_rate;
         assert!(
-            final_rate < INIT_SEND_RATE,
-            "stale peak floor must decay so rate can drain below INIT_SEND_RATE, got {final_rate}"
+            final_rate < 100.0,
+            "send rate must decay below 100 pkt/s within 10 s, got {final_rate}"
         );
     }
 
@@ -1520,12 +1575,39 @@ mod tests {
         let gap0 = episode.gap0;
         assert!(gap0 > Duration::ZERO, "initial gap must be positive");
 
-        // Mid-episode, ratchet the live rtt_floor upward by feeding an even higher
-        // RTT.  Without the snapshot the live gap would collapse as the floor
-        // catches up, but the guard compares against floor0, so it still fires.
-        let ratchet_start = t;
+        // Mid-episode: simulate the WindowedRttMin bucket rotating and
+        // ratcheting the live floor upward.  Replace rl.rtt_floor with a
+        // fresh window pre-fed ~750 ms while the drain episode holds ~1000 ms.
+        // The live gap (smooth - new_floor) genuinely shrinks below the
+        // GENTLE_DRAIN_GAP_SHRINK threshold, so the live-floor variant WOULD
+        // suppress the guard.  The episode's floor0 snapshot keeps the guard
+        // alive because it is compared against the pre-ratchet floor.
+        {
+            let mut new_floor = WindowedRttMin::new(t);
+            for i in 0..6 {
+                let feed_time = t + Duration::from_millis(750) * i;
+                new_floor.update(feed_time, Duration::from_millis(750));
+            }
+            rl.rtt_floor = new_floor;
+        }
+        t += Duration::from_millis(1);
+
+        let smooth = rl.pkt_send_space.smooth_rtt();
+        let live_floor = rl.rtt_floor.update(t, smooth);
+        let live_gap = smooth.saturating_sub(live_floor);
+        let shrink_threshold = gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK);
+        assert!(
+            live_gap < shrink_threshold,
+            "live gap {live_gap:?} must shrink below {shrink_threshold:?} (GENTLE_DRAIN_GAP_SHRINK × gap0 = {gap0:?} × {GENTLE_DRAIN_GAP_SHRINK}); \
+             the live-floor variant would suppress the guard"
+        );
+
+        // The guard must still fire because it compares against the episode's
+        // floor0 snapshot, not the live floor.  Continue the drain at elevated
+        // RTT until the GENTLE_DRAIN_CHECK_RTTS interval expires.
+        let guard_start = t;
         let mut guard_fired = false;
-        for _ in 0..60 {
+        for _ in 0..20 {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(1700);
             ack_seq(&mut rl, seq, Duration::from_millis(1600), t);
@@ -1534,7 +1616,7 @@ mod tests {
                 break;
             }
             assert!(
-                t < ratchet_start + Duration::from_secs(70),
+                t < guard_start + Duration::from_secs(40),
                 "guard must fire before the test times out"
             );
         }
