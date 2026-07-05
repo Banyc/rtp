@@ -11,12 +11,6 @@ pub struct RtxTimer {
 }
 impl RtxTimer {
     const MIN_RTO: Duration = Duration::from_secs(1);
-    /// Lowered RTO floor used after a tail-loss probe has been sent.
-    ///
-    /// The first timeout signal still keeps the 1 s floor to absorb estimator
-    /// error; once a tail probe has been sent the timeout is corroborated and
-    /// can safely be tightened so recovery does not wait another full second.
-    const TAIL_PROBED_MIN_RTO: Duration = Duration::from_millis(300);
     const K: f64 = 4.;
     const BETA: f64 = 1. / 4.;
     const ALPHA: f64 = 1. / 8.;
@@ -52,19 +46,14 @@ impl RtxTimer {
     //     Duration::from_secs_f64(rto).max(Self::MIN_RTO)
     // }
     pub fn rto(&self) -> Duration {
-        let tol = Self::K * self.smooth_rtt_var.get();
-        let rto = self.smooth_rtt.get() + tol;
-        Duration::from_secs_f64(rto).max(Self::MIN_RTO)
+        self.raw_rto().max(Self::MIN_RTO)
     }
 
-    /// RTO used after at least one tail-loss probe has been sent.
-    ///
-    /// Same formula as `rto()`, but floored at [`Self::TAIL_PROBED_MIN_RTO`]
-    /// instead of the first-signal 1 s floor.
-    pub fn rto_after_tail_probe(&self) -> Duration {
+    /// RTO formula value without any floor applied.
+    pub(crate) fn raw_rto(&self) -> Duration {
         let tol = Self::K * self.smooth_rtt_var.get();
         let rto = self.smooth_rtt.get() + tol;
-        Duration::from_secs_f64(rto).max(Self::TAIL_PROBED_MIN_RTO)
+        Duration::from_secs_f64(rto)
     }
 
     /// Reset the SRTT filter to a fixed value, keeping the same RTO calculation.
@@ -133,37 +122,4 @@ mod tests {
         assert!(rw <= rto.rto(), "rw={rw:?} rto={:?}", rto.rto());
     }
 
-    #[test]
-    fn post_tail_probe_rto_uses_lowered_floor() {
-        // Steady 100 ms samples: the first-signal floor keeps rto() >= 1 s,
-        // but after a tail probe we can tighten to 300 ms.
-        let mut rto = RtxTimer::new();
-        for _ in 0..20 {
-            rto.set(Duration::from_millis(100));
-        }
-        assert!(rto.rto() >= Duration::from_secs(1), "rto={:?}", rto.rto());
-        let tail_rto = rto.rto_after_tail_probe();
-        assert!(
-            tail_rto >= Duration::from_millis(300),
-            "tail_rto={tail_rto:?}"
-        );
-        assert!(
-            tail_rto < Duration::from_millis(500),
-            "tail_rto={tail_rto:?}"
-        );
-
-        // Jittery link: variance dominates both floors, so the post-probe RTO
-        // equals the normal RTO and does not spuriously tighten recovery.
-        let mut rto = RtxTimer::new();
-        for _ in 0..10 {
-            rto.set(Duration::from_millis(100));
-            rto.set(Duration::from_millis(900));
-        }
-        assert!(rto.rto() > Duration::from_secs(1), "rto={:?}", rto.rto());
-        assert_eq!(
-            rto.rto_after_tail_probe(),
-            rto.rto(),
-            "jitter-dominated RTO must not change after tail probe"
-        );
-    }
 }

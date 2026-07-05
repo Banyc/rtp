@@ -12,16 +12,10 @@ use primitive::{
     queue::send_wnd::SendWnd,
 };
 
-use crate::{pkt_recv_space::MAX_NUM_RECVING_PKTS, rto::RtxTimer, sack::AckBallSequence};
+use crate::{pkt_recv_space::MAX_NUM_RECVING_PKTS, rto::RtxTimer, sack::AckBallSequence, tlp::TailLossProber};
 
 pub const INIT_CWND: usize = 16;
 pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
-
-/// Maximum number of RFC 8985 tail-loss probes (PTO) per tail episode.
-const MAX_TAIL_PROBES: u8 = 2;
-/// Floor for the PTO timer so that the first sample is not taken before the
-/// peer has had a reasonable chance to acknowledge the tail packet.
-const TAIL_PROBE_MIN_TOL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub struct PktSendSpace {
@@ -41,10 +35,8 @@ pub struct PktSendSpace {
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: MinNoneOptCmp<u64>,
     loss_event_window: LossEventWindow,
-    /// Number of tail-loss probes (PTO) sent in the current tail episode.
-    /// Reset to 0 on ACK progress (`ack_buf` non-empty) or when a new packet is
-    /// pushed.
-    tail_probes_sent: u8,
+    /// RFC 8985 tail-loss-probe engine.
+    tlp: TailLossProber,
 
     // outage recovery epoch
     /// Start of the current outage-recovery epoch, if one is open.
@@ -70,7 +62,7 @@ impl PktSendSpace {
             out_of_order_seq_end: 0,
             max_pipe_seq: MinNoneOptCmp(None),
             loss_event_window: LossEventWindow::new(),
-            tail_probes_sent: 0,
+            tlp: TailLossProber::new(),
             recovery_start: None,
             outage_loss_cut: None,
             ever_progressed: false,
@@ -158,7 +150,7 @@ impl PktSendSpace {
             // Forward progress: we just delivered packets to the peer.
             self.ever_progressed = true;
             self.progress_wait_start = None;
-            self.tail_probes_sent = 0;
+            self.tlp.reset();
         }
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
@@ -230,30 +222,6 @@ impl PktSendSpace {
         self.num_txing < self.cwnd.get()
     }
 
-    /// RTO used for the current tail episode.
-    ///
-    /// Before any tail-loss probe has been sent, keep the 1 s `MIN_RTO` floor so
-    /// the first timeout signal absorbs estimator error. After a probe has been
-    /// sent, tighten the floor to `TAIL_PROBED_MIN_RTO`.
-    fn tail_rto(&self) -> Duration {
-        if self.tail_probes_sent > 0 {
-            self.rto.rto_after_tail_probe()
-        } else {
-            self.rto.rto()
-        }
-    }
-
-    /// Time between consecutive tail-loss probes for the current tail episode.
-    fn tail_probe_window(&self) -> Duration {
-        let srtt = self.rto.smooth_rtt();
-        let min_rto = self.tail_rto();
-        let min_tol = TAIL_PROBE_MIN_TOL;
-        // PTO formula: max(2*srtt, 2*min_rtt) with a 10 ms floor, capped at RTO.
-        let doubled_srtt = srtt.mul_f64(2.);
-        let min_rtt_doubled = self.min_rtt.map(|r| r.mul_f64(2.)).unwrap_or(doubled_srtt);
-        doubled_srtt.max(min_rtt_doubled).max(min_tol).min(min_rto)
-    }
-
     /// Sequence number of the current tail packet, if any.
     fn tail_seq(&self) -> Option<u64> {
         let next = self.send_wnd.next().copied()?;
@@ -266,7 +234,7 @@ impl PktSendSpace {
     /// Whether the tail packet is still unacked and enough time has passed for
     /// the next probe to fire.
     pub fn has_tail_probe(&self, now: Instant) -> bool {
-        if self.tail_probes_sent >= MAX_TAIL_PROBES {
+        if !self.tlp.can_probe() {
             return false;
         }
         let Some(seq) = self.tail_seq() else {
@@ -278,7 +246,7 @@ impl PktSendSpace {
         let Some(p) = p.as_ref() else {
             return false;
         };
-        p.hits_custom_rto(self.tail_probe_window(), now)
+        self.tlp.is_due(p.sent_time, &self.rto, self.min_rtt, now)
     }
 
     /// Produce a tail-loss probe if it is time for one. The probe retransmits
@@ -289,10 +257,8 @@ impl PktSendSpace {
             return None;
         }
         let seq = self.tail_seq()?;
-        // Compute the tightened RTO before borrowing the send window so the
-        // immutable read does not conflict with the mutable packet borrow.
-        self.tail_probes_sent += 1;
-        let rto = self.tail_rto();
+        self.tlp.sent();
+        let rto = self.tlp.rto(&self.rto);
         let p = self.send_wnd.get_mut(&seq)?.as_mut()?;
 
         // Refresh the timestamp/RTO so the probe is tracked as a fresh packet
@@ -328,7 +294,7 @@ impl PktSendSpace {
 
         self.send_wnd.push(Some(p));
         self.num_txing += 1;
-        self.tail_probes_sent = 0;
+        self.tlp.reset();
         if self.resp_wait_start.is_none() {
             self.resp_wait_start = Some(now);
         }
@@ -632,11 +598,10 @@ impl PktSendSpace {
         }
         if let Some(seq) = self.tail_seq()
             && let Some(Some(p)) = self.send_wnd.get(&seq)
-            && self.tail_probes_sent < MAX_TAIL_PROBES
         {
-            let t = p.sent_time + self.tail_probe_window();
-            let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
-            min_next_poll_time = Some(t);
+            if let Some(t) = self.tlp.next_probe_time(p.sent_time, &self.rto, self.min_rtt) {
+                min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
+            }
         }
         min_next_poll_time
     }
