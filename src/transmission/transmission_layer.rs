@@ -8,12 +8,11 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::{fec::FecState, ts_echo::TsEcho};
 use crate::{
     codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
-    fec::FecState,
     reliable::reliable_layer::{ReliableLayer, SharedTokenBucket},
     sack::{AckBall, AckBallSequence},
-    ts_echo::TsEcho,
 };
 
 const PRINT_DEBUG_MSGS: bool = false;
