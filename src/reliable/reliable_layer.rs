@@ -507,7 +507,10 @@ impl ReliableLayer {
             let binding_for = self
                 .drain_floor_binding_since
                 .map(|s| now.saturating_duration_since(s));
-            let closed_for = self.gentle.queue_since().map(|s| now.saturating_duration_since(s));
+            let closed_for = self
+                .gentle
+                .queue_since()
+                .map(|s| now.saturating_duration_since(s));
             let pinned_for = binding_for.zip(closed_for).map(|(b, c)| b.min(c));
             let grace = control_rtt.mul_f64(DRAIN_FLOOR_GRACE_RTTS);
             let drain_floor =
@@ -533,7 +536,8 @@ impl ReliableLayer {
                 }
             }
 
-            self.gentle.drain_episode_guard(smooth, floor, control_rtt, now);
+            self.gentle
+                .drain_episode_guard(smooth, floor, control_rtt, now);
             return;
         }
 
@@ -943,11 +947,12 @@ mod tests {
     };
 
     use super::{
-        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN,
-        GENTLE_REENTRY_COOLDOWN_RTTS, INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL,
-        MAX_SEND_DATA_BUF_LEN, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
-        RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts,
-        send_data_buf_len, token_bucket_with_tokens,
+        DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS,
+        GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS,
+        INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN,
+        QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET,
+        RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len,
+        token_bucket_with_tokens,
     };
 
     const TEST_MSS: usize = 1200;
@@ -1337,7 +1342,7 @@ mod tests {
             INIT_SEND_RATE * 4.0
         );
         assert!(
-            rl.delivery_peak.update(t, 0.0) * DRAIN_FLOOR_PEAK_FRACTION > INIT_SEND_RATE as f64,
+            rl.delivery_peak.update(t, 0.0) * DRAIN_FLOOR_PEAK_FRACTION > INIT_SEND_RATE,
             "DRE delivery peak * DRAIN_FLOOR_PEAK_FRACTION must exceed INIT_SEND_RATE, got {}",
             rl.delivery_peak.update(t, 0.0)
         );
@@ -1485,7 +1490,10 @@ mod tests {
         let control_rtt = rl.control_rtt();
         let expected_cooldown =
             GENTLE_REENTRY_COOLDOWN.max(control_rtt.mul_f64(GENTLE_REENTRY_COOLDOWN_RTTS));
-        let block_until = rl.gentle.gentle_block_until().expect("cooldown must be set");
+        let block_until = rl
+            .gentle
+            .gentle_block_until()
+            .expect("cooldown must be set");
         let cooldown = block_until.saturating_duration_since(t);
         assert!(
             cooldown >= expected_cooldown - Duration::from_millis(50),
@@ -1607,7 +1615,8 @@ mod tests {
             assert!(t < guard_start + Duration::from_secs(14), "guard must fire");
         }
         assert!(
-            rl.gentle.gentle_block_until()
+            rl.gentle
+                .gentle_block_until()
                 .is_some_and(|u| u > t + Duration::from_secs(10)),
             "guard must set a long cooldown"
         );
