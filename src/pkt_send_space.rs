@@ -12,7 +12,13 @@ use primitive::{
     queue::send_wnd::SendWnd,
 };
 
-use crate::{pkt_recv_space::MAX_NUM_RECVING_PKTS, rto::RtxTimer, sack::AckBallSequence, tlp::TailLossProber};
+use crate::{
+    outage::{OutageDetection, OutageEpoch},
+    pkt_recv_space::MAX_NUM_RECVING_PKTS,
+    rto::RtxTimer,
+    sack::AckBallSequence,
+    tlp::TailLossProber,
+};
 
 pub const INIT_CWND: usize = 16;
 pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
@@ -39,11 +45,7 @@ pub struct PktSendSpace {
     tlp: TailLossProber,
 
     // outage recovery epoch
-    /// Start of the current outage-recovery epoch, if one is open.
-    recovery_start: Option<Instant>,
-    /// Packets originally sent before this instant are considered pre-outage.
-    /// Their retransmission losses do not mark a congestion event.
-    outage_loss_cut: Option<Instant>,
+    outage: OutageEpoch,
 
     // reused buffers
     unacked_buf: Vec<u64>,
@@ -63,8 +65,7 @@ impl PktSendSpace {
             max_pipe_seq: MinNoneOptCmp(None),
             loss_event_window: LossEventWindow::new(),
             tlp: TailLossProber::new(),
-            recovery_start: None,
-            outage_loss_cut: None,
+            outage: OutageEpoch::new(),
             ever_progressed: false,
             progress_wait_start: None,
             unacked_buf: vec![],
@@ -192,26 +193,13 @@ impl PktSendSpace {
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
-        // During an outage-recovery epoch, censor stale RTT samples taken across
-        // the outage.  A sample is stale if it was sent before the outage cut.
-        // The cut persists after recovery_start is cleared so that late echoes
-        // of pre-outage packets are still discarded.
-        if let Some(cut) = self.outage_loss_cut {
-            let sent_at = now.checked_sub(rtt);
-            if sent_at.is_none_or(|sent_at| sent_at < cut) {
-                // Echoes from before the cut keep the recovery_start epoch open
-                // if it is still active, otherwise they are simply dropped.
-                return;
-            }
-            // A fresh post-outage sample ends the epoch and re-seeds sRTT.
-            // outage_loss_cut intentionally stays in place until a new outage
-            // re-arms it; this prevents late echoes of pre-outage packets from
-            // corrupting the freshly seeded sRTT.
-            if self.recovery_start.take().is_some() {
-                self.update_min_rtt(rtt);
-                self.rto.reset_to(rtt);
-                return;
-            }
+        if self.outage.should_censor_rtt_sample(rtt, now) {
+            return;
+        }
+        if self.outage.try_close_epoch_with_fresh_sample() {
+            self.update_min_rtt(rtt);
+            self.rto.reset_to(rtt);
+            return;
         }
 
         self.update_min_rtt(rtt);
@@ -314,12 +302,11 @@ impl PktSendSpace {
 
     pub fn has_rtx(&self, now: Instant) -> bool {
         let out_of_order_seq_end = self.out_of_order_seq_end;
-        let outage_loss_cut = self.outage_loss_cut;
         Self::unacked(&self.send_wnd)
             .take(self.cwnd.get())
             .any(|(s, p)| {
                 let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
-                let is_pre_outage_loss = Self::is_pre_outage_loss(p, outage_loss_cut);
+                let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
                 p.is_rtx(
                     is_seq_out_of_order,
                     is_pre_outage_loss,
@@ -332,10 +319,9 @@ impl PktSendSpace {
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let reorder_window = self.rto.reorder_window();
-        let outage_loss_cut = self.outage_loss_cut;
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
-            let is_pre_outage_loss = Self::is_pre_outage_loss(p, outage_loss_cut);
+            let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
             let should_rtx = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, reorder_window, now);
             if !should_rtx {
                 continue;
@@ -381,16 +367,6 @@ impl PktSendSpace {
         None
     }
 
-    fn is_pre_outage_loss(p: &TxingPkt, outage_loss_cut: Option<Instant>) -> bool {
-        let Some(cut) = outage_loss_cut else {
-            return false;
-        };
-        // The original transmission must have happened before the cut.  A later
-        // retransmission naturally expires the exemption because `sent_time` is
-        // overwritten each time we rtx.
-        p.sent_time < cut
-    }
-
     pub fn min_rtt(&self) -> Option<Duration> {
         self.min_rtt
     }
@@ -403,7 +379,7 @@ impl PktSendSpace {
         // While an outage-recovery epoch is open, clamp cwnd to INIT_CWND so a
         // just-restored path is not flooded before fresh RTT samples can seed
         // the congestion state.
-        let cwnd = if self.recovery_start.is_some() {
+        let cwnd = if self.outage.in_outage_recovery() {
             cwnd.min(INIT_CWND)
         } else {
             cwnd
@@ -432,64 +408,42 @@ impl PktSendSpace {
     }
 
     pub fn in_outage_recovery(&self) -> bool {
-        self.recovery_start.is_some()
+        self.outage.in_outage_recovery()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn outage_cut(&self) -> Option<Instant> {
-        self.outage_loss_cut
+        self.outage.outage_cut()
+    }
+
+    pub(crate) fn should_censor_rate_sample(&self, prior_time: Instant) -> bool {
+        self.outage.should_censor_rate_sample(prior_time)
     }
 
     pub fn detect_outage_recovery(&mut self, now: Instant) -> bool {
-        // Outage detection is keyed on forward progress stalls, not merely the
-        // absence of any ACK datagram.  Zero-progress duplicate ACKs can keep the
-        // total-silence clock alive without delivering data; we require that the
-        // sender has made prior progress and has now stopped making progress.
-        if !self.ever_progressed {
-            return false;
-        }
-
-        let no_progress_for = match self.no_progress_for(now) {
-            Some(d) => d,
-            None => return false,
-        };
+        let no_progress_for = self.no_progress_for(now);
         let rto = self.rto.rto();
-        if no_progress_for < rto {
-            return false;
-        }
-
-        // Conditions that detect a sustained outage:
-        //  - we have been waiting for forward progress for at least one RTO,
-        //  - and either there has been a loss event or the silence is long enough
-        //    that a clean link would have produced an ACK by now.
         let has_loss_event = self.loss_event_window.raw_has_loss_event();
-        let loss_or_long_silence = has_loss_event || no_progress_for >= rto * 2;
-        if !loss_or_long_silence {
-            // A clean long silence (no loss event) needs two RTOs to declare outage.
-            return false;
-        }
 
-        // Re-arming an already-closed epoch refreshes the outage cut without
-        // re-seeding sRTT; the fresh post-outage sample still owns that.
-        let rearming = self.recovery_start.is_some();
-        self.recovery_start = Some(now);
-        self.outage_loss_cut = Some(now);
-        if !rearming {
-            // New epoch: start with a seed sRTT of one RTO and clear prior loss
-            // history so the post-outage path is treated as fresh.
-            self.rto.reset_to(self.rto.rto());
-            self.loss_event_window.reset(now, self.rto.smooth_rtt());
+        match self.outage.detect(
+            now,
+            self.ever_progressed,
+            no_progress_for,
+            rto,
+            has_loss_event,
+        ) {
+            OutageDetection::NewEpoch => {
+                self.rto.reset_to(rto);
+                self.loss_event_window.reset(now, self.rto.smooth_rtt());
+                true
+            }
+            OutageDetection::Rearming => true,
+            OutageDetection::None => false,
         }
-        // Do not touch `cwnd` here; the epoch clamps it inside `set_send_rate`.
-        true
     }
 
     pub fn clear_outage_recovery(&mut self) {
-        // Do not clear outage_loss_cut here; it is intentionally left intact so
-        // that late echoes of pre-outage packets are still discarded.  However,
-        // a second outage-length stall inside an already-closed epoch should
-        // refresh the cut.  The caller signals this by calling detect again;
-        // detect_outage_recovery will re-arm recovery_start and update the cut.
-        self.recovery_start = None;
+        self.outage.clear();
     }
 
     pub fn cwnd_stats(&self, now: Instant) -> CwndStats {

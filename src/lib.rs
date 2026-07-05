@@ -1,6 +1,7 @@
 pub mod codec;
 mod fec;
 mod gentle;
+mod outage;
 pub mod keyed_udp;
 pub mod mpudp;
 pub mod pkt_recv_space;

@@ -409,11 +409,9 @@ impl ReliableLayer {
         // time predates the outage cut.  A blackout-spanning sample can report a
         // bogus delivery rate (~acked/outage-length) that would collapse the just-
         // restarted INIT_SEND_RATE back toward zero in the same ACK handler.
-        if self.pkt_send_space.in_outage_recovery()
-            && self
-                .pkt_send_space
-                .outage_cut()
-                .is_some_and(|cut| sr.prior_time() < cut)
+        if self
+            .pkt_send_space
+            .should_censor_rate_sample(sr.prior_time())
         {
             return;
         }
