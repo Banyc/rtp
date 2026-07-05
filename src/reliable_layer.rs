@@ -1484,9 +1484,9 @@ mod tests {
             INIT_SEND_RATE * 4.0
         );
         assert!(
-            (peak_rate * DRAIN_FLOOR_PEAK_FRACTION).min(INIT_SEND_RATE)
-                >= INIT_SEND_RATE - f64::EPSILON,
-            "base drain floor must clamp at INIT_SEND_RATE"
+            rl.delivery_peak.update(t, 0.0) * DRAIN_FLOOR_PEAK_FRACTION > INIT_SEND_RATE as f64,
+            "DRE delivery peak * DRAIN_FLOOR_PEAK_FRACTION must exceed INIT_SEND_RATE, got {}",
+            rl.delivery_peak.update(t, 0.0)
         );
         assert!(
             !rl.slow_start,
@@ -1591,26 +1591,29 @@ mod tests {
             rl.rtt_floor = new_floor;
         }
         t += Duration::from_millis(1);
-
-        let smooth = rl.pkt_send_space.smooth_rtt();
-        let live_floor = rl.rtt_floor.update(t, smooth);
-        let live_gap = smooth.saturating_sub(live_floor);
         let shrink_threshold = gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK);
-        assert!(
-            live_gap < shrink_threshold,
-            "live gap {live_gap:?} must shrink below {shrink_threshold:?} (GENTLE_DRAIN_GAP_SHRINK × gap0 = {gap0:?} × {GENTLE_DRAIN_GAP_SHRINK}); \
-             the live-floor variant would suppress the guard"
-        );
 
         // The guard must still fire because it compares against the episode's
-        // floor0 snapshot, not the live floor.  Continue the drain at elevated
-        // RTT until the GENTLE_DRAIN_CHECK_RTTS interval expires.
+        // floor0 snapshot, not the live floor.  Drain at ~1000 ms RTT so
+        // smooth stays ~1000 ms and the live gap remains below the threshold
+        // for the entire guard window — a live-floor mutant that suppresses
+        // the drain guard would fail here.
         let guard_start = t;
         let mut guard_fired = false;
         for _ in 0..20 {
             let seq = send_one(&mut rl, t);
-            t += Duration::from_millis(1700);
-            ack_seq(&mut rl, seq, Duration::from_millis(1600), t);
+            t += Duration::from_millis(1100);
+            ack_seq(&mut rl, seq, Duration::from_millis(1000), t);
+
+            let smooth = rl.pkt_send_space.smooth_rtt();
+            let live_floor = rl.rtt_floor.update(t, smooth);
+            let live_gap = smooth.saturating_sub(live_floor);
+            assert!(
+                live_gap < shrink_threshold,
+                "live gap {live_gap:?} must stay below {shrink_threshold:?} (GENTLE_DRAIN_GAP_SHRINK × gap0 = {gap0:?} × {GENTLE_DRAIN_GAP_SHRINK}); \
+                 the live-floor variant would suppress the guard"
+            );
+
             if !rl.gentle_mode {
                 guard_fired = true;
                 break;
