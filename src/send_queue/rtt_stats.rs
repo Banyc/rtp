@@ -64,6 +64,12 @@ impl RttStats {
         self.rto.reorder_window()
     }
 
+    /// Whether the structural low-jitter gate for evidence-gated fast loss
+    /// is armed (see [`RtxTimer::fast_loss_armed`]).
+    pub(crate) fn fast_loss_armed(&self) -> bool {
+        self.rto.fast_loss_armed()
+    }
+
     pub(crate) fn reset_rto(&mut self, rtt: Duration) {
         self.rto.reset_to(rtt);
     }

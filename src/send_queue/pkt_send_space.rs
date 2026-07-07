@@ -26,6 +26,11 @@ use crate::{
 pub const INIT_CWND: usize = 16;
 pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 
+/// Number of newer in-flight packets that must be SACKed past an unacked
+/// packet before the evidence-gated fast-loss path declares it lost.  Mirrors
+/// the classic dup-ACK threshold of 3.
+pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
+
 #[derive(Debug)]
 pub struct PktSendSpace {
     send_wnd: SendWnd<u64, Option<TxingPkt>>,
@@ -46,6 +51,14 @@ pub struct PktSendSpace {
     /// RTT statistics: smoothed RTT, RTO, and lifetime minimum.
     rtt_stats: RttStats,
 
+    /// Hard-disable flag for evidence-gated fast loss.  Set when reordering
+    /// is actually observed (a fast-loss-retransmitted packet's original
+    /// later arrives — detected by an ACK arriving for such a packet faster
+    /// than the retransmit could have been acknowledged).  Once set it stays
+    /// set for the life of the connection; the structural jitter gate alone
+    /// is not enough to re-arm after a real reordering event.
+    fast_loss_disabled: bool,
+
     // reused buffers
     unacked_buf: Vec<u64>,
     ack_buf: Vec<u64>,
@@ -64,6 +77,7 @@ impl PktSendSpace {
             liveness: PeerLiveness::new(),
             outage: OutageEpoch::new(),
             rtt_stats: RttStats::new(),
+            fast_loss_disabled: false,
             unacked_buf: vec![],
             ack_buf: vec![],
         }
@@ -75,6 +89,19 @@ impl PktSendSpace {
 
     pub fn smooth_rtt_var(&self) -> Duration {
         self.rtt_stats.smooth_rtt_var()
+    }
+
+    /// Whether the evidence-gated fast-loss path is currently armed.  Arming
+    /// requires the structural low-jitter gate (`K*rttvar < srtt/4`) AND no
+    /// observed reordering on the connection.  Always-on when armed; there is
+    /// no env toggle — the structural gate is the safety.
+    pub fn fast_loss_armed(&self) -> bool {
+        !self.fast_loss_disabled && self.rtt_stats.fast_loss_armed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fast_loss_disabled(&self) -> bool {
+        self.fast_loss_disabled
     }
 
     fn unacked(
@@ -142,6 +169,32 @@ impl PktSendSpace {
             self.liveness.record_progress();
             self.tlp.reset();
         }
+
+        // Evidence-gated fast loss — observed-reordering detection.
+        //
+        // If a packet that we retransmitted via the fast-loss path is acked,
+        // and the ACK arrives before the retransmit itself could plausibly
+        // have made a round trip (i.e. before `fast_loss_rtx_time + min_rtt`),
+        // the peer must have received the *original* — the link reorders, so
+        // fast loss is unsafe on this connection.  Hard-disable it for the
+        // life of the connection; the structural jitter gate alone is not
+        // enough to re-arm after a real reordering event.
+        if !self.fast_loss_disabled
+            && let Some(min_rtt) = self.rtt_stats.min_rtt()
+        {
+            for &s in &self.ack_buf {
+                let Some(Some(p)) = self.send_wnd.get(&s).map(|o| o.as_ref()) else {
+                    continue;
+                };
+                if let Some(rtx_t) = p.fast_loss_rtx_time
+                    && now < rtx_t + min_rtt
+                {
+                    self.fast_loss_disabled = true;
+                    break;
+                }
+            }
+        }
+
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
@@ -160,6 +213,28 @@ impl PktSendSpace {
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
+
+        // Evidence-gated fast loss — SACK-pass accounting.
+        //
+        // For each SACK ball the peer reported, every older in-flight packet
+        // that the SACKed sequence passed gets its `sack_passes` counter
+        // incremented.  The counter is always maintained; the *declaration*
+        // (in `rtx`/`has_rtx`) is what is gated by the structural low-jitter
+        // arming condition and the observed-reordering hard-disable.
+        for ball in recved.balls() {
+            let ball_end = ball.start + ball.size.get();
+            for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
+                if s < ball.start {
+                    // Every SACKed seq in this ball is newer than `s`; the
+                    // ball covers `ball.size.get()` packets past it.
+                    p.sack_passes = p.sack_passes.saturating_add(ball.size.get() as u32);
+                } else if s < ball_end {
+                    // `s` is itself inside this SACKed ball and will be
+                    // acked above; no passes to count for it.
+                }
+            }
+        }
+
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
         if peer_waiting_for_acked_pkts && delivered == 0 {
@@ -238,6 +313,8 @@ impl PktSendSpace {
                 data: _,
                 rto,
                 rto_from_tail_probe: true,
+                sack_passes: _,
+                fast_loss_rtx_time: _,
             };
         }
         Some(Pkt { seq, data: &p.data })
@@ -256,6 +333,8 @@ impl PktSendSpace {
             data,
             rto: self.rtt_stats.rto_duration(),
             rto_from_tail_probe: false,
+            sack_passes: 0,
+            fast_loss_rtx_time: None,
         };
 
         self.send_wnd.push(Some(p));
@@ -271,27 +350,33 @@ impl PktSendSpace {
 
     pub fn has_rtx(&self, now: Instant) -> bool {
         let out_of_order_seq_end = self.out_of_order_seq_end;
+        let fast_loss_armed = self.fast_loss_armed();
         Self::unacked(&self.send_wnd)
             .take(self.cwnd.get())
             .any(|(s, p)| {
                 let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
                 let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
-                p.is_rtx(
+                let time_based = p.is_rtx(
                     is_seq_out_of_order,
                     is_pre_outage_loss,
                     self.rtt_stats.reorder_window(),
                     now,
-                )
+                );
+                let fast_loss = fast_loss_armed && p.is_fast_loss();
+                time_based || fast_loss
             })
     }
 
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let reorder_window = self.rtt_stats.reorder_window();
+        let fast_loss_armed = self.fast_loss_armed();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
             let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
-            let should_rtx = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, reorder_window, now);
+            let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, reorder_window, now);
+            let fast_loss = fast_loss_armed && p.is_fast_loss();
+            let should_rtx = time_based || fast_loss;
             if !should_rtx {
                 continue;
             }
@@ -303,6 +388,10 @@ impl PktSendSpace {
             let already_rtxed = p.rtxed;
             let pre_outage_loss = !already_rtxed && is_pre_outage_loss;
             let tail_probe_loss = p.rto_from_tail_probe;
+            // A fast-loss retransmit is a genuine loss declaration (not a TLP
+            // probe), so it records a loss event exactly as a window-expiry
+            // loss would — no TLP probe accounting.
+            let is_fast_loss_rtx = fast_loss && !already_rtxed;
 
             // fresh pkt for this cwnd
             let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
@@ -321,6 +410,8 @@ impl PktSendSpace {
                     data: _,
                     rto: self.rtt_stats.rto_duration(),
                     rto_from_tail_probe: false,
+                    sack_passes: _,
+                    fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
                 };
             }
             if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
@@ -559,6 +650,16 @@ struct TxingPkt {
     /// still fires, but it must not record a congestion loss event because the
     /// probe itself already signalled the tail episode.
     pub rto_from_tail_probe: bool,
+    /// Number of newer in-flight packets that have been SACKed past this
+    /// packet.  Used by the evidence-gated fast-loss path: once this reaches
+    /// [`FAST_LOSS_SACK_THRESHOLD`], the packet is declared lost without
+    /// waiting for the time-based reorder window to expire.
+    pub sack_passes: u32,
+    /// `Some(t)` if this packet was retransmitted by the evidence-gated
+    /// fast-loss path at time `t`.  Used to detect observed reordering: if an
+    /// ACK for this packet arrives before `t + min_rtt` could plausibly have
+    /// elapsed, the original (not the retransmit) must have been delivered.
+    pub fast_loss_rtx_time: Option<Instant>,
 }
 impl TxingPkt {
     pub fn hits_rto(&self, now: Instant) -> bool {
@@ -588,6 +689,15 @@ impl TxingPkt {
         // after the outage can make progress.
         let pre_outage = pre_outage_loss;
         self.hits_rto(now) || out_of_order_rt || pre_outage
+    }
+
+    /// Whether this packet should be declared lost by the evidence-gated
+    /// fast-loss path: it has not yet been retransmitted and at least
+    /// [`FAST_LOSS_SACK_THRESHOLD`] newer in-flight packets have been SACKed
+    /// past it.  The structural arming gate and the observed-reordering
+    /// hard-disable are checked by the caller (`PktSendSpace::fast_loss_armed`).
+    pub fn is_fast_loss(&self) -> bool {
+        !self.rtxed && self.sack_passes >= FAST_LOSS_SACK_THRESHOLD
     }
 }
 
@@ -735,6 +845,40 @@ mod tests {
         let mut acked = Vec::new();
         space.ack(seq, &mut acked, now);
         acked.len()
+    }
+
+    /// SACK a single out-of-order sequence: the peer has received `seq` but
+    /// the cumulative ACK point is still below it.  This removes `seq` from
+    /// the send window (it is delivered) and increments `sack_passes` on
+    /// every older in-flight packet.
+    fn sack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
+        let ball = crate::sack::AckBall {
+            start: seq,
+            size: std::num::NonZeroU64::new(1).unwrap(),
+        };
+        let balls = [ball];
+        let recved = crate::sack::AckBallSequence::new(&balls);
+        let mut acked = Vec::new();
+        space.ack(recved, &mut acked, now);
+        acked.len()
+    }
+
+    fn sack_passes(space: &PktSendSpace, seq: u64) -> u32 {
+        space
+            .send_wnd
+            .get(&seq)
+            .and_then(|o| o.as_ref())
+            .map(|p| p.sack_passes)
+            .unwrap_or(0)
+    }
+
+    fn settle_high_jitter(space: &mut PktSendSpace, now: Instant) {
+        // Alternating 100 ms / 900 ms samples grow rttvar so that K*rttvar
+        // dominates srtt/4 — the structural fast-loss gate stays disarmed.
+        for i in 0..20 {
+            space.sample_rtt(ms(100), now + ms(i * 2));
+            space.sample_rtt(ms(900), now + ms(i * 2 + 1));
+        }
     }
 
     fn lose_packet(space: &mut PktSendSpace, seq: u64, now: Instant) {
@@ -1243,6 +1387,225 @@ mod tests {
         assert!(
             space.loss_event_window.raw_has_loss_event(),
             "plain RTO rtx must record a loss event"
+        );
+    }
+
+    #[test]
+    fn fast_loss_declares_before_reorder_window_with_sack_count_evidence() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Low-jitter link: K*rttvar < srtt/4, so the structural gate is armed.
+        assert!(
+            space.fast_loss_armed(),
+            "gate should be armed on a low-jitter link"
+        );
+
+        // Send four packets; seq 0 will be the one we starve of ACKs.
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        // SACK seqs 1, 2, 3 — each is newer than seq 0, so each SACK
+        // increments seq 0's sack_passes by 1.  After three SACKs the
+        // threshold (3) is reached.
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+        assert_eq!(sack_passes(&space, 0), 3, "seq 0 should have 3 sack passes");
+
+        // At t0 + 30 ms the time-based reorder window (~125 ms) has NOT
+        // expired, so a stock time-only declaration would not fire.  The
+        // evidence-gated fast-loss path must declare seq 0 lost anyway.
+        let early = t0 + ms(30);
+        assert!(
+            early.duration_since(t0) < space.smooth_rtt(),
+            "test must run before the reorder window expires"
+        );
+        assert!(
+            space.has_rtx(early),
+            "fast loss should make has_rtx true before the reorder window"
+        );
+        let rtx = space
+            .rtx(early)
+            .expect("fast loss should retransmit seq 0 before the reorder window");
+        assert_eq!(rtx.seq, 0, "fast loss should target the starved seq 0");
+    }
+
+    #[test]
+    fn fast_loss_stays_off_under_structural_jitter_gate() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_high_jitter(&mut space, t0);
+
+        // High-jitter link: K*rttvar dominates srtt/4, so the structural gate
+        // is disarmed — reordering can mimic loss, so the fast path must stay
+        // off and only the stock time-based declaration is allowed.
+        assert!(
+            !space.fast_loss_armed(),
+            "gate should be disarmed on a high-jitter link"
+        );
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        // Same SACK evidence as the low-jitter case: three newer packets
+        // SACKed past seq 0.  The sack_passes counter still reaches 3
+        // (tracking is unconditional), but the declaration must not fire.
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+        assert_eq!(sack_passes(&space, 0), 3, "sack passes are always tracked");
+
+        // Well before the (large, jitter-dominated) reorder window expires.
+        let early = t0 + ms(30);
+        assert!(
+            !space.has_rtx(early),
+            "fast loss must stay off when the structural gate is disarmed"
+        );
+        assert!(
+            space.rtx(early).is_none(),
+            "no retransmit should fire under high jitter before the reorder window"
+        );
+    }
+
+    #[test]
+    fn observed_reordering_hard_disables_fast_loss() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        // min_rtt is established by settle_rtt_at (100 ms) — needed for the
+        // observed-reordering detection (original arrives before the
+        // retransmit could plausibly be acked).
+        assert_eq!(space.min_rtt(), Some(ms(100)));
+        assert!(space.fast_loss_armed(), "gate armed on low-jitter link");
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+
+        // Fast-loss retransmit of seq 0 fires before the reorder window.
+        let rtx_t = t0 + ms(30);
+        let rtx = space
+            .rtx(rtx_t)
+            .expect("fast loss should fire for seq 0");
+        assert_eq!(rtx.seq, 0);
+        // The retransmit is recorded as a fast-loss rtx for reordering检测.
+        assert_eq!(
+            space
+                .send_wnd
+                .get(&0)
+                .and_then(|o| o.as_ref())
+                .unwrap()
+                .fast_loss_rtx_time,
+            Some(rtx_t),
+            "fast-loss rtx must stamp fast_loss_rtx_time"
+        );
+
+        // The original (not the retransmit) arrives: an ACK for seq 0 lands
+        // at rtx_t + 1 ms, which is before rtx_t + min_rtt (100 ms) — the
+        // retransmit could not have made a round trip that fast, so the peer
+        // must have received the original.  Reordering is observed: hard-
+        // disable fast loss for the rest of the connection.
+        let original_arrives = rtx_t + ms(1);
+        assert!(original_arrives < rtx_t + space.min_rtt().unwrap());
+        ack_one(&mut space, 0, original_arrives);
+        assert!(
+            space.fast_loss_disabled(),
+            "observed reordering must hard-disable fast loss"
+        );
+        assert!(
+            !space.fast_loss_armed(),
+            "fast loss must be disarmed after observed reordering"
+        );
+
+        // A subsequent flight with identical SACK evidence must NOT trigger a
+        // fast-loss retransmit, even though the structural jitter gate alone
+        // would still be armed.
+        send_packet(&mut space, original_arrives + ms(1));
+        send_packet(&mut space, original_arrives + ms(2));
+        send_packet(&mut space, original_arrives + ms(3));
+        send_packet(&mut space, original_arrives + ms(4));
+        // seq 4 is the new starved packet (front of the new flight).
+        let new_front = 4u64;
+        sack_one(&mut space, new_front + 1, original_arrives + ms(6));
+        sack_one(&mut space, new_front + 2, original_arrives + ms(7));
+        sack_one(&mut space, new_front + 3, original_arrives + ms(8));
+        assert_eq!(sack_passes(&space, new_front), 3);
+
+        let early2 = original_arrives + ms(9);
+        assert!(
+            !space.has_rtx(early2),
+            "fast loss must not fire after observed reordering disabled it"
+        );
+        assert!(
+            space.rtx(early2).is_none(),
+            "no fast-loss retransmit after observed reordering"
+        );
+    }
+
+    #[test]
+    fn fast_loss_rtx_records_loss_event_without_tlp_probe_accounting() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        assert!(space.fast_loss_armed());
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+
+        // No loss event yet — only SACK evidence, no declaration so far.
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no loss event before the fast-loss rtx"
+        );
+
+        let rtx_t = t0 + ms(30);
+        let rtx = space
+            .rtx(rtx_t)
+            .expect("fast loss should fire for seq 0");
+        assert_eq!(rtx.seq, 0);
+
+        // A fast-loss retransmit is a genuine loss declaration, not a TLP
+        // probe, so it must record a congestion loss event exactly as a
+        // window-expiry loss would — feeding delivery-rate CC the true loss
+        // rate.
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "fast-loss rtx must record a loss event for CC"
+        );
+
+        // And it must not be accounted as a tail-loss probe: the retransmitted
+        // packet carries no TLP marker.
+        let p = space
+            .send_wnd
+            .get(&0)
+            .and_then(|o| o.as_ref())
+            .expect("seq 0 still in flight after rtx");
+        assert!(
+            !p.rto_from_tail_probe,
+            "fast-loss rtx must not carry TLP probe accounting"
+        );
+        assert!(p.rtxed, "fast-loss rtx must mark the packet rtxed");
+        assert_eq!(
+            p.fast_loss_rtx_time,
+            Some(rtx_t),
+            "fast-loss rtx must stamp fast_loss_rtx_time"
         );
     }
 }

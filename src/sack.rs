@@ -67,6 +67,10 @@ impl<'a> AckBallSequence<'a> {
         Self { balls }
     }
 
+    pub fn balls(&self) -> &'a [AckBall] {
+        self.balls
+    }
+
     pub fn out_of_order_seq_end(&self) -> Option<u64> {
         Some(self.balls.last()?.start)
     }

@@ -78,6 +78,17 @@ impl RtxTimer {
         (srtt + extra).min(self.rto())
     }
 
+    /// Whether the structural low-jitter gate is armed: `K * rttvar <
+    /// srtt / 4`, i.e. the `srtt / 4` floor dominates the reorder window
+    /// because path jitter is small relative to sRTT.  This is the safety
+    /// gate for evidence-gated fast loss declaration — under high jitter
+    /// reordering mimics loss, so the fast path must stay off.
+    pub fn fast_loss_armed(&self) -> bool {
+        let srtt = self.smooth_rtt.get();
+        let rttvar = self.smooth_rtt_var.get();
+        rttvar * Self::K < srtt / 4.
+    }
+
     pub fn smooth_rtt(&self) -> Duration {
         Duration::from_secs_f64(self.smooth_rtt.get())
     }
