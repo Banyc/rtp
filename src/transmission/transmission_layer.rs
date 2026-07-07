@@ -23,8 +23,8 @@ const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
 const BUF_SIZE: usize = 1024 * 64;
 
-/// Whether retransmission armor (`RTP_F3_RTX_DUP`) is enabled at process
-/// startup.  Reads `RTP_F3_RTX_DUP` once; `1`/`true` enables it, anything
+/// Whether retransmission armor (`RTP_RTX_DUP`) is enabled at process
+/// startup.  Reads `RTP_RTX_DUP` once; `1`/`true` enables it, anything
 /// else preserves stock single-datagram behaviour byte-for-byte.
 ///
 /// When enabled, the transmission layer emits a second identical copy of
@@ -36,8 +36,8 @@ const BUF_SIZE: usize = 1024 * 64;
 /// delivery-rate congestion controller reports the bottleneck queue is
 /// building.  Duplicating ordinary data packets is never done — the win is
 /// specific to rare recovery packets.
-fn f3_rtx_dup_from_env() -> bool {
-    match std::env::var("RTP_F3_RTX_DUP") {
+fn rtx_dup_from_env() -> bool {
+    match std::env::var("RTP_RTX_DUP") {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
@@ -123,11 +123,11 @@ pub struct TransmissionLayer {
     reliable_layer_logger: Option<ReliableLayerLogger>,
     fec: Option<Mutex<FecState>>,
     clock_epoch: Instant,
-    /// Snapshot of `RTP_F3_RTX_DUP` taken at construction.  Stored as a field
+    /// Snapshot of `RTP_RTX_DUP` taken at construction.  Stored as a field
     /// rather than read from a `OnceLock` so tests can construct a layer with
     /// the toggle on or off deterministically without racing other parallel
     /// tests in the same binary.
-    f3_rtx_dup: bool,
+    rtx_dup: bool,
     /// Per-connection FEC tuning snapshot taken at construction.  When
     /// `instream_flush` is set, the data send burst force-flushes the open
     /// FEC group at its end instead of waiting for the stock
@@ -170,7 +170,7 @@ impl TransmissionLayer {
             reliable_layer_logger,
             fec: unreliable_layer.fec.map(Mutex::new),
             clock_epoch: now,
-            f3_rtx_dup: f3_rtx_dup_from_env(),
+            rtx_dup: rtx_dup_from_env(),
             fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         }
     }
@@ -183,12 +183,12 @@ impl TransmissionLayer {
         &self.reliable_layer
     }
 
-    /// Test-only: force the `RTP_F3_RTX_DUP` toggle to a fixed value regardless
+    /// Test-only: force the `RTP_RTX_DUP` toggle to a fixed value regardless
     /// of the process environment, so parallel tests in the same binary do not
     /// race on the env var.
     #[cfg(test)]
-    pub(crate) fn set_f3_rtx_dup_for_test(&mut self, enabled: bool) {
-        self.f3_rtx_dup = enabled;
+    pub(crate) fn set_rtx_dup_for_test(&mut self, enabled: bool) {
+        self.rtx_dup = enabled;
     }
 
     /// Test-only: take up to `n` tokens from the shared send-rate limiter so
@@ -399,7 +399,7 @@ impl TransmissionLayer {
             };
             match primary_res {
                 Ok(_) => {
-                    // Retransmission armor (`RTP_F3_RTX_DUP`): emit a second
+                    // Retransmission armor (`RTP_RTX_DUP`): emit a second
                     // identical copy of every retransmit and tail-loss-probe
                     // datagram, reusing the exact already-encoded symbol
                     // bytes (encode once, send twice).  The primary repair
@@ -409,7 +409,7 @@ impl TransmissionLayer {
                     // whenever the bottleneck queue is building.  Duplicating
                     // ordinary data packets is never done — the win is
                     // specific to rare recovery packets.
-                    if self.f3_rtx_dup && was_repair && !queue_building {
+                    if self.rtx_dup && was_repair && !queue_building {
                         let now = Instant::now();
                         let token_taken = self
                             .send_rate_limiter
@@ -463,7 +463,7 @@ impl TransmissionLayer {
         // tail-only and never competes with data bandwidth. When blocked, the
         // open group is skipped so no stale group carries into the next burst.
         //
-        // `FecTuning::instream_flush` (F5): force-flush the open DATA group at
+        // `FecTuning::instream_flush`: force-flush the open DATA group at
         // the end of every data send burst instead of waiting for the stock
         // `can_send_tail_fec` gate.  This is what lets a single-symbol
         // interactive message emit its (deeper) parity promptly rather than
@@ -976,7 +976,7 @@ pub struct UnreliableLayer {
     /// Per-connection FEC tuning.  Consumed at construction to drive the
     /// data-burst force-flush (`instream_flush`) and the single-symbol
     /// interactive parity depth.  Stock `FecTuning::default()` preserves the
-    /// pre-F5 behaviour byte-for-byte.
+    /// behaviour byte-for-byte.
     pub fec_tuning: FecTuning,
 }
 
@@ -1145,7 +1145,7 @@ mod tests {
 
     /// A `TransmissionLayer` test harness exposing the recording write via an
     /// `Arc<Mutex<RecordingWrite>>` shared with the layer's `UnreliableWrite`.
-    /// `fec` toggles FEC on; `enabled` toggles the `RTP_F3_RTX_DUP` retransmit
+    /// `fec` toggles FEC on; `enabled` toggles the `RTP_RTX_DUP` retransmit
     /// armor; `tuning` sets the per-connection FEC tuning (defaults to stock).
     fn harness(fec: bool, enabled: bool) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         harness_with_tuning(fec, enabled, crate::transmission::fec_tuning::FecTuning::default())
@@ -1175,7 +1175,7 @@ mod tests {
         let ul =
             crate::udp::wrap_fec_with_mss_and_fec_tuning(read, write, fec, crate::udp::NO_FEC_MSS, tuning);
         let mut tl = TransmissionLayer::new(ul, None);
-        tl.set_f3_rtx_dup_for_test(enabled);
+        tl.set_rtx_dup_for_test(enabled);
         (tl, recorder)
     }
 
@@ -1261,7 +1261,7 @@ mod tests {
         );
     }
 
-    /// F5: with `FecTuning::mindiv()` (instream flush + depth 3), a
+    /// With `FecTuning::mindiv()` (instream flush + depth 3), a
     /// single-symbol data burst must force-flush 3 parity copies at the
     /// burst end, even though `can_send_tail_fec` is false (an unacked data
     /// packet is still in flight).  Stock tuning skips the open group when

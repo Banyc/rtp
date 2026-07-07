@@ -31,8 +31,8 @@ pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 /// the classic dup-ACK threshold of 3.
 pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 
-/// Whether the jitter-tolerant fast-retransmit ("F2 jitter cap") path is
-/// enabled at process startup.  Reads `RTP_F2_JITTER_CAP` once; `1`/`true`
+/// Whether the jitter-tolerant fast-retransmit ("jitter cap") path is
+/// enabled at process startup.  Reads `RTP_JITTER_CAP` once; `1`/`true`
 /// enables it, anything else preserves stock behaviour byte-for-byte.
 ///
 /// When enabled, the retransmission of an out-of-order-passed packet is
@@ -44,8 +44,8 @@ pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 /// then (genuine loss).  If the original is acked before the stock deadline
 /// (it was reordering, not loss) no loss event is recorded and no later
 /// repair is double-counted.
-fn f2_jitter_cap_from_env() -> bool {
-    match std::env::var("RTP_F2_JITTER_CAP") {
+fn jitter_cap_from_env() -> bool {
+    match std::env::var("RTP_JITTER_CAP") {
         Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
         Err(_) => false,
     }
@@ -80,18 +80,18 @@ pub struct PktSendSpace {
     fast_loss_disabled: bool,
 
     /// Pending deferred loss-event recordings for the jitter-tolerant fast-
-    /// retransmit path (`RTP_F2_JITTER_CAP`).  Each entry is a packet that was
+    /// retransmit path (`RTP_JITTER_CAP`).  Each entry is a packet that was
     /// retransmitted at the fast reorder window; its CC loss event is deferred
     /// to the stock reorder-window deadline and recorded only if the packet
     /// is still unacked then.  An ACK for the seq cancels the entry
     /// (reordering, not loss).
     deferred_losses: Vec<DeferredLoss>,
 
-    /// Snapshot of `RTP_F2_JITTER_CAP` taken at construction.  Stored as a
+    /// Snapshot of `RTP_JITTER_CAP` taken at construction.  Stored as a
     /// field rather than read from a `OnceLock` so tests can construct a
     /// `PktSendSpace` with the toggle on or off deterministically without
     /// racing other parallel tests in the same binary.
-    f2_jitter_cap: bool,
+    jitter_cap: bool,
 
     // reused buffers
     unacked_buf: Vec<u64>,
@@ -113,7 +113,7 @@ impl PktSendSpace {
             rtt_stats: RttStats::new(),
             fast_loss_disabled: false,
             deferred_losses: vec![],
-            f2_jitter_cap: f2_jitter_cap_from_env(),
+            jitter_cap: jitter_cap_from_env(),
             unacked_buf: vec![],
             ack_buf: vec![],
         }
@@ -140,13 +140,13 @@ impl PktSendSpace {
         self.fast_loss_disabled
     }
 
-    /// Test-only constructor that forces the `RTP_F2_JITTER_CAP` toggle to a
+    /// Test-only constructor that forces the `RTP_JITTER_CAP` toggle to a
     /// fixed value regardless of the process environment, so parallel tests
     /// in the same binary do not race on the env var.
     #[cfg(test)]
-    pub(crate) fn with_f2_jitter_cap(enabled: bool) -> Self {
+    pub(crate) fn with_jitter_cap(enabled: bool) -> Self {
         let mut s = Self::new();
-        s.f2_jitter_cap = enabled;
+        s.jitter_cap = enabled;
         s
     }
 
@@ -408,8 +408,8 @@ impl PktSendSpace {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let fast_loss_armed = self.fast_loss_armed();
         let stock_window = self.rtt_stats.reorder_window();
-        let f2 = self.f2_jitter_cap;
-        let rtx_window = if f2 {
+        let jcap = self.jitter_cap;
+        let rtx_window = if jcap {
             self.rtt_stats.fast_reorder_window()
         } else {
             stock_window
@@ -433,8 +433,8 @@ impl PktSendSpace {
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let stock_window = self.rtt_stats.reorder_window();
-        let f2 = self.f2_jitter_cap;
-        let rtx_window = if f2 {
+        let jcap = self.jitter_cap;
+        let rtx_window = if jcap {
             self.rtt_stats.fast_reorder_window()
         } else {
             stock_window
@@ -463,7 +463,7 @@ impl PktSendSpace {
             let is_fast_loss_rtx = fast_loss && !already_rtxed;
 
             // Jitter-tolerant fast-retransmit deferred-loss accounting.  When
-            // the F2 toggle is on and this retransmit fired purely on the fast
+            // the jitter-cap toggle is on and this retransmit fired purely on the fast
             // reorder window (i.e. the stock window has NOT yet expired for
             // the original send), the CC loss event is deferred to the stock
             // deadline (`original_sent_time + stock_window`).  If the original
@@ -474,13 +474,13 @@ impl PktSendSpace {
             // (recovery) but the loss-rate signal seen by delivery-rate CC
             // only counts genuine losses.
             let original_sent_time = p.sent_time;
-            let f2_defer_loss = f2
+            let defer_loss = jcap
                 && !already_rtxed
                 && !pre_outage_loss
                 && !tail_probe_loss
                 && !is_fast_loss_rtx
                 && now < original_sent_time + stock_window;
-            let f2_stock_deadline = if f2_defer_loss {
+            let stock_deadline_opt = if defer_loss {
                 Some(original_sent_time + stock_window)
             } else {
                 None
@@ -505,13 +505,13 @@ impl PktSendSpace {
                     rto_from_tail_probe: false,
                     sack_passes: _,
                     fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
-                    deferred_loss_stock_deadline: f2_stock_deadline,
+                    deferred_loss_stock_deadline: stock_deadline_opt,
                 };
             }
-            if f2_defer_loss {
+            if defer_loss {
                 self.deferred_losses.push(DeferredLoss {
                     seq: s,
-                    stock_deadline: f2_stock_deadline.unwrap(),
+                    stock_deadline: stock_deadline_opt.unwrap(),
                 });
             } else if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
                 let smooth_rtt = self.rtt_stats.smooth_rtt();
@@ -735,11 +735,11 @@ impl PktSendSpace {
 
     pub fn next_poll_time(&self) -> Option<Instant> {
         let mut min_next_poll_time: Option<Instant> = None;
-        // Effective reorder-window deadline for rtx scheduling.  When the F2
+        // Effective reorder-window deadline for rtx scheduling.  When the
         // jitter-cap toggle is on, rtx timing uses the fast reorder window;
         // otherwise the stock window.  The poll must honour this deadline so
         // the fast-retransmit fires as soon as it is due.
-        let rtx_window = if self.f2_jitter_cap {
+        let rtx_window = if self.jitter_cap {
             self.rtt_stats.fast_reorder_window()
         } else {
             self.rtt_stats.reorder_window()
@@ -818,7 +818,7 @@ struct TxingPkt {
     /// elapsed, the original (not the retransmit) must have been delivered.
     pub fast_loss_rtx_time: Option<Instant>,
     /// `Some(t)` if this packet was retransmitted at time `t` by the
-    /// jitter-tolerant fast-retransmit path (`RTP_F2_JITTER_CAP`).  The
+    /// jitter-tolerant fast-retransmit path (`RTP_JITTER_CAP`).  The
     /// congestion-control loss event for that retransmit is *deferred* to the
     /// stock reorder-window deadline (`sent_time_of_original + reorder_window`
     /// computed against the original send time stored in
@@ -1787,9 +1787,9 @@ mod tests {
         );
     }
 
-    // ---- jitter-tolerant fast-retransmit (RTP_F2_JITTER_CAP) tests ----
+    // ---- jitter-tolerant fast-retransmit (RTP_JITTER_CAP) tests ----
     //
-    // These tests force the F2 toggle to a fixed value via `with_f2_jitter_cap`
+    // These tests force the jitter-cap toggle to a fixed value via `with_jitter_cap`
     // so they do not race on the process env var with parallel tests.
 
     /// High-jitter link where the fast reorder window is strictly below the
@@ -1822,10 +1822,10 @@ mod tests {
     }
 
     #[test]
-    fn f2_early_reorder_rtx_skips_loss_event_at_rtx_time() {
+    fn jitter_cap_early_reorder_rtx_skips_loss_event_at_rtx_time() {
         let t0 = Instant::now();
-        // F2 toggle ON, high-jitter link: fast window < stock window.
-        let mut space = PktSendSpace::with_f2_jitter_cap(true);
+        // Jitter-cap toggle ON, high-jitter link: fast window < stock window.
+        let mut space = PktSendSpace::with_jitter_cap(true);
         let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
         assert!(!space.fast_loss_armed(), "high-jitter gate disarmed");
 
@@ -1847,11 +1847,11 @@ mod tests {
         // The fast rtx must fire (toggle on → fast window governs rtx timing).
         assert!(
             space.has_rtx(rtx_t),
-            "F2 fast window must make has_rtx true before stock deadline"
+            "jitter-cap fast window must make has_rtx true before stock deadline"
         );
         let rtx = space
             .rtx(rtx_t)
-            .expect("F2 fast rtx must fire before the stock reorder window");
+            .expect("jitter-cap fast rtx must fire before the stock reorder window");
         assert_eq!(rtx.seq, 0);
 
         // *** The loss event must NOT be recorded at rtx time — it is deferred
@@ -1859,7 +1859,7 @@ mod tests {
         // bug. ***
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
-            "F2 fast rtx must NOT record a loss event at rtx time (deferred)"
+            "jitter-cap fast rtx must NOT record a loss event at rtx time (deferred)"
         );
 
         // The deferred entry must be pending with the stock deadline.
@@ -1873,9 +1873,9 @@ mod tests {
     }
 
     #[test]
-    fn f2_deferred_loss_event_records_at_stock_deadline_if_still_unacked() {
+    fn jitter_cap_deferred_loss_event_records_at_stock_deadline_if_still_unacked() {
         let t0 = Instant::now();
-        let mut space = PktSendSpace::with_f2_jitter_cap(true);
+        let mut space = PktSendSpace::with_jitter_cap(true);
         let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
 
         starve_seq0_with_sacks(&mut space, t0);
@@ -1883,7 +1883,7 @@ mod tests {
         let fast_deadline = t0 + fast;
         let stock_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
-        let rtx = space.rtx(rtx_t).expect("F2 fast rtx fires");
+        let rtx = space.rtx(rtx_t).expect("jitter-cap fast rtx fires");
         assert_eq!(rtx.seq, 0);
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
@@ -1918,9 +1918,9 @@ mod tests {
     }
 
     #[test]
-    fn f2_repaired_before_stock_deadline_is_not_double_counted() {
+    fn jitter_cap_repaired_before_stock_deadline_is_not_double_counted() {
         let t0 = Instant::now();
-        let mut space = PktSendSpace::with_f2_jitter_cap(true);
+        let mut space = PktSendSpace::with_jitter_cap(true);
         let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
 
         starve_seq0_with_sacks(&mut space, t0);
@@ -1928,7 +1928,7 @@ mod tests {
         let fast_deadline = t0 + fast;
         let stock_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
-        let rtx = space.rtx(rtx_t).expect("F2 fast rtx fires");
+        let rtx = space.rtx(rtx_t).expect("jitter-cap fast rtx fires");
         assert_eq!(rtx.seq, 0);
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
@@ -1967,10 +1967,10 @@ mod tests {
     }
 
     #[test]
-    fn f2_toggle_off_preserves_stock_out_of_order_window() {
+    fn jitter_cap_toggle_off_preserves_stock_out_of_order_window() {
         let t0 = Instant::now();
-        // F2 toggle OFF: behaviour must be byte-for-byte stock.
-        let mut space = PktSendSpace::with_f2_jitter_cap(false);
+        // Jitter-cap toggle OFF: behaviour must be byte-for-byte stock.
+        let mut space = PktSendSpace::with_jitter_cap(false);
         let (_fast, stock) = settle_high_jitter_f2(&mut space, t0);
         // Re-derive fast window to confirm toggle-off uses stock for rtx.
         let stock_window = space.rtt_stats.reorder_window();

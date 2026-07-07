@@ -79,7 +79,7 @@ impl RtxTimer {
     }
 
     /// Fast reorder window used only to schedule retransmission of
-    /// out-of-order-passed packets when the `RTP_F2_JITTER_CAP` toggle is on:
+    /// out-of-order-passed packets when the `RTP_JITTER_CAP` toggle is on:
     /// `srtt + max(rttvar, srtt/4)` (rttvar NOT multiplied by `K`), capped at
     /// the full RTO.  The loss-event accounting deadline still uses
     /// [`reorder_window`].  On low-jitter links (`K*rttvar ≤ srtt/4`) the

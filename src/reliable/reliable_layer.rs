@@ -121,7 +121,7 @@ pub struct ReliableLayer {
     /// estimation (`smooth > floor + gate_tol`).  Updated on every ACK rate
     /// sample in `adjust_send_rate_exponential`.  Read by the transmission
     /// layer to suppress retransmission-armor duplicate copies
-    /// (`RTP_F3_RTX_DUP`) — duplication under a building queue would worsen
+    /// (`RTP_RTX_DUP`) — duplication under a building queue would worsen
     /// the very congestion the dup is meant to recover from.
     queue_building: bool,
 
@@ -934,7 +934,7 @@ pub struct DataPkt {
     /// Whether this packet is a retransmission or a tail-loss probe (a
     /// recovery packet, not new data).  Used by the transmission layer to
     /// decide whether to emit a retransmission-armor duplicate copy
-    /// (`RTP_F3_RTX_DUP`).
+    /// (`RTP_RTX_DUP`).
     pub was_repair: bool,
 }
 #[derive(Debug, Clone)]

@@ -13,7 +13,7 @@
 //!
 //! The real configuration is the per-connection `FecTuning` argument threaded
 //! through the `*_with_mss_and_fec_tuning` connect/accept APIs.  The env var
-//! `RTP_F5_MINDIV=1` only feeds the default for A/B comparison — it is never
+//! `RTP_MINDIV=1` only feeds the default for A/B comparison — it is never
 //! read as the live setting, so it cannot silently apply to every connection
 //! in the process.
 //!
@@ -120,7 +120,7 @@ pub fn single_symbol_payload(mss: usize) -> Option<usize> {
     Some(data_mss.saturating_sub(crate::codec::data_overhead()))
 }
 
-/// Read `RTP_F5_MINDIV` once at process startup to feed the *default* FEC
+/// Read `RTP_MINDIV` once at process startup to feed the *default* FEC
 /// tuning for A/B comparison.  `1`/`true` selects `FecTuning::mindiv()`;
 /// anything else (including unset) selects `FecTuning::default()`.  This is
 /// **not** the live configuration — the real setting is the per-connection
@@ -128,7 +128,7 @@ pub fn single_symbol_payload(mss: usize) -> Option<usize> {
 /// APIs, so env-var state can never silently apply to every connection in
 /// the process.
 pub fn fec_tuning_from_env() -> FecTuning {
-    match std::env::var("RTP_F5_MINDIV") {
+    match std::env::var("RTP_MINDIV") {
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FecTuning::mindiv(),
         _ => FecTuning::default(),
     }
