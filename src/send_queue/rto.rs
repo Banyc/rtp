@@ -78,6 +78,21 @@ impl RtxTimer {
         (srtt + extra).min(self.rto())
     }
 
+    /// Fast reorder window used only to schedule retransmission of
+    /// out-of-order-passed packets when the `RTP_F2_JITTER_CAP` toggle is on:
+    /// `srtt + max(rttvar, srtt/4)` (rttvar NOT multiplied by `K`), capped at
+    /// the full RTO.  The loss-event accounting deadline still uses
+    /// [`reorder_window`].  On low-jitter links (`K*rttvar ≤ srtt/4`) the
+    /// `srtt/4` floor dominates both windows, so `fast_reorder_window ==
+    /// reorder_window` and the toggle is a no-op there.
+    pub fn fast_reorder_window(&self) -> Duration {
+        let srtt = self.smooth_rtt();
+        let rttvar = Duration::from_secs_f64(self.smooth_rtt_var.get());
+        let quarter = srtt / 4;
+        let extra = rttvar.max(quarter);
+        (srtt + extra).min(self.rto())
+    }
+
     /// Whether the structural low-jitter gate is armed: `K * rttvar <
     /// srtt / 4`, i.e. the `srtt / 4` floor dominates the reorder window
     /// because path jitter is small relative to sRTT.  This is the safety
@@ -131,6 +146,46 @@ mod tests {
         let rw = rto.reorder_window();
         assert!(rw > Duration::from_millis(900), "rw={rw:?}");
         assert!(rw <= rto.rto(), "rw={rw:?} rto={:?}", rto.rto());
+    }
+
+    #[test]
+    fn fast_reorder_window_equals_stock_on_low_jitter() {
+        // On low-jitter links K*rttvar ≤ srtt/4, the srtt/4 floor dominates
+        // both windows, so fast_reorder_window == reorder_window (no behavior
+        // change with the toggle on).
+        let mut rto = RtxTimer::new();
+        for _ in 0..20 {
+            rto.set(Duration::from_millis(100));
+        }
+        assert!(rto.fast_loss_armed(), "low-jitter gate must be armed");
+        assert_eq!(
+            rto.fast_reorder_window(),
+            rto.reorder_window(),
+            "fast window must equal stock window on low-jitter links"
+        );
+    }
+
+    #[test]
+    fn fast_reorder_window_is_below_stock_on_high_jitter() {
+        // On high-jitter links K*rttvar dominates, so the fast window (which
+        // uses rttvar NOT multiplied by K) is below the stock window but never
+        // below srtt + srtt/4.
+        let mut rto = RtxTimer::new();
+        for _ in 0..10 {
+            rto.set(Duration::from_millis(100));
+            rto.set(Duration::from_millis(900));
+        }
+        assert!(!rto.fast_loss_armed(), "high-jitter gate must be disarmed");
+        let fast = rto.fast_reorder_window();
+        let stock = rto.reorder_window();
+        assert!(fast < stock, "fast={fast:?} must be below stock={stock:?}");
+        let srtt = rto.smooth_rtt();
+        assert!(
+            fast >= srtt + srtt / 4,
+            "fast={fast:?} must be ≥ srtt+srtt/4={:?}",
+            srtt + srtt / 4
+        );
+        assert!(fast <= rto.rto(), "fast={fast:?} must be ≤ rto={:?}", rto.rto());
     }
 
 }

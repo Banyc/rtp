@@ -229,6 +229,11 @@ impl ReliableLayer {
             self.backoff_on_huge_data_loss_exponential(now);
         }
 
+        // Reconcile any deferred CC loss-events whose stock reorder-window
+        // deadline has now elapsed (jitter-tolerant fast-retransmit path).
+        // Runs every send tick so deadlines are honoured promptly.
+        self.pkt_send_space.poll_deferred_loss(now);
+
         // During an outage-recovery epoch the whole pre-outage window is
         // immediately eligible for retransmission.  We must pace these
         // retransmits through the token bucket so a just-restored link is not
@@ -348,6 +353,11 @@ impl ReliableLayer {
 
         self.pkt_send_space
             .ack(recved, &mut self.pkt_stats_buf, now);
+
+        // Reconcile deferred CC loss-events after the ack: any whose seq was
+        // just acked has been cancelled, and any whose stock deadline has
+        // elapsed should now be recorded (genuine loss).
+        self.pkt_send_space.poll_deferred_loss(now);
 
         if entered_recovery {
             self.rtt_floor = WindowedRttMin::new(now);

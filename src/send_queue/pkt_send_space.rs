@@ -31,6 +31,26 @@ pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 /// the classic dup-ACK threshold of 3.
 pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 
+/// Whether the jitter-tolerant fast-retransmit ("F2 jitter cap") path is
+/// enabled at process startup.  Reads `RTP_F2_JITTER_CAP` once; `1`/`true`
+/// enables it, anything else preserves stock behaviour byte-for-byte.
+///
+/// When enabled, the retransmission of an out-of-order-passed packet is
+/// scheduled on a fast reorder window `srtt + max(rttvar, srtt/4)` (rttvar
+/// NOT multiplied by `K`), well below the stock `srtt + max(K*rttvar,
+/// srtt/4)` on high-jitter links.  The congestion-control loss event is NOT
+/// recorded at the fast retransmit time: it is deferred to the stock
+/// reorder-window deadline and recorded only if the packet is still unacked
+/// then (genuine loss).  If the original is acked before the stock deadline
+/// (it was reordering, not loss) no loss event is recorded and no later
+/// repair is double-counted.
+fn f2_jitter_cap_from_env() -> bool {
+    match std::env::var("RTP_F2_JITTER_CAP") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct PktSendSpace {
     send_wnd: SendWnd<u64, Option<TxingPkt>>,
@@ -59,6 +79,20 @@ pub struct PktSendSpace {
     /// is not enough to re-arm after a real reordering event.
     fast_loss_disabled: bool,
 
+    /// Pending deferred loss-event recordings for the jitter-tolerant fast-
+    /// retransmit path (`RTP_F2_JITTER_CAP`).  Each entry is a packet that was
+    /// retransmitted at the fast reorder window; its CC loss event is deferred
+    /// to the stock reorder-window deadline and recorded only if the packet
+    /// is still unacked then.  An ACK for the seq cancels the entry
+    /// (reordering, not loss).
+    deferred_losses: Vec<DeferredLoss>,
+
+    /// Snapshot of `RTP_F2_JITTER_CAP` taken at construction.  Stored as a
+    /// field rather than read from a `OnceLock` so tests can construct a
+    /// `PktSendSpace` with the toggle on or off deterministically without
+    /// racing other parallel tests in the same binary.
+    f2_jitter_cap: bool,
+
     // reused buffers
     unacked_buf: Vec<u64>,
     ack_buf: Vec<u64>,
@@ -78,6 +112,8 @@ impl PktSendSpace {
             outage: OutageEpoch::new(),
             rtt_stats: RttStats::new(),
             fast_loss_disabled: false,
+            deferred_losses: vec![],
+            f2_jitter_cap: f2_jitter_cap_from_env(),
             unacked_buf: vec![],
             ack_buf: vec![],
         }
@@ -102,6 +138,16 @@ impl PktSendSpace {
     #[cfg(test)]
     pub(crate) fn fast_loss_disabled(&self) -> bool {
         self.fast_loss_disabled
+    }
+
+    /// Test-only constructor that forces the `RTP_F2_JITTER_CAP` toggle to a
+    /// fixed value regardless of the process environment, so parallel tests
+    /// in the same binary do not race on the env var.
+    #[cfg(test)]
+    pub(crate) fn with_f2_jitter_cap(enabled: bool) -> Self {
+        let mut s = Self::new();
+        s.f2_jitter_cap = enabled;
+        s
     }
 
     fn unacked(
@@ -202,6 +248,14 @@ impl PktSendSpace {
             if s == *self.send_wnd.start().unwrap() {
                 self.send_wnd.pop().unwrap();
                 self.send_wnd.pop_none();
+            }
+
+            // Jitter-tolerant fast-retransmit: the original (or the repair)
+            // was acked before the stock reorder-window deadline elapsed, so
+            // this was reordering, not loss — cancel any deferred loss-event
+            // recording for this seq so CC does not double-count it.
+            if !self.deferred_losses.is_empty() {
+                self.deferred_losses.retain(|dl| dl.seq != s);
             }
 
             // Do not use the ACK arrival time as an RTT sample: `sent_time` is
@@ -315,6 +369,7 @@ impl PktSendSpace {
                 rto_from_tail_probe: true,
                 sack_passes: _,
                 fast_loss_rtx_time: _,
+                deferred_loss_stock_deadline: _,
             };
         }
         Some(Pkt { seq, data: &p.data })
@@ -335,6 +390,7 @@ impl PktSendSpace {
             rto_from_tail_probe: false,
             sack_passes: 0,
             fast_loss_rtx_time: None,
+            deferred_loss_stock_deadline: None,
         };
 
         self.send_wnd.push(Some(p));
@@ -351,6 +407,13 @@ impl PktSendSpace {
     pub fn has_rtx(&self, now: Instant) -> bool {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let fast_loss_armed = self.fast_loss_armed();
+        let stock_window = self.rtt_stats.reorder_window();
+        let f2 = self.f2_jitter_cap;
+        let rtx_window = if f2 {
+            self.rtt_stats.fast_reorder_window()
+        } else {
+            stock_window
+        };
         Self::unacked(&self.send_wnd)
             .take(self.cwnd.get())
             .any(|(s, p)| {
@@ -359,7 +422,7 @@ impl PktSendSpace {
                 let time_based = p.is_rtx(
                     is_seq_out_of_order,
                     is_pre_outage_loss,
-                    self.rtt_stats.reorder_window(),
+                    rtx_window,
                     now,
                 );
                 let fast_loss = fast_loss_armed && p.is_fast_loss();
@@ -369,12 +432,18 @@ impl PktSendSpace {
 
     pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
-        let reorder_window = self.rtt_stats.reorder_window();
+        let stock_window = self.rtt_stats.reorder_window();
+        let f2 = self.f2_jitter_cap;
+        let rtx_window = if f2 {
+            self.rtt_stats.fast_reorder_window()
+        } else {
+            stock_window
+        };
         let fast_loss_armed = self.fast_loss_armed();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
             let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
             let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
-            let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, reorder_window, now);
+            let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, rtx_window, now);
             let fast_loss = fast_loss_armed && p.is_fast_loss();
             let should_rtx = time_based || fast_loss;
             if !should_rtx {
@@ -392,6 +461,30 @@ impl PktSendSpace {
             // probe), so it records a loss event exactly as a window-expiry
             // loss would — no TLP probe accounting.
             let is_fast_loss_rtx = fast_loss && !already_rtxed;
+
+            // Jitter-tolerant fast-retransmit deferred-loss accounting.  When
+            // the F2 toggle is on and this retransmit fired purely on the fast
+            // reorder window (i.e. the stock window has NOT yet expired for
+            // the original send), the CC loss event is deferred to the stock
+            // deadline (`original_sent_time + stock_window`).  If the original
+            // is acked before that deadline the deferred entry is cancelled
+            // (reordering, not loss); otherwise it is recorded exactly once
+            // by `poll_deferred_loss`.  This is what keeps goodput from
+            // collapsing on high-jitter lossy links: the rtx happens early
+            // (recovery) but the loss-rate signal seen by delivery-rate CC
+            // only counts genuine losses.
+            let original_sent_time = p.sent_time;
+            let f2_defer_loss = f2
+                && !already_rtxed
+                && !pre_outage_loss
+                && !tail_probe_loss
+                && !is_fast_loss_rtx
+                && now < original_sent_time + stock_window;
+            let f2_stock_deadline = if f2_defer_loss {
+                Some(original_sent_time + stock_window)
+            } else {
+                None
+            };
 
             // fresh pkt for this cwnd
             let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
@@ -412,9 +505,15 @@ impl PktSendSpace {
                     rto_from_tail_probe: false,
                     sack_passes: _,
                     fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
+                    deferred_loss_stock_deadline: f2_stock_deadline,
                 };
             }
-            if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
+            if f2_defer_loss {
+                self.deferred_losses.push(DeferredLoss {
+                    seq: s,
+                    stock_deadline: f2_stock_deadline.unwrap(),
+                });
+            } else if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
                 let smooth_rtt = self.rtt_stats.smooth_rtt();
                 self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
@@ -425,6 +524,40 @@ impl PktSendSpace {
             return Some(p);
         }
         None
+    }
+
+    /// Record any deferred CC loss-events whose stock reorder-window deadline
+    /// has now elapsed and whose packet is still unacked (genuine loss).
+    /// Cancelled automatically when the seq is acked (see `ack`).  This must
+    /// be polled every send tick so deadlines are honoured promptly.
+    pub fn poll_deferred_loss(&mut self, now: Instant) {
+        if self.deferred_losses.is_empty() {
+            return;
+        }
+        let smooth_rtt = self.rtt_stats.smooth_rtt();
+        let mut i = 0;
+        while i < self.deferred_losses.len() {
+            let dl = &self.deferred_losses[i];
+            if now < dl.stock_deadline {
+                i += 1;
+                continue;
+            }
+            // Deadline elapsed: is the seq still in flight (genuine loss)?
+            // `send_wnd.get(&seq)` returning Some(Some(_)) means the packet is
+            // still unacked; if it is None or Some(None) the packet was acked
+            // and `ack` already cancelled this entry — but be defensive and
+            // double-check here too.
+            let still_in_flight = self
+                .send_wnd
+                .get(&dl.seq)
+                .and_then(|o| o.as_ref())
+                .is_some();
+            if still_in_flight {
+                self.loss_event_window
+                    .record_lost(1, now, smooth_rtt);
+            }
+            self.deferred_losses.swap_remove(i);
+        }
     }
 
     pub fn min_rtt(&self) -> Option<Duration> {
@@ -602,13 +735,27 @@ impl PktSendSpace {
 
     pub fn next_poll_time(&self) -> Option<Instant> {
         let mut min_next_poll_time: Option<Instant> = None;
-        for p in Self::unacked(&self.send_wnd)
-            .map(|(_, v)| v)
-            .take(self.cwnd.get())
-        {
+        // Effective reorder-window deadline for rtx scheduling.  When the F2
+        // jitter-cap toggle is on, rtx timing uses the fast reorder window;
+        // otherwise the stock window.  The poll must honour this deadline so
+        // the fast-retransmit fires as soon as it is due.
+        let rtx_window = if self.f2_jitter_cap {
+            self.rtt_stats.fast_reorder_window()
+        } else {
+            self.rtt_stats.reorder_window()
+        };
+        for (s, p) in Self::unacked(&self.send_wnd).take(self.cwnd.get()) {
+            // RTO deadline (sent_time + rto) — the hard retransmit fallback.
             let t = p.next_rto_time();
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
+            // Reorder-window deadline (sent_time + rtx_window) — only relevant
+            // for out-of-order packets (in-order packets are covered by the
+            // cumulative ACK and never declared lost on the reorder path).
+            if s < self.out_of_order_seq_end {
+                let rw_t = p.sent_time + rtx_window;
+                min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(rw_t)).unwrap_or(rw_t));
+            }
         }
         if let Some(seq) = self.tail_seq()
             && let Some(Some(p)) = self.send_wnd.get(&seq)
@@ -617,6 +764,16 @@ impl PktSendSpace {
                 .next_probe_time(p.sent_time, &self.rtt_stats)
         {
             min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
+        }
+        // Deferred-loss stock deadlines — `poll_deferred_loss` must run at or
+        // after each deadline so the deferred CC loss event is recorded
+        // promptly when the packet is genuinely still unacked.
+        for dl in &self.deferred_losses {
+            min_next_poll_time = Some(
+                min_next_poll_time
+                    .map(|min| min.min(dl.stock_deadline))
+                    .unwrap_or(dl.stock_deadline),
+            );
         }
         min_next_poll_time
     }
@@ -660,6 +817,15 @@ struct TxingPkt {
     /// ACK for this packet arrives before `t + min_rtt` could plausibly have
     /// elapsed, the original (not the retransmit) must have been delivered.
     pub fast_loss_rtx_time: Option<Instant>,
+    /// `Some(t)` if this packet was retransmitted at time `t` by the
+    /// jitter-tolerant fast-retransmit path (`RTP_F2_JITTER_CAP`).  The
+    /// congestion-control loss event for that retransmit is *deferred* to the
+    /// stock reorder-window deadline (`sent_time_of_original + reorder_window`
+    /// computed against the original send time stored in
+    /// `deferred_loss_stock_deadline`).  If the original is acked before that
+    /// deadline the loss event is cancelled (it was reordering, not loss);
+    /// otherwise it is recorded exactly once at the deadline.
+    pub deferred_loss_stock_deadline: Option<Instant>,
 }
 impl TxingPkt {
     pub fn hits_rto(&self, now: Instant) -> bool {
@@ -702,6 +868,18 @@ impl TxingPkt {
 }
 
 struct SeqOutOfOrder(pub bool);
+
+/// A pending deferred CC loss-event recording for the jitter-tolerant fast-
+/// retransmit path.  The loss event for `seq` was deferred at `rtx_time` to
+/// `stock_deadline` (the original send time + stock reorder window).  When
+/// [`PktSendSpace::poll_deferred_loss`] runs at `now >= stock_deadline` it
+/// records one loss event iff `seq` is still in flight (genuine loss); if the
+/// seq was acked in the meantime the entry was already cancelled by `ack`.
+#[derive(Debug, Clone, Copy)]
+struct DeferredLoss {
+    seq: u64,
+    stock_deadline: Instant,
+}
 
 #[derive(Debug, Clone)]
 pub struct Pkt<'a> {
@@ -1606,6 +1784,237 @@ mod tests {
             p.fast_loss_rtx_time,
             Some(rtx_t),
             "fast-loss rtx must stamp fast_loss_rtx_time"
+        );
+    }
+
+    // ---- jitter-tolerant fast-retransmit (RTP_F2_JITTER_CAP) tests ----
+    //
+    // These tests force the F2 toggle to a fixed value via `with_f2_jitter_cap`
+    // so they do not race on the process env var with parallel tests.
+
+    /// High-jitter link where the fast reorder window is strictly below the
+    /// stock window.  Returns the `(fast_window, stock_window)` pair so tests
+    /// can pick deadlines on either side.
+    fn settle_high_jitter_f2(space: &mut PktSendSpace, t0: Instant) -> (Duration, Duration) {
+        settle_high_jitter(space, t0);
+        let fast = space.rtt_stats.fast_reorder_window();
+        let stock = space.rtt_stats.reorder_window();
+        assert!(
+            fast < stock,
+            "test requires fast < stock window; fast={fast:?} stock={stock:?}"
+        );
+        (fast, stock)
+    }
+
+    /// Send seq 0..3 and SACK seqs 1, 2, 3 so seq 0 is out-of-order-passed
+    /// and the reorder-window path is eligible for it.
+    fn starve_seq0_with_sacks(space: &mut PktSendSpace, t0: Instant) {
+        send_packet(space, t0);
+        send_packet(space, t0 + ms(1));
+        send_packet(space, t0 + ms(2));
+        send_packet(space, t0 + ms(3));
+        sack_one(space, 1, t0 + ms(10));
+        sack_one(space, 2, t0 + ms(11));
+        sack_one(space, 3, t0 + ms(12));
+        // seq 0 is below out_of_order_seq_end (= 3), so the reorder-window
+        // path applies to it.
+        assert!(space.out_of_order_seq_end > 0);
+    }
+
+    #[test]
+    fn f2_early_reorder_rtx_skips_loss_event_at_rtx_time() {
+        let t0 = Instant::now();
+        // F2 toggle ON, high-jitter link: fast window < stock window.
+        let mut space = PktSendSpace::with_f2_jitter_cap(true);
+        let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
+        assert!(!space.fast_loss_armed(), "high-jitter gate disarmed");
+
+        starve_seq0_with_sacks(&mut space, t0);
+
+        // Pick a time strictly after the fast window but strictly before the
+        // stock window for the original send of seq 0 (sent at t0).
+        let fast_deadline = t0 + fast;
+        let stock_deadline = t0 + stock;
+        let rtx_t = fast_deadline + ms(50);
+        assert!(rtx_t < stock_deadline, "rtx_t must be before stock deadline");
+
+        // No loss event before the rtx.
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no loss event before rtx"
+        );
+
+        // The fast rtx must fire (toggle on → fast window governs rtx timing).
+        assert!(
+            space.has_rtx(rtx_t),
+            "F2 fast window must make has_rtx true before stock deadline"
+        );
+        let rtx = space
+            .rtx(rtx_t)
+            .expect("F2 fast rtx must fire before the stock reorder window");
+        assert_eq!(rtx.seq, 0);
+
+        // *** The loss event must NOT be recorded at rtx time — it is deferred
+        // to the stock deadline.  Recording it here is the goodput-collapse
+        // bug. ***
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "F2 fast rtx must NOT record a loss event at rtx time (deferred)"
+        );
+
+        // The deferred entry must be pending with the stock deadline.
+        assert_eq!(
+            space.deferred_losses.len(),
+            1,
+            "one deferred loss entry pending"
+        );
+        assert_eq!(space.deferred_losses[0].seq, 0);
+        assert_eq!(space.deferred_losses[0].stock_deadline, stock_deadline);
+    }
+
+    #[test]
+    fn f2_deferred_loss_event_records_at_stock_deadline_if_still_unacked() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::with_f2_jitter_cap(true);
+        let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
+
+        starve_seq0_with_sacks(&mut space, t0);
+
+        let fast_deadline = t0 + fast;
+        let stock_deadline = t0 + stock;
+        let rtx_t = fast_deadline + ms(50);
+        let rtx = space.rtx(rtx_t).expect("F2 fast rtx fires");
+        assert_eq!(rtx.seq, 0);
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no loss event at rtx time (deferred)"
+        );
+
+        // Still before the stock deadline: polling must not record anything.
+        let before_deadline = stock_deadline - ms(10);
+        space.poll_deferred_loss(before_deadline);
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no loss event before stock deadline"
+        );
+        assert_eq!(
+            space.deferred_losses.len(),
+            1,
+            "deferred entry still pending before stock deadline"
+        );
+
+        // At the stock deadline, the packet is still unacked (genuine loss):
+        // the deferred loss event must now be recorded exactly once.
+        space.poll_deferred_loss(stock_deadline + ms(1));
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "deferred loss event must record at stock deadline if still unacked"
+        );
+        assert_eq!(
+            space.deferred_losses.len(),
+            0,
+            "deferred entry cleared after recording"
+        );
+    }
+
+    #[test]
+    fn f2_repaired_before_stock_deadline_is_not_double_counted() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::with_f2_jitter_cap(true);
+        let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
+
+        starve_seq0_with_sacks(&mut space, t0);
+
+        let fast_deadline = t0 + fast;
+        let stock_deadline = t0 + stock;
+        let rtx_t = fast_deadline + ms(50);
+        let rtx = space.rtx(rtx_t).expect("F2 fast rtx fires");
+        assert_eq!(rtx.seq, 0);
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no loss event at rtx time (deferred)"
+        );
+        assert_eq!(space.deferred_losses.len(), 1);
+
+        // The original (or the repair) is acked before the stock deadline:
+        // this was reordering, not loss.  The deferred entry must be cancelled
+        // and no loss event recorded.  Polling after the deadline must NOT
+        // double-count a later repair either.
+        let ack_t = stock_deadline - ms(100);
+        assert!(ack_t > rtx_t);
+        let acked = ack_one(&mut space, 0, ack_t);
+        assert_eq!(acked, 1, "seq 0 must be acked");
+
+        // The ack cancels the deferred entry.
+        assert_eq!(
+            space.deferred_losses.len(),
+            0,
+            "deferred entry cancelled by ack before stock deadline"
+        );
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "reordering must not record a loss event"
+        );
+
+        // Polling after the stock deadline must not record anything (the
+        // entry is gone, no double-count).
+        space.poll_deferred_loss(stock_deadline + ms(1));
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no double-count after repair before stock deadline"
+        );
+        assert_eq!(space.deferred_losses.len(), 0);
+    }
+
+    #[test]
+    fn f2_toggle_off_preserves_stock_out_of_order_window() {
+        let t0 = Instant::now();
+        // F2 toggle OFF: behaviour must be byte-for-byte stock.
+        let mut space = PktSendSpace::with_f2_jitter_cap(false);
+        let (_fast, stock) = settle_high_jitter_f2(&mut space, t0);
+        // Re-derive fast window to confirm toggle-off uses stock for rtx.
+        let stock_window = space.rtt_stats.reorder_window();
+        assert_eq!(stock_window, stock);
+
+        starve_seq0_with_sacks(&mut space, t0);
+
+        // Pick a time after the fast window but before the stock window: with
+        // the toggle OFF the fast rtx must NOT fire (stock behaviour).
+        let fast = space.rtt_stats.fast_reorder_window();
+        let fast_deadline = t0 + fast;
+        let stock_deadline = t0 + stock;
+        let between = fast_deadline + ms(50);
+        assert!(between < stock_deadline);
+        assert!(
+            !space.has_rtx(between),
+            "toggle off: no rtx before the stock reorder window"
+        );
+        assert!(
+            space.rtx(between).is_none(),
+            "toggle off: no retransmit before the stock reorder window"
+        );
+
+        // No deferred loss entry was created with the toggle off.
+        assert_eq!(
+            space.deferred_losses.len(),
+            0,
+            "toggle off: no deferred loss entries"
+        );
+
+        // At the stock deadline the stock rtx fires and records the loss
+        // event immediately (no deferral).
+        let rtx_t = stock_deadline + ms(1);
+        assert!(space.has_rtx(rtx_t), "toggle off: stock rtx fires at stock deadline");
+        let rtx = space.rtx(rtx_t).expect("stock rtx at stock deadline");
+        assert_eq!(rtx.seq, 0);
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "toggle off: stock rtx records loss event immediately (no deferral)"
+        );
+        assert_eq!(
+            space.deferred_losses.len(),
+            0,
+            "toggle off: no deferred entries created"
         );
     }
 }

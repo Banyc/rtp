@@ -64,6 +64,12 @@ impl RttStats {
         self.rto.reorder_window()
     }
 
+    /// Fast reorder window used only to schedule retransmission when the
+    /// `RTP_F2_JITTER_CAP` toggle is on (see [`RtxTimer::fast_reorder_window`]).
+    pub(crate) fn fast_reorder_window(&self) -> Duration {
+        self.rto.fast_reorder_window()
+    }
+
     /// Whether the structural low-jitter gate for evidence-gated fast loss
     /// is armed (see [`RtxTimer::fast_loss_armed`]).
     pub(crate) fn fast_loss_armed(&self) -> bool {
