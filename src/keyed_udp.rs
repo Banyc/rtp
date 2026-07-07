@@ -9,8 +9,11 @@ use udp_listener::{ConnWrite, Packet, UtpListener};
 
 use crate::{
     socket::{ReadSocket, WriteSocket, socket},
-    transmission::transmission_layer::{UnreliableLayer, UnreliableWrite},
-    udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss},
+    transmission::{
+        fec_tuning::{FecTuning, fec_tuning_from_env},
+        transmission_layer::{UnreliableLayer, UnreliableWrite},
+    },
+    udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss_and_fec_tuning},
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
@@ -29,6 +32,20 @@ fn checked_keyed_mss<K: DispatchKey>(mss_after_fec: NonZeroUsize) -> NonZeroUsiz
         "mss {mss_after_fec} leaves no payload room after {key_size}-byte dispatch key and {overhead}-byte codec overhead"
     );
     NonZeroUsize::new(remaining).unwrap()
+}
+
+/// Apply the keyed-dispatch MSS reduction to an already-wrapped
+/// [`UnreliableLayer`].  The dispatch key is prepended to every datagram, so
+/// the effective MSS the reliable layer sees is `mss - key_size`.  The FEC
+/// tuning is preserved unchanged.
+fn apply_keyed_mss<K: DispatchKey>(layer: UnreliableLayer) -> UnreliableLayer {
+    UnreliableLayer {
+        utp_read: layer.utp_read,
+        utp_write: layer.utp_write,
+        mss: checked_keyed_mss::<K>(layer.mss),
+        fec: layer.fec,
+        fec_tuning: layer.fec_tuning,
+    }
 }
 
 #[derive(Debug)]
@@ -61,17 +78,26 @@ impl<K: DispatchKey> Server<K> {
         fec: bool,
         mss: usize,
     ) -> std::io::Result<Accepted<K>> {
+        let tuning = fec_tuning_from_env();
+        self.accept_without_handshake_with_mss_and_fec_tuning(fec, mss, tuning)
+            .await
+    }
+
+    /// [`Self::accept_without_handshake()`] with a custom MSS and a
+    /// per-connection [`FecTuning`].  Both peers must agree on the MSS and the
+    /// FEC flag; the FEC tuning is likewise out-of-band.
+    pub async fn accept_without_handshake_with_mss_and_fec_tuning(
+        &self,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+    ) -> std::io::Result<Accepted<K>> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &conn_key);
-        let unreliable_layer = wrap_fec_with_mss(read, write, fec, mss);
-        let unreliable_layer = UnreliableLayer {
-            utp_read: unreliable_layer.utp_read,
-            utp_write: unreliable_layer.utp_write,
-            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
-            fec: unreliable_layer.fec,
-        };
+        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, tuning);
+        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -87,12 +113,7 @@ impl<K: DispatchKey> Server<K> {
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &conn_key);
         let unreliable_layer = wrap_fec(read, write, fec);
-        let unreliable_layer = UnreliableLayer {
-            utp_read: unreliable_layer.utp_read,
-            utp_write: unreliable_layer.utp_write,
-            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
-            fec: unreliable_layer.fec,
-        };
+        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -141,16 +162,25 @@ impl<K: DispatchKey> Client<K> {
         fec: bool,
         mss: usize,
     ) -> Option<Connected> {
+        let tuning = fec_tuning_from_env();
+        self.open_without_handshake_with_mss_and_fec_tuning(dispatch_key, fec, mss, tuning)
+    }
+
+    /// [`Self::open_without_handshake()`] with a custom MSS and a
+    /// per-connection [`FecTuning`].  Both peers must agree on the MSS and
+    /// the FEC flag; the FEC tuning is likewise out-of-band.
+    pub fn open_without_handshake_with_mss_and_fec_tuning(
+        &self,
+        dispatch_key: K,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+    ) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key);
-        let unreliable_layer = wrap_fec_with_mss(read, write, fec, mss);
-        let unreliable_layer = UnreliableLayer {
-            utp_read: unreliable_layer.utp_read,
-            utp_write: unreliable_layer.utp_write,
-            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
-            fec: unreliable_layer.fec,
-        };
+        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, tuning);
+        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Some(Connected { read, write })
     }
@@ -160,12 +190,7 @@ impl<K: DispatchKey> Client<K> {
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key);
         let unreliable_layer = wrap_fec(read, write, fec);
-        let unreliable_layer = UnreliableLayer {
-            utp_read: unreliable_layer.utp_read,
-            utp_write: unreliable_layer.utp_write,
-            mss: checked_keyed_mss::<K>(unreliable_layer.mss),
-            fec: unreliable_layer.fec,
-        };
+        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Some(Connected { read, write })
     }

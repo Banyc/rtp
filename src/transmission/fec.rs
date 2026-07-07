@@ -30,6 +30,11 @@ const GROUP_SIZE_HIST_LEN: usize = MAX_DATA_PER_GROUP + 1;
 #[derive(Debug, Clone)]
 pub struct FecConfig {
     pub symbol_size: usize,
+    /// Parity depth requested for groups that encode as exactly one data
+    /// symbol.  Multi-symbol groups always keep the stock 1:4 ratio and the
+    /// spare-token budget gate regardless of this value.  `1` is stock
+    /// behaviour.  See `FecTuning::interactive_parity_depth`.
+    pub interactive_parity_depth: u8,
 }
 
 /// Encapsulated FEC state owned by the transmission layer. The transmission
@@ -54,6 +59,12 @@ pub struct FecState {
     /// pending). Cleared otherwise. When blocked, `close_fec_burst` skips the
     /// open group instead of flushing it.
     tail_flush_allowed: bool,
+    /// Per-connection interactive parity depth for single-symbol groups (from
+    /// `FecTuning`).  `1` is stock; a deeper value makes
+    /// `maybe_flush_parities` emit up to that many parity copies for a group
+    /// with exactly one data symbol, bypassing the spare-token budget gate.
+    /// Multi-symbol groups always keep the stock gate and ratio.
+    interactive_parity_depth: u8,
     stats: Stats,
 }
 
@@ -144,6 +155,7 @@ impl FecState {
             recovered: VecDeque::new(),
             enc_buf: vec![0; config.symbol_size * 2],
             tail_flush_allowed: false,
+            interactive_parity_depth: config.interactive_parity_depth.max(1),
             stats: Stats::default(),
         }
     }
@@ -202,10 +214,22 @@ impl FecState {
     /// spare-bandwidth-only and must not compete with data traffic. Groups
     /// larger than `PARITY_DATA_THRESHOLD` are also skipped.
     ///
+    /// **Single-symbol interactive exception:** when the open group has
+    /// exactly one data symbol and `interactive_parity_depth > 1`, the group
+    /// emits up to `interactive_parity_depth` parity copies **bypassing the
+    /// spare-token budget gate**.  Multi-symbol groups always keep the stock
+    /// 1:4 ratio and the budget gate regardless of the configured depth —
+    /// ungated depth > 1 on bulk would add ~75% overhead and defeat the
+    /// point.  The single-symbol group is exactly the case where the stock
+    /// depth-1 parity is no better than a retransmit (one independent loss
+    /// draw for the whole message), so the deeper parity buys tail latency
+    /// for negligible bytes on a large-MSS path.
+    ///
     /// Reed-Solomon needs the complete parity set to reconstruct, so the full
-    /// `parity_count` tokens are reserved atomically before encoding any.
-    /// Parity must fit within 1/3 of the currently-available send budget
-    /// (`PARITY_BUDGET_DEN`), leaving the rest for data traffic.
+    /// `parity_count` tokens are reserved atomically before encoding any
+    /// (the stock path only; the single-symbol bypass skips the budget
+    /// check).  Parity must fit within 1/3 of the currently-available send
+    /// budget (`PARITY_BUDGET_DEN`), leaving the rest for data traffic.
     pub fn maybe_flush_parities(
         &mut self,
         send_rate_limiter: &mut TokenBucket,
@@ -224,6 +248,33 @@ impl FecState {
             return vec![];
         }
         let parity_count = parity_for(data_count);
+
+        // Single-symbol interactive exception: a group with exactly one data
+        // symbol and a configured depth > 1 bypasses the spare-token budget
+        // gate and emits up to `interactive_parity_depth` parity copies.
+        // Multi-symbol groups always keep the stock gate regardless of depth.
+        if data_count == 1 && self.interactive_parity_depth > 1 {
+            // Bypass the budget gate for the single-symbol interactive case.
+            // The parity set is tiny (one data symbol → at most a handful of
+            // parity symbols) and the whole point is tail-latency insurance
+            // for an interactive message; gating it on spare tokens would
+            // re-introduce the stock retransmit-equivalent behaviour.
+            let depth = self.interactive_parity_depth;
+            if FEC_DEBUG {
+                eprintln!(
+                    "FEC: flushing {depth} parities for single-symbol group (interactive, budget bypassed)"
+                );
+            }
+            self.stats.groups_flushed += 1;
+            let mut parity_encoder = self.encoder.flush_parities(depth);
+            let mut pkts = vec![];
+            while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
+                pkts.push(self.enc_buf[..n].to_vec());
+            }
+            self.stats.parity_sent += pkts.len();
+            return pkts;
+        }
+
         let available_tokens = send_rate_limiter.gen_tokens(now);
         let parity_budget = available_tokens / PARITY_BUDGET_DEN;
         if usize::from(parity_count) > parity_budget {
@@ -294,6 +345,19 @@ impl FecState {
         self.stats.recovered_symbols
     }
 
+    /// Test-only accessor for the configured single-symbol interactive
+    /// parity depth.
+    #[cfg(test)]
+    pub(crate) fn interactive_parity_depth(&self) -> u8 {
+        self.interactive_parity_depth
+    }
+
+    /// Test-only accessor for the running parity-sent counter.
+    #[cfg(test)]
+    pub(crate) fn parity_sent(&self) -> usize {
+        self.stats.parity_sent
+    }
+
     /// Print the basic FEC counters to stderr. Only active when `FEC_DEBUG` is
     /// enabled — flip that flag to debug FEC behavior. Called by the
     /// transmission layer when the read stream reaches EOF so the snapshot is
@@ -320,5 +384,164 @@ fn parity_for(data_count: usize) -> u8 {
 fn inc_hist(hist: &mut [u64], idx: usize) {
     if let Some(count) = hist.get_mut(idx) {
         *count += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A fresh `FecState` with a given interactive parity depth, sized for a
+    /// large-MSS loopback path so single-symbol groups dominate.
+    fn fec_state(symbol_size: usize, interactive_parity_depth: u8) -> FecState {
+        FecState::new(FecConfig {
+            symbol_size,
+            interactive_parity_depth,
+        })
+    }
+
+    /// A `TokenBucket` with effectively unlimited tokens so the stock budget
+    /// gate never trims a parity burst (the multi-symbol gate is exercised by
+    /// a separate test that drains the bucket).  Returns `(bucket, now)` so
+    /// the caller uses the same `now` the bucket was filled at.
+    fn unlimited_bucket(now: Instant) -> (TokenBucket, Instant) {
+        use core::num::NonZeroUsize;
+        use core::time::Duration;
+        use primitive::ops::float::PosR;
+        let tb = TokenBucket::new(
+            PosR::new(1e9).unwrap(),
+            NonZeroUsize::new(usize::MAX).unwrap(),
+            now,
+        );
+        // Pre-fill by advancing time; return the advanced timestamp so
+        // callers query the bucket at the same instant.
+        let later = now + Duration::from_secs(1000);
+        let mut tb = tb;
+        let _ = tb.gen_tokens(later);
+        (tb, later)
+    }
+
+    /// A `TokenBucket` drained to zero so the stock budget gate trims any
+    /// multi-symbol parity burst (single-symbol interactive bypass still
+    /// applies).  Rate is 1 token/sec so no tokens regenerate during the
+    /// test.
+    fn empty_bucket(now: Instant) -> TokenBucket {
+        use core::num::NonZeroUsize;
+        use core::time::Duration;
+        use primitive::ops::float::PosR;
+        let mut tb = TokenBucket::new(PosR::new(1.0).unwrap(), NonZeroUsize::new(usize::MAX).unwrap(), now);
+        // Force-fill then drain all tokens.
+        let later = now + Duration::from_secs(1000);
+        let _ = tb.gen_tokens(later);
+        let drained = tb.take_at_most_tokens(usize::MAX, later);
+        assert!(drained > 0, "bucket should have tokens to drain");
+        // Now the bucket is empty; rate=1/s so it stays ~empty for the test.
+        tb
+    }
+
+    /// A single-symbol group with `interactive_parity_depth = 3` must emit
+    /// exactly 3 parity copies, bypassing the spare-token budget gate even
+    /// when the bucket is empty.
+    #[test]
+    fn single_symbol_group_emits_depth_parities_bypassing_budget() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 3);
+        let mut tb = empty_bucket(now);
+
+        // Encode one data symbol (single-symbol group).
+        let data = b"hello interactive world";
+        let mut sym_buf = vec![0u8; 8192];
+        let _n = fec.encode_data(data, &mut sym_buf);
+        assert_eq!(fec.encoder.group_data_count(), 1);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        assert_eq!(
+            pkts.len(),
+            3,
+            "single-symbol group at depth 3 must emit 3 parity copies, got {}",
+            pkts.len()
+        );
+        assert_eq!(fec.parity_sent(), 3);
+    }
+
+    /// A multi-symbol group must keep the stock budget gate regardless of the
+    /// configured interactive depth: when the bucket is empty, a
+    /// multi-symbol group is skipped (0 parity) even with depth 3.
+    #[test]
+    fn multi_symbol_group_keeps_budget_gate_even_with_depth() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 3);
+        let mut tb = empty_bucket(now);
+
+        // Encode two data symbols (multi-symbol group). Note
+        // PARITY_DATA_THRESHOLD is 4, so a 2-symbol group is not force-skipped.
+        let data = b"first symbol payload";
+        let mut sym_buf = vec![0u8; 8192];
+        fec.encode_data(data, &mut sym_buf);
+        fec.encode_data(data, &mut sym_buf);
+        assert_eq!(fec.encoder.group_data_count(), 2);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        assert_eq!(
+            pkts.len(),
+            0,
+            "multi-symbol group with empty bucket must be skipped (0 parity), got {}",
+            pkts.len()
+        );
+    }
+
+    /// A multi-symbol group with a full bucket emits the stock 1:4 parity
+    /// (1 parity for 2-4 data symbols), NOT the interactive depth — proving
+    /// the depth is single-symbol-only.
+    #[test]
+    fn multi_symbol_group_with_full_bucket_emits_stock_parity_not_depth() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 3);
+        let (mut tb, now) = unlimited_bucket(now);
+
+        // Two data symbols → stock parity_for(2) = 1.
+        let data = b"first symbol payload";
+        let mut sym_buf = vec![0u8; 8192];
+        fec.encode_data(data, &mut sym_buf);
+        fec.encode_data(data, &mut sym_buf);
+        assert_eq!(fec.encoder.group_data_count(), 2);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        assert_eq!(
+            pkts.len(),
+            1,
+            "multi-symbol group must emit stock parity_for(2)=1, not depth 3; got {}",
+            pkts.len()
+        );
+    }
+
+    /// A single-symbol group with depth 1 (stock) emits 1 parity and respects
+    /// the budget gate — proving the bypass only fires when depth > 1.
+    #[test]
+    fn single_symbol_group_at_depth_1_respects_budget_gate() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let mut tb = empty_bucket(now);
+
+        let data = b"hello";
+        let mut sym_buf = vec![0u8; 8192];
+        fec.encode_data(data, &mut sym_buf);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        assert_eq!(
+            pkts.len(),
+            0,
+            "single-symbol group at depth 1 with empty bucket must be skipped, got {}",
+            pkts.len()
+        );
+    }
+
+    /// `FecState::new` clamps a misconfigured `interactive_parity_depth = 0`
+    /// to 1 so the stock path always emits at least 1 parity.
+    #[test]
+    fn depth_zero_is_clamped_to_one() {
+        let fec = fec_state(8192 - 11, 0);
+        assert_eq!(fec.interactive_parity_depth(), 1);
     }
 }

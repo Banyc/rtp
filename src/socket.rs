@@ -627,6 +627,109 @@ mod tests {
         );
     }
 
+    /// FEC must recover lost data symbols at a large MSS (8192) under packet
+    /// loss for the single-symbol interactive path.  At MSS 8192 a small
+    /// message (< ~8175 bytes) is a single data symbol, so the stock
+    /// depth-1 parity is one independent loss draw for the whole message.
+    /// `FecTuning::mindiv()` (instream flush + depth 3) gives each
+    /// single-symbol group three parity copies bypassing the budget gate,
+    /// so a single loss is recoverable.  This sends many small interactive
+    /// messages over a lossy large-MSS link and asserts
+    /// `recovered_symbols > 0` on the receiver.
+    ///
+    /// Construction goes through `wrap_fec_lossy_with_mss_and_fec_tuning`,
+    /// which delegates to the same `checked_mss_and_fec` /
+    /// `wrap_fec_with_mss_and_fec_tuning` path production uses — so a
+    /// regression that silently disables FEC at a non-default MSS (e.g.
+    /// `if fec && mss == NO_FEC_MSS`) fails this test, not just the
+    /// default-MSS one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fec_recovers_under_loss_with_mss_8192() {
+        use crate::socket::socket;
+        use crate::transmission::fec_tuning::FecTuning;
+        use crate::udp::testing::{
+            LossRate, wrap_fec_lossy_with_mss_and_fec_tuning,
+        };
+
+        // 3% loss on each side.
+        let rate_a = LossRate::new(300);
+        let rate_b = LossRate::new(300);
+
+        let fec = true;
+        let mss = 8192;
+        let tuning = FecTuning::mindiv();
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+
+        // Construct both layers via the production FEC construction path
+        // (checked_mss_and_fec / wrap_fec_with_mss_and_fec_tuning) with the
+        // lossy read/write injected.  No post-construction overrides of
+        // `.fec` or `.fec_tuning` — the test must exercise the real path so
+        // a regression disabling FEC at non-default MSS fails here.
+        let a_layer = wrap_fec_lossy_with_mss_and_fec_tuning(
+            a.clone(), a, fec, mss, tuning, rate_a,
+        );
+        let b_layer = wrap_fec_lossy_with_mss_and_fec_tuning(
+            b.clone(), b, fec, mss, tuning, rate_b,
+        );
+        let (a_r, a_w) = socket(a_layer, None);
+        let (b_r, b_w) = socket(b_layer, None);
+        let b_r = b_r;
+        let mut a_w = a_w;
+        let a_r = a_r;
+        let mut b_w = b_w;
+
+        // Send many small interactive messages, each forming a single data
+        // symbol at MSS 8192.  512 messages of 256 bytes gives ~512
+        // single-symbol groups; 3% loss drops ~15 data symbols, and mindiv's
+        // depth-3 parity recovers the bulk of them.
+        let msg_len = 256;
+        let n_msgs = 512;
+        let mut sent = Vec::with_capacity(n_msgs);
+        for i in 0..n_msgs {
+            let mut m = vec![0u8; msg_len];
+            for byte in &mut m {
+                *byte = (i as u8).wrapping_add(rand::random());
+            }
+            sent.push(m.clone());
+        }
+
+        // Echo server: read each message and echo it back so the connection
+        // stays alive and the receiver drains.  Returns the receiver's FEC
+        // recovered-symbol count for the assertion.
+        let sent_for_server = sent.clone();
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; msg_len];
+            for expected in &sent_for_server {
+                let n = b_r.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], expected.as_slice());
+                b_w.send(&buf[..n]).await.unwrap();
+            }
+            b_r.fec_recovered_symbols()
+        });
+
+        for m in &sent {
+            a_w.send(m).await.unwrap();
+            // Read the echo back to pace the stream and avoid overwhelming the
+            // receiver window.  The echo is a single-symbol group in the
+            // reverse direction, also protected by mindiv.
+            let mut echo = vec![0u8; m.len()];
+            let n = a_r.recv(&mut echo).await.unwrap();
+            assert_eq!(&echo[..n], m.as_slice());
+        }
+        drop(a_w);
+        drop(a_r);
+        let recovered = server_task.await.unwrap();
+
+        assert!(recovered.is_some(), "FEC should be enabled on the receiver");
+        assert!(
+            recovered.unwrap() > 0,
+            "FEC should recover >0 symbols at MSS 8192 under 3% loss with mindiv, got 0"
+        );
+    }
+
     /// The async write stream must stage at most the reliable layer's send
     /// data buffer capacity per `poll_write`. Writing a slice much larger than
     /// that should consume at most that many bytes in a single poll.

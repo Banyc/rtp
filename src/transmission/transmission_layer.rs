@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{fec::FecState, ts_echo::TsEcho};
+use super::{fec::FecState, fec_tuning::FecTuning, ts_echo::TsEcho};
 use crate::{
     codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
     reliable::reliable_layer::{ReliableLayer, SharedTokenBucket},
@@ -128,6 +128,13 @@ pub struct TransmissionLayer {
     /// the toggle on or off deterministically without racing other parallel
     /// tests in the same binary.
     f3_rtx_dup: bool,
+    /// Per-connection FEC tuning snapshot taken at construction.  When
+    /// `instream_flush` is set, the data send burst force-flushes the open
+    /// FEC group at its end instead of waiting for the stock
+    /// `can_send_tail_fec` gate.  ACK/kill bursts keep the stock gate
+    /// regardless.  `interactive_parity_depth` is consumed by the `FecState`
+    /// at construction; this field only drives the force-flush.
+    fec_instream_flush: bool,
 }
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
@@ -164,6 +171,7 @@ impl TransmissionLayer {
             fec: unreliable_layer.fec.map(Mutex::new),
             clock_epoch: now,
             f3_rtx_dup: f3_rtx_dup_from_env(),
+            fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         }
     }
 
@@ -454,9 +462,18 @@ impl TransmissionLayer {
         // when the reliable layer has no more data/RTX to send, so parity is
         // tail-only and never competes with data bandwidth. When blocked, the
         // open group is skipped so no stale group carries into the next burst.
+        //
+        // `FecTuning::instream_flush` (F5): force-flush the open DATA group at
+        // the end of every data send burst instead of waiting for the stock
+        // `can_send_tail_fec` gate.  This is what lets a single-symbol
+        // interactive message emit its (deeper) parity promptly rather than
+        // being skipped at the burst end.  ACK/kill bursts (above) keep the
+        // stock gate regardless — only data bursts are force-flushed, since
+        // ACK/kill parity is not the interactive win.
         if self.fec.is_some() {
             let now = Instant::now();
-            let can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+            let can_send_tail_fec = self.fec_instream_flush
+                || { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
             self.close_fec_burst(now, can_send_tail_fec).await;
         }
         Ok(0 < written_bytes || written_fin)
@@ -956,6 +973,11 @@ pub struct UnreliableLayer {
     pub utp_write: Box<dyn UnreliableWrite>,
     pub mss: NonZeroUsize,
     pub fec: Option<FecState>,
+    /// Per-connection FEC tuning.  Consumed at construction to drive the
+    /// data-burst force-flush (`instream_flush`) and the single-symbol
+    /// interactive parity depth.  Stock `FecTuning::default()` preserves the
+    /// pre-F5 behaviour byte-for-byte.
+    pub fec_tuning: FecTuning,
 }
 
 #[derive(Debug, Clone)]
@@ -1123,7 +1145,17 @@ mod tests {
 
     /// A `TransmissionLayer` test harness exposing the recording write via an
     /// `Arc<Mutex<RecordingWrite>>` shared with the layer's `UnreliableWrite`.
+    /// `fec` toggles FEC on; `enabled` toggles the `RTP_F3_RTX_DUP` retransmit
+    /// armor; `tuning` sets the per-connection FEC tuning (defaults to stock).
     fn harness(fec: bool, enabled: bool) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        harness_with_tuning(fec, enabled, crate::transmission::fec_tuning::FecTuning::default())
+    }
+
+    fn harness_with_tuning(
+        fec: bool,
+        enabled: bool,
+        tuning: crate::transmission::fec_tuning::FecTuning,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
         #[async_trait]
@@ -1140,7 +1172,8 @@ mod tests {
         }
         let write = SharedWrite(recorder.clone());
         let read = BlackholeRead;
-        let ul = crate::udp::wrap_fec_with_mss(read, write, fec, crate::udp::NO_FEC_MSS);
+        let ul =
+            crate::udp::wrap_fec_with_mss_and_fec_tuning(read, write, fec, crate::udp::NO_FEC_MSS, tuning);
         let mut tl = TransmissionLayer::new(ul, None);
         tl.set_f3_rtx_dup_for_test(enabled);
         (tl, recorder)
@@ -1225,6 +1258,46 @@ mod tests {
             recorder.lock().unwrap().count(),
             1,
             "toggle off must send exactly one datagram (stock)"
+        );
+    }
+
+    /// F5: with `FecTuning::mindiv()` (instream flush + depth 3), a
+    /// single-symbol data burst must force-flush 3 parity copies at the
+    /// burst end, even though `can_send_tail_fec` is false (an unacked data
+    /// packet is still in flight).  Stock tuning skips the open group when
+    /// `can_send_tail_fec` is false; the instream-flush gate overrides that
+    /// so the single-symbol interactive message gets its parity promptly.
+    /// The single-symbol budget bypass is covered by the `fec.rs` unit tests.
+    ///
+    /// Mutation target: if the `fec_instream_flush` force-flush is removed
+    /// (stock `can_send_tail_fec` gate always applied), the unacked data
+    /// packet makes `can_send_tail_fec` false, the group is skipped, and
+    /// this test gets 1 datagram (data only) instead of 4.
+    #[tokio::test]
+    async fn f5_single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
+        use crate::transmission::fec_tuning::FecTuning;
+
+        // mindiv: instream flush + depth 3.
+        let (tl, recorder) = harness_with_tuning(true, false, FecTuning::mindiv());
+        // Stage one small data packet (a single-symbol group at the default
+        // MSS, since 100 bytes << single_symbol_payload).
+        let payload = vec![0u8; 100];
+        let now = Instant::now();
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            assert_eq!(rl.send_data_buf(&payload, now), payload.len());
+        }
+        // The packet is now staged but unacked, so `can_send_tail_fec` is
+        // false (has_rtx / send buffer not empty).  Stock tuning would skip
+        // the group; mindiv force-flushes it.
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        // 1 data symbol + 3 parity copies = 4 datagrams.
+        assert_eq!(
+            n, 4,
+            "mindiv single-symbol burst must emit 1 data + 3 parity = 4 datagrams, got {n}"
         );
     }
 }

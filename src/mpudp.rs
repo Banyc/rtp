@@ -6,7 +6,10 @@ use mpudp::{conn::MpUdpConn, listen::MpUdpListener, read::MpUdpRead, write::MpUd
 
 use crate::{
     socket::{ReadSocket, WriteSocket, socket},
-    transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
+    transmission::{
+        fec_tuning::FecTuning,
+        transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
+    },
     udp::LogConfig,
 };
 
@@ -30,7 +33,19 @@ impl Listener {
     }
     pub async fn accept_without_handshake(&mut self) -> io::Result<Conn> {
         let conn = self.listener.accept().await?;
-        convert_conn(conn, None).await
+        convert_conn(conn, None, FecTuning::default()).await
+    }
+
+    /// [`Self::accept_without_handshake()`] with a per-connection
+    /// [`FecTuning`].  mpudp carries no FEC today (`fec` is always `None`),
+    /// so the tuning is currently inert; the variant is exposed for API
+    /// parity with `udp`/`keyed_udp`.
+    pub async fn accept_without_handshake_with_fec_tuning(
+        &mut self,
+        tuning: FecTuning,
+    ) -> io::Result<Conn> {
+        let conn = self.listener.accept().await?;
+        convert_conn(conn, None, tuning).await
     }
 }
 #[derive(Debug)]
@@ -44,10 +59,27 @@ impl Conn {
         log_config: Option<LogConfig<'_>>,
     ) -> io::Result<Self> {
         let conn = MpUdpConn::connect(addrs).await?;
-        convert_conn(conn, log_config).await
+        convert_conn(conn, log_config, FecTuning::default()).await
+    }
+
+    /// [`Self::connect_without_handshake()`] with a per-connection
+    /// [`FecTuning`].  mpudp carries no FEC today (`fec` is always `None`),
+    /// so the tuning is currently inert; the variant is exposed for API
+    /// parity with `udp`/`keyed_udp`.
+    pub async fn connect_without_handshake_with_fec_tuning(
+        addrs: impl Iterator<Item = SocketAddr>,
+        log_config: Option<LogConfig<'_>>,
+        tuning: FecTuning,
+    ) -> io::Result<Self> {
+        let conn = MpUdpConn::connect(addrs).await?;
+        convert_conn(conn, log_config, tuning).await
     }
 }
-async fn convert_conn(conn: MpUdpConn, log_config: Option<LogConfig<'_>>) -> io::Result<Conn> {
+async fn convert_conn(
+    conn: MpUdpConn,
+    log_config: Option<LogConfig<'_>>,
+    tuning: FecTuning,
+) -> io::Result<Conn> {
     let log_config = match log_config {
         Some(c) => {
             let zero_addr = "0.0.0.0:0".parse().unwrap();
@@ -64,6 +96,7 @@ async fn convert_conn(conn: MpUdpConn, log_config: Option<LogConfig<'_>>) -> io:
         utp_write: Box::new(AtomicMpUdpWrite::new(w)),
         mss: NonZeroUsize::new(MSS).unwrap(),
         fec: None,
+        fec_tuning: tuning,
     };
     let (read, write) = socket(unreliable_layer, log_config);
     let conn = Conn { read, write };

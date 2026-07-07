@@ -10,6 +10,7 @@ use crate::{
     socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
     transmission::{
         fec::{FecConfig, FecState},
+        fec_tuning::{FecTuning, fec_tuning_from_env},
         transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
     },
 };
@@ -53,7 +54,9 @@ impl Listener {
     /// [`Self::accept()`] but without handshake
     pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted> {
         let mss = NO_FEC_MSS;
-        self.accept_without_handshake_with_mss(fec, mss).await
+        let tuning = FecTuning::default();
+        self.accept_without_handshake_with_mss_and_fec_tuning(fec, mss, tuning)
+            .await
     }
 
     /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
@@ -61,7 +64,8 @@ impl Listener {
     /// You should keep this method in a loop.
     pub async fn accept(&self, fec: bool) -> std::io::Result<Handshake> {
         let mss = NO_FEC_MSS;
-        self.accept_with_mss(fec, mss).await
+        let tuning = fec_tuning_from_env();
+        self.accept_with_mss_and_fec_tuning(fec, mss, tuning).await
     }
 
     /// [`Self::accept()`] but without handshake and with a custom MSS.
@@ -70,9 +74,9 @@ impl Listener {
         fec: bool,
         mss: usize,
     ) -> std::io::Result<Accepted> {
-        let accepted = self.listener.accept().await?;
-        let handshake = false;
-        accept(accepted, handshake, fec, mss).await
+        let tuning = fec_tuning_from_env();
+        self.accept_without_handshake_with_mss_and_fec_tuning(fec, mss, tuning)
+            .await
     }
 
     /// [`Self::accept()`] with a custom MSS.
@@ -82,9 +86,43 @@ impl Listener {
     /// overhead. Both peers must use the same `mss`; there is no in-band
     /// negotiation.
     pub async fn accept_with_mss(&self, fec: bool, mss: usize) -> std::io::Result<Handshake> {
+        let tuning = fec_tuning_from_env();
+        self.accept_with_mss_and_fec_tuning(fec, mss, tuning).await
+    }
+
+    /// [`Self::accept()`] but without handshake, with a custom MSS and a
+    /// per-connection [`FecTuning`].  Both peers must agree on the MSS and
+    /// the FEC flag; the FEC tuning is likewise out-of-band (no in-band
+    /// negotiation).  See [`FecTuning`] for the large-MSS recipe and the
+    /// platform-fragmentation caveat.
+    pub async fn accept_without_handshake_with_mss_and_fec_tuning(
+        &self,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+    ) -> std::io::Result<Accepted> {
+        let accepted = self.listener.accept().await?;
+        let handshake = false;
+        accept(accepted, handshake, fec, mss, tuning).await
+    }
+
+    /// [`Self::accept()`] with a custom MSS and a per-connection
+    /// [`FecTuning`].
+    ///
+    /// # Panics
+    /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+    /// overhead. Both peers must use the same `mss`; there is no in-band
+    /// negotiation.  The FEC tuning is likewise out-of-band — both peers
+    /// must pass the same [`FecTuning`] for the parity depth to match.
+    pub async fn accept_with_mss_and_fec_tuning(
+        &self,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+    ) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
         let handshake = true;
-        Ok(tokio::spawn(accept(accepted, handshake, fec, mss)))
+        Ok(tokio::spawn(accept(accepted, handshake, fec, mss, tuning)))
     }
 }
 #[derive(Debug)]
@@ -98,10 +136,11 @@ async fn accept(
     handshake: bool,
     fec: bool,
     mss: usize,
+    tuning: FecTuning,
 ) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
-    let mut unreliable_layer = wrap_fec_with_mss(read, write, fec, mss);
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, tuning);
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -121,7 +160,8 @@ pub async fn connect_without_handshake(
 ) -> std::io::Result<Connected> {
     let handshake = false;
     let mss = NO_FEC_MSS;
-    connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
+    let tuning = FecTuning::default();
+    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
 }
 pub async fn connect(
     bind: impl tokio::net::ToSocketAddrs,
@@ -131,7 +171,8 @@ pub async fn connect(
 ) -> std::io::Result<Connected> {
     let handshake = true;
     let mss = NO_FEC_MSS;
-    connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
+    let tuning = fec_tuning_from_env();
+    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
 }
 pub async fn connect_without_handshake_with_mss(
     bind: impl tokio::net::ToSocketAddrs,
@@ -141,7 +182,8 @@ pub async fn connect_without_handshake_with_mss(
     mss: usize,
 ) -> std::io::Result<Connected> {
     let handshake = false;
-    connect_with_mss(bind, addr, log_config, handshake, fec, mss).await
+    let tuning = fec_tuning_from_env();
+    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
 }
 /// Connect to `addr` with a custom MSS.
 ///
@@ -162,6 +204,34 @@ pub async fn connect_with_mss(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<Connected> {
+    let tuning = fec_tuning_from_env();
+    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
+}
+
+/// Connect to `addr` with a custom MSS and a per-connection [`FecTuning`].
+///
+/// # Panics
+/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+/// overhead.
+///
+/// # Platform notes
+/// On macOS, datagrams larger than the kernel `net.inet.udp.maxdgram`
+/// (default 9216 bytes) fail with `EMSGSIZE`. Because the symbol size derives
+/// from the configured `mss`, both peers must use the same value; there is no
+/// in-band negotiation.  The FEC tuning is likewise out-of-band — both peers
+/// must pass the same [`FecTuning`] for the parity depth to match.  The
+/// large-MSS recipe targets loopback / jumbo / fragmentation-tolerant paths;
+/// real WANs IP-fragment 8 KiB UDP and one lost fragment kills the whole
+/// symbol, inverting the benefit.
+pub async fn connect_with_mss_and_fec_tuning(
+    bind: impl tokio::net::ToSocketAddrs,
+    addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
+    handshake: bool,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
@@ -174,7 +244,8 @@ pub async fn connect_with_mss(
         None => None,
     };
     let udp = Arc::new(udp);
-    let mut unreliable_layer = wrap_fec_with_mss(Arc::clone(&udp), udp, fec, mss);
+    let mut unreliable_layer =
+        wrap_fec_with_mss_and_fec_tuning(Arc::clone(&udp), udp, fec, mss, tuning);
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -199,32 +270,51 @@ pub(crate) fn wrap_fec(
     write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
-    wrap_fec_with_mss(read, write, fec, NO_FEC_MSS)
+    wrap_fec_with_mss_and_fec_tuning(read, write, fec, NO_FEC_MSS, FecTuning::default())
 }
 
+#[allow(dead_code)] // used in tests; kept as a pub(crate) convenience wrapper
 pub(crate) fn wrap_fec_with_mss(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,
     fec: bool,
     mss: usize,
 ) -> UnreliableLayer {
-    let (mss, fec_state) = checked_mss_and_fec(fec, mss);
+    wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, fec_tuning_from_env())
+}
+
+pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
+    read: impl UnreliableRead,
+    write: impl UnreliableWrite,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+) -> UnreliableLayer {
+    let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning);
     UnreliableLayer {
         utp_read: Box::new(read),
         utp_write: Box::new(write),
         mss,
         fec: fec_state,
+        fec_tuning: tuning,
     }
 }
 
-fn checked_mss_and_fec(fec: bool, mss: usize) -> (NonZeroUsize, Option<FecState>) {
+fn checked_mss_and_fec(
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+) -> (NonZeroUsize, Option<FecState>, FecTuning) {
     assert!(
         mss <= MAX_MSS,
         "mss {mss} exceeds the {MAX_MSS}-byte datagram ceiling"
     );
     let fec_state = if fec {
         let symbol_size = symbol_size(mss).expect("mss too small for the FEC header");
-        Some(FecState::new(FecConfig { symbol_size }))
+        Some(FecState::new(FecConfig {
+            symbol_size,
+            interactive_parity_depth: tuning.interactive_parity_depth,
+        }))
     } else {
         None
     };
@@ -237,7 +327,18 @@ fn checked_mss_and_fec(fec: bool, mss: usize) -> (NonZeroUsize, Option<FecState>
         crate::codec::data_overhead() < mss,
         "mss {mss} leaves no room for the codec payload"
     );
-    (NonZeroUsize::new(mss).unwrap(), fec_state)
+    // FEC off → depth is irrelevant; normalise to the default so the field is
+    // inert. When FEC is on, clamp to 1 so a misconfigured 0 cannot disable
+    // parity entirely (the stock path always emits at least 1).
+    let tuning = if fec_state.is_none() {
+        FecTuning::default()
+    } else {
+        FecTuning {
+            interactive_parity_depth: tuning.interactive_parity_depth.max(1),
+            ..tuning
+        }
+    };
+    (NonZeroUsize::new(mss).unwrap(), fec_state, tuning)
 }
 
 // Accepted socket
@@ -488,12 +589,36 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        let (mss, fec_state) = checked_mss_and_fec(fec, mss);
+        wrap_fec_lossy_with_mss_and_fec_tuning(
+            read, write, fec, mss, fec_tuning_from_env(), rate,
+        )
+    }
+
+    /// Like `wrap_fec_lossy_with_mss` but takes an explicit `FecTuning` and
+    /// threads it through the same `checked_mss_and_fec` /
+    /// `wrap_fec_with_mss_and_fec_tuning` construction path production uses.
+    /// Only the lossy read/write injection differs from production; the FEC
+    /// state, MSS normalisation, and tuning clamping are identical, so a
+    /// regression that silently disables FEC at a non-default MSS is caught.
+    pub fn wrap_fec_lossy_with_mss_and_fec_tuning<R, W>(
+        read: R,
+        write: W,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+        rate: LossRate,
+    ) -> UnreliableLayer
+    where
+        R: UnreliableRead + Send + Sync + 'static,
+        W: UnreliableWrite + Send + Sync + 'static,
+    {
+        let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning);
         UnreliableLayer {
             utp_read: Box::new(LossyRead::new(read, rate.clone())),
             utp_write: Box::new(LossyWrite::new(write, rate)),
             mss,
             fec: fec_state,
+            fec_tuning: tuning,
         }
     }
 }
