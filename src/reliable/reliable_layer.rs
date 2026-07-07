@@ -117,6 +117,14 @@ pub struct ReliableLayer {
     // Gentle-mode congestion controller state.
     pub(crate) gentle: GentleMode,
 
+    /// Whether the bottleneck queue is currently building per delivery-rate
+    /// estimation (`smooth > floor + gate_tol`).  Updated on every ACK rate
+    /// sample in `adjust_send_rate_exponential`.  Read by the transmission
+    /// layer to suppress retransmission-armor duplicate copies
+    /// (`RTP_F3_RTX_DUP`) — duplication under a building queue would worsen
+    /// the very congestion the dup is meant to recover from.
+    queue_building: bool,
+
     /// How long the drain floor has been continuously binding while the queue
     /// builds.  Used to decay a stale peak delivery-rate floor after a genuine
     /// capacity drop.
@@ -155,6 +163,7 @@ impl ReliableLayer {
             slow_start: true,
             slow_start_acked_pkts: 0,
             gentle: GentleMode::new(),
+            queue_building: false,
             drain_floor_binding_since: None,
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
@@ -189,6 +198,22 @@ impl ReliableLayer {
 
     pub fn pkt_recv_space(&self) -> &PktRecvSpace {
         &self.pkt_recv_space
+    }
+
+    /// Whether the delivery-rate congestion controller currently considers the
+    /// bottleneck queue to be building (smooth RTT above the floor plus the
+    /// gate tolerance).  Used by the transmission layer to suppress
+    /// retransmission-armor duplicate copies under congestion.
+    pub fn queue_building(&self) -> bool {
+        self.queue_building
+    }
+
+    /// Test-only: force the `queue_building` flag so the retransmission-armor
+    /// duplicate-copy suppression gate can be exercised deterministically
+    /// without having to drive a full delivery-rate sample sequence.
+    #[cfg(test)]
+    pub(crate) fn set_queue_building_for_test(&mut self, v: bool) {
+        self.queue_building = v;
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
@@ -259,6 +284,7 @@ impl ReliableLayer {
             return Some(DataPkt {
                 seq: p.seq,
                 data_written,
+                was_repair: true,
             });
         }
 
@@ -276,6 +302,7 @@ impl ReliableLayer {
             return Some(DataPkt {
                 seq: p.seq,
                 data_written,
+                was_repair: true,
             });
         }
 
@@ -335,6 +362,7 @@ impl ReliableLayer {
         Some(DataPkt {
             seq: p.seq,
             data_written,
+            was_repair: false,
         })
     }
 
@@ -365,6 +393,7 @@ impl ReliableLayer {
             self.slow_start = false;
             self.slow_start_acked_pkts = 0;
             self.gentle.reset();
+            self.queue_building = false;
             self.drain_floor_binding_since = None;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
         }
@@ -460,6 +489,7 @@ impl ReliableLayer {
         // Gate hysteresis: while actively draining in gentle mode, use tol/2.
         let gate_tol = self.gentle.gate_tol(tol);
         let queue_building = smooth > floor + gate_tol;
+        self.queue_building = queue_building;
 
         let little_data_loss = loss_event_rate.map(|lr| lr < CC_DATA_LOSS_RATE);
         if self.slow_start {
@@ -901,6 +931,11 @@ impl WindowedRttMin {
 pub struct DataPkt {
     pub seq: u64,
     pub data_written: DataPktPayload,
+    /// Whether this packet is a retransmission or a tail-loss probe (a
+    /// recovery packet, not new data).  Used by the transmission layer to
+    /// decide whether to emit a retransmission-armor duplicate copy
+    /// (`RTP_F3_RTX_DUP`).
+    pub was_repair: bool,
 }
 #[derive(Debug, Clone)]
 pub enum DataPktPayload {

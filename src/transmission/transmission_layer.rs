@@ -23,6 +23,26 @@ const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
 const BUF_SIZE: usize = 1024 * 64;
 
+/// Whether retransmission armor (`RTP_F3_RTX_DUP`) is enabled at process
+/// startup.  Reads `RTP_F3_RTX_DUP` once; `1`/`true` enables it, anything
+/// else preserves stock single-datagram behaviour byte-for-byte.
+///
+/// When enabled, the transmission layer emits a second identical copy of
+/// every retransmit and tail-loss-probe datagram — reusing the exact
+/// already-encoded symbol bytes (encode once, send twice).  The primary
+/// repair datagram always sends (it bypasses the pacing token bucket as
+/// today); the duplicate is skipped when the token bucket lacks tokens and
+/// is charged to the bucket when sent, and is suppressed whenever the
+/// delivery-rate congestion controller reports the bottleneck queue is
+/// building.  Duplicating ordinary data packets is never done — the win is
+/// specific to rare recovery packets.
+fn f3_rtx_dup_from_env() -> bool {
+    match std::env::var("RTP_F3_RTX_DUP") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
 /// Reusable buffers for the send path. Allocated once and passed by `&mut`
@@ -103,6 +123,11 @@ pub struct TransmissionLayer {
     reliable_layer_logger: Option<ReliableLayerLogger>,
     fec: Option<Mutex<FecState>>,
     clock_epoch: Instant,
+    /// Snapshot of `RTP_F3_RTX_DUP` taken at construction.  Stored as a field
+    /// rather than read from a `OnceLock` so tests can construct a layer with
+    /// the toggle on or off deterministically without racing other parallel
+    /// tests in the same binary.
+    f3_rtx_dup: bool,
 }
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
@@ -138,6 +163,7 @@ impl TransmissionLayer {
             reliable_layer_logger,
             fec: unreliable_layer.fec.map(Mutex::new),
             clock_epoch: now,
+            f3_rtx_dup: f3_rtx_dup_from_env(),
         }
     }
 
@@ -147,6 +173,25 @@ impl TransmissionLayer {
 
     pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
         &self.reliable_layer
+    }
+
+    /// Test-only: force the `RTP_F3_RTX_DUP` toggle to a fixed value regardless
+    /// of the process environment, so parallel tests in the same binary do not
+    /// race on the env var.
+    #[cfg(test)]
+    pub(crate) fn set_f3_rtx_dup_for_test(&mut self, enabled: bool) {
+        self.f3_rtx_dup = enabled;
+    }
+
+    /// Test-only: take up to `n` tokens from the shared send-rate limiter so
+    /// the retransmission-armor duplicate-copy token gate can be exercised
+    /// (the primary rtx bypasses the bucket; the dup needs a token).
+    #[cfg(test)]
+    pub(crate) fn drain_rate_limiter_for_test(&self, n: usize, now: Instant) -> usize {
+        self.send_rate_limiter
+            .lock()
+            .unwrap()
+            .take_at_most_tokens(n, now)
     }
 
     /// Number of codec payloads recovered by FEC parity so far, or `None` when
@@ -308,6 +353,11 @@ impl TransmissionLayer {
                     0
                 }
             };
+            let was_repair = p.was_repair;
+            // Snapshot the queue-building gate now so the dup decision uses the
+            // latest ACK-derived delivery-rate signal.  The primary repair
+            // bypasses the token bucket, so this read is independent of it.
+            let queue_building = self.reliable_layer.lock().unwrap().queue_building();
             let data = EncodeData {
                 seq: p.seq,
                 send_ts: Some(self.wire_ts(now)),
@@ -331,8 +381,54 @@ impl TransmissionLayer {
                     None => utp_pkt,
                 }
             };
-            match self.utp_write.lock().await.send(send_buf).await {
-                Ok(_) => continue,
+            // Send the primary in a block so the `utp_write` `MutexGuard`
+            // (a temporary in the `.lock().await.send(..).await` expression)
+            // is dropped before the retransmission-armor duplicate copy below,
+            // which re-locks the same mutex.
+            let primary_res = {
+                let mut guard = self.utp_write.lock().await;
+                guard.send(send_buf).await
+            };
+            match primary_res {
+                Ok(_) => {
+                    // Retransmission armor (`RTP_F3_RTX_DUP`): emit a second
+                    // identical copy of every retransmit and tail-loss-probe
+                    // datagram, reusing the exact already-encoded symbol
+                    // bytes (encode once, send twice).  The primary repair
+                    // bypasses the token bucket (already sent above); the
+                    // duplicate is skipped when the bucket lacks tokens and
+                    // is charged to the bucket when sent, and is suppressed
+                    // whenever the bottleneck queue is building.  Duplicating
+                    // ordinary data packets is never done — the win is
+                    // specific to rare recovery packets.
+                    if self.f3_rtx_dup && was_repair && !queue_building {
+                        let now = Instant::now();
+                        let token_taken = self
+                            .send_rate_limiter
+                            .lock()
+                            .unwrap()
+                            .take_exact_tokens(1, now);
+                        if token_taken {
+                            // Reuse the exact bytes just sent (the same
+                            // `send_buf` slice) — do NOT re-encode.
+                            match self.utp_write.lock().await.send(send_buf).await {
+                                Ok(_) => {}
+                                Err(std::io::ErrorKind::WouldBlock) => {
+                                    if FEC_DEBUG {
+                                        eprintln!(
+                                            "send_pkts: dup WouldBlock (transient)"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    self.first_error.set(e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Err(std::io::ErrorKind::WouldBlock) => {
                     // Transient UDP send-buffer exhaustion. Treat as packet
                     // loss/backpressure: skip this packet and keep going. The
@@ -945,4 +1041,190 @@ pub struct Log<'a> {
     pub recv_seq: Option<u64>,
     pub delivery_rate: Option<f64>,
     pub app_limited: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A `UnreliableWrite` that records every datagram sent to it, so tests
+    /// can count copies and inspect the exact bytes (for the
+    /// "reuses-identical-encoded-symbol" assertion).
+    #[derive(Debug, Default)]
+    struct RecordingWrite {
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+    impl RecordingWrite {
+        fn push(&self, b: Vec<u8>) {
+            self.sent.lock().unwrap().push(b);
+        }
+        fn count(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+        fn datagrams(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlackholeRead;
+    #[async_trait]
+    impl UnreliableRead for BlackholeRead {
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+    }
+
+    /// Feed `n` RTT samples so the smoothed RTT settles to ~`rtt`, shrinking
+    /// the reorder window so a retransmit fires quickly in real wall-clock
+    /// time.
+    fn settle_rtt(tl: &TransmissionLayer, rtt: Duration, n: usize) {
+        let rl = tl.reliable_layer();
+        let mut rl = rl.lock().unwrap();
+        let mut t = Instant::now();
+        for _ in 0..n {
+            rl.sample_rtt(rtt, t);
+            t += Duration::from_micros(100);
+        }
+    }
+
+    /// Push one data packet through the reliable layer so the send window
+    /// has an unacked packet that can be retransmitted later.
+    fn send_one_packet(tl: &TransmissionLayer, now: Instant) -> u64 {
+        let rl = tl.reliable_layer();
+        let mut rl = rl.lock().unwrap();
+        let payload = vec![0u8; 100];
+        assert_eq!(
+            rl.send_data_buf(&payload, now),
+            payload.len(),
+            "send_data_buf must accept the payload"
+        );
+        let mut pkt = vec![0u8; crate::udp::NO_FEC_MSS];
+        let p = rl
+            .send_data_pkt(&mut pkt, now)
+            .expect("send_data_pkt must send a packet");
+        match p.data_written {
+            crate::reliable::reliable_layer::DataPktPayload::Data(_) => p.seq,
+            _ => panic!("expected data packet"),
+        }
+    }
+
+    /// Wait long enough for the (settled ~1ms) reorder window AND the TLP
+    /// `MIN_TOL` (10 ms) to elapse so the next `send_pkts` call fires a
+    /// retransmit or tail-loss probe.  30 ms gives ample margin over parallel
+    /// test scheduling jitter.
+    async fn wait_for_rtx_window() {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    /// A `TransmissionLayer` test harness exposing the recording write via an
+    /// `Arc<Mutex<RecordingWrite>>` shared with the layer's `UnreliableWrite`.
+    fn harness(fec: bool, enabled: bool) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        struct SharedWrite(Arc<Mutex<RecordingWrite>>);
+        #[async_trait]
+        impl UnreliableWrite for SharedWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+        }
+        impl std::fmt::Debug for SharedWrite {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SharedWrite").finish_non_exhaustive()
+            }
+        }
+        let write = SharedWrite(recorder.clone());
+        let read = BlackholeRead;
+        let ul = crate::udp::wrap_fec_with_mss(read, write, fec, crate::udp::NO_FEC_MSS);
+        let mut tl = TransmissionLayer::new(ul, None);
+        tl.set_f3_rtx_dup_for_test(enabled);
+        (tl, recorder)
+    }
+
+    #[tokio::test]
+    async fn rtx_dup_queue_building_gate_suppresses_extra_copy() {
+        // When the bottleneck queue is building, the duplicate must be
+        // suppressed even though tokens are available: ungated duplication
+        // under congestion collapses bulk goodput.
+        let (tl, recorder) = harness(false, true);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        // Force the queue-building gate closed.
+        tl.reliable_layer().lock().unwrap().set_queue_building_for_test(true);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        // Exactly one datagram (the primary rtx/TLP); the dup was suppressed by
+        // the queue-building gate.
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "queue-building must suppress the duplicate copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn fec_rtx_dup_reuses_identical_encoded_symbol() {
+        // The duplicate must reuse the exact already-encoded symbol bytes
+        // (encode once, send twice).  With FEC active the encoded symbol is
+        // the FEC-wrapped datagram; the dup must be byte-identical to the
+        // primary.  (A tail FEC parity may also be flushed at burst end; it
+        // is a distinct symbol, so only the first two datagrams are compared.)
+        let (tl, recorder) = harness(true, true);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let dg = recorder.lock().unwrap().datagrams();
+        assert!(dg.len() >= 2, "primary + duplicate (got {})", dg.len());
+        assert_eq!(
+            dg[0], dg[1],
+            "dup must reuse the exact encoded symbol bytes (no re-encode)"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_rtx_bypasses_empty_bucket_and_dup_is_skipped() {
+        // The primary rtx always sends (bypasses the empty pacing token
+        // bucket); the duplicate is skipped when the bucket lacks tokens and
+        // is charged to the bucket when sent.  Drain the bucket first; only
+        // the primary should go out.
+        let (tl, recorder) = harness(false, true);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        // Drain every token from the shared bucket.
+        let drained = tl.drain_rate_limiter_for_test(usize::MAX, Instant::now());
+        assert!(drained > 0, "bucket should have started with tokens");
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "primary sends from empty bucket; dup is skipped (no token)"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtx_dup_disabled_sends_one_datagram() {
+        // With the toggle off, a retransmit must send exactly one datagram
+        // (stock behaviour byte-for-byte): no duplicate copy.
+        let (tl, recorder) = harness(false, false);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "toggle off must send exactly one datagram (stock)"
+        );
+    }
 }
