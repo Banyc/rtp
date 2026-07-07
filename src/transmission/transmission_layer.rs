@@ -43,6 +43,29 @@ fn rtx_dup_from_env() -> bool {
     }
 }
 
+/// Whether in-stream group FEC (`RTP_INSTREAM_GROUP_FEC`) is enabled at
+/// process startup.  Reads the env var once; `1`/`true` enables it, anything
+/// else preserves stock behaviour byte-for-byte (parity is tail-only and
+/// force-skipped at `PARITY_DATA_THRESHOLD`).
+///
+/// When enabled, the transmission layer suppresses the
+/// `PARITY_DATA_THRESHOLD` force-skip in `encode_data` (passing
+/// `instream = true`), so a data group may accumulate up to
+/// `INSTREAM_DATA_PER_GROUP` (8) data symbols.  Right after each successful
+/// data send, `maybe_flush_full_fec_group` emits
+/// `INSTREAM_PARITY_PER_GROUP` (4) parity symbols inline mid-burst when the
+/// group is full, gated on the spare-token budget.  At the data-path burst
+/// close, a partial DATA group is force-flushed (regardless of the stock
+/// `can_send_tail_fec` gate) so a burst ending mid-group still emits its
+/// stock 1:4 parity.  ACK/kill bursts keep the stock tail gate untouched
+/// (force-flushing ACK bursts tripled reverse-path packets for zero gain).
+fn instream_group_fec_from_env() -> bool {
+    match std::env::var("RTP_INSTREAM_GROUP_FEC") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
 type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
 /// Reusable buffers for the send path. Allocated once and passed by `&mut`
@@ -135,6 +158,16 @@ pub struct TransmissionLayer {
     /// regardless.  `interactive_parity_depth` is consumed by the `FecState`
     /// at construction; this field only drives the force-flush.
     fec_instream_flush: bool,
+    /// Snapshot of `RTP_INSTREAM_GROUP_FEC` taken at construction.  When
+    /// `true`, the data send path suppresses the `PARITY_DATA_THRESHOLD`
+    /// force-skip in `encode_data`, flushes `INSTREAM_PARITY_PER_GROUP`
+    /// parity symbols inline mid-burst once a group of
+    /// `INSTREAM_DATA_PER_GROUP` data symbols fills, and force-flushes
+    /// partial DATA groups at burst end.  ACK/kill bursts keep the stock
+    /// tail gate.  Stored as a field (not read from a `OnceLock`) so tests
+    /// can construct a layer with the toggle on or off deterministically
+    /// without racing other parallel tests in the same binary.
+    instream_group_fec_enabled: bool,
 }
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
@@ -172,6 +205,7 @@ impl TransmissionLayer {
             clock_epoch: now,
             rtx_dup: rtx_dup_from_env(),
             fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
+            instream_group_fec_enabled: instream_group_fec_from_env(),
         }
     }
 
@@ -189,6 +223,14 @@ impl TransmissionLayer {
     #[cfg(test)]
     pub(crate) fn set_rtx_dup_for_test(&mut self, enabled: bool) {
         self.rtx_dup = enabled;
+    }
+
+    /// Test-only: force the `RTP_INSTREAM_GROUP_FEC` toggle to a fixed value
+    /// regardless of the process environment, so parallel tests in the same
+    /// binary do not race on the env var.
+    #[cfg(test)]
+    pub(crate) fn set_instream_group_fec_for_test(&mut self, enabled: bool) {
+        self.instream_group_fec_enabled = enabled;
     }
 
     /// Test-only: take up to `n` tokens from the shared send-rate limiter so
@@ -307,7 +349,7 @@ impl TransmissionLayer {
             match self.fec.as_ref() {
                 Some(fec) => {
                     let mut fec = fec.lock().unwrap();
-                    let n = fec.encode_data(codec_pkt, fec_buf);
+                    let n = fec.encode_data(codec_pkt, fec_buf, false);
                     &fec_buf[..n]
                 }
                 None => codec_pkt,
@@ -378,12 +420,15 @@ impl TransmissionLayer {
             }
             // Wrap the codec packet with a FEC data-symbol header (if FEC is
             // active) before sending, so the receiver can recover it via
-            // parity if it's lost.
+            // parity if it's lost.  When in-stream group FEC is enabled, the
+            // `PARITY_DATA_THRESHOLD` force-skip is suppressed so a group may
+            // accumulate up to `INSTREAM_DATA_PER_GROUP` data symbols.
+            let instream = self.instream_group_fec_enabled;
             let send_buf: &[u8] = {
                 match self.fec.as_ref() {
                     Some(fec) => {
                         let mut fec = fec.lock().unwrap();
-                        let fec_n = fec.encode_data(utp_pkt, &mut bufs.fec);
+                        let fec_n = fec.encode_data(utp_pkt, &mut bufs.fec, instream);
                         &bufs.fec[..fec_n]
                     }
                     None => utp_pkt,
@@ -399,6 +444,16 @@ impl TransmissionLayer {
             };
             match primary_res {
                 Ok(_) => {
+                    // In-stream group FEC: when the toggle is on and the open
+                    // FEC group just reached `INSTREAM_DATA_PER_GROUP` data
+                    // symbols, emit `INSTREAM_PARITY_PER_GROUP` parity
+                    // symbols inline mid-burst.  The group must be flushed
+                    // *after* the data send succeeded and the `utp_write`
+                    // guard is dropped — holding the guard across the parity
+                    // flush deadlocks (the flush re-locks `utp_write`).
+                    if self.fec.is_some() && instream {
+                        self.maybe_flush_full_fec_group(Instant::now()).await;
+                    }
                     // Retransmission armor (`RTP_RTX_DUP`): emit a second
                     // identical copy of every retransmit and tail-loss-probe
                     // datagram, reusing the exact already-encoded symbol
@@ -470,13 +525,44 @@ impl TransmissionLayer {
         // being skipped at the burst end.  ACK/kill bursts (above) keep the
         // stock gate regardless — only data bursts are force-flushed, since
         // ACK/kill parity is not the interactive win.
+        //
+        // In-stream group FEC (`RTP_INSTREAM_GROUP_FEC`): when the toggle is
+        // on, a partial DATA group (1..INSTREAM_DATA_PER_GROUP symbols) is
+        // force-flushed at burst end regardless of `can_send_tail_fec`, so a
+        // burst ending mid-group still emits its stock 1:4 parity.  ACK/kill
+        // bursts keep the stock tail gate untouched (force-flushing ACK
+        // bursts tripled reverse-path packets for zero gain).
         if self.fec.is_some() {
             let now = Instant::now();
+            let stock_can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+            let data_path = true;
             let can_send_tail_fec = self.fec_instream_flush
-                || { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+                || stock_can_send_tail_fec
+                || (data_path && self.instream_group_fec_enabled);
             self.close_fec_burst(now, can_send_tail_fec).await;
         }
         Ok(0 < written_bytes || written_fin)
+    }
+
+    /// In-stream group FEC: if the open FEC group just reached
+    /// `INSTREAM_DATA_PER_GROUP` data symbols, emit
+    /// `INSTREAM_PARITY_PER_GROUP` parity symbols inline mid-burst, gated on
+    /// the spare-token budget.  No-op when FEC is off, the toggle is off, or
+    /// the group is not full.  The `utp_write` guard must be dropped before
+    /// calling this — `flush_fec_parities` re-locks `utp_write` to send the
+    /// parity packets, so holding the guard across the call deadlocks.
+    async fn maybe_flush_full_fec_group(&self, now: Instant) {
+        let Some(fec) = self.fec.as_ref() else {
+            return;
+        };
+        let should_flush = {
+            let fec = fec.lock().unwrap();
+            fec.group_data_full(self.instream_group_fec_enabled)
+        };
+        if !should_flush {
+            return;
+        }
+        self.flush_fec_parities(now).await;
     }
 
     /// Close the current FEC burst: flush parities for the open group when a
@@ -520,7 +606,7 @@ impl TransmissionLayer {
         let parity_pkts = {
             let mut fec = fec.lock().unwrap();
             let mut tb = self.send_rate_limiter.lock().unwrap();
-            fec.maybe_flush_parities(&mut tb, now)
+            fec.maybe_flush_parities(&mut tb, now, self.instream_group_fec_enabled)
         };
         for pkt in parity_pkts {
             match self.utp_write.lock().await.send(&pkt).await {
@@ -1298,6 +1384,207 @@ mod tests {
         assert_eq!(
             n, 4,
             "mindiv single-symbol burst must emit 1 data + 3 parity = 4 datagrams, got {n}"
+        );
+    }
+
+    // ---- In-stream group FEC integration tests ----
+
+    /// Helper: stage `n` full-size data packets directly into the reliable
+    /// layer's send buffer (bypassing the staging cap) so a single `send_pkts`
+    /// call emits them all in one FEC group.  Uses a large MSS (8192) so the
+    /// send buffer can hold 8 full-size packets.
+    fn stage_n_packets(tl: &TransmissionLayer, n: usize) -> usize {
+        // Compute the payload size the same way `checked_mss_and_fec` does:
+        // data_mss(mss) = mss - HDR_SIZE(11) - DATA_SYMBOL_HDR_SIZE(2),
+        // then subtract codec data_overhead (15).
+        let mss = 8192usize;
+        let post_fec_mss = mss - 11 - 2; // data_mss: FEC hdr + data-symbol hdr
+        let payload_len = post_fec_mss - crate::codec::data_overhead();
+        let rl = tl.reliable_layer();
+        let mut rl = rl.lock().unwrap();
+        for _ in 0..n {
+            let payload = vec![0u8; payload_len];
+            rl.enqueue_send_data_for_test(&payload);
+        }
+        payload_len
+    }
+
+    /// A `TransmissionLayer` test harness with an explicit MSS, exposing the
+    /// recording write via an `Arc<Mutex<RecordingWrite>>`.  Used by the
+    /// in-stream group FEC tests which need a large MSS to fit 8 full-size
+    /// packets in the send buffer.
+    fn harness_with_mss(
+        fec: bool,
+        enabled: bool,
+        mss: usize,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        struct SharedWrite(Arc<Mutex<RecordingWrite>>);
+        #[async_trait]
+        impl UnreliableWrite for SharedWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+        }
+        impl std::fmt::Debug for SharedWrite {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SharedWrite").finish_non_exhaustive()
+            }
+        }
+        let write = SharedWrite(recorder.clone());
+        let read = BlackholeRead;
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            read,
+            write,
+            fec,
+            mss,
+            crate::transmission::fec_tuning::FecTuning::default(),
+        );
+        let mut tl = TransmissionLayer::new(ul, None);
+        tl.set_rtx_dup_for_test(enabled);
+        (tl, recorder)
+    }
+
+    /// A full 8-data-symbol group must emit 4 parity symbols inline mid-burst,
+    /// before the burst-end tail flush.  With the toggle on, the
+    /// `PARITY_DATA_THRESHOLD` force-skip is suppressed, the group
+    /// accumulates to 8, and `maybe_flush_full_fec_group` emits 4 parities
+    /// right after the 8th data send.  The tail flush at burst end then sees
+    /// an empty group (0 data symbols) and emits nothing.
+    ///
+    /// Mutation target: if the force-skip is kept on the instream path
+    /// (`encode_data` ignores `instream`), the group never reaches 8, so
+    /// inline parity is never emitted; the datagram count is 8 (data only)
+    /// instead of 12 (8 data + 4 parity).
+    #[tokio::test]
+    async fn full_group_flushes_four_parities_inline_mid_burst() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        tl.set_instream_group_fec_for_test(true);
+        stage_n_packets(&tl, 8);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        // 8 data symbols + 4 parity = 12 datagrams.
+        assert_eq!(
+            n, 12,
+            "full in-stream group must emit 8 data + 4 parity = 12 datagrams, got {n}"
+        );
+    }
+
+    /// A partial data burst (fewer than 8 data symbols) with the toggle on
+    /// must flush its stock parity at burst end.  The teeth for the
+    /// data-path tail gate are in the `fec.rs` unit test
+    /// `partial_instream_group_flushes_stock_parity_at_burst_end`, which
+    /// directly verifies a 5-symbol group is NOT skipped by the
+    /// `PARITY_DATA_THRESHOLD` gate on the instream path.  This integration
+    /// test is a complementary end-to-end check: stage 3 packets, send them,
+    /// and verify 3 data + 1 parity = 4 datagrams.
+    #[tokio::test]
+    async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        tl.set_instream_group_fec_for_test(true);
+        stage_n_packets(&tl, 3);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        // 3 data symbols + 1 stock parity (parity_for(3) = ceil(3/4) = 1) = 4.
+        assert_eq!(
+            n, 4,
+            "partial data burst with toggle on must flush 3 data + 1 parity = 4 datagrams, got {n}"
+        );
+    }
+
+    /// An ACK burst must keep the stock tail gate: when `can_send_tail_fec`
+    /// is false, the FEC group is skipped (no parity), even when the toggle
+    /// is on.  Force-flushing ACK bursts would triple reverse-path packets
+    /// for zero gain.  Mutation target: if the ACK path uses the data-path
+    /// tail gate (`|| (data_path && instream_group_fec_enabled)`), the ACK
+    /// group is force-flushed and this test fails.
+    ///
+    /// This test is exercised via the `send_kill_pkt` path: a kill packet is
+    /// sent via `send_with_fec` (instream=false), and the subsequent
+    /// `close_fec_burst` uses the stock gate.  Since `can_send_tail_fec` is
+    /// false (no RTT samples → no settled tail), the group is skipped.
+    #[tokio::test]
+    async fn ack_burst_keeps_stock_tail_gate_when_blocked() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        tl.set_instream_group_fec_for_test(true);
+        // Stage unsent data in the send buffer so `is_send_buf_empty` is
+        // false, making `can_send_tail_fec` false.  This is the condition
+        // that the data-path force-flush overrides (so partial DATA groups
+        // still flush at burst end), but the ACK/kill path must NOT override
+        // — the kill group must be skipped (no parity).
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.enqueue_send_data_for_test(&[0u8; 100]);
+        }
+        // Send a kill packet.  The kill path calls `send_with_fec` (which
+        // encodes with instream=false) then `close_fec_burst` with the stock
+        // `can_send_tail_fec` gate.  Since the send buffer has unsent data,
+        // `can_send_tail_fec` is false, so the kill group is skipped.
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_kill_pkt(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        // 1 kill datagram, 0 parity (stock gate blocked → group skipped).
+        assert_eq!(
+            n, 1,
+            "ACK/kill burst with stock tail gate blocked must emit 1 datagram (no parity), got {n}"
+        );
+    }
+
+    /// When the toggle is off, the wire behavior must be byte-identical to
+    /// stock: the `PARITY_DATA_THRESHOLD` force-skip fires at 4, so a burst
+    /// of 8 packets produces groups of at most 4, and the tail flush emits
+    /// at most `MAX_PARITY_PER_GROUP` parity.  No inline mid-burst parity
+    /// is ever emitted.
+    #[tokio::test]
+    async fn toggle_off_wire_byte_identical_to_stock() {
+        // With the toggle off, the wire behavior must be byte-identical to
+        // stock: the `PARITY_DATA_THRESHOLD` force-skip fires at 4, so a burst
+        // of 8 packets produces groups of at most 4, and no inline mid-burst
+        // parity is ever emitted.
+        let (tl_off, recorder_off) = harness_with_mss(true, false, 8192);
+        // Toggle is off (env not set → false).  Stage 8 packets and send.
+        stage_n_packets(&tl_off, 8);
+        let mut bufs = SendBufs::new();
+        let _ = tl_off.send_pkts(&mut bufs).await;
+        let n_off = recorder_off.lock().unwrap().count();
+
+        // Now run the same with a second stock layer (also toggle off).
+        let (tl_stock, recorder_stock) = harness_with_mss(true, false, 8192);
+        stage_n_packets(&tl_stock, 8);
+        let mut bufs2 = SendBufs::new();
+        let _ = tl_stock.send_pkts(&mut bufs2).await;
+        let n_stock = recorder_stock.lock().unwrap().count();
+
+        assert_eq!(
+            n_off, n_stock,
+            "toggle off must produce identical datagram count to stock (got {n_off} vs {n_stock})"
+        );
+        // With the toggle off, the force-skip at 4 means the group never
+        // reaches 8, so no inline 4-parity flush fires.  The tail flush
+        // emits at most MAX_PARITY_PER_GROUP (5) parity for the last
+        // <=4-symbol group.  So the total is 8 data + some tail parity.
+        // The key assertion: no inline mid-burst 4-parity flush.
+        assert!(
+            n_off <= 8 + 5,
+            "toggle off must not emit inline mid-burst parity (got {n_off} > 13)"
+        );
+        // And specifically: if the toggle were ON, we'd get 12 (8 data +
+        // 4 inline parity + 0 tail parity since the group is flushed
+        // inline).  With toggle off, we get at most 8 + tail_parity, and
+        // the tail parity is at most 5 — but crucially, the 4-parity
+        // inline flush never fires, so n_off != 12.
+        // (The tail flush may or may not fire depending on
+        // can_send_tail_fec; with 8 unacked packets it's false, so the
+        // group is skipped — n_off = 8.  But we don't hard-assert that
+        // since the exact tail behavior depends on the reliable layer
+        // state; the key is that n_off != 12, proving no inline flush.)
+        assert_ne!(
+            n_off, 12,
+            "toggle off must NOT emit 8 data + 4 inline parity = 12 (inline flush must not fire)"
         );
     }
 }

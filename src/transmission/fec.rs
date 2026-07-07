@@ -17,6 +17,15 @@ const MAX_PARITY_PER_GROUP: usize =
 /// Groups with at most this many data symbols get parity protection.
 /// Larger groups skip parity to avoid impacting throughput of big traffic.
 const PARITY_DATA_THRESHOLD: usize = 4;
+/// In-stream group FEC: a data group accumulates up to this many data symbols
+/// before a full-group inline parity flush is emitted mid-burst.  Stock
+/// (toggle off) force-skips at `PARITY_DATA_THRESHOLD` instead, so groups never
+/// reach this size.
+const INSTREAM_DATA_PER_GROUP: usize = 8;
+/// Parity symbols emitted for a full in-stream group (`INSTREAM_DATA_PER_GROUP`
+/// data symbols).  8+4 = 12 fits the stock decoder `MAX_GROUP_SIZE` (25) and
+/// `WINDOW_SIZE` (32) without bumping either constant.
+const INSTREAM_PARITY_PER_GROUP: usize = 4;
 /// Parity must consume at most this fraction of the currently-available send
 /// budget. Parity is spare-bandwidth-only: it must never compete with data
 /// traffic, so a parity burst is only flushed when it fits within 1/3 of the
@@ -200,11 +209,31 @@ impl FecState {
     /// early avoids encoding/decoding parity for symbols that can never be
     /// recovered. Only the most recent `<= PARITY_DATA_THRESHOLD` symbols of a
     /// burst are kept and protected.
-    pub fn encode_data(&mut self, data: &[u8], out: &mut [u8]) -> usize {
-        if self.encoder.group_data_count() >= PARITY_DATA_THRESHOLD {
+    ///
+    /// **In-stream group FEC exception:** when `instream` is `true` (the toggle
+    /// is enabled for this connection), the `PARITY_DATA_THRESHOLD` force-skip
+    /// is suppressed so a group may accumulate up to
+    /// `INSTREAM_DATA_PER_GROUP` data symbols.  The transmission layer flushes
+    /// `INSTREAM_PARITY_PER_GROUP` parities inline once the group is full (see
+    /// `group_data_full`), instead of waiting for the burst tail.  Stock path
+    /// passes `false` and keeps the force-skip, so behaviour is byte-identical
+    /// when the toggle is off.
+    pub fn encode_data(&mut self, data: &[u8], out: &mut [u8], instream: bool) -> usize {
+        if !instream && self.encoder.group_data_count() >= PARITY_DATA_THRESHOLD {
             self.encoder.skip_group();
         }
         self.encoder.encode_data(data, out)
+    }
+
+    /// Whether the open FEC group is a full in-stream group ready for an inline
+    /// mid-burst parity flush.  Only `true` when `instream` is `true` (the
+    /// toggle is on) AND the group has reached `INSTREAM_DATA_PER_GROUP` data
+    /// symbols.  The caller invokes this after each `encode_data` push, so the
+    /// first time the count equals the threshold the group flushes inline
+    /// (8 data symbols → 4 parity symbols).  Stock path passes `false` and
+    /// always gets `false`, so the inline flush never fires.
+    pub fn group_data_full(&self, instream: bool) -> bool {
+        instream && self.encoder.group_data_count() >= INSTREAM_DATA_PER_GROUP
     }
 
     /// Attempt to flush parities for the current group, rate-limited by the
@@ -212,7 +241,17 @@ impl FecState {
     /// a ready-to-send wire packet. If the parity burst would exceed 1/3 of
     /// the available send budget, the group is skipped — parity is
     /// spare-bandwidth-only and must not compete with data traffic. Groups
-    /// larger than `PARITY_DATA_THRESHOLD` are also skipped.
+    /// larger than `PARITY_DATA_THRESHOLD` are also skipped (stock path).
+    ///
+    /// **In-stream group FEC:** when `instream` is `true`, a full group of
+    /// exactly `INSTREAM_DATA_PER_GROUP` data symbols emits
+    /// `INSTREAM_PARITY_PER_GROUP` parity symbols, gated on the spare-token
+    /// budget (ungated parity on a bulk path collapses throughput from ~0.34
+    /// to ~0.06 MiB/s in prototyping).  Partial groups (`data_count <`
+    /// `INSTREAM_DATA_PER_GROUP` and `> 0`) are skipped here — the
+    /// transmission layer force-flushes them at burst end via
+    /// `flush_fec_group`.  Stock path passes `false` and keeps the
+    /// `PARITY_DATA_THRESHOLD` skip.
     ///
     /// **Single-symbol interactive exception:** when the open group has
     /// exactly one data symbol and `interactive_parity_depth > 1`, the group
@@ -234,31 +273,15 @@ impl FecState {
         &mut self,
         send_rate_limiter: &mut TokenBucket,
         now: Instant,
+        instream: bool,
     ) -> Vec<Vec<u8>> {
         let data_count = self.encoder.group_data_count();
         if data_count == 0 {
             return vec![];
         }
-        // Defensive: `encode_data` force-skips at PARITY_DATA_THRESHOLD, so a
-        // group reaching here should already be <= threshold. Skip if a stale
-        // larger group somehow survived (e.g. a flush was permitted at a burst
-        // end that the early-skip did not catch).
-        if data_count > PARITY_DATA_THRESHOLD {
-            self.encoder.skip_group();
-            return vec![];
-        }
-        let parity_count = parity_for(data_count);
-
-        // Single-symbol interactive exception: a group with exactly one data
-        // symbol and a configured depth > 1 bypasses the spare-token budget
-        // gate and emits up to `interactive_parity_depth` parity copies.
-        // Multi-symbol groups always keep the stock gate regardless of depth.
+        // Single-symbol interactive exception first: it bypasses the budget
+        // gate and the threshold/instream skips below.
         if data_count == 1 && self.interactive_parity_depth > 1 {
-            // Bypass the budget gate for the single-symbol interactive case.
-            // The parity set is tiny (one data symbol → at most a handful of
-            // parity symbols) and the whole point is tail-latency insurance
-            // for an interactive message; gating it on spare tokens would
-            // re-introduce the stock retransmit-equivalent behaviour.
             let depth = self.interactive_parity_depth;
             if FEC_DEBUG {
                 eprintln!(
@@ -274,6 +297,54 @@ impl FecState {
             self.stats.parity_sent += pkts.len();
             return pkts;
         }
+        // In-stream full-group path: a group of exactly
+        // `INSTREAM_DATA_PER_GROUP` data symbols emits
+        // `INSTREAM_PARITY_PER_GROUP` parity symbols, budget-gated.  This
+        // fires inline mid-burst (the transmission layer calls
+        // `maybe_flush_parities` right after the data send that filled the
+        // group) and at burst end if a full group was not yet flushed.
+        if instream && data_count == INSTREAM_DATA_PER_GROUP {
+            let parity_count = INSTREAM_PARITY_PER_GROUP as u8;
+            let available_tokens = send_rate_limiter.gen_tokens(now);
+            let parity_budget = available_tokens / PARITY_BUDGET_DEN;
+            if usize::from(parity_count) > parity_budget {
+                self.stats.groups_skipped_no_surplus_tokens += 1;
+                inc_hist(
+                    &mut self.stats.group_size_skipped_no_surplus_tokens,
+                    data_count,
+                );
+                self.encoder.skip_group();
+                return vec![];
+            }
+            assert!(send_rate_limiter.take_exact_tokens(usize::from(parity_count), now));
+            if FEC_DEBUG {
+                eprintln!(
+                    "FEC: flushing {parity_count} parities for full in-stream group of {data_count}"
+                );
+            }
+            self.stats.groups_flushed += 1;
+            let mut parity_encoder = self.encoder.flush_parities(parity_count);
+            let mut pkts = vec![];
+            while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
+                pkts.push(self.enc_buf[..n].to_vec());
+            }
+            self.stats.parity_sent += pkts.len();
+            return pkts;
+        }
+        // Stock path: groups above `PARITY_DATA_THRESHOLD` are skipped so
+        // parity never impacts throughput of big traffic.  When `instream` is
+        // `true`, the force-skip in `encode_data` is suppressed and a partial
+        // group may carry 5..7 data symbols to the burst end — those are
+        // flushed here with the stock 1:4 parity (budget-gated), not skipped.
+        // A group above `INSTREAM_DATA_PER_GROUP` should never reach here
+        // (the inline flush resets it at 8), but defensively skip it.
+        if (!instream && data_count > PARITY_DATA_THRESHOLD)
+            || (instream && data_count > INSTREAM_DATA_PER_GROUP)
+        {
+            self.encoder.skip_group();
+            return vec![];
+        }
+        let parity_count = parity_for(data_count);
 
         let available_tokens = send_rate_limiter.gen_tokens(now);
         let parity_budget = available_tokens / PARITY_BUDGET_DEN;
@@ -298,6 +369,13 @@ impl FecState {
         }
         self.stats.parity_sent += pkts.len();
         pkts
+    }
+
+    /// Number of data symbols in the currently-open FEC group.  Exposed so the
+    /// transmission layer's data-path burst close can decide whether a partial
+    /// group needs force-flushing.
+    pub fn group_data_count(&self) -> usize {
+        self.encoder.group_data_count()
     }
 
     /// Feed an incoming raw UDP packet through the FEC decoder. Returns:
@@ -452,10 +530,10 @@ mod tests {
         // Encode one data symbol (single-symbol group).
         let data = b"hello interactive world";
         let mut sym_buf = vec![0u8; 8192];
-        let _n = fec.encode_data(data, &mut sym_buf);
+        let _n = fec.encode_data(data, &mut sym_buf, false);
         assert_eq!(fec.encoder.group_data_count(), 1);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             3,
@@ -478,11 +556,11 @@ mod tests {
         // PARITY_DATA_THRESHOLD is 4, so a 2-symbol group is not force-skipped.
         let data = b"first symbol payload";
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(data, &mut sym_buf);
-        fec.encode_data(data, &mut sym_buf);
+        fec.encode_data(data, &mut sym_buf, false);
+        fec.encode_data(data, &mut sym_buf, false);
         assert_eq!(fec.encoder.group_data_count(), 2);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             0,
@@ -503,11 +581,11 @@ mod tests {
         // Two data symbols → stock parity_for(2) = 1.
         let data = b"first symbol payload";
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(data, &mut sym_buf);
-        fec.encode_data(data, &mut sym_buf);
+        fec.encode_data(data, &mut sym_buf, false);
+        fec.encode_data(data, &mut sym_buf, false);
         assert_eq!(fec.encoder.group_data_count(), 2);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             1,
@@ -526,9 +604,9 @@ mod tests {
 
         let data = b"hello";
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(data, &mut sym_buf);
+        fec.encode_data(data, &mut sym_buf, false);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now);
+        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             0,
@@ -543,5 +621,214 @@ mod tests {
     fn depth_zero_is_clamped_to_one() {
         let fec = fec_state(8192 - 11, 0);
         assert_eq!(fec.interactive_parity_depth(), 1);
+    }
+
+    // ---- In-stream group FEC tests ----
+
+    /// A full in-stream group (8 data symbols) with a full bucket must emit
+    /// exactly 4 parity symbols inline.  Mutation target: if the force-skip
+    /// at `PARITY_DATA_THRESHOLD` is kept on the instream path (i.e.
+    /// `encode_data` ignores the `instream` flag), the group never reaches 8
+    /// symbols and this test fails (0 parity instead of 4).
+    #[test]
+    fn full_group_flushes_four_parities_inline_mid_burst() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let (mut tb, now) = unlimited_bucket(now);
+
+        // Encode 8 data symbols with instream=true (suppresses the
+        // PARITY_DATA_THRESHOLD force-skip).
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+        for _ in 0..INSTREAM_DATA_PER_GROUP {
+            fec.encode_data(data, &mut sym_buf, true);
+        }
+        assert_eq!(fec.encoder.group_data_count(), INSTREAM_DATA_PER_GROUP);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(
+            pkts.len(),
+            INSTREAM_PARITY_PER_GROUP,
+            "full in-stream group of {} data symbols must emit {} parities, got {}",
+            INSTREAM_DATA_PER_GROUP,
+            INSTREAM_PARITY_PER_GROUP,
+            pkts.len()
+        );
+    }
+
+    /// A partial in-stream group (fewer than 8 data symbols) at burst end
+    /// must still flush its stock 1:4 parity (not be skipped by the
+    /// `PARITY_DATA_THRESHOLD` gate).  Mutation target: if the stock
+    /// threshold skip is applied to instream partial groups (i.e.
+    /// `maybe_flush_parities` uses `!instream` for the threshold skip), a
+    /// 5-symbol group is skipped and this test fails (0 parity instead of 2).
+    #[test]
+    fn partial_instream_group_flushes_stock_parity_at_burst_end() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let (mut tb, now) = unlimited_bucket(now);
+
+        // Encode 5 data symbols with instream=true.  A stock path would
+        // force-skip at 4, but instream suppresses that, so the group
+        // reaches 5.  At burst end, `maybe_flush_parities(instream=true)`
+        // must NOT skip it (5 <= INSTREAM_DATA_PER_GROUP=8) and must emit
+        // the stock 1:4 parity = ceil(5/4) = 2.
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+        for _ in 0..5 {
+            fec.encode_data(data, &mut sym_buf, true);
+        }
+        assert_eq!(fec.encoder.group_data_count(), 5);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(
+            pkts.len(),
+            2,
+            "partial in-stream group of 5 must flush stock parity_for(5)=2, got {}",
+            pkts.len()
+        );
+    }
+
+    /// A full in-stream group with an empty bucket must be skipped (0
+    /// parity) — the budget gate is NOT bypassed for multi-symbol groups.
+    /// Mutation target: if the budget check is skipped for instream groups,
+    /// this test fails (4 parity instead of 0).
+    #[test]
+    fn full_group_budget_exhaustion_suppresses_parity() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let mut tb = empty_bucket(now);
+
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+        for _ in 0..INSTREAM_DATA_PER_GROUP {
+            fec.encode_data(data, &mut sym_buf, true);
+        }
+        assert_eq!(fec.encoder.group_data_count(), INSTREAM_DATA_PER_GROUP);
+
+        let pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(
+            pkts.len(),
+            0,
+            "full in-stream group with empty bucket must be skipped (0 parity), got {}",
+            pkts.len()
+        );
+    }
+
+    /// With instream=false (toggle off), the force-skip at
+    /// `PARITY_DATA_THRESHOLD` fires, so a group never exceeds 4 data
+    /// symbols.  Encoding 8 symbols with instream=false produces a group of
+    /// at most 4 (the rest are force-skipped into new groups).  This proves
+    /// the toggle-off path is byte-identical to stock.
+    #[test]
+    fn toggle_off_keeps_threshold_force_skip() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let (_tb, _now) = unlimited_bucket(now);
+
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+        for _ in 0..8 {
+            fec.encode_data(data, &mut sym_buf, false);
+        }
+        // Stock force-skip at PARITY_DATA_THRESHOLD=4 means the group never
+        // exceeds 4.  After 8 encode_data calls, the open group has at most
+        // 4 symbols (the first 4 were force-skipped into a closed group when
+        // the 5th was encoded).
+        assert!(
+            fec.encoder.group_data_count() <= PARITY_DATA_THRESHOLD,
+            "toggle off must keep the force-skip; group_data_count={} > {}",
+            fec.encoder.group_data_count(),
+            PARITY_DATA_THRESHOLD
+        );
+    }
+
+    /// `group_data_full` returns true only when instream is true AND the
+    /// group has reached `INSTREAM_DATA_PER_GROUP`.  Stock path (instream=
+    /// false) always returns false.
+    #[test]
+    fn group_data_full_only_when_instream_and_full() {
+        let mut fec = fec_state(8192 - 11, 1);
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+
+        // Empty group: never full.
+        assert!(!fec.group_data_full(true));
+        assert!(!fec.group_data_full(false));
+
+        // Partial group (4 symbols): not full even with instream.
+        for _ in 0..4 {
+            fec.encode_data(data, &mut sym_buf, true);
+        }
+        assert!(!fec.group_data_full(true), "4 < 8 must not be full");
+        assert!(!fec.group_data_full(false));
+
+        // Full group (8 symbols): full only with instream.
+        for _ in 0..4 {
+            fec.encode_data(data, &mut sym_buf, true);
+        }
+        assert!(fec.group_data_full(true), "8 == 8 must be full (instream)");
+        assert!(!fec.group_data_full(false), "toggle off must never be full");
+    }
+
+    /// Parity emitted by a full in-stream group (8 data + 4 parity) must
+    /// recover a lost data symbol at the decoder.  This proves the 8+4 group
+    /// fits the stock decoder (`MAX_GROUP_SIZE=25`, `WINDOW_SIZE=32`) without
+    /// bumping either constant, and that the parity is wire-correct.
+    #[test]
+    fn parity_recovers_lost_data_symbol_in_group() {
+        use fec::de::FecDecoder;
+        use std::num::NonZeroU64;
+
+        let symbol_size = 8192 - 11;
+        let mut fec = fec_state(symbol_size, 1);
+        let (mut tb, now) = unlimited_bucket(Instant::now());
+
+        // Encode 8 distinct data symbols so we can identify which one was
+        // recovered.  Each codec packet is a small unique payload.
+        let payloads: Vec<Vec<u8>> =
+            (0..INSTREAM_DATA_PER_GROUP).map(|i| vec![i as u8; 32]).collect();
+        let mut sym_buf = vec![0u8; 8192];
+        let mut wire_data_pkts = vec![];
+        for p in &payloads {
+            let n = fec.encode_data(p, &mut sym_buf, true);
+            wire_data_pkts.push(sym_buf[..n].to_vec());
+        }
+        assert_eq!(fec.encoder.group_data_count(), INSTREAM_DATA_PER_GROUP);
+
+        // Flush 4 parities for the full group.
+        let parity_pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(parity_pkts.len(), INSTREAM_PARITY_PER_GROUP);
+
+        // Feed 7 of 8 data symbols + all 4 parities to a stock decoder,
+        // dropping data symbol #3 (simulating a loss mid-burst).
+        let mut decoder = FecDecoder::builder()
+            .window_size(NonZeroU64::new(WINDOW_SIZE.get()).unwrap())
+            .symbol_size(symbol_size)
+            .max_group_size(MAX_GROUP_SIZE)
+            .build();
+        let mut recovered = vec![];
+        for (i, pkt) in wire_data_pkts.iter().enumerate() {
+            if i == 3 {
+                continue; // drop this one
+            }
+            decoder.decode(pkt, |data| recovered.push(data.to_vec()));
+        }
+        for pkt in &parity_pkts {
+            decoder.decode(pkt, |data| recovered.push(data.to_vec()));
+        }
+        // The decoder must recover the missing data symbol (#3, all bytes
+        // = 3).  With 4 parity packets, the decoder fires recovery once per
+        // parity after enough symbols arrive, so we expect >= 1 recovery;
+        // each recovery returns the same missing symbol.
+        assert!(
+            !recovered.is_empty(),
+            "decoder must recover the lost data symbol from 8+4 group, got 0 recoveries"
+        );
+        assert!(
+            recovered[0].iter().all(|&b| b == 3),
+            "recovered symbol must be the dropped one (all bytes == 3), got {:?}",
+            recovered[0]
+        );
     }
 }

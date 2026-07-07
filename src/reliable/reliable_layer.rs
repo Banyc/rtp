@@ -216,6 +216,15 @@ impl ReliableLayer {
         self.queue_building = v;
     }
 
+    /// Test-only: directly enqueue `buf` into the send buffer, bypassing the
+    /// staging-cap gate in `send_data_buf`.  Used by in-stream group FEC tests
+    /// to stage many packets worth of data so a single `send_pkts` call emits
+    /// a full 8-symbol group.
+    #[cfg(test)]
+    pub(crate) fn enqueue_send_data_for_test(&mut self, buf: &[u8]) {
+        self.send_data_buf.batch_enqueue(buf);
+    }
+
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
         self.pkt_send_space.sample_rtt(rtt, now);
     }
