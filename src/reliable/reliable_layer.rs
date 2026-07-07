@@ -225,6 +225,17 @@ impl ReliableLayer {
         self.send_data_buf.batch_enqueue(buf);
     }
 
+    /// Test-only: shrink the congestion window so the send loop stops after a
+    /// fixed number of new packets, leaving the rest of the staged data in the
+    /// send buffer.  This makes `is_send_buf_empty` false (and thus the stock
+    /// `can_send_tail_fec` gate closed) without draining the token bucket, so
+    /// the FEC parity flush still has spare tokens.  Used by in-stream group
+    /// FEC tests that need the stock tail gate genuinely closed.
+    #[cfg(test)]
+    pub(crate) fn set_cwnd_for_test(&mut self, cwnd: NonZeroUsize) {
+        self.pkt_send_space.set_cwnd_for_test(cwnd);
+    }
+
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
         self.pkt_send_space.sample_rtt(rtt, now);
     }

@@ -169,6 +169,16 @@ impl PktSendSpace {
         self.cwnd
     }
 
+    /// Test-only: shrink the congestion window to `cwnd` so the send loop
+    /// stops after that many new packets, leaving the rest of staged data in
+    /// the send buffer.  Used by in-stream group FEC tests that need the stock
+    /// `can_send_tail_fec` gate closed (send buffer not empty) while still
+    /// having a partial FEC group open.
+    #[cfg(test)]
+    pub(crate) fn set_cwnd_for_test(&mut self, cwnd: NonZeroUsize) {
+        self.cwnd = cwnd;
+    }
+
     pub fn next_seq(&self) -> u64 {
         *self.send_wnd.next().unwrap()
     }

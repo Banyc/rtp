@@ -527,11 +527,12 @@ impl TransmissionLayer {
         // ACK/kill parity is not the interactive win.
         //
         // In-stream group FEC (`RTP_INSTREAM_GROUP_FEC`): when the toggle is
-        // on, a partial DATA group (1..INSTREAM_DATA_PER_GROUP symbols) is
+        // on, a partial DATA group (2..INSTREAM_DATA_PER_GROUP symbols) is
         // force-flushed at burst end regardless of `can_send_tail_fec`, so a
-        // burst ending mid-group still emits its stock 1:4 parity.  ACK/kill
-        // bursts keep the stock tail gate untouched (force-flushing ACK
-        // bursts tripled reverse-path packets for zero gain).
+        // burst ending mid-group still emits its INSTREAM_PARITY_PER_GROUP
+        // parity.  ACK/kill bursts keep the stock tail gate untouched
+        // (force-flushing ACK bursts tripled reverse-path packets for zero
+        // gain).
         if self.fec.is_some() {
             let now = Instant::now();
             let stock_can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
@@ -1360,7 +1361,7 @@ mod tests {
     /// packet makes `can_send_tail_fec` false, the group is skipped, and
     /// this test gets 1 datagram (data only) instead of 4.
     #[tokio::test]
-    async fn f5_single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
+    async fn single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
         use crate::transmission::fec_tuning::FecTuning;
 
         // mindiv: instream flush + depth 3.
@@ -1472,26 +1473,81 @@ mod tests {
         );
     }
 
-    /// A partial data burst (fewer than 8 data symbols) with the toggle on
-    /// must flush its stock parity at burst end.  The teeth for the
-    /// data-path tail gate are in the `fec.rs` unit test
-    /// `partial_instream_group_flushes_stock_parity_at_burst_end`, which
-    /// directly verifies a 5-symbol group is NOT skipped by the
-    /// `PARITY_DATA_THRESHOLD` gate on the instream path.  This integration
-    /// test is a complementary end-to-end check: stage 3 packets, send them,
-    /// and verify 3 data + 1 parity = 4 datagrams.
+    /// A partial data burst (3 data symbols) with the toggle on and the stock
+    /// tail gate genuinely closed must still flush 4 parities via the
+    /// data-path force-flush (`|| (data_path && instream_group_fec_enabled)`).
+    /// The stock gate is closed by shrinking cwnd to 3 so the send loop stops
+    /// after 3 new packets, leaving the rest of the staged data in the send
+    /// buffer (`is_send_buf_empty` = false → `can_send_tail_fec` = false).
+    /// The token bucket still has tokens (64 − 3 = 61) so the 4-parity budget
+    /// gate passes.
+    ///
+    /// Mutation targets:
+    /// (a) revert the instream branch to `data_count == INSTREAM_DATA_PER_GROUP`
+    ///     → 3-symbol group falls through to stock parity_for(3)=1, not 4.
+    /// (b) with the toggle off, no force-flush fires and the stock gate is
+    ///     closed → group skipped, 0 parity (see inverse test).
+    /// (c) drop the `(data_path && instream_group_fec_enabled)` OR at the
+    ///     data-burst close → stock gate is closed, group skipped, 0 parity.
     #[tokio::test]
     async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
         tl.set_instream_group_fec_for_test(true);
+        // Shrink cwnd to 3 so the send loop emits exactly 3 new packets, then
+        // stops (cwnd full).  The remaining staged data stays in the send
+        // buffer, making `is_send_buf_empty` = false → stock gate closed.
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.set_cwnd_for_test(std::num::NonZeroUsize::new(3).unwrap());
+        }
+        // Stage 3 full packets (the ones that will send) + extra data that
+        // stays in the buffer (the 4th packet the cwnd-full loop won't send).
         stage_n_packets(&tl, 3);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.enqueue_send_data_for_test(&[0u8; 100]);
+        }
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
-        // 3 data symbols + 1 stock parity (parity_for(3) = ceil(3/4) = 1) = 4.
+        // 3 data symbols + 4 parity (INSTREAM_PARITY_PER_GROUP) = 7.
         assert_eq!(
-            n, 4,
-            "partial data burst with toggle on must flush 3 data + 1 parity = 4 datagrams, got {n}"
+            n, 7,
+            "partial data burst with toggle on and stock gate closed must flush \
+             3 data + 4 parity = 7 datagrams, got {n}"
+        );
+    }
+
+    /// Inverse of `partial_data_burst_force_flushes_when_tail_gate_closed`:
+    /// with the toggle OFF and the stock gate closed (same cwnd-3 + extra
+    /// data setup), the data-path force-flush does NOT fire, so the open
+    /// group is skipped (0 parity).  This proves the force-flush is gated on
+    /// the toggle, not unconditional.  3 data + 0 parity = 3 datagrams.
+    #[tokio::test]
+    async fn partial_data_burst_skipped_when_toggle_off_and_gate_closed() {
+        let (tl, recorder) = harness_with_mss(true, false, 8192);
+        // Toggle is OFF (do not call set_instream_group_fec_for_test).
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.set_cwnd_for_test(std::num::NonZeroUsize::new(3).unwrap());
+        }
+        stage_n_packets(&tl, 3);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.enqueue_send_data_for_test(&[0u8; 100]);
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        // 3 data symbols + 0 parity (stock gate closed, no force-flush) = 3.
+        assert_eq!(
+            n, 3,
+            "partial data burst with toggle off and stock gate closed must emit \
+             3 data + 0 parity = 3 datagrams, got {n}"
         );
     }
 

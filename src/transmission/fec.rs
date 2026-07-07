@@ -243,15 +243,16 @@ impl FecState {
     /// spare-bandwidth-only and must not compete with data traffic. Groups
     /// larger than `PARITY_DATA_THRESHOLD` are also skipped (stock path).
     ///
-    /// **In-stream group FEC:** when `instream` is `true`, a full group of
-    /// exactly `INSTREAM_DATA_PER_GROUP` data symbols emits
-    /// `INSTREAM_PARITY_PER_GROUP` parity symbols, gated on the spare-token
-    /// budget (ungated parity on a bulk path collapses throughput from ~0.34
-    /// to ~0.06 MiB/s in prototyping).  Partial groups (`data_count <`
-    /// `INSTREAM_DATA_PER_GROUP` and `> 0`) are skipped here — the
-    /// transmission layer force-flushes them at burst end via
-    /// `flush_fec_group`.  Stock path passes `false` and keeps the
-    /// `PARITY_DATA_THRESHOLD` skip.
+    /// **In-stream group FEC:** when `instream` is `true`, any multi-symbol
+    /// group (`data_count >= 2`) emits `INSTREAM_PARITY_PER_GROUP` parity
+    /// symbols, gated on the spare-token budget (ungated parity on a bulk
+    /// path collapses throughput from ~0.34 to ~0.06 MiB/s in prototyping).
+    /// Depth-4 parity on partial multi-symbol groups (2..7 data symbols) is
+    /// the measured win for interactive messages — a 2048-byte message at
+    /// default MSS is 2 data symbols, and stock `parity_for(2)=1` parity
+    /// makes message p50 *worse* with the toggle on.  The transmission layer
+    /// force-flushes partial groups at burst end via `flush_fec_parities`.
+    /// Stock path passes `false` and keeps the `PARITY_DATA_THRESHOLD` skip.
     ///
     /// **Single-symbol interactive exception:** when the open group has
     /// exactly one data symbol and `interactive_parity_depth > 1`, the group
@@ -297,13 +298,15 @@ impl FecState {
             self.stats.parity_sent += pkts.len();
             return pkts;
         }
-        // In-stream full-group path: a group of exactly
-        // `INSTREAM_DATA_PER_GROUP` data symbols emits
-        // `INSTREAM_PARITY_PER_GROUP` parity symbols, budget-gated.  This
-        // fires inline mid-burst (the transmission layer calls
-        // `maybe_flush_parities` right after the data send that filled the
-        // group) and at burst end if a full group was not yet flushed.
-        if instream && data_count == INSTREAM_DATA_PER_GROUP {
+        // In-stream group FEC path: any multi-symbol group (data_count >= 2)
+        // emits `INSTREAM_PARITY_PER_GROUP` parity symbols, budget-gated.
+        // This fires inline mid-burst (a full 8-symbol group triggers the
+        // transmission layer's `maybe_flush_full_fec_group`) and at burst end
+        // for partial groups (2..7 symbols) via the data-path force-flush.
+        // Single-symbol groups (data_count == 1) are handled by the
+        // interactive exception above when `interactive_parity_depth > 1`,
+        // or fall through to the stock path below.
+        if instream && data_count >= 2 {
             let parity_count = INSTREAM_PARITY_PER_GROUP as u8;
             let available_tokens = send_rate_limiter.gen_tokens(now);
             let parity_budget = available_tokens / PARITY_BUDGET_DEN;
@@ -319,7 +322,7 @@ impl FecState {
             assert!(send_rate_limiter.take_exact_tokens(usize::from(parity_count), now));
             if FEC_DEBUG {
                 eprintln!(
-                    "FEC: flushing {parity_count} parities for full in-stream group of {data_count}"
+                    "FEC: flushing {parity_count} parities for in-stream group of {data_count}"
                 );
             }
             self.stats.groups_flushed += 1;
@@ -333,11 +336,12 @@ impl FecState {
         }
         // Stock path: groups above `PARITY_DATA_THRESHOLD` are skipped so
         // parity never impacts throughput of big traffic.  When `instream` is
-        // `true`, the force-skip in `encode_data` is suppressed and a partial
-        // group may carry 5..7 data symbols to the burst end — those are
-        // flushed here with the stock 1:4 parity (budget-gated), not skipped.
-        // A group above `INSTREAM_DATA_PER_GROUP` should never reach here
-        // (the inline flush resets it at 8), but defensively skip it.
+        // `true`, multi-symbol groups (>= 2) are already handled by the
+        // instream branch above; the only instream group that reaches here is
+        // a single-symbol group with `interactive_parity_depth <= 1`, which
+        // falls through to the stock 1:4 parity.  A group above
+        // `INSTREAM_DATA_PER_GROUP` should never reach here (the inline flush
+        // resets it at 8), but defensively skip it.
         if (!instream && data_count > PARITY_DATA_THRESHOLD)
             || (instream && data_count > INSTREAM_DATA_PER_GROUP)
         {
@@ -656,12 +660,14 @@ mod tests {
         );
     }
 
-    /// A partial in-stream group (fewer than 8 data symbols) at burst end
-    /// must still flush its stock 1:4 parity (not be skipped by the
-    /// `PARITY_DATA_THRESHOLD` gate).  Mutation target: if the stock
-    /// threshold skip is applied to instream partial groups (i.e.
-    /// `maybe_flush_parities` uses `!instream` for the threshold skip), a
-    /// 5-symbol group is skipped and this test fails (0 parity instead of 2).
+    /// A partial multi-symbol in-stream group (5 data symbols) must flush
+    /// `INSTREAM_PARITY_PER_GROUP` (4) parities at burst end, not the stock
+    /// `parity_for(5)=2`.  Depth-4 parity on partial multi-symbol groups is
+    /// the measured win for interactive messages (a 2048-byte message at
+    /// default MSS is 2 data symbols; stock parity_for(2)=1 makes p50 worse).
+    /// Mutation target: if the instream branch condition is reverted to
+    /// `data_count == INSTREAM_DATA_PER_GROUP`, a 5-symbol group falls through
+    /// to the stock path and emits `parity_for(5)=2` instead of 4.
     #[test]
     fn partial_instream_group_flushes_stock_parity_at_burst_end() {
         let now = Instant::now();
@@ -671,8 +677,7 @@ mod tests {
         // Encode 5 data symbols with instream=true.  A stock path would
         // force-skip at 4, but instream suppresses that, so the group
         // reaches 5.  At burst end, `maybe_flush_parities(instream=true)`
-        // must NOT skip it (5 <= INSTREAM_DATA_PER_GROUP=8) and must emit
-        // the stock 1:4 parity = ceil(5/4) = 2.
+        // must emit INSTREAM_PARITY_PER_GROUP=4 (not stock parity_for(5)=2).
         let data = b"payload";
         let mut sym_buf = vec![0u8; 8192];
         for _ in 0..5 {
@@ -683,8 +688,8 @@ mod tests {
         let pkts = fec.maybe_flush_parities(&mut tb, now, true);
         assert_eq!(
             pkts.len(),
-            2,
-            "partial in-stream group of 5 must flush stock parity_for(5)=2, got {}",
+            INSTREAM_PARITY_PER_GROUP,
+            "partial in-stream group of 5 must flush {INSTREAM_PARITY_PER_GROUP} parities, got {}",
             pkts.len()
         );
     }
