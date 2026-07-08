@@ -1,5 +1,5 @@
 use core::time::Duration;
-use std::{sync::Arc, time::Instant};
+use std::{sync::{Arc, Mutex}, time::Instant};
 
 use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
@@ -269,6 +269,7 @@ pub fn socket(
 
     let read = ReadSocket {
         transmission_layer: Arc::clone(&transmission_layer),
+        frame_buf: Mutex::new(Vec::new()),
         _shutdown_guard: read_shutdown.drop_guard(),
     };
     let write = WriteSocket {
@@ -283,6 +284,7 @@ pub fn socket(
 #[derive(Debug)]
 pub struct ReadSocket {
     transmission_layer: Arc<TransmissionLayer>,
+    frame_buf: Mutex<Vec<u8>>,
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
 impl ReadSocket {
@@ -300,7 +302,39 @@ impl ReadSocket {
     /// }
     /// ```
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        self.transmission_layer.recv(data).await
+        {
+            let mut frame_buf = self.frame_buf.lock().unwrap();
+            if !frame_buf.is_empty() {
+                let n = frame_buf.len().min(data.len());
+                data[..n].copy_from_slice(&frame_buf[..n]);
+                frame_buf.drain(..n);
+                return Ok(n);
+            }
+        }
+        if self
+            .transmission_layer
+            .reliable_layer()
+            .lock()
+            .unwrap()
+            .frame_delivery_enabled()
+        {
+            match self.transmission_layer.recv_frame().await? {
+                Some(frame) => {
+                    let n = frame.len().min(data.len());
+                    data[..n].copy_from_slice(&frame[..n]);
+                    if n < frame.len() {
+                        self.frame_buf
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(&frame[n..]);
+                    }
+                    Ok(n)
+                }
+                None => Ok(0),
+            }
+        } else {
+            self.transmission_layer.recv(data).await
+        }
     }
 
     /// Receive one complete frame in frame-delivery mode.  Returns
