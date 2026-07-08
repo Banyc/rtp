@@ -11,9 +11,10 @@ use crate::{
     socket::{ReadSocket, WriteSocket, socket},
     transmission::{
         fec_tuning::{FecTuning, fec_tuning_from_env},
+        frame_delivery::{FrameDelivery, frame_delivery_from_env},
         transmission_layer::{UnreliableLayer, UnreliableWrite},
     },
-    udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss_and_fec_tuning},
+    udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery},
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
@@ -45,6 +46,7 @@ fn apply_keyed_mss<K: DispatchKey>(layer: UnreliableLayer) -> UnreliableLayer {
         mss: checked_keyed_mss::<K>(layer.mss),
         fec: layer.fec,
         fec_tuning: layer.fec_tuning,
+        frame_delivery: layer.frame_delivery,
     }
 }
 
@@ -79,7 +81,8 @@ impl<K: DispatchKey> Server<K> {
         mss: usize,
     ) -> std::io::Result<Accepted<K>> {
         let tuning = fec_tuning_from_env();
-        self.accept_without_handshake_with_mss_and_fec_tuning(fec, mss, tuning)
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
             .await
     }
 
@@ -92,11 +95,28 @@ impl<K: DispatchKey> Server<K> {
         mss: usize,
         tuning: FecTuning,
     ) -> std::io::Result<Accepted<K>> {
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
+            .await
+    }
+
+    /// [`Self::accept_without_handshake()`] with a custom MSS, a
+    /// per-connection [`FecTuning`], and an explicit [`FrameDelivery`].
+    /// Both peers must enable frame delivery together; there is no in-band
+    /// negotiation — same coupling as the FEC flag.
+    pub async fn accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+        &self,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+        frame_delivery: FrameDelivery,
+    ) -> std::io::Result<Accepted<K>> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &conn_key);
-        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, tuning);
+        let unreliable_layer =
+            wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(read, write, fec, mss, tuning, frame_delivery);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -163,7 +183,8 @@ impl<K: DispatchKey> Client<K> {
         mss: usize,
     ) -> Option<Connected> {
         let tuning = fec_tuning_from_env();
-        self.open_without_handshake_with_mss_and_fec_tuning(dispatch_key, fec, mss, tuning)
+        let frame_delivery = frame_delivery_from_env();
+        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(dispatch_key, fec, mss, tuning, frame_delivery)
     }
 
     /// [`Self::open_without_handshake()`] with a custom MSS and a
@@ -176,10 +197,27 @@ impl<K: DispatchKey> Client<K> {
         mss: usize,
         tuning: FecTuning,
     ) -> Option<Connected> {
+        let frame_delivery = frame_delivery_from_env();
+        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(dispatch_key, fec, mss, tuning, frame_delivery)
+    }
+
+    /// [`Self::open_without_handshake()`] with a custom MSS, a
+    /// per-connection [`FecTuning`], and an explicit [`FrameDelivery`].
+    /// Both peers must enable frame delivery together; there is no in-band
+    /// negotiation — same coupling as the FEC flag.
+    pub fn open_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+        &self,
+        dispatch_key: K,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+        frame_delivery: FrameDelivery,
+    ) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key);
-        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, tuning);
+        let unreliable_layer =
+            wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(read, write, fec, mss, tuning, frame_delivery);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Some(Connected { read, write })

@@ -23,10 +23,16 @@ use crate::{
     recv_queue::pkt_recv_space::PktRecvSpace,
     sack::AckBallSequence,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
+    transmission::frame_delivery::FrameDelivery,
 };
 
 const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
+/// Maximum application bytes in a single frame in frame-delivery mode.  Set
+/// equal to the stock `MAX_SEND_DATA_BUF_LEN` so a frame can occupy the whole
+/// staging buffer; the per-packet payload cap (`max_data_size_per_pkt`) still
+/// governs how many packets a frame is split into.
+const MAX_FRAME_LEN: usize = MAX_SEND_DATA_BUF_LEN;
 
 /// Cap on newly accepted staging bytes, in units of a pacing window.
 ///
@@ -130,12 +136,39 @@ pub struct ReliableLayer {
     /// capacity drop.
     drain_floor_binding_since: Option<Instant>,
 
+    /// Per-connection frame-delivery mode snapshot taken at construction.
+    /// When `enabled`, application data is staged as whole frames and
+    /// packetized frame-aligned; the receive path may deliver complete frames
+    /// out of order past sequence holes.  When disabled, the layer is
+    /// byte-for-byte stock (no `FRAME_DATA_TS` is ever emitted, the
+    /// byte-stream `recv`/`send` paths are unchanged).
+    frame_delivery: FrameDelivery,
+    /// Pending (not yet fully packetized) frames in frame-delivery mode.
+    /// Each entry is a frame whose bytes have been accepted by
+    /// `send_frame_buf` but not yet fully drained into `pkt_send_space`.
+    /// `offset` is the number of bytes already packetized from `data`.
+    /// Empty when frame-delivery mode is off (the stock byte-stream path uses
+    /// `send_data_buf` directly).
+    pending_frames: Vec<PendingFrame>,
+
     // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
     pkt_buf: Vec<dre::Packet>,
 }
+
+/// A frame accepted by `send_frame_buf` but not yet fully packetized.
+/// `offset` is the number of bytes already sent in earlier packets.
+#[derive(Debug, Clone)]
+struct PendingFrame {
+    data: Vec<u8>,
+    offset: usize,
+}
 impl ReliableLayer {
-    pub fn new(mss: NonZeroUsize, now: Instant) -> (Self, Arc<Mutex<TokenBucket>>) {
+    pub fn new(
+        mss: NonZeroUsize,
+        frame_delivery: FrameDelivery,
+        now: Instant,
+    ) -> (Self, Arc<Mutex<TokenBucket>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let bucket_burst = burst_pkts(send_rate);
         let send_rate_limiter = Arc::new(Mutex::new(token_bucket_with_tokens(
@@ -153,7 +186,7 @@ impl ReliableLayer {
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new(),
-            pkt_recv_space: PktRecvSpace::new(),
+            pkt_recv_space: PktRecvSpace::new(frame_delivery),
             send_rate,
             bucket_burst,
             prev_sample_rate: None,
@@ -165,10 +198,17 @@ impl ReliableLayer {
             gentle: GentleMode::new(),
             queue_building: false,
             drain_floor_binding_since: None,
+            frame_delivery,
+            pending_frames: Vec::new(),
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
         (this, send_rate_limiter)
+    }
+
+    /// Whether frame-delivery mode is enabled on this connection.
+    pub fn frame_delivery_enabled(&self) -> bool {
+        self.frame_delivery.enabled
     }
 
     pub fn is_no_data_to_send(&self) -> bool {
@@ -176,11 +216,18 @@ impl ReliableLayer {
     }
 
     pub fn is_send_buf_empty(&self) -> bool {
-        self.send_data_buf.is_empty()
+        let stock_empty = self.send_data_buf.is_empty()
             && matches!(
                 self.send_fin_buf,
                 SendFinBuf::Empty | SendFinBuf::EmptyAndBlocked
-            )
+            );
+        if self.frame_delivery.enabled {
+            // In frame mode the staging buffer is unused; `pending_frames` is
+            // the source of truth for unsent application bytes.
+            stock_empty && self.pending_frames.is_empty()
+        } else {
+            stock_empty
+        }
     }
 
     pub fn can_send_tail_fec(&self, now: Instant) -> bool {
@@ -264,6 +311,53 @@ impl ReliableLayer {
         write_bytes
     }
 
+    /// Stage a whole application frame in frame-delivery mode.  The frame is
+    /// queued in `pending_frames` and packetized frame-aligned by subsequent
+    /// `send_data_pkt` calls (a packet never carries bytes of two frames).
+    /// Returns `Ok(())` on success, or `Err(InvalidInput)` when the mode is
+    /// off, the frame is empty, or the frame exceeds `MAX_FRAME_LEN`.
+    pub fn send_frame_buf(&mut self, frame: &[u8], now: Instant) -> Result<(), std::io::ErrorKind> {
+        if !self.frame_delivery.enabled {
+            return Err(std::io::ErrorKind::InvalidInput);
+        }
+        if frame.is_empty() {
+            return Err(std::io::ErrorKind::InvalidInput);
+        }
+        if frame.len() > MAX_FRAME_LEN {
+            return Err(std::io::ErrorKind::InvalidInput);
+        }
+        self.detect_application_limited_phases(now);
+        // Respect the same staging-cap discipline as the stock path so a small
+        // interactive frame is not starved behind a bulk backlog already on
+        // the stage.  Pending bytes (bytes of in-progress frames still to be
+        // packetized) count against the cap.
+        let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
+        let cap = (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(MAX_FRAME_LEN);
+        let pending_bytes: usize = self
+            .pending_frames
+            .iter()
+            .map(|pf| pf.data.len() - pf.offset)
+            .sum();
+        let free_bytes = cap.saturating_sub(pending_bytes);
+        if free_bytes < frame.len() {
+            return Err(std::io::ErrorKind::WouldBlock);
+        }
+        self.pending_frames.push(PendingFrame {
+            data: frame.to_vec(),
+            offset: 0,
+        });
+        Ok(())
+    }
+
+    /// Total bytes of pending (not yet fully packetized) frames in
+    /// frame-delivery mode.  Zero when the mode is off.
+    pub fn pending_frame_bytes(&self) -> usize {
+        self.pending_frames
+            .iter()
+            .map(|pf| pf.data.len() - pf.offset)
+            .sum()
+    }
+
     /// Move data from inner data buffer to inner packet space and return one of the packets if possible
     pub fn send_data_pkt(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
@@ -304,6 +398,7 @@ impl ReliableLayer {
             return Some(DataPkt {
                 seq: p.seq,
                 data_written,
+                frame_len: p.frame_len,
                 was_repair: true,
             });
         }
@@ -322,6 +417,7 @@ impl ReliableLayer {
             return Some(DataPkt {
                 seq: p.seq,
                 data_written,
+                frame_len: p.frame_len,
                 was_repair: true,
             });
         }
@@ -334,6 +430,10 @@ impl ReliableLayer {
         // limiter.
         if !self.pkt_send_space.accepts_new_pkt() {
             return None;
+        }
+
+        if self.frame_delivery.enabled {
+            return self.send_data_pkt_frame(pkt, now);
         }
 
         let pkt_bytes = pkt
@@ -374,7 +474,7 @@ impl ReliableLayer {
         let data = buf;
 
         pkt[..data.len()].copy_from_slice(&data);
-        let p = self.pkt_send_space.send(data, stats, now);
+        let p = self.pkt_send_space.send(data, stats, None, now);
 
         let data_written = NonZeroUsize::new(pkt_bytes)
             .map(DataPktPayload::Data)
@@ -382,6 +482,100 @@ impl ReliableLayer {
         Some(DataPkt {
             seq: p.seq,
             data_written,
+            frame_len: None,
+            was_repair: false,
+        })
+    }
+
+    /// Frame-delivery-mode new-packet path.  Staging is via `pending_frames`;
+    /// packetization is frame-aligned (a packet never carries bytes of two
+    /// frames).  The first packet of a frame carries `Some(frame_len)`; the
+    /// continuation packets carry `None`.  The `pkt` scratch buffer receives
+    /// the payload bytes; the returned `DataPkt.frame_len` tells the
+    /// transmission layer which codec command to emit.
+    fn send_data_pkt_frame(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
+        // FIN handling mirrors the stock path: a FIN is sent only when no
+        // pending frame bytes remain and the FIN buffer is armed.
+        let no_pending = self.pending_frames.is_empty();
+        let max_payload = self.max_data_size_per_pkt();
+
+        // Pull the next frame to packetize.  A frame stays at the head until
+        // all its bytes have been packetized; then it is dropped and the next
+        // frame becomes the head.
+        let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) = match self.pending_frames.first_mut() {
+            Some(pf) => {
+                let remaining = pf.data.len() - pf.offset;
+                let take = remaining.min(max_payload);
+                (pf.data.len() as u32, pf.offset, take, pf.offset == 0)
+            }
+            None => {
+                // No pending frame bytes.  Either emit a FIN or signal idle.
+                if !matches!(self.send_fin_buf, SendFinBuf::Some) {
+                    return None;
+                }
+                if !no_pending {
+                    // Should be impossible (no_pending == pending_frames.is_empty()).
+                    return None;
+                }
+                // We will send a FIN.  Take a token below.
+                (0u32, 0usize, 0usize, false)
+            }
+        };
+
+        // Charge a token for the new packet (or FIN).  The cwnd gate was
+        // already checked by the caller.
+        if !self
+            .send_rate_limiter
+            .lock()
+            .unwrap()
+            .take_exact_tokens(1, now)
+        {
+            // Rate limiter not ready.  Do not consume the FIN; retry later.
+            return None;
+        }
+
+        if take_bytes == 0 {
+            // FIN packet: no frame, no payload, no frame_len.
+            self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
+            let stats = self
+                .connection_stats
+                .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
+            let buf = self.pkt_send_space.reused_buf().take();
+            let p = self.pkt_send_space.send(buf, stats, None, now);
+            return Some(DataPkt {
+                seq: p.seq,
+                data_written: DataPktPayload::Fin,
+                frame_len: None,
+                was_repair: false,
+            });
+        }
+
+        let stats = self
+            .connection_stats
+            .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
+
+        let mut buf = self.pkt_send_space.reused_buf().take();
+        let pf = self.pending_frames.first_mut().unwrap();
+        buf.extend_from_slice(&pf.data[pf.offset..pf.offset + take_bytes]);
+        pf.offset += take_bytes;
+        let frame_done = pf.offset == pf.data.len();
+        let is_first = pf.offset == take_bytes;
+        let frame_len_val = if is_first { Some(frame_len) } else { None };
+        let frame_len = frame_len_val;
+        if frame_done {
+            self.pending_frames.remove(0);
+        }
+
+        pkt[..buf.len()].copy_from_slice(&buf);
+        let p = self.pkt_send_space.send(buf, stats, frame_len, now);
+
+        let data_written = NonZeroUsize::new(take_bytes)
+            .map(DataPktPayload::Data)
+            .unwrap_or(DataPktPayload::Fin);
+        Some(DataPkt {
+            seq: p.seq,
+            data_written,
+            frame_len,
             was_repair: false,
         })
     }
@@ -698,14 +892,51 @@ impl ReliableLayer {
     /// Take a pkt from the unreliable layer
     ///
     /// Return `false` if the data is rejected due to window capacity
-    pub fn recv_data_pkt(&mut self, seq: u64, pkt: &[u8]) -> bool {
+    pub fn recv_data_pkt(&mut self, seq: u64, frame_len: Option<u32>, pkt: &[u8]) -> bool {
         let mut buf = self.pkt_recv_space.reused_buf().take();
         buf.extend(pkt);
-        if !self.pkt_recv_space.recv(seq, buf) {
+        if !self.pkt_recv_space.recv(seq, buf, frame_len) {
             return false;
+        }
+        if self.frame_delivery.enabled {
+            // In frame mode, complete frames may be delivered out of order;
+            // the receive queue handles reassembly.  The byte-stream buffer
+            // (`recv_data_buf`) is bypassed entirely in frame mode.
+            return true;
         }
         self.move_recv_data();
         true
+    }
+
+    /// Pop one complete frame from the receive queue in frame-delivery mode.
+    /// Returns `Ok(Some(frame))` when a complete frame is available (possibly
+    /// out of order past sequence holes), `Ok(None)` on EOF (FIN received and
+    /// no more frames), or `Err(InvalidInput)` when frame-delivery mode is
+    /// off.
+    pub fn recv_frame_buf(&mut self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+        if !self.frame_delivery.enabled {
+            return Err(std::io::ErrorKind::InvalidInput);
+        }
+        // Try to pop a complete frame from the receive queue.
+        if let Some(frame) = self.pkt_recv_space.pop_complete_frame() {
+            // An empty frame is the FIN marker.  Surface it as EOF (None)
+            // once no more frames remain behind it; but a frame-start slot
+            // with frame_len == 0 is exactly the FIN packet.  In frame mode
+            // the FIN is encoded as an empty-payload packet with no
+            // frame_len, handled below, so a zero-length frame here is a
+            // genuine (if unusual) empty application frame.  We still
+            // deliver it.
+            return Ok(Some(frame));
+        }
+        // FIN handling: in frame mode the FIN is an empty-payload packet with
+        // no frame_len.  When the in-order cursor reaches it (all earlier
+        // packets delivered) the receiver sets `recv_fin_buf` and the
+        // frame-delivery API surfaces EOF.
+        if self.recv_fin_buf {
+            return Ok(None);
+        }
+        // No complete frame and no FIN yet: pending.
+        Err(std::io::ErrorKind::WouldBlock)
     }
 
     /// Move data from pkt space to data buffer
@@ -730,9 +961,14 @@ impl ReliableLayer {
 
     fn detect_application_limited_phases(&mut self, now: Instant) {
         let cwnd_stats = self.pkt_send_space.cwnd_stats(now);
+        let staged_bytes = if self.frame_delivery.enabled {
+            self.pending_frame_bytes()
+        } else {
+            self.send_data_buf.len()
+        };
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
-                few_data_to_send: self.send_data_buf.len() < self.max_data_size_per_pkt(),
+                few_data_to_send: staged_bytes < self.max_data_size_per_pkt(),
                 not_transmitting_a_packet: true,
                 cwnd_not_full: self.pkt_send_space.accepts_new_pkt(),
                 all_lost_packets_retransmitted: cwnd_stats.all_lost_pkts_rtxed,
@@ -951,6 +1187,13 @@ impl WindowedRttMin {
 pub struct DataPkt {
     pub seq: u64,
     pub data_written: DataPktPayload,
+    /// Application frame length this packet belongs to.  `Some` only for the
+    /// first packet of a frame in frame-delivery mode; the transmission layer
+    /// uses this to choose `FRAME_DATA_TS` vs `DATA_TS` on the wire.  `None`
+    /// for continuation packets, all stock packets, FIN, and repairs of
+    /// continuation packets.  Retransmits/tail-probes inherit the stored
+    /// `TxingPkt.frame_len` so the framing is preserved across repairs.
+    pub frame_len: Option<u32>,
     /// Whether this packet is a retransmission or a tail-loss probe (a
     /// recovery packet, not new data).  Used by the transmission layer to
     /// decide whether to emit a retransmission-armor duplicate copy
@@ -1172,7 +1415,12 @@ mod tests {
     }
 
     fn test_layer(now: Instant) -> super::ReliableLayer {
-        super::ReliableLayer::new(NonZeroUsize::new(TEST_MSS).unwrap(), now).0
+        super::ReliableLayer::new(
+            NonZeroUsize::new(TEST_MSS).unwrap(),
+            crate::transmission::frame_delivery::FrameDelivery::default(),
+            now,
+        )
+        .0
     }
 
     fn send_burst(rl: &mut super::ReliableLayer, n: usize, now: Instant) {

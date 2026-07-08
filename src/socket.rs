@@ -303,6 +303,16 @@ impl ReadSocket {
         self.transmission_layer.recv(data).await
     }
 
+    /// Receive one complete frame in frame-delivery mode.  Returns
+    /// `Ok(Some(frame))` when a complete frame is available (possibly out of
+    /// order past sequence holes), `Ok(None)` on EOF, or `Err(InvalidInput)`
+    /// when frame-delivery mode is off.  When enabled, the byte-stream
+    /// `recv()` returns `InvalidInput` — frame delivery and stock byte
+    /// delivery are mutually exclusive per connection.
+    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+        self.transmission_layer.recv_frame().await
+    }
+
     /// Undo this method:
     ///
     /// ```rust
@@ -333,7 +343,9 @@ impl WriteSocket {
     ///
     /// Return the number of bytes sent.
     ///
-    /// You probably want to send a message like this:
+    /// In frame-delivery mode, every `send()` call maps to exactly one wire
+    /// frame — one write = one frame.  This is what the `AsyncWrite` adapter
+    /// and mux-over-rtp depend on.
     ///
     /// ```rust
     /// use tokio::io::AsyncWriteExt;
@@ -346,6 +358,18 @@ impl WriteSocket {
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
         self.transmission_layer
             .send(data, self.no_delay, &mut self.send_bufs)
+            .await
+    }
+
+    /// Send one complete frame in frame-delivery mode.  Returns
+    /// `Ok(frame.len())` on success; `Err(InvalidInput)` when the mode is
+    /// off or the frame is empty/oversize; `Err(WouldBlock)` when the
+    /// staging cap is full (caller should retry after the send path drains).
+    /// When enabled, `send()` delegates to `send_frame()` — one write = one
+    /// frame.
+    pub async fn send_frame(&mut self, frame: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        self.transmission_layer
+            .send_frame(frame, self.no_delay, &mut self.send_bufs)
             .await
     }
 

@@ -8,6 +8,7 @@ use crate::{
     socket::{ReadSocket, WriteSocket, socket},
     transmission::{
         fec_tuning::FecTuning,
+        frame_delivery::{FrameDelivery, frame_delivery_from_env},
         transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     },
     udp::LogConfig,
@@ -33,7 +34,8 @@ impl Listener {
     }
     pub async fn accept_without_handshake(&mut self) -> io::Result<Conn> {
         let conn = self.listener.accept().await?;
-        convert_conn(conn, None, FecTuning::default()).await
+        let frame_delivery = frame_delivery_from_env();
+        convert_conn(conn, None, FecTuning::default(), frame_delivery).await
     }
 
     /// [`Self::accept_without_handshake()`] with a per-connection
@@ -45,7 +47,21 @@ impl Listener {
         tuning: FecTuning,
     ) -> io::Result<Conn> {
         let conn = self.listener.accept().await?;
-        convert_conn(conn, None, tuning).await
+        let frame_delivery = frame_delivery_from_env();
+        convert_conn(conn, None, tuning, frame_delivery).await
+    }
+
+    /// [`Self::accept_without_handshake()`] with a per-connection
+    /// [`FecTuning`] and an explicit [`FrameDelivery`].  mpudp carries no
+    /// FEC today (`fec` is always `None`), so the tuning is currently inert;
+    /// the variant is exposed for API parity with `udp`/`keyed_udp`.
+    pub async fn accept_without_handshake_with_fec_tuning_and_frame_delivery(
+        &mut self,
+        tuning: FecTuning,
+        frame_delivery: FrameDelivery,
+    ) -> io::Result<Conn> {
+        let conn = self.listener.accept().await?;
+        convert_conn(conn, None, tuning, frame_delivery).await
     }
 }
 #[derive(Debug)]
@@ -59,7 +75,8 @@ impl Conn {
         log_config: Option<LogConfig<'_>>,
     ) -> io::Result<Self> {
         let conn = MpUdpConn::connect(addrs).await?;
-        convert_conn(conn, log_config, FecTuning::default()).await
+        let frame_delivery = frame_delivery_from_env();
+        convert_conn(conn, log_config, FecTuning::default(), frame_delivery).await
     }
 
     /// [`Self::connect_without_handshake()`] with a per-connection
@@ -72,13 +89,31 @@ impl Conn {
         tuning: FecTuning,
     ) -> io::Result<Self> {
         let conn = MpUdpConn::connect(addrs).await?;
-        convert_conn(conn, log_config, tuning).await
+        let frame_delivery = frame_delivery_from_env();
+        convert_conn(conn, log_config, tuning, frame_delivery).await
+    }
+
+    /// [`Self::connect_without_handshake()`] with a per-connection
+    /// [`FecTuning`] and an explicit [`FrameDelivery`].  Both peers must
+    /// enable frame delivery together; there is no in-band negotiation.
+    /// mpudp carries no FEC today (`fec` is always `None`), so the tuning
+    /// is currently inert; the variant is exposed for API parity with
+    /// `udp`/`keyed_udp`.
+    pub async fn connect_without_handshake_with_fec_tuning_and_frame_delivery(
+        addrs: impl Iterator<Item = SocketAddr>,
+        log_config: Option<LogConfig<'_>>,
+        tuning: FecTuning,
+        frame_delivery: FrameDelivery,
+    ) -> io::Result<Self> {
+        let conn = MpUdpConn::connect(addrs).await?;
+        convert_conn(conn, log_config, tuning, frame_delivery).await
     }
 }
 async fn convert_conn(
     conn: MpUdpConn,
     log_config: Option<LogConfig<'_>>,
     tuning: FecTuning,
+    frame_delivery: FrameDelivery,
 ) -> io::Result<Conn> {
     let log_config = match log_config {
         Some(c) => {
@@ -97,6 +132,7 @@ async fn convert_conn(
         mss: NonZeroUsize::new(MSS).unwrap(),
         fec: None,
         fec_tuning: tuning,
+        frame_delivery,
     };
     let (read, write) = socket(unreliable_layer, log_config);
     let conn = Conn { read, write };

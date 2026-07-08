@@ -11,6 +11,7 @@ use crate::{
     transmission::{
         fec::{FecConfig, FecState},
         fec_tuning::{FecTuning, fec_tuning_from_env},
+        frame_delivery::{FrameDelivery, frame_delivery_from_env},
         transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
     },
 };
@@ -55,7 +56,8 @@ impl Listener {
     pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted> {
         let mss = NO_FEC_MSS;
         let tuning = FecTuning::default();
-        self.accept_without_handshake_with_mss_and_fec_tuning(fec, mss, tuning)
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
             .await
     }
 
@@ -65,7 +67,8 @@ impl Listener {
     pub async fn accept(&self, fec: bool) -> std::io::Result<Handshake> {
         let mss = NO_FEC_MSS;
         let tuning = fec_tuning_from_env();
-        self.accept_with_mss_and_fec_tuning(fec, mss, tuning).await
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery).await
     }
 
     /// [`Self::accept()`] but without handshake and with a custom MSS.
@@ -75,7 +78,8 @@ impl Listener {
         mss: usize,
     ) -> std::io::Result<Accepted> {
         let tuning = fec_tuning_from_env();
-        self.accept_without_handshake_with_mss_and_fec_tuning(fec, mss, tuning)
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
             .await
     }
 
@@ -87,7 +91,8 @@ impl Listener {
     /// negotiation.
     pub async fn accept_with_mss(&self, fec: bool, mss: usize) -> std::io::Result<Handshake> {
         let tuning = fec_tuning_from_env();
-        self.accept_with_mss_and_fec_tuning(fec, mss, tuning).await
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery).await
     }
 
     /// [`Self::accept()`] but without handshake, with a custom MSS and a
@@ -101,9 +106,9 @@ impl Listener {
         mss: usize,
         tuning: FecTuning,
     ) -> std::io::Result<Accepted> {
-        let accepted = self.listener.accept().await?;
-        let handshake = false;
-        accept(accepted, handshake, fec, mss, tuning).await
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
+            .await
     }
 
     /// [`Self::accept()`] with a custom MSS and a per-connection
@@ -120,9 +125,46 @@ impl Listener {
         mss: usize,
         tuning: FecTuning,
     ) -> std::io::Result<Handshake> {
+        let frame_delivery = frame_delivery_from_env();
+        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery).await
+    }
+
+    /// [`Self::accept()`] but without handshake, with a custom MSS, a
+    /// per-connection [`FecTuning`], and an explicit [`FrameDelivery`].
+    /// Both peers must enable frame delivery together; there is no in-band
+    /// negotiation — same coupling as the FEC flag.
+    pub async fn accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+        &self,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+        frame_delivery: FrameDelivery,
+    ) -> std::io::Result<Accepted> {
+        let accepted = self.listener.accept().await?;
+        let handshake = false;
+        accept(accepted, handshake, fec, mss, tuning, frame_delivery).await
+    }
+
+    /// [`Self::accept()`] with a custom MSS, a per-connection
+    /// [`FecTuning`], and an explicit [`FrameDelivery`].  Both peers must
+    /// enable frame delivery together; there is no in-band negotiation —
+    /// same coupling as the FEC flag.
+    ///
+    /// # Panics
+    /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+    /// overhead. Both peers must use the same `mss`; there is no in-band
+    /// negotiation.  The FEC tuning is likewise out-of-band — both peers
+    /// must pass the same [`FecTuning`] for the parity depth to match.
+    pub async fn accept_with_mss_fec_tuning_and_frame_delivery(
+        &self,
+        fec: bool,
+        mss: usize,
+        tuning: FecTuning,
+        frame_delivery: FrameDelivery,
+    ) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
         let handshake = true;
-        Ok(tokio::spawn(accept(accepted, handshake, fec, mss, tuning)))
+        Ok(tokio::spawn(accept(accepted, handshake, fec, mss, tuning, frame_delivery)))
     }
 }
 #[derive(Debug)]
@@ -137,10 +179,12 @@ async fn accept(
     fec: bool,
     mss: usize,
     tuning: FecTuning,
+    frame_delivery: FrameDelivery,
 ) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
-    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, tuning);
+    let mut unreliable_layer =
+        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(read, write, fec, mss, tuning, frame_delivery);
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -161,7 +205,8 @@ pub async fn connect_without_handshake(
     let handshake = false;
     let mss = NO_FEC_MSS;
     let tuning = FecTuning::default();
-    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
+    let frame_delivery = frame_delivery_from_env();
+    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
 }
 pub async fn connect(
     bind: impl tokio::net::ToSocketAddrs,
@@ -172,7 +217,8 @@ pub async fn connect(
     let handshake = true;
     let mss = NO_FEC_MSS;
     let tuning = fec_tuning_from_env();
-    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
+    let frame_delivery = frame_delivery_from_env();
+    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
 }
 pub async fn connect_without_handshake_with_mss(
     bind: impl tokio::net::ToSocketAddrs,
@@ -183,7 +229,8 @@ pub async fn connect_without_handshake_with_mss(
 ) -> std::io::Result<Connected> {
     let handshake = false;
     let tuning = fec_tuning_from_env();
-    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
+    let frame_delivery = frame_delivery_from_env();
+    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
 }
 /// Connect to `addr` with a custom MSS.
 ///
@@ -205,7 +252,8 @@ pub async fn connect_with_mss(
     mss: usize,
 ) -> std::io::Result<Connected> {
     let tuning = fec_tuning_from_env();
-    connect_with_mss_and_fec_tuning(bind, addr, log_config, handshake, fec, mss, tuning).await
+    let frame_delivery = frame_delivery_from_env();
+    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
 }
 
 /// Connect to `addr` with a custom MSS and a per-connection [`FecTuning`].
@@ -232,6 +280,27 @@ pub async fn connect_with_mss_and_fec_tuning(
     mss: usize,
     tuning: FecTuning,
 ) -> std::io::Result<Connected> {
+    let frame_delivery = frame_delivery_from_env();
+    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
+}
+
+/// Connect to `addr` with a custom MSS, a per-connection [`FecTuning`],
+/// and an explicit [`FrameDelivery`].  Both peers must enable frame delivery
+/// together; there is no in-band negotiation — same coupling as the FEC flag.
+///
+/// # Panics
+/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+/// overhead.
+pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
+    bind: impl tokio::net::ToSocketAddrs,
+    addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
+    handshake: bool,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+    frame_delivery: FrameDelivery,
+) -> std::io::Result<Connected> {
     let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
@@ -245,7 +314,7 @@ pub async fn connect_with_mss_and_fec_tuning(
     };
     let udp = Arc::new(udp);
     let mut unreliable_layer =
-        wrap_fec_with_mss_and_fec_tuning(Arc::clone(&udp), udp, fec, mss, tuning);
+        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(Arc::clone(&udp), udp, fec, mss, tuning, frame_delivery);
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -270,7 +339,14 @@ pub(crate) fn wrap_fec(
     write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning(read, write, fec, NO_FEC_MSS, FecTuning::default())
+    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        read,
+        write,
+        fec,
+        NO_FEC_MSS,
+        FecTuning::default(),
+        FrameDelivery::default(),
+    )
 }
 
 #[allow(dead_code)] // used in tests; kept as a pub(crate) convenience wrapper
@@ -280,15 +356,36 @@ pub(crate) fn wrap_fec_with_mss(
     fec: bool,
     mss: usize,
 ) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning(read, write, fec, mss, fec_tuning_from_env())
+    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        read,
+        write,
+        fec,
+        mss,
+        fec_tuning_from_env(),
+        FrameDelivery::default(),
+    )
 }
 
+#[allow(dead_code)] // used in tests
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,
     fec: bool,
     mss: usize,
     tuning: FecTuning,
+) -> UnreliableLayer {
+    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        read, write, fec, mss, tuning, FrameDelivery::default(),
+    )
+}
+
+pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+    read: impl UnreliableRead,
+    write: impl UnreliableWrite,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+    frame_delivery: FrameDelivery,
 ) -> UnreliableLayer {
     let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning);
     UnreliableLayer {
@@ -297,6 +394,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
         mss,
         fec: fec_state,
         fec_tuning: tuning,
+        frame_delivery,
     }
 }
 
@@ -619,6 +717,7 @@ pub mod testing {
             mss,
             fec: fec_state,
             fec_tuning: tuning,
+            frame_delivery: FrameDelivery::default(),
         }
     }
 }

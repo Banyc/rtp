@@ -375,6 +375,7 @@ impl PktSendSpace {
                 rtxed: _,
                 considered_new_in_cwnd: _,
                 data: _,
+                frame_len: _,
                 rto,
                 rto_from_tail_probe: true,
                 sack_passes: _,
@@ -382,10 +383,20 @@ impl PktSendSpace {
                 deferred_loss_stock_deadline: _,
             };
         }
-        Some(Pkt { seq, data: &p.data })
+        Some(Pkt {
+            seq,
+            data: &p.data,
+            frame_len: p.frame_len,
+        })
     }
 
-    pub fn send(&mut self, data: Vec<u8>, stats: PacketState, now: Instant) -> Pkt<'_> {
+    pub fn send(
+        &mut self,
+        data: Vec<u8>,
+        stats: PacketState,
+        frame_len: Option<u32>,
+        now: Instant,
+    ) -> Pkt<'_> {
         let s = *self.send_wnd.next().unwrap();
 
         self.max_pipe_seq = MinNoneOptCmp(Some(s));
@@ -396,6 +407,7 @@ impl PktSendSpace {
             rtxed: false,
             considered_new_in_cwnd: false,
             data,
+            frame_len,
             rto: self.rtt_stats.rto_duration(),
             rto_from_tail_probe: false,
             sack_passes: 0,
@@ -411,6 +423,7 @@ impl PktSendSpace {
         Pkt {
             seq: s,
             data: &self.send_wnd.get(&s).unwrap().as_ref().unwrap().data,
+            frame_len,
         }
     }
 
@@ -511,6 +524,7 @@ impl PktSendSpace {
                     rtxed: true,
                     considered_new_in_cwnd,
                     data: _,
+                    frame_len: _,
                     rto: self.rtt_stats.rto_duration(),
                     rto_from_tail_probe: false,
                     sack_passes: _,
@@ -530,6 +544,7 @@ impl PktSendSpace {
             let p = Pkt {
                 seq: s,
                 data: &p.data,
+                frame_len: p.frame_len,
             };
             return Some(p);
         }
@@ -811,6 +826,13 @@ struct TxingPkt {
     pub rtxed: bool,
     pub considered_new_in_cwnd: bool,
     pub data: Vec<u8>,
+    /// Application frame length this packet belongs to, in bytes.  `Some` only
+    /// for the *first* packet of a frame in frame-delivery mode; `None` for
+    /// continuation packets and for all packets when frame-delivery mode is
+    /// off.  Stored so retransmissions re-encode the same framing on the wire
+    /// (the first packet of a frame keeps `FRAME_DATA_TS`; a retransmit of a
+    /// continuation packet keeps `DATA_TS`).
+    pub frame_len: Option<u32>,
     pub rto: Duration,
     /// True only if this packet's RTO was last re-armed by a tail-loss probe
     /// using the tightened post-probe floor.  A subsequent full-RTO retransmit
@@ -895,6 +917,11 @@ struct DeferredLoss {
 pub struct Pkt<'a> {
     pub seq: u64,
     pub data: &'a [u8],
+    /// Application frame length this packet belongs to.  `Some` only for the
+    /// first packet of a frame in frame-delivery mode; the transmission layer
+    /// uses this to choose `FRAME_DATA_TS` vs `DATA_TS` on the wire.  Retrans-
+    /// mits carry the same value so the framing is preserved across repairs.
+    pub frame_len: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1019,7 +1046,7 @@ mod tests {
         let data = vec![0u8; 1];
         let stats = ConnectionState::new(now).send_packet_2(now, space.no_pkts_in_flight());
         let seq = space.next_seq();
-        space.send(data, stats, now);
+        space.send(data, stats, None, now);
         seq
     }
 

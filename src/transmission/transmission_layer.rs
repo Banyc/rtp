@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{fec::FecState, fec_tuning::FecTuning, ts_echo::TsEcho};
+use super::{fec::FecState, fec_tuning::FecTuning, frame_delivery::FrameDelivery, ts_echo::TsEcho};
 use crate::{
     codec::{EncodeAck, EncodeData, decode, encode_ack_data, encode_kill},
     reliable::reliable_layer::{ReliableLayer, SharedTokenBucket},
@@ -172,7 +172,8 @@ pub struct TransmissionLayer {
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let now = Instant::now();
-        let (reliable_layer, send_rate_limiter) = ReliableLayer::new(unreliable_layer.mss, now);
+        let frame_delivery = unreliable_layer.frame_delivery;
+        let (reliable_layer, send_rate_limiter) = ReliableLayer::new(unreliable_layer.mss, frame_delivery, now);
         let reliable_layer = Mutex::new(reliable_layer);
         let sent_data_pkt = tokio::sync::Notify::new();
         let recv_data_pkt = tokio::sync::Notify::new();
@@ -411,6 +412,7 @@ impl TransmissionLayer {
             let data = EncodeData {
                 seq: p.seq,
                 send_ts: Some(self.wire_ts(now)),
+                frame_len: p.frame_len,
                 data: &bufs.data[..data_written],
             };
             let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
@@ -753,7 +755,7 @@ impl TransmissionLayer {
                         Some(data) => {
                             // UDP local -{data}> reliable
                             let to_ack = reliable_layer
-                                .recv_data_pkt(data.seq, &pkt[data.buf_range.clone()]);
+                                .recv_data_pkt(data.seq, data.frame_len, &pkt[data.buf_range.clone()]);
                             if FEC_DEBUG {
                                 eprintln!(
                                     "recv_data_pkt seq={} empty={} ack={}",
@@ -774,7 +776,7 @@ impl TransmissionLayer {
                     continue;
                 };
 
-                if data.buf_range.is_empty() {
+                if data.buf_range.is_empty() && data.frame_len.is_none() {
                     recv_pkts.num_fin_segments += 1;
                 } else {
                     recv_pkts.num_payload_segments += 1;
@@ -950,6 +952,22 @@ impl TransmissionLayer {
         no_delay: bool,
         bufs: &mut SendBufs,
     ) -> Result<usize, std::io::ErrorKind> {
+        // In frame-delivery mode, delegate each send() call to send_frame()
+        // so one write = one frame — this is what the AsyncWrite adapter and
+        // mux-over-rtp depend on.
+        if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
+            self.send_frame(data, no_delay, bufs).await
+        } else {
+            self.send_stock(data, no_delay, bufs).await
+        }
+    }
+
+    async fn send_stock(
+        &self,
+        data: &[u8],
+        no_delay: bool,
+        bufs: &mut SendBufs,
+    ) -> Result<usize, std::io::ErrorKind> {
         let mut sent_data_pkt = self.sent_data_pkt.notified();
         let written_bytes = loop {
             self.first_error.throw_error()?;
@@ -979,8 +997,61 @@ impl TransmissionLayer {
         Ok(written_bytes)
     }
 
-    /// Return `Ok(0)` when the read stream hits EOF
+    /// Send one complete frame in frame-delivery mode.  When enabled, this is
+    /// also what `send()` delegates to — one write = one frame.  Returns
+    /// `Ok(frame.len())` on success; `Err(InvalidInput)` when the mode is off
+    /// or the frame is empty/oversize; `Err(WouldBlock)` when the staging cap
+    /// is full (the caller should spin on `sent_data_pkt`).
+    pub async fn send_frame(
+        &self,
+        frame: &[u8],
+        no_delay: bool,
+        bufs: &mut SendBufs,
+    ) -> Result<usize, std::io::ErrorKind> {
+        let frame_len = frame.len();
+        let mut sent_data_pkt = self.sent_data_pkt.notified();
+        loop {
+            self.first_error.throw_error()?;
+            let now = Instant::now();
+            let res = {
+                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+                reliable_layer.send_frame_buf(frame, now)
+            };
+            match res {
+                Ok(()) => {
+                    self.log("send_frame_buf");
+                    if no_delay {
+                        let made_progress = self.send_pkts(bufs).await?;
+                        if !made_progress {
+                            self.resume_send.notify_one();
+                        }
+                    }
+                    return Ok(frame_len);
+                }
+                Err(std::io::ErrorKind::WouldBlock) => {
+                    // Staging cap full; wait for the send path to drain some frames.
+                    if no_delay {
+                        self.send_pkts(bufs).await?;
+                    }
+                    tokio::select! {
+                        () = sent_data_pkt => (),
+                        () = self.first_error.some().cancelled() => (),
+                    }
+                    sent_data_pkt = self.sent_data_pkt.notified();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Return `Ok(0)` when the read stream hits EOF.
+    /// In frame-delivery mode, byte-stream recv is not supported — the caller
+    /// must use `recv_frame()` instead.
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
+            return Err(std::io::ErrorKind::InvalidInput);
+        }
         let mut recv_data_pkt = self.recv_data_pkt.notified();
         let read_bytes = loop {
             self.first_error.throw_error()?;
@@ -1018,6 +1089,44 @@ impl TransmissionLayer {
             recv_data_pkt = self.recv_data_pkt.notified();
         };
         Ok(read_bytes)
+    }
+
+    /// Receive one complete frame in frame-delivery mode.  Returns
+    /// `Ok(Some(frame))` when a complete frame is available (possibly out of
+    /// order past sequence holes), `Ok(None)` on EOF, or `Err(InvalidInput)`
+    /// when the mode is off.
+    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+        let mut recv_data_pkt = self.recv_data_pkt.notified();
+        loop {
+            self.first_error.throw_error()?;
+
+            let res = {
+                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+                reliable_layer.recv_frame_buf()
+            };
+            match res {
+                Ok(Some(frame)) => {
+                    self.log("recv_frame_buf");
+                    return Ok(Some(frame));
+                }
+                Ok(None) => {
+                    self.recv_fin.cancel();
+                    if let Some(fec) = self.fec.as_ref() {
+                        fec.lock().unwrap().debug_print_stats();
+                    }
+                    return Ok(None);
+                }
+                Err(std::io::ErrorKind::WouldBlock) => {
+                    tokio::select! {
+                        () = recv_data_pkt => (),
+                        () = self.first_error.some().cancelled() => (),
+                    }
+                    recv_data_pkt = self.recv_data_pkt.notified();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     fn log(&self, op: &str) {
@@ -1065,6 +1174,11 @@ pub struct UnreliableLayer {
     /// interactive parity depth.  Stock `FecTuning::default()` preserves the
     /// behaviour byte-for-byte.
     pub fec_tuning: FecTuning,
+    /// Per-connection frame-delivery mode.  When `enabled`, application data
+    /// is staged as whole frames and the receiver may deliver complete frames
+    /// out of order past sequence holes.  Both peers must enable together (no
+    /// in-band negotiation).  `Default` is `enabled: false` — stock.
+    pub frame_delivery: FrameDelivery,
 }
 
 #[derive(Debug, Clone)]
