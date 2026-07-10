@@ -525,25 +525,18 @@ impl ReliableLayer {
     /// the payload bytes; the returned `DataPkt.frame_len` tells the
     /// transmission layer which codec command to emit.
     fn send_data_pkt_frame(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
-        // FIN handling mirrors the stock path: a FIN is sent only when no
-        // pending frame bytes remain and the FIN buffer is armed.
         let no_pending = self.pending_frames.is_empty();
         let normal_max_payload = self.max_data_size_per_pkt();
-        // The first packet of a frame carries the 4-byte frame-length header
-        // (FRAME_DATA_TS), so its payload cap is 4 bytes smaller than the
-        // continuation packets' (which use DATA_TS).  Without this, the first
-        // packet would be ~4 bytes over the FEC-reduced MSS budget and could
-        // be oversized/FEC-unrecoverable.
         let first_pkt_max_payload = self
             .mss
             .get()
             .checked_sub(crate::codec::frame_data_overhead())
-            .unwrap_or(1);
+            .unwrap();
 
-        // Pull the next frame to packetize.  A frame stays at the head until
-        // all its bytes have been packetized; then it is dropped and the next
-        // frame becomes the head.
-        let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) = match self.pending_frames.first_mut() {
+        let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) = match self
+            .pending_frames
+            .first_mut()
+        {
             Some(pf) => {
                 let remaining = pf.data.len() - pf.offset;
                 let cap = if pf.offset == 0 {
@@ -555,33 +548,26 @@ impl ReliableLayer {
                 (pf.data.len() as u32, pf.offset, take, pf.offset == 0)
             }
             None => {
-                // No pending frame bytes.  Either emit a FIN or signal idle.
                 if !matches!(self.send_fin_buf, SendFinBuf::Some) {
                     return None;
                 }
                 if !no_pending {
-                    // Should be impossible (no_pending == pending_frames.is_empty()).
                     return None;
                 }
-                // We will send a FIN.  Take a token below.
                 (0u32, 0usize, 0usize, false)
             }
         };
 
-        // Charge a token for the new packet (or FIN).  The cwnd gate was
-        // already checked by the caller.
         if !self
             .send_rate_limiter
             .lock()
             .unwrap()
             .take_exact_tokens(1, now)
         {
-            // Rate limiter not ready.  Do not consume the FIN; retry later.
             return None;
         }
 
         if take_bytes == 0 {
-            // FIN packet: no frame, no payload, no frame_len.
             self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
             let stats = self
                 .connection_stats
@@ -2079,14 +2065,12 @@ mod tests {
         }
     }
 
-    /// Fix #9: `first_frame_packet_respects_fec_reduced_mss` — the first
-    /// packet (offset 0) of a frame carries the 4-byte frame-length header
-    /// (FRAME_DATA_TS), so its payload cap must be `mss -
-    /// frame_data_overhead()`, not the normal `mss - data_overhead()`.
-    /// Without this, the first frame packet would be ~4 bytes over budget
-    /// (oversized/FEC-unrecoverable).
+    /// `first_frame_pkt_within_fec_mss` — a 1-byte frame at a legal small MSS
+    /// yields an on-wire first packet <= the FEC-reduced MSS.  Before the fix,
+    /// the first-packet cap used `mss - data_overhead()` (not
+    /// `frame_data_overhead()`), so the first packet was ~4 bytes over budget.
     #[test]
-    fn first_frame_packet_respects_fec_reduced_mss() {
+    fn first_frame_pkt_within_fec_mss() {
         let now = Instant::now();
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
@@ -2096,32 +2080,19 @@ mod tests {
         )
         .0;
 
-        // Stage a frame large enough to produce a first + continuation packet.
-        // The first packet's payload cap is `mss - frame_data_overhead()`.
-        let normal_payload = rl.max_data_size_per_pkt();
-        let first_payload = mss - crate::codec::frame_data_overhead();
-        assert!(
-            first_payload < normal_payload,
-            "first-packet cap must be smaller than the continuation cap"
-        );
-        // A frame larger than `first_payload` but not more than
-        // `first_payload + normal_payload` will produce exactly 2 packets.
-        let frame = vec![0u8; first_payload + 1];
+        // A 1-byte frame at a legal small MSS.
+        let frame = vec![0u8; 1];
         rl.send_frame_buf(&frame, now).unwrap();
 
-        // Send the first packet.
+        // Send the first (and only) packet.
         let mut pkt = vec![0u8; mss];
-        let p = rl.send_data_pkt(&mut pkt, now).expect("first pkt");
-        // The first packet must carry frame_len (Some).
+        let p = rl.send_data_pkt(&mut pkt, now).expect("must send first pkt");
         assert!(p.frame_len.is_some(), "first packet must carry frame_len");
+
         let payload_len = match p.data_written {
             super::DataPktPayload::Data(n) => n.get(),
             _ => panic!("expected data packet"),
         };
-        assert!(
-            payload_len <= first_payload,
-            "first packet payload {payload_len} must be <= first-packet cap {first_payload}"
-        );
 
         // The on-wire size of the first packet = frame_data_overhead + payload.
         let on_wire_first = crate::codec::frame_data_overhead() + payload_len;

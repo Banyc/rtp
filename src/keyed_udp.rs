@@ -22,7 +22,10 @@ use crate::{
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
-fn checked_keyed_mss<K: DispatchKey>(mss_after_fec: NonZeroUsize) -> NonZeroUsize {
+fn checked_keyed_mss<K: DispatchKey>(
+    mss_after_fec: NonZeroUsize,
+    frame_delivery: FrameDelivery,
+) -> NonZeroUsize {
     let key_size = K::max_size();
     let remaining = mss_after_fec
         .get()
@@ -30,7 +33,11 @@ fn checked_keyed_mss<K: DispatchKey>(mss_after_fec: NonZeroUsize) -> NonZeroUsiz
         .unwrap_or_else(|| {
             panic!("mss {mss_after_fec} leaves no room for the {key_size}-byte dispatch key")
         });
-    let overhead = crate::codec::data_overhead();
+    let overhead = if frame_delivery.enabled {
+        crate::codec::frame_data_overhead()
+    } else {
+        crate::codec::data_overhead()
+    };
     assert!(
         overhead < remaining,
         "mss {mss_after_fec} leaves no payload room after {key_size}-byte dispatch key and {overhead}-byte codec overhead"
@@ -43,13 +50,14 @@ fn checked_keyed_mss<K: DispatchKey>(mss_after_fec: NonZeroUsize) -> NonZeroUsiz
 /// the effective MSS the reliable layer sees is `mss - key_size`.  The FEC
 /// tuning is preserved unchanged.
 fn apply_keyed_mss<K: DispatchKey>(layer: UnreliableLayer) -> UnreliableLayer {
+    let frame_delivery = layer.frame_delivery;
     UnreliableLayer {
         utp_read: layer.utp_read,
         utp_write: layer.utp_write,
-        mss: checked_keyed_mss::<K>(layer.mss),
+        mss: checked_keyed_mss::<K>(layer.mss, frame_delivery),
         fec: layer.fec,
         fec_tuning: layer.fec_tuning,
-        frame_delivery: layer.frame_delivery,
+        frame_delivery,
     }
 }
 
@@ -687,5 +695,66 @@ mod tests {
             Ok(Err(e)) => panic!("second keyed send failed after cancellation: {e:?}"),
             Err(_) => panic!("second keyed send hung after cancellation"),
         }
+    }
+
+    /// `frame_mode_rejects_undersized_mss` — a frame-delivery + FEC +
+    /// dispatch-key (u16) connection whose post-FEC MSS leaves less than
+    /// `frame_data_overhead()` after the key must panic at construction
+    /// (the `assert!` in `checked_keyed_mss` fires) rather than silently
+    /// transmitting oversized packets.  Before the fix,
+    /// `checked_keyed_mss` validated against `data_overhead()` (15B) even
+    /// in frame-delivery mode, which needs `frame_data_overhead()` (19B),
+    /// so the first-packet cap would underflow and `.unwrap_or(1)` would
+    /// silently emit a 1-byte payload producing an oversized codec packet.
+    #[test]
+    #[should_panic(expected = "leaves no payload room")]
+    fn frame_mode_rejects_undersized_mss() {
+        use crate::transmission::fec_tuning::FecTuning;
+        use crate::transmission::frame_delivery::FrameDelivery;
+        use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
+        use crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
+
+        #[derive(Debug)]
+        struct DummyRead;
+        #[async_trait]
+        impl UnreliableRead for DummyRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+        }
+        #[derive(Debug)]
+        struct DummyWrite;
+        #[async_trait]
+        impl UnreliableWrite for DummyWrite {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Ok(0)
+            }
+        }
+
+        // Pick an MSS that passes `checked_mss_and_fec` (post-FEC mss >
+        // frame_data_overhead(19)) but fails `checked_keyed_mss` (post-FEC
+        // mss - u16 key(2) < frame_data_overhead(19)).
+        //
+        // FEC reduces mss by: HDR_SIZE(11) + DATA_SYMBOL_HDR_SIZE(2) = 13.
+        // Post-FEC mss = raw_mss - 13.
+        // We want: post-FEC mss > 19 AND post-FEC mss - 2 < 19
+        //   => 19 < post-FEC mss < 21 => post-FEC mss = 20 => raw_mss = 33.
+        // remaining = 20 - 2 = 18 < frame_data_overhead(19) => assert fires.
+        let mss = 33;
+
+        let layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            DummyRead,
+            DummyWrite,
+            true, // FEC on
+            mss,
+            FecTuning::default(),
+            FrameDelivery::enabled(),
+        );
+        // apply_keyed_mss calls checked_keyed_mss::<u16>(layer.mss, frame_delivery)
+        // which must panic because remaining (15) < frame_data_overhead (19).
+        super::apply_keyed_mss::<u16>(layer);
     }
 }

@@ -490,6 +490,12 @@ const HANDSHAKE_SEND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// returned immediately.  This keeps connection setup alive against a
 /// writer that WouldBlocks transiently instead of aborting on the first
 /// exhausted send budget.
+///
+/// Each `send` is wrapped in `tokio::time::timeout_at(deadline)` so a send
+/// future that stays pending (poisoned kqueue writability under interface
+/// backpressure) is preempted at the deadline rather than hanging forever.
+/// The retry sleep is clamped to the deadline so a writer that becomes
+/// writable late in the budget is not missed (sleep overshoot is avoided).
 async fn handshake_send(
     utp_write: &mut Box<dyn crate::transmission::transmission_layer::UnreliableWrite>,
     buf: &[u8],
@@ -499,13 +505,19 @@ async fn handshake_send(
         if Instant::now() >= deadline {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
-        match utp_write.send(buf).await {
-            Ok(_) => return Ok(()),
-            Err(std::io::ErrorKind::WouldBlock) => {
-                tokio::time::sleep(HANDSHAKE_SEND_RETRY_INTERVAL).await;
-                continue;
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            utp_write.send(buf),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(std::io::ErrorKind::WouldBlock)) => {
+                let retry_at = (Instant::now() + HANDSHAKE_SEND_RETRY_INTERVAL).min(deadline);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
             }
-            Err(e) => return Err(std::io::Error::from(e)),
+            Ok(Err(e)) => return Err(std::io::Error::from(e)),
+            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
         }
     }
 }
@@ -997,70 +1009,111 @@ mod tests {
         let _ = send_task.await;
     }
 
-    /// Fix #13: `handshake_retries_transient_wouldblock` — handshake
-    /// against a writer that WouldBlocks transiently then succeeds must
-    /// complete the handshake (does not error out early).  Before the fix,
-    /// one exhausted raw-send retry budget aborted connection setup
-    /// immediately instead of retrying within the handshake timeout.
+    /// `handshake_send_times_out_on_sustained_would_block` — an
+    /// always-WouldBlock writer with a 5 ms deadline returns exactly
+    /// `ErrorKind::TimedOut` and elapsed ~= the budget (not before, not
+    /// unbounded).  Before the fix, `send` was awaited with no timeout, so
+    /// a pending send future hung past the deadline indefinitely.
     #[tokio::test(flavor = "multi_thread")]
-    async fn handshake_retries_transient_wouldblock() {
+    async fn handshake_send_times_out_on_sustained_would_block() {
         use async_trait::async_trait;
-        use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
+        use crate::transmission::transmission_layer::UnreliableWrite;
 
-        // A writer that WouldBlocks a few times then succeeds.
-        #[derive(Debug)]
-        struct TransientWrite {
-            count: std::sync::Mutex<u32>,
-        }
+        struct AlwaysWouldBlock;
         #[async_trait]
-        impl UnreliableWrite for TransientWrite {
+        impl UnreliableWrite for AlwaysWouldBlock {
             async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-                let mut c = self.count.lock().unwrap();
-                *c += 1;
-                if *c <= 3 {
-                    return Err(std::io::ErrorKind::WouldBlock);
-                }
-                Ok(_buf.len())
-            }
-        }
-        #[derive(Debug)]
-        struct EchoRead;
-        #[async_trait]
-        impl UnreliableRead for EchoRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 Err(std::io::ErrorKind::WouldBlock)
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                buf[0] = 0xAA;
-                Ok(1)
+        }
+        impl std::fmt::Debug for AlwaysWouldBlock {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("AlwaysWouldBlock").finish_non_exhaustive()
             }
         }
 
-        let writer = TransientWrite {
-            count: std::sync::Mutex::new(0),
-        };
-        let reader = EchoRead;
-        let mut layer = crate::udp::wrap_fec(reader, writer, false);
+        let mut writer: Box<dyn UnreliableWrite> = Box::new(AlwaysWouldBlock);
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let start = Instant::now();
+        let result = handshake_send(&mut writer, b"x", deadline).await;
+        let elapsed = start.elapsed();
 
-        // The handshake must complete despite the transient WouldBlocks.
-        // The challenge byte is 0xAA (from EchoRead), so we need the
-        // challenge to match.  Actually the handshake generates a random
-        // challenge, sends it, and expects the echo to match.  The EchoRead
-        // always returns 0xAA, so the handshake will loop until it
-        // generates 0xAA as the challenge (1/256 chance per iteration).
-        // Instead, let's make the read return the first byte it receives.
-        // Simplification: just check it doesn't hang or abort early on
-        // WouldBlock — the handshake may fail on challenge mismatch, but
-        // the key assertion is no early abort on WouldBlock.
+        match result {
+            Err(e) => assert!(
+                e.kind() == std::io::ErrorKind::TimedOut,
+                "expected TimedOut, got {:?}",
+                e.kind()
+            ),
+            Ok(_) => panic!("expected TimedOut, got Ok"),
+        }
+        // Must not return before the deadline (the between-iteration check
+        // alone would fire immediately on the first WouldBlock → ~0 ms).
+        assert!(
+            elapsed >= Duration::from_millis(5),
+            "elapsed {elapsed:?} must be >= 5ms budget"
+        );
+        // Must not hang unbounded — allow generous scheduling slack.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "elapsed {elapsed:?} must be bounded (< 500ms)"
+        );
+    }
+
+    /// `handshake_send_completes_on_late_writability` — a writer that
+    /// WouldBlocks for most of the budget then becomes writable before the
+    /// deadline returns `Ok(())`.  Before the fix, the fixed retry sleep was
+    /// not clamped to the deadline, so a writer that became writable late in
+    /// the budget was missed (sleep overshoots and returns TimedOut without
+    /// retrying the now-ready send).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handshake_send_completes_on_late_writability() {
+        use async_trait::async_trait;
+        use crate::transmission::transmission_layer::UnreliableWrite;
+
+        struct LateWritable {
+            ready_at: Instant,
+        }
+        #[async_trait]
+        impl UnreliableWrite for LateWritable {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                if Instant::now() >= self.ready_at {
+                    Ok(_buf.len())
+                } else {
+                    Err(std::io::ErrorKind::WouldBlock)
+                }
+            }
+        }
+        impl std::fmt::Debug for LateWritable {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("LateWritable").finish_non_exhaustive()
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        // Become writable 50 ms before the deadline — late in the budget but
+        // before it expires.  The retry interval is 50 ms, so without
+        // clamping the sleep to the deadline the last retry before the
+        // writer is ready could overshoot and return TimedOut instead of
+        // retrying the now-ready send.  With clamping, the sleep lands at
+        // the deadline if the interval would overshoot, but a retry at
+        // ~150 ms (when the writer is ready) must succeed before the 200 ms
+        // deadline elapses.
+        let ready_at = Instant::now() + Duration::from_millis(150);
+
+        let mut writer: Box<dyn UnreliableWrite> = Box::new(LateWritable { ready_at });
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            client_opening_handshake(&mut layer),
+            Duration::from_secs(2),
+            handshake_send(&mut writer, b"x", deadline),
         )
         .await;
+
         match result {
-            Ok(Ok(())) => {} // challenge happened to match
-            Ok(Err(std::io::Error { .. })) => {} // mismatch or timeout — acceptable
-            Err(_) => panic!("handshake hung on transient WouldBlock"),
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "handshake_send should complete on late writability, got err: {:?}",
+                e.kind()
+            ),
+            Err(_) => panic!("handshake_send hung (should have completed)"),
         }
     }
 }
