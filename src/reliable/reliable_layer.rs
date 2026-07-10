@@ -299,6 +299,22 @@ impl ReliableLayer {
         self.send_data_buf.capacity()
     }
 
+    /// Maximum application bytes in a single frame in frame-delivery mode.
+    /// In stock (non-frame) mode this returns the byte-stream staging
+    /// capacity (`send_data_buf_capacity`), preserving the existing
+    /// `WriteStream` behavior.  In frame-delivery mode, the AsyncWrite
+    /// adapter must cap each write at this value so one write = one frame
+    /// (capping at the byte-stream stage cap would split a large frame
+    /// into multiple wire frames, breaking the one-write-one-frame
+    /// invariant).
+    pub fn write_unit_capacity(&self) -> usize {
+        if self.frame_delivery.enabled {
+            MAX_FRAME_LEN
+        } else {
+            self.send_data_buf.capacity()
+        }
+    }
+
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> usize {
         self.detect_application_limited_phases(now);
 
@@ -331,6 +347,13 @@ impl ReliableLayer {
         // interactive frame is not starved behind a bulk backlog already on
         // the stage.  Pending bytes (bytes of in-progress frames still to be
         // packetized) count against the cap.
+        //
+        // **Empty-stage bypass:** when the stage is empty (no pending frames),
+        // admit any legal frame (up to MAX_FRAME_LEN) regardless of the soft
+        // cap.  Without this, a frame larger than the ~2-packet initial stage
+        // cap is rejected on an empty stage and waits forever for a send
+        // notification that never comes (the send path only notifies after
+        // draining, which can't start because the frame was never admitted).
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap = (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(MAX_FRAME_LEN);
         let pending_bytes: usize = self
@@ -338,6 +361,14 @@ impl ReliableLayer {
             .iter()
             .map(|pf| pf.data.len() - pf.offset)
             .sum();
+        if pending_bytes == 0 {
+            // Empty stage: admit any legal frame.
+            self.pending_frames.push(PendingFrame {
+                data: frame.to_vec(),
+                offset: 0,
+            });
+            return Ok(());
+        }
         let free_bytes = cap.saturating_sub(pending_bytes);
         if free_bytes < frame.len() {
             return Err(std::io::ErrorKind::WouldBlock);
@@ -497,7 +528,17 @@ impl ReliableLayer {
         // FIN handling mirrors the stock path: a FIN is sent only when no
         // pending frame bytes remain and the FIN buffer is armed.
         let no_pending = self.pending_frames.is_empty();
-        let max_payload = self.max_data_size_per_pkt();
+        let normal_max_payload = self.max_data_size_per_pkt();
+        // The first packet of a frame carries the 4-byte frame-length header
+        // (FRAME_DATA_TS), so its payload cap is 4 bytes smaller than the
+        // continuation packets' (which use DATA_TS).  Without this, the first
+        // packet would be ~4 bytes over the FEC-reduced MSS budget and could
+        // be oversized/FEC-unrecoverable.
+        let first_pkt_max_payload = self
+            .mss
+            .get()
+            .checked_sub(crate::codec::frame_data_overhead())
+            .unwrap_or(1);
 
         // Pull the next frame to packetize.  A frame stays at the head until
         // all its bytes have been packetized; then it is dropped and the next
@@ -505,7 +546,12 @@ impl ReliableLayer {
         let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) = match self.pending_frames.first_mut() {
             Some(pf) => {
                 let remaining = pf.data.len() - pf.offset;
-                let take = remaining.min(max_payload);
+                let cap = if pf.offset == 0 {
+                    first_pkt_max_payload
+                } else {
+                    normal_max_payload
+                };
+                let take = remaining.min(cap);
                 (pf.data.len() as u32, pf.offset, take, pf.offset == 0)
             }
             None => {
@@ -919,19 +965,19 @@ impl ReliableLayer {
         }
         // Try to pop a complete frame from the receive queue.
         if let Some(frame) = self.pkt_recv_space.pop_complete_frame() {
-            // An empty frame is the FIN marker.  Surface it as EOF (None)
-            // once no more frames remain behind it; but a frame-start slot
-            // with frame_len == 0 is exactly the FIN packet.  In frame mode
-            // the FIN is encoded as an empty-payload packet with no
-            // frame_len, handled below, so a zero-length frame here is a
-            // genuine (if unusual) empty application frame.  We still
-            // deliver it.
             return Ok(Some(frame));
         }
-        // FIN handling: in frame mode the FIN is an empty-payload packet with
-        // no frame_len.  When the in-order cursor reaches it (all earlier
-        // packets delivered) the receiver sets `recv_fin_buf` and the
-        // frame-delivery API surfaces EOF.
+        // FIN handling: in frame mode the FIN is an empty-payload packet
+        // with no `frame_len`.  `move_recv_data` (which sets `recv_fin_buf`)
+        // is bypassed in frame mode, so we gate EOF on the recv-space cursor
+        // directly: a FIN at the in-order head means all earlier data has
+        // been delivered, so surface EOF.  A FIN behind an out-of-order gap
+        // does NOT surface EOF until the gap fills.
+        if self.pkt_recv_space.fin_at_head() {
+            self.recv_fin_buf = true;
+            return Ok(None);
+        }
+        // Fallback: if `recv_fin_buf` was set by some other path, honor it.
         if self.recv_fin_buf {
             return Ok(None);
         }
@@ -2031,6 +2077,95 @@ mod tests {
                 t.saturating_duration_since(t0)
             );
         }
+    }
+
+    /// Fix #9: `first_frame_packet_respects_fec_reduced_mss` — the first
+    /// packet (offset 0) of a frame carries the 4-byte frame-length header
+    /// (FRAME_DATA_TS), so its payload cap must be `mss -
+    /// frame_data_overhead()`, not the normal `mss - data_overhead()`.
+    /// Without this, the first frame packet would be ~4 bytes over budget
+    /// (oversized/FEC-unrecoverable).
+    #[test]
+    fn first_frame_packet_respects_fec_reduced_mss() {
+        let now = Instant::now();
+        let mss = NO_FEC_MSS;
+        let mut rl = super::ReliableLayer::new(
+            NonZeroUsize::new(mss).unwrap(),
+            crate::transmission::frame_delivery::FrameDelivery::enabled(),
+            now,
+        )
+        .0;
+
+        // Stage a frame large enough to produce a first + continuation packet.
+        // The first packet's payload cap is `mss - frame_data_overhead()`.
+        let normal_payload = rl.max_data_size_per_pkt();
+        let first_payload = mss - crate::codec::frame_data_overhead();
+        assert!(
+            first_payload < normal_payload,
+            "first-packet cap must be smaller than the continuation cap"
+        );
+        // A frame larger than `first_payload` but not more than
+        // `first_payload + normal_payload` will produce exactly 2 packets.
+        let frame = vec![0u8; first_payload + 1];
+        rl.send_frame_buf(&frame, now).unwrap();
+
+        // Send the first packet.
+        let mut pkt = vec![0u8; mss];
+        let p = rl.send_data_pkt(&mut pkt, now).expect("first pkt");
+        // The first packet must carry frame_len (Some).
+        assert!(p.frame_len.is_some(), "first packet must carry frame_len");
+        let payload_len = match p.data_written {
+            super::DataPktPayload::Data(n) => n.get(),
+            _ => panic!("expected data packet"),
+        };
+        assert!(
+            payload_len <= first_payload,
+            "first packet payload {payload_len} must be <= first-packet cap {first_payload}"
+        );
+
+        // The on-wire size of the first packet = frame_data_overhead + payload.
+        let on_wire_first = crate::codec::frame_data_overhead() + payload_len;
+        assert!(
+            on_wire_first <= mss,
+            "first frame packet on-wire size {on_wire_first} must be <= MSS {mss}"
+        );
+    }
+
+    /// Fix #11: `large_legal_frame_admitted_to_empty_stage` — a frame
+    /// larger than the ~2-packet initial stage cap is admitted into an
+    /// EMPTY stage regardless of the soft cap.  Before the fix, it was
+    /// rejected and waited forever for a send notification that never
+    /// came (hang).
+    #[test]
+    fn large_legal_frame_admitted_to_empty_stage() {
+        let now = Instant::now();
+        let mss = NO_FEC_MSS;
+        let mut rl = super::ReliableLayer::new(
+            NonZeroUsize::new(mss).unwrap(),
+            crate::transmission::frame_delivery::FrameDelivery::enabled(),
+            now,
+        )
+        .0;
+
+        // The initial stage cap is ~2 packets worth of payload.
+        let normal_payload = rl.max_data_size_per_pkt();
+        let stage_cap = (2 * normal_payload).min(super::MAX_FRAME_LEN);
+
+        // A frame larger than the stage cap but within MAX_FRAME_LEN.
+        let frame_len = stage_cap + normal_payload;
+        assert!(
+            frame_len <= super::MAX_FRAME_LEN,
+            "test frame must be a legal size"
+        );
+        let frame = vec![0u8; frame_len];
+
+        // This must succeed (not return WouldBlock), proving the empty-stage
+        // bypass works.
+        let result = rl.send_frame_buf(&frame, now);
+        assert!(
+            result.is_ok(),
+            "large legal frame must be admitted to an empty stage, got {result:?}"
+        );
     }
 }
 

@@ -236,6 +236,27 @@ impl PktRecvSpace {
         }
     }
 
+    /// In frame-delivery mode, check whether a FIN (empty-payload packet
+    /// with no `frame_len`) is sitting at the in-order head of the receive
+    /// queue — i.e. all earlier packets have been consumed or tombstoned.
+    /// This is the EOF signal for frame mode: `move_recv_data` is bypassed
+    /// in frame mode, so the `recv_fin_buf` flag is never set by that path.
+    /// Instead, the caller checks this method directly to surface EOF.
+    ///
+    /// Returns `true` only when:
+    /// - `next` is `Some(n)` and a `Data` slot exists at `n`, and
+    /// - that slot's payload is empty (`data.is_empty()`), and
+    /// - that slot has no `frame_len` (it's a FIN, not a zero-length frame).
+    pub fn fin_at_head(&self) -> bool {
+        let Some(next) = self.next else {
+            return false;
+        };
+        match self.slots.get(&next) {
+            Some(RecvSlot::Data(pkt)) => pkt.data.is_empty() && pkt.frame_len.is_none(),
+            _ => false,
+        }
+    }
+
     pub fn pop(&mut self) -> Option<Vec<u8>> {
         loop {
             let next = self.next?;
@@ -296,7 +317,7 @@ mod tests {
         // seq 0 is now behind next == Some(1)
         assert!(space.recv(0, b"stale".to_vec(), None));
         // Should not be in the slot map.
-        assert!(space.slots.get(&0).is_none());
+        assert!(!space.slots.contains_key(&0));
         // But it should still be acked (balls count unchanged — it's already
         // merged into the same ball).
         assert_eq!(space.ack_history().balls().count(), ack_count_after);
@@ -464,7 +485,7 @@ mod tests {
         space.pop_complete_frame();
         // seq 1 is now a tombstone; seq 0 is a hole.
         assert!(matches!(space.slots.get(&1), Some(RecvSlot::Tombstone)));
-        assert!(space.slots.get(&0).is_none());
+        assert!(!space.slots.contains_key(&0));
         // The tombstone at seq 1 keeps `next` pinned at 0 (hole at 0 prevents
         // collapse), so the window is [0, 8191].  seq 8192 is out of window.
         let out_of_window = MAX_NUM_RECVING_PKTS as u64;
@@ -485,5 +506,60 @@ mod tests {
         assert_eq!(space.pop().unwrap(), b" ");
         assert_eq!(space.pop().unwrap(), b"world");
         assert!(space.pop().is_none());
+    }
+
+    /// Fix #8: `fin_at_head_after_all_data_delivered` — a FIN (empty-payload
+    /// packet with no `frame_len`) delivered in frame mode after all data
+    /// surfaces EOF via `fin_at_head()`.  Before the fix, `recv_data_pkt`
+    /// returned early in frame mode bypassing `move_recv_data` (the only
+    /// place that set `recv_fin_buf`), so an in-order FIN yielded
+    /// `WouldBlock` forever (connections hung on close).
+    #[test]
+    fn fin_at_head_after_all_data_delivered() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        // Deliver a data frame at seq 0, then a FIN at seq 1.
+        assert!(space.recv(0, b"data".to_vec(), Some(4)));
+        assert!(space.recv(1, vec![], None));
+
+        // Pop the data frame first.
+        let frame = space.pop_complete_frame().unwrap();
+        assert_eq!(frame, b"data");
+
+        // Now the FIN is at the in-order head (seq 1, after seq 0 was
+        // tombstoned and collapsed).  `fin_at_head()` must return true.
+        // First, the tombstone at seq 0 must be collapsed.
+        space.collapse_tombstone_prefix();
+        assert!(
+            space.fin_at_head(),
+            "FIN at in-order head must be detected after all data delivered"
+        );
+    }
+
+    /// Fix #8 (inverse): `fin_behind_gap_does_not_surface_eof` — a FIN
+    /// behind an out-of-order gap does NOT surface EOF until the gap fills.
+    #[test]
+    fn fin_behind_gap_does_not_surface_eof() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        // Gap at seq 0; FIN at seq 1 (but seq 0 is missing).
+        assert!(space.recv(1, vec![], None));
+
+        // The FIN is NOT at the in-order head (seq 0 is missing).
+        assert!(
+            !space.fin_at_head(),
+            "FIN behind a gap must not surface EOF"
+        );
+
+        // Fill the gap with a data frame.
+        assert!(space.recv(0, b"late".to_vec(), Some(4)));
+        // Pop the data frame.
+        let frame = space.pop_complete_frame().unwrap();
+        assert_eq!(frame, b"late");
+        space.collapse_tombstone_prefix();
+
+        // Now the FIN is at the in-order head.
+        assert!(
+            space.fin_at_head(),
+            "FIN must surface EOF after the gap fills"
+        );
     }
 }

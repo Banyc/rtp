@@ -676,6 +676,7 @@ dependencies = [
  "dre",
  "fec",
  "file_transfer",
+ "libc",
  "mpudp",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.56)",
  "rand 0.10.1",

@@ -10,6 +10,7 @@ byteorder = "1"
 csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
 fec = { git = "https://github.com/Banyc/fec.git", tag = "v0.0.3" }
+libc = "0.2"
 mpudp = { git = "https://github.com/Banyc/mpudp.git", tag = "v0.0.3" }
 primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.56" }
 rand = "0.10"
@@ -20,6 +21,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "rt"] }
 tokio-util = "0.7"
 udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.13" }
+
+[features]
+default = []
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -1,6 +1,9 @@
 use core::{net::SocketAddr, num::NonZeroUsize};
 use std::{path::Path, sync::Arc};
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+
 use async_trait::async_trait;
 use fec::proto::{data_mss, symbol_size};
 use tokio::net::UdpSocket;
@@ -27,17 +30,30 @@ type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
 type IdentityConn = Conn<UdpSocket, SocketAddr, Packet>;
 type IdentityConnRead = ConnRead<Packet>;
 
+#[cfg(unix)]
+pub type MaybeRawFd = RawFd;
+#[cfg(not(unix))]
+pub type MaybeRawFd = ();
+pub fn maybe_raw_fd(udp: &UdpSocket) -> MaybeRawFd {
+    cfg_select! {
+        unix      => udp.as_raw_fd(),
+        not(unix) => ()
+    }
+}
+
 pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
 
 #[derive(Debug)]
 pub struct Listener {
     listener: IdentityUdpListener,
     local_addr: SocketAddr,
+    raw_fd: MaybeRawFd,
 }
 impl Listener {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let local_addr = udp.local_addr()?;
+        let raw_fd = maybe_raw_fd(&udp);
         let listener = UtpListener::new_identity_dispatch(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
@@ -45,6 +61,7 @@ impl Listener {
         Ok(Self {
             listener,
             local_addr,
+            raw_fd,
         })
     }
 
@@ -57,8 +74,13 @@ impl Listener {
         let mss = NO_FEC_MSS;
         let tuning = FecTuning::default();
         let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
+        .await
     }
 
     /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
@@ -68,7 +90,8 @@ impl Listener {
         let mss = NO_FEC_MSS;
         let tuning = fec_tuning_from_env();
         let frame_delivery = frame_delivery_from_env();
-        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery).await
+        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
+            .await
     }
 
     /// [`Self::accept()`] but without handshake and with a custom MSS.
@@ -79,8 +102,13 @@ impl Listener {
     ) -> std::io::Result<Accepted> {
         let tuning = fec_tuning_from_env();
         let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
+        .await
     }
 
     /// [`Self::accept()`] with a custom MSS.
@@ -92,7 +120,8 @@ impl Listener {
     pub async fn accept_with_mss(&self, fec: bool, mss: usize) -> std::io::Result<Handshake> {
         let tuning = fec_tuning_from_env();
         let frame_delivery = frame_delivery_from_env();
-        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery).await
+        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
+            .await
     }
 
     /// [`Self::accept()`] but without handshake, with a custom MSS and a
@@ -107,8 +136,13 @@ impl Listener {
         tuning: FecTuning,
     ) -> std::io::Result<Accepted> {
         let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
+        .await
     }
 
     /// [`Self::accept()`] with a custom MSS and a per-connection
@@ -126,7 +160,8 @@ impl Listener {
         tuning: FecTuning,
     ) -> std::io::Result<Handshake> {
         let frame_delivery = frame_delivery_from_env();
-        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery).await
+        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
+            .await
     }
 
     /// [`Self::accept()`] but without handshake, with a custom MSS, a
@@ -142,7 +177,16 @@ impl Listener {
     ) -> std::io::Result<Accepted> {
         let accepted = self.listener.accept().await?;
         let handshake = false;
-        accept(accepted, handshake, fec, mss, tuning, frame_delivery).await
+        accept(
+            accepted,
+            handshake,
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+            self.raw_fd,
+        )
+        .await
     }
 
     /// [`Self::accept()`] with a custom MSS, a per-connection
@@ -164,7 +208,15 @@ impl Listener {
     ) -> std::io::Result<Handshake> {
         let accepted = self.listener.accept().await?;
         let handshake = true;
-        Ok(tokio::spawn(accept(accepted, handshake, fec, mss, tuning, frame_delivery)))
+        Ok(tokio::spawn(accept(
+            accepted,
+            handshake,
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+            self.raw_fd,
+        )))
     }
 }
 #[derive(Debug)]
@@ -180,11 +232,23 @@ async fn accept(
     mss: usize,
     tuning: FecTuning,
     frame_delivery: FrameDelivery,
+    raw_fd: MaybeRawFd,
 ) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
-    let mut unreliable_layer =
-        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(read, write, fec, mss, tuning, frame_delivery);
+    let write = RawFdConnWrite {
+        inner: write,
+        raw_fd,
+        peer: Some(peer_addr),
+    };
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        read,
+        write,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    );
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -206,7 +270,17 @@ pub async fn connect_without_handshake(
     let mss = NO_FEC_MSS;
     let tuning = FecTuning::default();
     let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
+    connect_with_mss_fec_tuning_and_frame_delivery(
+        bind,
+        addr,
+        log_config,
+        handshake,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    )
+    .await
 }
 pub async fn connect(
     bind: impl tokio::net::ToSocketAddrs,
@@ -218,7 +292,17 @@ pub async fn connect(
     let mss = NO_FEC_MSS;
     let tuning = fec_tuning_from_env();
     let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
+    connect_with_mss_fec_tuning_and_frame_delivery(
+        bind,
+        addr,
+        log_config,
+        handshake,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    )
+    .await
 }
 pub async fn connect_without_handshake_with_mss(
     bind: impl tokio::net::ToSocketAddrs,
@@ -230,7 +314,17 @@ pub async fn connect_without_handshake_with_mss(
     let handshake = false;
     let tuning = fec_tuning_from_env();
     let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
+    connect_with_mss_fec_tuning_and_frame_delivery(
+        bind,
+        addr,
+        log_config,
+        handshake,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    )
+    .await
 }
 /// Connect to `addr` with a custom MSS.
 ///
@@ -253,7 +347,17 @@ pub async fn connect_with_mss(
 ) -> std::io::Result<Connected> {
     let tuning = fec_tuning_from_env();
     let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
+    connect_with_mss_fec_tuning_and_frame_delivery(
+        bind,
+        addr,
+        log_config,
+        handshake,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    )
+    .await
 }
 
 /// Connect to `addr` with a custom MSS and a per-connection [`FecTuning`].
@@ -281,7 +385,17 @@ pub async fn connect_with_mss_and_fec_tuning(
     tuning: FecTuning,
 ) -> std::io::Result<Connected> {
     let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(bind, addr, log_config, handshake, fec, mss, tuning, frame_delivery).await
+    connect_with_mss_fec_tuning_and_frame_delivery(
+        bind,
+        addr,
+        log_config,
+        handshake,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    )
+    .await
 }
 
 /// Connect to `addr` with a custom MSS, a per-connection [`FecTuning`],
@@ -291,6 +405,7 @@ pub async fn connect_with_mss_and_fec_tuning(
 /// # Panics
 /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
 /// overhead.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
@@ -313,8 +428,14 @@ pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
         None => None,
     };
     let udp = Arc::new(udp);
-    let mut unreliable_layer =
-        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(Arc::clone(&udp), udp, fec, mss, tuning, frame_delivery);
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        Arc::clone(&udp),
+        udp,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    );
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -375,7 +496,12 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
     tuning: FecTuning,
 ) -> UnreliableLayer {
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read, write, fec, mss, tuning, FrameDelivery::default(),
+        read,
+        write,
+        fec,
+        mss,
+        tuning,
+        FrameDelivery::default(),
     )
 }
 
@@ -387,7 +513,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     tuning: FecTuning,
     frame_delivery: FrameDelivery,
 ) -> UnreliableLayer {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning);
+    let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning, frame_delivery);
     UnreliableLayer {
         utp_read: Box::new(read),
         utp_write: Box::new(write),
@@ -402,6 +528,7 @@ fn checked_mss_and_fec(
     fec: bool,
     mss: usize,
     tuning: FecTuning,
+    frame_delivery: FrameDelivery,
 ) -> (NonZeroUsize, Option<FecState>, FecTuning) {
     assert!(
         mss <= MAX_MSS,
@@ -425,6 +552,17 @@ fn checked_mss_and_fec(
         crate::codec::data_overhead() < mss,
         "mss {mss} leaves no room for the codec payload"
     );
+    // In frame-delivery mode, the first packet of each frame carries a
+    // 4-byte frame-length header (FRAME_DATA_TS), so the MSS must leave
+    // room for `frame_data_overhead()` (data_overhead + 4), not just
+    // `data_overhead()`.  A too-small MSS would yield 0-byte-payload first
+    // packets.
+    if frame_delivery.enabled {
+        assert!(
+            crate::codec::frame_data_overhead() < mss,
+            "mss {mss} leaves no room for the first-frame header"
+        );
+    }
     // FEC off → depth is irrelevant; normalise to the default so the field is
     // inert. When FEC is on, clamp to 1 so a misconfigured 0 cannot disable
     // parity entirely (the stock path always emits at least 1).
@@ -464,14 +602,29 @@ impl UnreliableRead for IdentityConnRead {
         Ok(min_len)
     }
 }
+/// `ConnWrite<UdpSocket>` wrapper that carries the socket's raw fd for
+/// interface-backpressure fallback on Unix.  On non-Unix, behaves
+/// identically to the stock `ConnWrite<UdpSocket>` path.
+#[derive(Debug)]
+pub(crate) struct RawFdConnWrite {
+    inner: ConnWrite<UdpSocket>,
+    raw_fd: MaybeRawFd,
+    peer: Option<core::net::SocketAddr>,
+}
+
 #[async_trait]
-impl UnreliableWrite for ConnWrite<UdpSocket> {
+impl UnreliableWrite for RawFdConnWrite {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        match Self::try_send(self, buf) {
+        match self.inner.try_send(buf) {
             Ok(n) => Ok(n),
-            Err(e) if should_wait_after_try_send(&e) => Self::send(self, buf)
-                .await
-                .map_err(|e| normalize_send_err(e).kind()),
+            Err(e) if should_wait_after_try_send(&e) => {
+                cfg_select! {
+                    target_os = "macos" => raw_sendto_fallback(self.raw_fd, buf, self.peer).await,
+                    not(target_os = "macos") => self.inner.send(buf)
+                            .await
+                            .map_err(|e| normalize_send_err(e).kind()),
+                }
+            }
             Err(e) => Err(normalize_send_err(e).kind()),
         }
     }
@@ -495,9 +648,18 @@ impl UnreliableWrite for Arc<UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         match UdpSocket::try_send(self, buf) {
             Ok(n) => Ok(n),
-            Err(e) if should_wait_after_try_send(&e) => UdpSocket::send(self, buf)
-                .await
-                .map_err(|e| normalize_send_err(e).kind()),
+            Err(e) if should_wait_after_try_send(&e) => {
+                #[cfg(target_os = "macos")]
+                {
+                    raw_sendto_fallback(self.as_raw_fd(), buf, None).await
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    UdpSocket::send(self, buf)
+                        .await
+                        .map_err(|e| normalize_send_err(e).kind())
+                }
+            }
             Err(e) => Err(normalize_send_err(e).kind()),
         }
     }
@@ -534,7 +696,8 @@ pub(crate) fn normalize_send_err(e: std::io::Error) -> std::io::Error {
 }
 
 /// Decide whether a failed [`UnreliableWrite::try_send`] should fall back to
-/// the async `send` path (waiting for the socket to become writable).
+/// the async `send` path (waiting for the socket to become writable), or to
+/// the raw-fd fallback ([`raw_sendto_fallback`]).
 ///
 /// We only want to wait when the error is a genuine "would block" from a
 /// non-blocking socket that is not currently writable. If the kernel
@@ -550,6 +713,80 @@ pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
     match e.raw_os_error() {
         Some(code) => !is_enobufs_raw_os_error(code),
         None => true,
+    }
+}
+
+/// On macOS, kqueue EVFILT_WRITE tracks only socket sndbuf, not mbuf/
+/// interface-queue pressure — so tokio UDP writability readiness is
+/// *poisoned* under interface backpressure: it reports writable, the send
+/// returns EAGAIN, and a readiness-await parks forever.  Fall back to
+/// bounded raw `send` / `sendto` retries on the socket's raw fd instead
+/// of ever awaiting writability.  Interrupted/EINTR is retried (without
+/// consuming a retry) and each retry backs off with increasing delay so
+/// the send buffer has time to drain.
+///
+/// When `peer` is `Some`, the socket is unconnected and `send_to` is used
+/// to address the peer directly.  When `None`, the socket is connected
+/// and a plain `send` suffices.
+///
+/// The raw fd is borrowed via `std::net::UdpSocket::from_raw_fd` so the
+/// OS handles the sockaddr encoding — this avoids both the byte-order bug
+/// of hand-rolled `sockaddr_in` (`from_be_bytes` stores 127.0.0.1 as
+/// memory [1,0,0,127] on little-endian) and the Linux build break from
+/// the BSD-only `sin_len`/`sin6_len` fields.  The borrowed socket is
+/// `mem::forget`ten so the fd is never closed.
+///
+/// Returns `Err(WouldBlock)` when retry budget is exhausted — the caller
+/// must retry later, not treat the packet as sent.
+pub(crate) async fn raw_sendto_fallback(
+    raw_fd: MaybeRawFd,
+    buf: &[u8],
+    peer: Option<core::net::SocketAddr>,
+) -> Result<usize, std::io::ErrorKind> {
+    const BACKOFFS_US: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
+    #[cfg(not(unix))]
+    {
+        let _ = (raw_fd, buf, peer);
+        return Err(std::io::ErrorKind::Unsupported);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        let socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
+        let mut attempt = 0;
+        loop {
+            let res = match &peer {
+                Some(peer) => socket.send_to(buf, peer),
+                None => socket.send(buf),
+            };
+            match res {
+                Ok(n) => {
+                    core::mem::forget(socket);
+                    return Ok(n);
+                }
+                Err(err) => {
+                    let kind = err.kind();
+                    match kind {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock => {
+                            if attempt >= BACKOFFS_US.len() {
+                                core::mem::forget(socket);
+                                return Err(std::io::ErrorKind::WouldBlock);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_micros(
+                                BACKOFFS_US[attempt],
+                            ))
+                            .await;
+                            attempt += 1;
+                        }
+                        _ => {
+                            core::mem::forget(socket);
+                            return Err(normalize_send_err(err).kind());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -687,9 +924,7 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        wrap_fec_lossy_with_mss_and_fec_tuning(
-            read, write, fec, mss, fec_tuning_from_env(), rate,
-        )
+        wrap_fec_lossy_with_mss_and_fec_tuning(read, write, fec, mss, fec_tuning_from_env(), rate)
     }
 
     /// Like `wrap_fec_lossy_with_mss` but takes an explicit `FecTuning` and
@@ -710,7 +945,7 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning);
+        let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning, FrameDelivery::default());
         UnreliableLayer {
             utp_read: Box::new(LossyRead::new(read, rate.clone())),
             utp_write: Box::new(LossyWrite::new(write, rate)),
@@ -910,5 +1145,93 @@ mod tests {
         let mut buf = [0; 1];
         connected.write.send(&msg).await.unwrap();
         connected.read.recv(&mut buf).await.unwrap();
+    }
+
+    /// Invariant 1: a writer whose `try_send` always returns WouldBlock
+    /// must not hang — the raw-fd fallback delivers or returns a bounded
+    /// error.  A hang (timeout) is failure.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn udp_send_never_parks_on_tokio_writability() {
+        let a = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect("127.0.0.1:1").await.unwrap();
+        let buf = vec![0u8; 1424];
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), {
+            let a = Arc::clone(&a);
+            async move {
+                let mut w: Box<dyn UnreliableWrite> = Box::new(a);
+                w.send(&buf).await
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_elapsed) => panic!("send hung on WouldBlock (>500 ms)"),
+        }
+    }
+
+    /// Fix #1: `raw_fallback_sends_to_peer_on_unconnected_socket` — bind an
+    /// unconnected `UdpSocket`, send via the raw fallback with
+    /// `Some(127.0.0.1:port)`, and assert the datagram arrives at that peer.
+    /// Before the fix, `u32::from_be_bytes(octets)` stored 127.0.0.1 as memory
+    /// `[1,0,0,127]` on little-endian (macOS), so the datagram went to the
+    /// wrong address and never arrived.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raw_fallback_sends_to_peer_on_unconnected_socket() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        // Bind an unconnected socket so `peer` is `Some`.
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&sender);
+
+        let payload = b"raw-fallback-test";
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw_sendto_fallback(raw_fd, payload, Some(peer_addr)),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(n)) => assert_eq!(n, payload.len()),
+            Ok(Err(e)) => panic!("raw_sendto_fallback failed: {e:?}"),
+            Err(_) => panic!("raw_sendto_fallback hung"),
+        }
+
+        let mut buf = [0u8; 32];
+        let (n, from) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.recv_from(&mut buf),
+        )
+        .await
+        .expect("peer recv timed out")
+        .expect("peer recv failed");
+        assert_eq!(&buf[..n], payload);
+        assert_eq!(from.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    /// Fix #10: `frame_delivery_mss_to_small_for_first_frame_header_errors`
+    /// — constructing a frame-delivery connection with an MSS too small for
+    /// the first-frame header errors instead of silently producing 0-byte-
+    /// payload first packets.
+    #[test]
+    #[should_panic(expected = "first-frame header")]
+    fn frame_delivery_mss_to_small_for_first_frame_header_errors() {
+        use crate::transmission::frame_delivery::FrameDelivery;
+        // An MSS that is large enough for `data_overhead` but too small for
+        // `frame_data_overhead` (data_overhead + 4).
+        let mss = crate::codec::data_overhead() + 1;
+        let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Dummy,
+            Dummy,
+            false,
+            mss,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            FrameDelivery::enabled(),
+        );
     }
 }

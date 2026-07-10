@@ -40,15 +40,9 @@
 /// Pass `FrameDelivery { enabled: true }` to both peers via the
 /// `*_with_mss_fec_tuning_and_frame_delivery` constructor family to switch the
 /// connection into frame-delivery mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameDelivery {
     pub enabled: bool,
-}
-
-impl Default for FrameDelivery {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 impl FrameDelivery {

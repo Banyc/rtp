@@ -14,7 +14,10 @@ use crate::{
         frame_delivery::{FrameDelivery, frame_delivery_from_env},
         transmission_layer::{UnreliableLayer, UnreliableWrite},
     },
-    udp::{should_wait_after_try_send, wrap_fec, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery},
+    udp::{
+        self, MaybeRawFd, maybe_raw_fd, should_wait_after_try_send, wrap_fec,
+        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+    },
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
@@ -54,11 +57,13 @@ fn apply_keyed_mss<K: DispatchKey>(layer: UnreliableLayer) -> UnreliableLayer {
 pub struct Server<K> {
     listener: UtpListener<UdpSocket, K, Packet>,
     local_addr: SocketAddr,
+    raw_fd: MaybeRawFd,
 }
 impl<K: DispatchKey> Server<K> {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let local_addr = udp.local_addr()?;
+        let raw_fd = maybe_raw_fd(&udp);
         let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
@@ -67,6 +72,7 @@ impl<K: DispatchKey> Server<K> {
         Ok(Self {
             listener,
             local_addr,
+            raw_fd,
         })
     }
 
@@ -82,8 +88,13 @@ impl<K: DispatchKey> Server<K> {
     ) -> std::io::Result<Accepted<K>> {
         let tuning = fec_tuning_from_env();
         let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
+        .await
     }
 
     /// [`Self::accept_without_handshake()`] with a custom MSS and a
@@ -96,8 +107,13 @@ impl<K: DispatchKey> Server<K> {
         tuning: FecTuning,
     ) -> std::io::Result<Accepted<K>> {
         let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
+        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
+        .await
     }
 
     /// [`Self::accept_without_handshake()`] with a custom MSS, a
@@ -114,9 +130,18 @@ impl<K: DispatchKey> Server<K> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
-        let write = KeyedConnWrite::new(write, &conn_key);
-        let unreliable_layer =
-            wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(read, write, fec, mss, tuning, frame_delivery);
+        let write = {
+            let peer = write.peer_addr();
+            KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
+        };
+        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            read,
+            write,
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        );
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -131,7 +156,10 @@ impl<K: DispatchKey> Server<K> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
-        let write = KeyedConnWrite::new(write, &conn_key);
+        let write = {
+            let peer = write.peer_addr();
+            KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
+        };
         let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
@@ -152,6 +180,7 @@ pub struct Accepted<K> {
 #[derive(Debug)]
 pub struct Client<K> {
     listener: UtpListener<UdpSocket, K, Packet>,
+    raw_fd: MaybeRawFd,
 }
 impl<K: DispatchKey> Client<K> {
     pub async fn connect_without_handshake(
@@ -160,12 +189,13 @@ impl<K: DispatchKey> Client<K> {
     ) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(bind).await?;
         udp.connect(server).await?;
+        let raw_fd = maybe_raw_fd(&udp);
         let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
             Arc::new(dispatch),
         );
-        Ok(Self { listener })
+        Ok(Self { listener, raw_fd })
     }
 
     /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
@@ -184,7 +214,13 @@ impl<K: DispatchKey> Client<K> {
     ) -> Option<Connected> {
         let tuning = fec_tuning_from_env();
         let frame_delivery = frame_delivery_from_env();
-        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(dispatch_key, fec, mss, tuning, frame_delivery)
+        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            dispatch_key,
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
     }
 
     /// [`Self::open_without_handshake()`] with a custom MSS and a
@@ -198,7 +234,13 @@ impl<K: DispatchKey> Client<K> {
         tuning: FecTuning,
     ) -> Option<Connected> {
         let frame_delivery = frame_delivery_from_env();
-        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(dispatch_key, fec, mss, tuning, frame_delivery)
+        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(
+            dispatch_key,
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        )
     }
 
     /// [`Self::open_without_handshake()`] with a custom MSS, a
@@ -215,9 +257,15 @@ impl<K: DispatchKey> Client<K> {
     ) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
-        let write = KeyedConnWrite::new(write, &dispatch_key);
-        let unreliable_layer =
-            wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(read, write, fec, mss, tuning, frame_delivery);
+        let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
+        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            read,
+            write,
+            fec,
+            mss,
+            tuning,
+            frame_delivery,
+        );
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
         Some(Connected { read, write })
@@ -226,7 +274,7 @@ impl<K: DispatchKey> Client<K> {
     pub fn open_without_handshake(&self, dispatch_key: K, fec: bool) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
-        let write = KeyedConnWrite::new(write, &dispatch_key);
+        let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
         let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write) = socket(unreliable_layer, None);
@@ -242,32 +290,63 @@ pub struct Connected {
 #[derive(Debug)]
 pub struct KeyedConnWrite {
     write: ConnWrite<UdpSocket>,
-    buf: tokio::sync::Mutex<Vec<u8>>,
+    raw_fd: MaybeRawFd,
+    peer: Option<core::net::SocketAddr>,
+    key_prefix: Vec<u8>,
+    buf: tokio::sync::Mutex<Option<Vec<u8>>>,
     data_offset: usize,
 }
 impl KeyedConnWrite {
-    pub fn new<K: DispatchKey>(write: ConnWrite<UdpSocket>, conn_key: &K) -> Self {
+    pub fn new<K: DispatchKey>(
+        write: ConnWrite<UdpSocket>,
+        conn_key: &K,
+        raw_fd: MaybeRawFd,
+        peer: Option<core::net::SocketAddr>,
+    ) -> Self {
         let mut buf = vec![];
         let n = K::max_size();
         let fill = (0..n).map(|_| 0);
         buf.extend(fill);
         let n = conn_key.encode(&mut buf).unwrap();
+        let key_prefix = buf[..n].to_vec();
         Self {
             write,
-            buf: tokio::sync::Mutex::new(buf),
+            raw_fd,
+            peer,
+            key_prefix,
+            buf: tokio::sync::Mutex::new(Some(buf)),
             data_offset: n,
         }
     }
 
     pub async fn send(&self, data: &[u8]) -> std::io::Result<usize> {
-        let mut buf = self.buf.lock().await;
+        let mut buf = {
+            let mut guard = self.buf.lock().await;
+            guard.take().unwrap_or_else(|| self.key_prefix.clone())
+        };
         buf.drain(self.data_offset..);
         buf.extend(data);
-        match self.write.try_send(&buf) {
+        let res = match self.write.try_send(&buf) {
             Ok(n) => Ok(n),
-            Err(e) if should_wait_after_try_send(&e) => self.write.send(&buf).await,
+            Err(e) if should_wait_after_try_send(&e) => {
+                #[cfg(target_os = "macos")]
+                {
+                    udp::raw_sendto_fallback(self.raw_fd, &buf, self.peer)
+                        .await
+                        .map_err(std::io::Error::from)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    self.write.send(&buf).await
+                }
+            }
             Err(e) => Err(e),
+        };
+        {
+            let mut guard = self.buf.lock().await;
+            *guard = Some(buf);
         }
+        res
     }
 }
 #[async_trait]
@@ -507,8 +586,8 @@ mod tests {
         // not happen. The 50 ms timeout should elapse before any data arrives,
         // even though the server's pong is already in the socket buffer.
         let mut buf = [0u8; 16];
-        let timeout_result = tokio::time::timeout(Duration::from_millis(50), opened.read.recv(&mut buf))
-            .await;
+        let timeout_result =
+            tokio::time::timeout(Duration::from_millis(50), opened.read.recv(&mut buf)).await;
         assert!(
             timeout_result.is_err(),
             "inbound keyed packets must not be delivered unless dispatch is polled, even when the reply is already in the socket buffer"
@@ -532,5 +611,81 @@ mod tests {
         drop(opened);
         dispatch_task.abort();
         server_task.await.unwrap();
+    }
+
+    /// Fix #3: `keyed_writer_delivers_via_raw_path_when_writability_never_ready`
+    /// — a keyed writer whose async writability never becomes ready still
+    /// delivers via the raw path (or errors bounded) — must not hang.
+    ///
+    /// We can't easily make the tokio writability "never ready" on a real
+    /// socket, but we CAN verify the keyed writer does not re-enter the
+    /// poisoned `self.write.send().await` path on non-WouldBlock errors
+    /// by checking that a send to an unreachable peer completes (not hangs)
+    /// within a bounded time.
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyed_writer_delivers_via_raw_path_when_writability_never_ready() {
+        use std::time::Duration;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
+                .await
+                .unwrap();
+        let mut conn = client.open_without_handshake(42, false).unwrap();
+
+        // Send a small payload.  On macOS the raw fallback path is used on
+        // WouldBlock.  The send must complete within a bounded time (not
+        // hang on the poisoned tokio writability path).
+        let payload = b"keyed-raw-test";
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.write.send(payload),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("keyed send failed: {e:?}"),
+            Err(_) => panic!("keyed send hung (re-entered poisoned writability)"),
+        }
+    }
+
+    /// Fix #4: `keyed_send_cancellation_safe` — cancel a keyed send
+    /// mid-flight (drop the future), then a second send on the same
+    /// `KeyedConnWrite` must succeed (no panic at `unwrap()` on a
+    /// `None` buffer).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyed_send_cancellation_safe() {
+        use std::time::Duration;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
+                .await
+                .unwrap();
+        let mut conn = client.open_without_handshake(42, false).unwrap();
+
+        // Spawn a send future and cancel it by aborting the task before
+        // it completes.  We use tokio::select! with a timeout to force
+        // cancellation mid-flight.
+        {
+            let send_fut = conn.write.send(b"cancelled");
+            tokio::pin!(send_fut);
+            // Poll it once with a timeout to force cancellation.
+            let _ = tokio::time::timeout(Duration::from_millis(1), &mut send_fut).await;
+            // The future is dropped here (cancellation), which may leave
+            // the buffer lease as None.
+        }
+
+        // A second send on the same connection must succeed (no panic at
+        // unwrap() on a None buffer).
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.write.send(b"second-send"),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("second keyed send failed after cancellation: {e:?}"),
+            Err(_) => panic!("second keyed send hung after cancellation"),
+        }
     }
 }
