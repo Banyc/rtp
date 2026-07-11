@@ -10,8 +10,12 @@ use tokio::task::JoinSet;
 
 use crate::{
     codec::in_cmd_space,
-    transmission::transmission_layer::{
-        LogConfig, RecvBufs, SendBufs, SendKillPkt, TransmissionLayer, UnreliableLayer,
+    transmission::{
+        shared::{build_parts, Shared},
+        write_half::WriteHalf,
+        transmission_layer::{
+            LogConfig, RecvBufs, SendBufs, SendKillPkt, UnreliableLayer,
+        },
     },
 };
 
@@ -171,12 +175,12 @@ pub fn socket(
 ) -> (ReadSocket, WriteSocket) {
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
-    let transmission_layer = Arc::new(TransmissionLayer::new(unreliable_layer, log_config));
+    let (shared, write_half, read_half) = build_parts(unreliable_layer, log_config);
     let mut events = JoinSet::new();
 
     // Send timer
     events.spawn({
-        let transmission_layer = Arc::clone(&transmission_layer);
+        let write_half = Arc::clone(&write_half);
         async move {
             let mut send_bufs = SendBufs::new();
             loop {
@@ -184,9 +188,9 @@ pub fn socket(
                 // poll time so that a notification arriving between the last
                 // send_pkts pass and this registration is stored as a permit
                 // and wakes us immediately.
-                let resume_send = transmission_layer.resume_send().notified();
+                let resume_send = write_half.resume_send().notified();
                 let now = Instant::now();
-                let next_poll_time = transmission_layer.next_poll_send_time();
+                let next_poll_time = write_half.next_poll_send_time();
                 let fast_poll_time = now + TIMER_INTERVAL;
                 // When the rate limiter already has a token available (its
                 // `next_token_time` is now or in the past), honoring it would
@@ -204,7 +208,7 @@ pub fn socket(
                     () = tokio::time::sleep_until(poll_time.into()) => (),
                     () = resume_send => (),
                 }
-                if transmission_layer.send_pkts(&mut send_bufs).await.is_err() {
+                if write_half.send_pkts(&mut send_bufs).await.is_err() {
                     return;
                 }
             }
@@ -214,7 +218,8 @@ pub fn socket(
     // Recv
     events.spawn({
         let read_shutdown = read_shutdown.clone();
-        let transmission_layer = Arc::clone(&transmission_layer);
+        let write_half = Arc::clone(&write_half);
+        let mut read_half = read_half;
         async move {
             let mut recv_bufs = RecvBufs::new();
             loop {
@@ -222,7 +227,7 @@ pub fn socket(
                 //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
-                let recv_pkts = match transmission_layer
+                let recv_pkts = match read_half
                     .recv_pkts(&mut recv_bufs)
                     .await
                 {
@@ -231,7 +236,7 @@ pub fn socket(
                         match should_send_kill_pkt {
                             SendKillPkt::Yes => {
                                 let mut send_bufs = SendBufs::new();
-                                let _ = transmission_layer.send_kill_pkt(&mut send_bufs).await;
+                                let _ = write_half.send_kill_pkt(&mut send_bufs).await;
                             }
                             SendKillPkt::No => (),
                         }
@@ -240,7 +245,7 @@ pub fn socket(
                 };
                 if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
                     let mut send_bufs = SendBufs::new();
-                    let _ = transmission_layer.send_kill_pkt(&mut send_bufs).await;
+                    let _ = write_half.send_kill_pkt(&mut send_bufs).await;
                 }
             }
         }
@@ -249,36 +254,36 @@ pub fn socket(
     tokio::spawn({
         let read_shutdown = read_shutdown.clone();
         let write_shutdown = write_shutdown.clone();
-        let transmission_layer = Arc::clone(&transmission_layer);
+        let shared = Arc::clone(&shared);
         async move {
             let _event_guard = events;
 
             tokio::select! {
                 () = write_shutdown.cancelled() => {
-                    transmission_layer.send_fin_buf();
+                    shared.send_fin_buf();
                 }
-                () = transmission_layer.some_error().cancelled() => (),
+                () = shared.some_error().cancelled() => (),
             }
             tokio::select! {
                 () = read_shutdown.cancelled() => (),
-                () = transmission_layer.some_error().cancelled() => (),
+                () = shared.some_error().cancelled() => (),
             }
 
             tokio::select! {
-                () = transmission_layer.recv_fin().cancelled() => (),
-                () = transmission_layer.some_error().cancelled() => (),
+                () = shared.recv_fin().cancelled() => (),
+                () = shared.some_error().cancelled() => (),
                 () = tokio::time::sleep(Duration::from_secs(675)) => (),
             }
         }
     });
 
     let read = ReadSocket {
-        transmission_layer: Arc::clone(&transmission_layer),
+        transmission_layer: Arc::clone(&shared),
         frame_buf: Mutex::new(Vec::new()),
         _shutdown_guard: read_shutdown.drop_guard(),
     };
     let write = WriteSocket {
-        transmission_layer: Arc::clone(&transmission_layer),
+        transmission_layer: Arc::clone(&write_half),
         send_bufs: SendBufs::new(),
         no_delay: true,
         _shutdown_guard: write_shutdown.drop_guard(),
@@ -288,7 +293,7 @@ pub fn socket(
 
 #[derive(Debug)]
 pub struct ReadSocket {
-    transmission_layer: Arc<TransmissionLayer>,
+    transmission_layer: Arc<Shared>,
     frame_buf: Mutex<Vec<u8>>,
     _shutdown_guard: tokio_util::sync::DropGuard,
 }
@@ -372,7 +377,7 @@ impl ReadSocket {
 
 #[derive(Debug)]
 pub struct WriteSocket {
-    transmission_layer: Arc<TransmissionLayer>,
+    transmission_layer: Arc<WriteHalf>,
     send_bufs: SendBufs,
     no_delay: bool,
     _shutdown_guard: tokio_util::sync::DropGuard,
