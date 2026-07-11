@@ -484,41 +484,31 @@ const INIT_CONNECT_RTO: Duration = Duration::from_secs(1);
 /// a transiently-blocked writer retries promptly within the handshake
 /// timeout.
 const HANDSHAKE_SEND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const HANDSHAKE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Send `buf` via `utp_write`, retrying on `WouldBlock` until `deadline`.
-/// Returns `TimedOut` only when the deadline elapses; any other error is
-/// returned immediately.  This keeps connection setup alive against a
-/// writer that WouldBlocks transiently instead of aborting on the first
-/// exhausted send budget.
-///
-/// Each `send` is wrapped in `tokio::time::timeout_at(deadline)` so a send
-/// future that stays pending (poisoned kqueue writability under interface
-/// backpressure) is preempted at the deadline rather than hanging forever.
-/// The retry sleep is clamped to the deadline so a writer that becomes
-/// writable late in the budget is not missed (sleep overshoot is avoided).
 async fn handshake_send(
     utp_write: &mut Box<dyn crate::transmission::transmission_layer::UnreliableWrite>,
     buf: &[u8],
     deadline: Instant,
 ) -> Result<(), std::io::Error> {
+    let send_deadline = deadline.min(Instant::now() + HANDSHAKE_SEND_TIMEOUT);
     loop {
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        }
         match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
+            tokio::time::Instant::from_std(send_deadline),
             utp_write.send(buf),
         )
         .await
         {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(std::io::ErrorKind::WouldBlock)) => {
-                let retry_at = (Instant::now() + HANDSHAKE_SEND_RETRY_INTERVAL).min(deadline);
-                tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
-            }
+            Ok(Ok(n)) if n == buf.len() => return Ok(()),
+            Ok(Ok(_)) => continue,
             Ok(Err(e)) => return Err(std::io::Error::from(e)),
             Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
         }
+        let retry_at = Instant::now()
+            .checked_add(HANDSHAKE_SEND_RETRY_INTERVAL)
+            .map(|t| t.min(send_deadline))
+            .unwrap_or(send_deadline);
+        tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
     }
 }
 
@@ -534,11 +524,14 @@ pub async fn client_opening_handshake(
         }
     }
     let deadline = Instant::now() + INIT_CONNECT_RTO.mul_f64((NUM_CONNECT_RETRIES + 1) as f64);
+    let send_deadline = deadline
+        .checked_sub(2 * INIT_CONNECT_RTO)
+        .unwrap_or(deadline);
     for i in 0..=NUM_CONNECT_RETRIES {
         if i == NUM_CONNECT_RETRIES {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
-        handshake_send(&mut unreliable.utp_write, &challenge, deadline).await?;
+        handshake_send(&mut unreliable.utp_write, &challenge, send_deadline).await?;
         let mut resp = [0; 1];
         tokio::select! {
             res = unreliable.utp_read.recv(&mut resp) => {
@@ -552,7 +545,7 @@ pub async fn client_opening_handshake(
     }
 
     neg_challenge(&mut challenge);
-    handshake_send(&mut unreliable.utp_write, &challenge, deadline).await?;
+    handshake_send(&mut unreliable.utp_write, &challenge, send_deadline).await?;
     Ok(())
 }
 
@@ -565,7 +558,10 @@ pub async fn server_opening_handshake(
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     let due = Instant::now() + INIT_CONNECT_RTO;
-    handshake_send(&mut unreliable.utp_write, &challenge, due).await?;
+    let send_due = due
+        .checked_sub(2 * INIT_CONNECT_RTO)
+        .unwrap_or(due);
+    handshake_send(&mut unreliable.utp_write, &challenge, send_due).await?;
 
     neg_challenge(&mut challenge);
     let mut resp = [0; 1];

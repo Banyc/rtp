@@ -336,7 +336,7 @@ impl TransmissionLayer {
                 return Ok(());
             }
             tokio::select! {
-                () = sent_data_pkt => (),
+                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
                 () = self.first_error.some().cancelled() => (),
             }
             sent_data_pkt = self.sent_data_pkt.notified();
@@ -438,8 +438,9 @@ impl TransmissionLayer {
             (s.ack_page_cursor.max(MAX_NUM_ACK).min(count), count)
         };
 
-        // Claim the echo_ts from AckFlushState; it is restored on failure.
         let mut echo_ts = self.ack_flush.lock().unwrap().ts_echo.take();
+        let echo_backup = echo_ts;
+        let claimed_acks = self.ack_flush.lock().unwrap().pending_acks;
         let mut page_0 = true;
         let mut skip = 0;
         let fec_enabled = self.fec.is_some();
@@ -471,10 +472,7 @@ impl TransmissionLayer {
                     }
                 }
                 Err(std::io::ErrorKind::WouldBlock) => {
-                    // Transient: restore the echo and leave pending_acks
-                    // intact (subtract only the pages actually sent) so the
-                    // next flush retries.
-                    if let Some(ts) = echo_ts.take() {
+                    if let Some(ts) = echo_ts.take().or(echo_backup) {
                         self.ack_flush.lock().unwrap().ts_echo.restore(ts);
                     }
                     let mut s = self.ack_flush.lock().unwrap();
@@ -483,7 +481,7 @@ impl TransmissionLayer {
                 }
                 Err(e) => {
                     self.first_error.set(e);
-                    if let Some(ts) = echo_ts.take() {
+                    if let Some(ts) = echo_ts.take().or(echo_backup) {
                         self.ack_flush.lock().unwrap().ts_echo.restore(ts);
                     }
                     return Err(e);
@@ -492,20 +490,18 @@ impl TransmissionLayer {
 
             if page_0 {
                 page_0 = false;
-                if history_count <= MAX_NUM_ACK {
+                if history_count < MAX_NUM_ACK {
                     let mut s = self.ack_flush.lock().unwrap();
                     s.ack_page_cursor = MAX_NUM_ACK;
-                    let claimed = s.pending_acks;
-                    s.complete_claim(claimed, true);
+                    s.complete_claim(claimed_acks, true);
                     s.last_ack_flush = Some(now);
                     break;
                 }
                 skip = cursor;
-                if skip >= history_count {
+                if skip > history_count {
                     let mut s = self.ack_flush.lock().unwrap();
                     s.ack_page_cursor = MAX_NUM_ACK;
-                    let claimed = s.pending_acks;
-                    s.complete_claim(claimed, true);
+                    s.complete_claim(claimed_acks, true);
                     s.last_ack_flush = Some(now);
                     break;
                 }
@@ -516,8 +512,7 @@ impl TransmissionLayer {
                 } else {
                     s.ack_page_cursor = MAX_NUM_ACK;
                 }
-                let claimed = s.pending_acks;
-                s.complete_claim(claimed, true);
+                s.complete_claim(claimed_acks, true);
                 s.last_ack_flush = Some(now);
                 break;
             }
@@ -1089,19 +1084,17 @@ impl TransmissionLayer {
                 reliable_layer.send_data_buf(data, now)
             };
             self.log("send_data_buf");
-
             if no_delay {
                 let made_progress = self.send_pkts(bufs).await?;
                 if !made_progress && 0 < written_bytes {
                     self.resume_send.notify_one();
                 }
             }
-
             if 0 < written_bytes {
                 break written_bytes;
             }
             tokio::select! {
-                () = sent_data_pkt => (),
+                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
                 () = self.first_error.some().cancelled() => (),
             }
             sent_data_pkt = self.sent_data_pkt.notified();
@@ -1141,12 +1134,11 @@ impl TransmissionLayer {
                     return Ok(frame_len);
                 }
                 Err(std::io::ErrorKind::WouldBlock) => {
-                    // Staging cap full; wait for the send path to drain some frames.
                     if no_delay {
                         self.send_pkts(bufs).await?;
                     }
                     tokio::select! {
-                        () = sent_data_pkt => (),
+                        _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
                         () = self.first_error.some().cancelled() => (),
                     }
                     sent_data_pkt = self.sent_data_pkt.notified();
@@ -1349,6 +1341,16 @@ impl FirstError {
 
     pub fn some(&self) -> &tokio_util::sync::CancellationToken {
         &self.some
+    }
+
+    pub fn notified(
+        &self,
+    ) -> impl std::future::Future<Output = std::io::ErrorKind> + '_ {
+        let token = self.some.clone();
+        async move {
+            token.cancelled().await;
+            self.first_error.read().unwrap().unwrap()
+        }
     }
 }
 
