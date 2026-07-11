@@ -500,9 +500,13 @@ async fn handshake_send(
         .await
         {
             Ok(Ok(n)) if n == buf.len() => return Ok(()),
-            Ok(Ok(_)) => continue,
+            Ok(Ok(_)) => {}
+            Ok(Err(std::io::ErrorKind::WouldBlock)) => {}
             Ok(Err(e)) => return Err(std::io::Error::from(e)),
             Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+        }
+        if Instant::now() >= send_deadline {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
         }
         let retry_at = Instant::now()
             .checked_add(HANDSHAKE_SEND_RETRY_INTERVAL)
