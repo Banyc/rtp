@@ -338,7 +338,7 @@ impl KeyedConnWrite {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    self.write.send(&buf).await
+                    self.write.send(&self.buf).await
                 }
             }
             Err(e) => Err(e),
