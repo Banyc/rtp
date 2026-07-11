@@ -300,8 +300,7 @@ pub struct KeyedConnWrite {
     write: ConnWrite<UdpSocket>,
     raw_fd: MaybeRawFd,
     peer: Option<core::net::SocketAddr>,
-    key_prefix: Vec<u8>,
-    buf: tokio::sync::Mutex<Option<Vec<u8>>>,
+    buf: Vec<u8>,
     data_offset: usize,
 }
 impl KeyedConnWrite {
@@ -316,30 +315,24 @@ impl KeyedConnWrite {
         let fill = (0..n).map(|_| 0);
         buf.extend(fill);
         let n = conn_key.encode(&mut buf).unwrap();
-        let key_prefix = buf[..n].to_vec();
         Self {
             write,
             raw_fd,
             peer,
-            key_prefix,
-            buf: tokio::sync::Mutex::new(Some(buf)),
+            buf,
             data_offset: n,
         }
     }
 
-    pub async fn send(&self, data: &[u8]) -> std::io::Result<usize> {
-        let mut buf = {
-            let mut guard = self.buf.lock().await;
-            guard.take().unwrap_or_else(|| self.key_prefix.clone())
-        };
-        buf.drain(self.data_offset..);
-        buf.extend(data);
-        let res = match self.write.try_send(&buf) {
+    pub async fn send(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.drain(self.data_offset..);
+        self.buf.extend(data);
+        match self.write.try_send(&self.buf) {
             Ok(n) => Ok(n),
             Err(e) if should_wait_after_try_send(&e) => {
                 #[cfg(target_os = "macos")]
                 {
-                    udp::raw_sendto_fallback(self.raw_fd, &buf, self.peer)
+                    udp::raw_sendto_fallback(self.raw_fd, &self.buf, self.peer)
                         .await
                         .map_err(std::io::Error::from)
                 }
@@ -349,12 +342,7 @@ impl KeyedConnWrite {
                 }
             }
             Err(e) => Err(e),
-        };
-        {
-            let mut guard = self.buf.lock().await;
-            *guard = Some(buf);
         }
-        res
     }
 }
 #[async_trait]
@@ -645,11 +633,7 @@ mod tests {
         // WouldBlock.  The send must complete within a bounded time (not
         // hang on the poisoned tokio writability path).
         let payload = b"keyed-raw-test";
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            conn.write.send(payload),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), conn.write.send(payload)).await;
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => panic!("keyed send failed: {e:?}"),
@@ -685,11 +669,8 @@ mod tests {
 
         // A second send on the same connection must succeed (no panic at
         // unwrap() on a None buffer).
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            conn.write.send(b"second-send"),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), conn.write.send(b"second-send")).await;
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => panic!("second keyed send failed after cancellation: {e:?}"),
