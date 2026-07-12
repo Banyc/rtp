@@ -202,8 +202,7 @@ impl PktSendSpace {
         self.liveness.no_resp_for(now)
     }
 
-    #[cfg(test)]
-    fn no_progress_for(&self, now: Instant) -> Option<Duration> {
+    pub fn no_progress_for(&self, now: Instant) -> Option<Duration> {
         self.liveness.no_progress_for(now)
     }
 
@@ -2006,17 +2005,13 @@ mod tests {
     #[test]
     fn jitter_cap_toggle_off_preserves_stock_out_of_order_window() {
         let t0 = Instant::now();
-        // Jitter-cap toggle OFF: behaviour must be byte-for-byte stock.
         let mut space = PktSendSpace::with_jitter_cap(false);
         let (_fast, stock) = settle_high_jitter_f2(&mut space, t0);
-        // Re-derive fast window to confirm toggle-off uses stock for rtx.
         let stock_window = space.rtt_stats.reorder_window();
         assert_eq!(stock_window, stock);
 
         starve_seq0_with_sacks(&mut space, t0);
 
-        // Pick a time after the fast window but before the stock window: with
-        // the toggle OFF the fast rtx must NOT fire (stock behaviour).
         let fast = space.rtt_stats.fast_reorder_window();
         let fast_deadline = t0 + fast;
         let stock_deadline = t0 + stock;
@@ -2031,15 +2026,12 @@ mod tests {
             "toggle off: no retransmit before the stock reorder window"
         );
 
-        // No deferred loss entry was created with the toggle off.
         assert_eq!(
             space.deferred_losses.len(),
             0,
             "toggle off: no deferred loss entries"
         );
 
-        // At the stock deadline the stock rtx fires and records the loss
-        // event immediately (no deferral).
         let rtx_t = stock_deadline + ms(1);
         assert!(space.has_rtx(rtx_t), "toggle off: stock rtx fires at stock deadline");
         let rtx = space.rtx(rtx_t).expect("stock rtx at stock deadline");
@@ -2052,6 +2044,59 @@ mod tests {
             space.deferred_losses.len(),
             0,
             "toggle off: no deferred entries created"
+        );
+    }
+
+    #[test]
+    fn zero_progress_stall_declares_broken_pipe() {
+        use crate::transmission::write_half::WriteHalf;
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let rto = space.rto_duration();
+
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+
+        let send_start = t0 + ms(11);
+        for i in 0..22 {
+            send_packet(&mut space, send_start + ms(i * 1));
+        }
+
+        let mut t = send_start + ms(22 * 1 + 1);
+        for _ in 0..320 {
+            ack_one(&mut space, 0, t);
+            t += ms(100);
+        }
+
+        let no_resp = space.no_resp_for(t);
+        let no_progress = space.no_progress_for(t);
+        assert!(
+            no_resp.is_some_and(|d| d < rto.mul_f64(16.0)),
+            "duplicate ACKs keep resp_wait short; no_resp={no_resp:?}"
+        );
+        assert!(
+            no_progress.is_some_and(|d| d >= Duration::from_secs(30)),
+            "zero-progress stall must exceed 30s; no_progress={no_progress:?}"
+        );
+
+        assert!(
+            WriteHalf::should_declare_broken_pipe(
+                no_resp,
+                no_progress,
+                !space.no_pkts_in_flight(),
+                rto,
+            ),
+            "stalled-but-responding peer must be declared broken pipe"
+        );
+
+        for seq in 1..23 {
+            ack_one(&mut space, seq, t + ms((seq * 1) as u64));
+        }
+        assert_eq!(
+            space.no_progress_for(t + Duration::from_secs(600)),
+            None,
+            "drained idle window must report no progress wait"
         );
     }
 }

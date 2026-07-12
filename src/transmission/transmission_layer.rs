@@ -22,6 +22,7 @@ pub(crate) const MAX_NUM_ACK: usize = 64;
 pub(crate) const ACK_FLUSH_COUNT: usize = 8;
 pub(crate) const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 pub(crate) const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
+pub(crate) const MIN_NO_PROGRESS_FOR: Duration = Duration::from_secs(30);
 pub(crate) const BUF_SIZE: usize = 1024 * 64;
 
 /// Whether retransmission armor (`RTP_RTX_DUP`) is enabled at process
