@@ -4,8 +4,8 @@ use std::time::Instant;
 use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
 use super::shared::Shared;
 use super::transmission_layer::{
-    SendBufs, ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, MIN_NO_PROGRESS_FOR,
-    MIN_NO_RESP_FOR, PRINT_DEBUG_MSGS, UnreliableWrite,
+    SendBufs, ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK,
+    PRINT_DEBUG_MSGS, UnreliableWrite,
 };
 
 #[derive(Debug)]
@@ -23,34 +23,17 @@ impl std::ops::Deref for WriteHalf {
 }
 
 impl WriteHalf {
-    pub(crate) fn should_declare_broken_pipe(
-        no_resp_for: Option<std::time::Duration>,
-        no_progress_for: Option<std::time::Duration>,
-        has_in_flight: bool,
-        rto: std::time::Duration,
-    ) -> bool {
-        let response_dead = no_resp_for
-            .is_some_and(|d| d >= rto.mul_f64(16.0) && d >= MIN_NO_RESP_FOR);
-        let progress_dead = has_in_flight
-            && no_progress_for.is_some_and(|d| d >= rto.mul_f64(16.0).max(MIN_NO_PROGRESS_FOR));
-        response_dead || progress_dead
+    pub(crate) fn proactively_terminate_stalled_session(&self) {
+        let now = Instant::now();
+        let reliable_layer = self.reliable_layer.lock().unwrap();
+        let send_space = reliable_layer.pkt_send_space();
+        if send_space.should_terminate_session(now) {
+            self.first_error.set(std::io::ErrorKind::BrokenPipe);
+        }
     }
 
     pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
-        let detect_broken_pipe_proactively = || {
-            let now = Instant::now();
-            let reliable_layer = self.reliable_layer.lock().unwrap();
-            let send_space = reliable_layer.pkt_send_space();
-            if Self::should_declare_broken_pipe(
-                send_space.no_resp_for(now),
-                send_space.no_progress_for(now),
-                !send_space.no_pkts_in_flight(),
-                send_space.rto_duration(),
-            ) {
-                self.first_error.set(std::io::ErrorKind::BrokenPipe);
-            }
-        };
-        detect_broken_pipe_proactively();
+        self.proactively_terminate_stalled_session();
 
         let mut written_bytes = 0;
         let mut written_fin = false;
@@ -487,34 +470,18 @@ impl WriteHalf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time::Duration;
+    use crate::send_queue::liveness::PeerLiveness;
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn inert_catcher() {
-        assert!(
-            WriteHalf::should_declare_broken_pipe(
-                Some(Duration::from_millis(5)),
-                Some(Duration::from_secs(31)),
-                true,
-                Duration::from_millis(200),
-            ),
-            "progress branch must fire with 31s of zero progress and in-flight packets"
-        );
-        assert!(
-            !WriteHalf::should_declare_broken_pipe(
-                Some(Duration::from_millis(5)),
-                None,
-                false,
-                Duration::from_millis(200),
-            ),
-            "idle safety: must not fire with empty window"
-        );
+    fn term(l: &PeerLiveness, now: Instant, rto: Duration, has_in_flight: bool) -> bool {
+        l.should_terminate_session(now, rto, has_in_flight)
     }
 
-    #[test] fn idle_empty_queue_not_killed() { let rto = Duration::from_millis(100); assert!(!WriteHalf::should_declare_broken_pipe(None, None, false, rto)); assert!(!WriteHalf::should_declare_broken_pipe(Some(Duration::from_millis(1)), Some(Duration::from_secs(999)), false, rto)); }
+    #[test] fn inert_catcher() { let now = Instant::now(); let mut l = PeerLiveness::new(); l.refresh_waits(now - Duration::from_millis(5)); l.record_progress(); l.refresh_waits(now - Duration::from_secs(31)); l.refresh_waits(now - Duration::from_millis(1)); assert!(term(&l, now, Duration::from_millis(200), true), "progress branch must fire"); assert!(!term(&l, now, Duration::from_millis(200), false), "idle safety: must not fire with empty window"); }
 
-    #[test] fn slow_but_progressing_not_killed() { let rto = Duration::from_millis(100); assert!(!WriteHalf::should_declare_broken_pipe(Some(Duration::from_millis(50)), None, true, rto)); assert!(!WriteHalf::should_declare_broken_pipe(Some(Duration::from_millis(50)), Some(Duration::from_secs(1)), true, rto)); }
+    #[test] fn idle_empty_queue_not_killed() { let rto = Duration::from_millis(100); let l = PeerLiveness::new(); assert!(!term(&l, Instant::now(), rto, false)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(1)); l2.on_send(Instant::now() - Duration::from_secs(999)); assert!(!term(&l2, Instant::now(), rto, false)); }
 
-    #[test] fn response_watchdog_still_fires() { let rto = Duration::from_millis(100); assert!(WriteHalf::should_declare_broken_pipe(Some(Duration::from_secs(31)), None, false, rto)); assert!(!WriteHalf::should_declare_broken_pipe(Some(Duration::from_secs(10)), None, false, rto)); }
+    #[test] fn slow_but_progressing_not_killed() { let rto = Duration::from_millis(100); let mut l = PeerLiveness::new(); l.refresh_waits(Instant::now() - Duration::from_millis(50)); l.record_progress(); assert!(!term(&l, Instant::now(), rto, true)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(50)); l2.record_progress(); l2.on_send(Instant::now() - Duration::from_secs(1)); assert!(!term(&l2, Instant::now(), rto, true)); }
+
+    #[test] fn response_watchdog_still_fires() { let rto = Duration::from_millis(100); let mut l = PeerLiveness::new(); l.on_send(Instant::now() - Duration::from_secs(31)); assert!(term(&l, Instant::now(), rto, false)); let mut l2 = PeerLiveness::new(); l2.on_send(Instant::now() - Duration::from_secs(10)); assert!(!term(&l2, Instant::now(), rto, false)); }
 }

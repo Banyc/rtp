@@ -198,12 +198,23 @@ impl PktSendSpace {
         &mut self.reused_buf
     }
 
+    #[cfg(test)]
     pub fn no_resp_for(&self, now: Instant) -> Option<Duration> {
         self.liveness.no_resp_for(now)
     }
 
+    #[cfg(test)]
     pub fn no_progress_for(&self, now: Instant) -> Option<Duration> {
         self.liveness.no_progress_for(now)
+    }
+
+    /// Terminate a stalled session using liveness policy constants.
+    pub fn should_terminate_session(&self, now: Instant) -> bool {
+        self.liveness.should_terminate_session(
+            now,
+            self.rto_duration(),
+            !self.no_pkts_in_flight(),
+        )
     }
 
     pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
@@ -2055,7 +2066,6 @@ mod tests {
 
     #[test]
     fn zero_progress_stall_declares_broken_pipe() {
-        use crate::transmission::write_half::WriteHalf;
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
@@ -2087,12 +2097,7 @@ mod tests {
         );
 
         assert!(
-            WriteHalf::should_declare_broken_pipe(
-                no_resp,
-                no_progress,
-                !space.no_pkts_in_flight(),
-                rto,
-            ),
+            space.should_terminate_session(t),
             "stalled-but-responding peer must be declared broken pipe"
         );
 
@@ -2108,12 +2113,9 @@ mod tests {
 
     #[test]
     fn fresh_sacks_behind_permanent_hole_do_not_reset_cumulative_progress() {
-        use crate::transmission::write_half::WriteHalf;
-
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
-        let rto = space.rto_duration();
         assert_eq!(send_packet(&mut space, t0), 0);
         assert_eq!(ack_one(&mut space, 0, t0 + ms(10)), 1);
         assert_eq!(send_packet(&mut space, t0 + ms(11)), 1);
@@ -2149,23 +2151,15 @@ mod tests {
             "fresh SACKs beyond the hole must not reset cumulative progress; no_progress={no_progress:?}"
         );
         assert!(
-            WriteHalf::should_declare_broken_pipe(
-                no_resp,
-                no_progress,
-                !space.no_pkts_in_flight(),
-                rto,
-            )
+            space.should_terminate_session(last_ack)
         );
     }
 
     #[test]
     fn fresh_sacks_behind_initial_hole_age_cumulative_progress() {
-        use crate::transmission::write_half::WriteHalf;
-
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
-        let rto = space.rto_duration();
         assert_eq!(send_packet(&mut space, t0), 0);
         let mut last_ack = t0;
         for i in 0..8 {
@@ -2193,12 +2187,7 @@ mod tests {
             "the initial cumulative hole must age even before first progress; no_progress={no_progress:?}"
         );
         assert!(
-            WriteHalf::should_declare_broken_pipe(
-                no_resp,
-                no_progress,
-                !space.no_pkts_in_flight(),
-                rto,
-            )
+            space.should_terminate_session(last_ack)
         );
     }
 }
