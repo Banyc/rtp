@@ -42,7 +42,7 @@ impl PeerLiveness {
     /// responded, and if progress was made earlier the stall clock starts.
     pub(crate) fn refresh_waits(&mut self, now: Instant) {
         self.resp_wait_start = Some(now);
-        if self.ever_progressed && self.progress_wait_start.is_none() {
+        if self.progress_wait_start.is_none() {
             self.progress_wait_start = Some(now);
         }
     }
@@ -53,7 +53,7 @@ impl PeerLiveness {
         if self.resp_wait_start.is_none() {
             self.resp_wait_start = Some(now);
         }
-        if self.ever_progressed && self.progress_wait_start.is_none() {
+        if self.progress_wait_start.is_none() {
             self.progress_wait_start = Some(now);
         }
     }

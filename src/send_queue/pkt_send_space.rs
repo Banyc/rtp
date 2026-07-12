@@ -207,9 +207,9 @@ impl PktSendSpace {
     }
 
     pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
-        let next_unacked = self.send_wnd.start().or(self.send_wnd.next()).copied();
+        let cumulative_front_before = self.send_wnd.start().or(self.send_wnd.next()).copied();
         let peer_waiting_for_acked_pkts =
-            next_unacked.is_some_and(|next_unacked| recved.first_unacked() < next_unacked);
+            cumulative_front_before.is_some_and(|front| recved.first_unacked() < front);
         if let Some(seq) = recved.out_of_order_seq_end() {
             self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
@@ -220,8 +220,6 @@ impl PktSendSpace {
         recved.ack(&self.unacked_buf, &mut self.ack_buf);
         let delivered = self.ack_buf.len();
         if delivered > 0 {
-            // Forward progress: we just delivered packets to the peer.
-            self.liveness.record_progress();
             self.tlp.reset();
         }
 
@@ -275,6 +273,14 @@ impl PktSendSpace {
             // come from peer-echoed send timestamps via `sample_rtt`.
             self.reused_buf.put(p.data);
             acked.push(p.stats);
+        }
+
+        let cumulative_front_after = self.send_wnd.start().or(self.send_wnd.next()).copied();
+        if cumulative_front_before
+            .zip(cumulative_front_after)
+            .is_some_and(|(before, after)| before < after)
+        {
+            self.liveness.record_progress();
         }
 
         // Evidence-gated fast loss — SACK-pass accounting.
@@ -2097,6 +2103,102 @@ mod tests {
             space.no_progress_for(t + Duration::from_secs(600)),
             None,
             "drained idle window must report no progress wait"
+        );
+    }
+
+    #[test]
+    fn fresh_sacks_behind_permanent_hole_do_not_reset_cumulative_progress() {
+        use crate::transmission::write_half::WriteHalf;
+
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let rto = space.rto_duration();
+        assert_eq!(send_packet(&mut space, t0), 0);
+        assert_eq!(ack_one(&mut space, 0, t0 + ms(10)), 1);
+        assert_eq!(send_packet(&mut space, t0 + ms(11)), 1);
+        let mut last_ack = t0 + ms(11);
+        for i in 0..8 {
+            let send_at = t0 + ms(12) + Duration::from_secs(i * 5);
+            let seq = send_packet(&mut space, send_at);
+            let balls = [
+                crate::sack::AckBall {
+                    start: 0,
+                    size: std::num::NonZeroU64::new(1).unwrap(),
+                },
+                crate::sack::AckBall {
+                    start: 2,
+                    size: std::num::NonZeroU64::new(seq - 1).unwrap(),
+                },
+            ];
+            let mut acked = Vec::new();
+            last_ack = send_at + ms(1);
+            space.ack(
+                crate::sack::AckBallSequence::new(&balls),
+                &mut acked,
+                last_ack,
+            );
+            assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
+            assert_eq!(space.send_wnd.start().copied(), Some(1));
+        }
+        let no_resp = space.no_resp_for(last_ack);
+        let no_progress = space.no_progress_for(last_ack);
+        assert_eq!(no_resp, Some(Duration::ZERO));
+        assert!(
+            no_progress.is_some_and(|d| d > Duration::from_secs(30)),
+            "fresh SACKs beyond the hole must not reset cumulative progress; no_progress={no_progress:?}"
+        );
+        assert!(
+            WriteHalf::should_declare_broken_pipe(
+                no_resp,
+                no_progress,
+                !space.no_pkts_in_flight(),
+                rto,
+            )
+        );
+    }
+
+    #[test]
+    fn fresh_sacks_behind_initial_hole_age_cumulative_progress() {
+        use crate::transmission::write_half::WriteHalf;
+
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let rto = space.rto_duration();
+        assert_eq!(send_packet(&mut space, t0), 0);
+        let mut last_ack = t0;
+        for i in 0..8 {
+            let send_at = t0 + ms(1) + Duration::from_secs(i * 5);
+            let seq = send_packet(&mut space, send_at);
+            let balls = [crate::sack::AckBall {
+                start: 1,
+                size: std::num::NonZeroU64::new(seq).unwrap(),
+            }];
+            let mut acked = Vec::new();
+            last_ack = send_at + ms(1);
+            space.ack(
+                crate::sack::AckBallSequence::new(&balls),
+                &mut acked,
+                last_ack,
+            );
+            assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
+            assert_eq!(space.send_wnd.start().copied(), Some(0));
+        }
+        let no_resp = space.no_resp_for(last_ack);
+        let no_progress = space.no_progress_for(last_ack);
+        assert_eq!(no_resp, Some(Duration::ZERO));
+        assert!(
+            no_progress.is_some_and(|d| d > Duration::from_secs(30)),
+            "the initial cumulative hole must age even before first progress; no_progress={no_progress:?}"
+        );
+        assert!(
+            WriteHalf::should_declare_broken_pipe(
+                no_resp,
+                no_progress,
+                !space.no_pkts_in_flight(),
+                rto,
+            )
         );
     }
 }
