@@ -212,13 +212,21 @@ impl FirstError {
     }
 
     pub fn set(&self, err: std::io::ErrorKind) {
-        {
+        let _ = self.set_if_empty(err);
+    }
+
+    pub fn set_if_empty(&self, err: std::io::ErrorKind) -> bool {
+        let inserted = {
             let mut first_error = self.first_error.write().unwrap();
-            if first_error.is_none() {
+            if first_error.is_some() {
+                false
+            } else {
                 *first_error = Some(err);
+                true
             }
-        }
+        };
         self.some.cancel();
+        inserted
     }
 
     pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
