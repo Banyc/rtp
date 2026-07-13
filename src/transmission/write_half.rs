@@ -477,7 +477,7 @@ mod tests {
         l.should_terminate_session(now, has_in_flight)
     }
 
-    #[test] fn inert_catcher() { let now = Instant::now(); let mut l = PeerLiveness::new(); let rto = Duration::from_millis(200); let long_ago = now - Duration::from_secs(31); l.on_send(long_ago, rto); l.record_progress(); l.refresh_waits(now - Duration::from_millis(1), rto); assert!(term(&l, now, true), "progress branch must fire"); assert!(!term(&l, now, false), "idle safety: must not fire with empty window"); }
+    #[test] fn inert_catcher() { let now = Instant::now(); let mut l = PeerLiveness::new(); let rto = Duration::from_millis(200); let long_ago = now - Duration::from_secs(31); l.on_send(long_ago, rto); l.record_progress(); l.on_send(long_ago, rto); l.refresh_waits(now - Duration::from_millis(1), rto); assert!(term(&l, now, true), "progress branch must fire"); assert!(!term(&l, now, false), "idle safety: must not fire with empty window"); }
 
     #[test] fn idle_empty_queue_not_killed() { let rto = Duration::from_millis(100); let l = PeerLiveness::new(); assert!(!term(&l, Instant::now(), false)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(1), rto); l2.on_send(Instant::now() - Duration::from_secs(999), rto); assert!(!term(&l2, Instant::now(), false)); }
 

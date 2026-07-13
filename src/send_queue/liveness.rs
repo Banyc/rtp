@@ -49,11 +49,8 @@ impl PeerLiveness {
     }
 
     pub(crate) fn record_progress(&mut self) {
-        if self.ever_progressed {
-            self.progress_wait = None;
-        } else {
-            self.ever_progressed = true;
-        }
+        self.ever_progressed = true;
+        self.progress_wait = None;
     }
 
     pub(crate) fn reset_waits(&mut self) {
@@ -177,15 +174,16 @@ mod tests {
     }
 
     #[test]
-    fn recent_cumulative_progress_restarts_the_watchdog() {
-        let mut l = PeerLiveness::new();
-        let rto = Duration::from_millis(100);
+    fn first_cumulative_progress_restarts_watchdog() {
         let now = Instant::now();
-        l.record_progress();
-        l.refresh_waits(now - Duration::from_millis(10), rto);
+        let rto = Duration::from_millis(100);
+        let mut liveness = PeerLiveness::new();
+        liveness.on_send(now - Duration::from_secs(29), rto);
+        liveness.record_progress();
+        liveness.refresh_waits(now - Duration::from_secs(1), rto);
         assert!(
-            !l.should_terminate_session(now, true),
-            "progress 10ms ago must fend off watchdog"
+            !liveness.should_terminate_session(now + Duration::from_secs(2), true),
+            "first cumulative progress must replace the old progress deadline"
         );
     }
 }
