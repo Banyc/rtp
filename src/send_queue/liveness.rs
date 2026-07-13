@@ -118,25 +118,14 @@ mod tests {
 
         let mut latched = PeerLiveness::new();
         latched.on_send(now, Duration::from_millis(100));
-        latched.on_send(
-            now + Duration::from_secs(1),
-            Duration::from_secs(30),
-        );
-        assert!(
-            latched.should_terminate_session(now + Duration::from_secs(47), true)
-        );
-        assert!(
-            latched.should_terminate_session(now + Duration::from_secs(47), false)
-        );
-        assert!(
-            latched.should_terminate_session(now + MAX_WATCHDOG_TIMEOUT, true)
-        );
+        latched.on_send(now + Duration::from_secs(1), Duration::from_secs(30));
+        assert!(latched.should_terminate_session(now + Duration::from_secs(47), true));
+        assert!(latched.should_terminate_session(now + Duration::from_secs(47), false));
+        assert!(latched.should_terminate_session(now + MAX_WATCHDOG_TIMEOUT, true));
 
         let mut capped = PeerLiveness::new();
         capped.on_send(now, Duration::from_secs(30));
-        assert!(
-            !capped.should_terminate_session(now + Duration::from_secs(47), true)
-        );
+        assert!(!capped.should_terminate_session(now + Duration::from_secs(47), true));
         assert!(
             capped.should_terminate_session(
                 now + MAX_WATCHDOG_TIMEOUT + Duration::from_secs(1),
@@ -150,22 +139,13 @@ mod tests {
         let mut l = PeerLiveness::new();
         let rto = Duration::from_millis(100);
         let now = Instant::now();
-        l.on_send(
-            now - MIN_NO_RESP_FOR - Duration::from_millis(1),
-            rto,
-        );
+        l.on_send(now - MIN_NO_RESP_FOR - Duration::from_millis(1), rto);
         assert!(l.should_terminate_session(now, false));
         let mut l2 = PeerLiveness::new();
-        l2.on_send(
-            now - MIN_NO_RESP_FOR + Duration::from_millis(10),
-            rto,
-        );
+        l2.on_send(now - MIN_NO_RESP_FOR + Duration::from_millis(10), rto);
         assert!(!l2.should_terminate_session(now, false));
         let mut l3 = PeerLiveness::new();
-        l3.on_send(
-            now - MIN_NO_RESP_FOR - Duration::from_millis(1),
-            rto,
-        );
+        l3.on_send(now - MIN_NO_RESP_FOR - Duration::from_millis(1), rto);
         assert!(
             l3.should_terminate_session(now, false),
             "floor enforces 30s minimum"

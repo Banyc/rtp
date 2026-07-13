@@ -61,7 +61,10 @@ impl TailLossProber {
         let srtt = rtt_stats.smooth_rtt();
         let min_tol = Self::MIN_TOL;
         let doubled_srtt = srtt.mul_f64(2.);
-        let min_rtt_doubled = rtt_stats.min_rtt().map(|r| r.mul_f64(2.)).unwrap_or(doubled_srtt);
+        let min_rtt_doubled = rtt_stats
+            .min_rtt()
+            .map(|r| r.mul_f64(2.))
+            .unwrap_or(doubled_srtt);
         let cap = self.rto(rtt_stats);
         doubled_srtt.max(min_rtt_doubled).max(min_tol).min(cap)
     }
@@ -78,11 +81,7 @@ impl TailLossProber {
     }
 
     /// Next poll time for the next probe, if budget remains.
-    pub fn next_probe_time(
-        &self,
-        sent_time: Instant,
-        rtt_stats: &RttStats,
-    ) -> Option<Instant> {
+    pub fn next_probe_time(&self, sent_time: Instant, rtt_stats: &RttStats) -> Option<Instant> {
         if !self.can_probe() {
             return None;
         }
@@ -186,7 +185,10 @@ mod tests {
         tlp.sent();
         assert!(!tlp.can_probe());
         // next_probe_time returns None when budget exhausted
-        assert!(tlp.next_probe_time(Instant::now(), &settled_rtt_stats()).is_none());
+        assert!(
+            tlp.next_probe_time(Instant::now(), &settled_rtt_stats())
+                .is_none()
+        );
     }
 
     #[test]

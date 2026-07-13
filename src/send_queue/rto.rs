@@ -185,7 +185,10 @@ mod tests {
             "fast={fast:?} must be ≥ srtt+srtt/4={:?}",
             srtt + srtt / 4
         );
-        assert!(fast <= rto.rto(), "fast={fast:?} must be ≤ rto={:?}", rto.rto());
+        assert!(
+            fast <= rto.rto(),
+            "fast={fast:?} must be ≤ rto={:?}",
+            rto.rto()
+        );
     }
-
 }

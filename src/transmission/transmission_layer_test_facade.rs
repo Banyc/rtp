@@ -2,16 +2,15 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use async_trait::async_trait;
-use super::shared::{self, build_parts};
-use super::shared::Shared;
-use super::write_half::WriteHalf;
 use super::read_half::ReadHalf;
+use super::shared::Shared;
+use super::shared::{self, build_parts};
 use super::transmission_layer::{
-    LogConfig, RecvBufs, RecvPkts, SendBufs, SendKillPkt,
-    UnreliableLayer, UnreliableRead, UnreliableWrite,
-    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK,
+    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, LogConfig, MAX_NUM_ACK, RecvBufs, RecvPkts,
+    SendBufs, SendKillPkt, UnreliableLayer, UnreliableRead, UnreliableWrite,
 };
+use super::write_half::WriteHalf;
+use async_trait::async_trait;
 
 #[cfg(test)]
 pub struct TransmissionLayer {
@@ -211,9 +210,9 @@ impl TransmissionLayer {
             }
 
             let mut end_of_acks = false;
+            use super::ts_echo::TsEcho;
             use crate::codec::decode;
             use crate::sack::AckBallSequence;
-            use super::ts_echo::TsEcho;
             for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
                 bufs.ack_from_peer.clear();
                 let data = match decode(pkt, &mut bufs.ack_from_peer) {
@@ -228,7 +227,11 @@ impl TransmissionLayer {
 
                 if let Some(echo_ts) = data.echo_ts {
                     let local_ts = self.wire_ts(now);
-                    if self.recent_echoes.lock().unwrap().should_sample(echo_ts, now)
+                    if self
+                        .recent_echoes
+                        .lock()
+                        .unwrap()
+                        .should_sample(echo_ts, now)
                         && let Some(rtt) = TsEcho::rtt_from_echo(local_ts, echo_ts)
                     {
                         self.reliable_layer.lock().unwrap().sample_rtt(rtt, now);
@@ -254,8 +257,11 @@ impl TransmissionLayer {
                         None => false,
                         Some(data) => {
                             // UDP local -{data}> reliable
-                            let to_ack = reliable_layer
-                                .recv_data_pkt(data.seq, data.frame_len, &pkt[data.buf_range.clone()]);
+                            let to_ack = reliable_layer.recv_data_pkt(
+                                data.seq,
+                                data.frame_len,
+                                &pkt[data.buf_range.clone()],
+                            );
                             if FEC_DEBUG {
                                 eprintln!(
                                     "recv_data_pkt seq={} empty={} ack={}",
@@ -329,23 +335,21 @@ impl TransmissionLayer {
 
         // Wake the send path so it can flush pending ACKs.  The recv path
         // never sends, so it cannot block on a stalled `utp_write`.
-        let should_flush = ack_deadline_hit
-            || 0 < recv_pkts.num_fin_segments
-            || {
-                let s = self.ack_flush.lock().unwrap();
-                ACK_FLUSH_COUNT <= s.pending_acks
-                    || s.last_ack_flush
-                        .is_none_or(|last| ACK_FLUSH_AGE <= Instant::now().duration_since(last))
-                    || {
-                        let reliable_layer = self.reliable_layer.lock().unwrap();
-                        reliable_layer
-                            .pkt_recv_space()
-                            .ack_history()
-                            .balls()
-                            .nth(1)
-                            .is_some()
-                    }
-            };
+        let should_flush = ack_deadline_hit || 0 < recv_pkts.num_fin_segments || {
+            let s = self.ack_flush.lock().unwrap();
+            ACK_FLUSH_COUNT <= s.pending_acks
+                || s.last_ack_flush
+                    .is_none_or(|last| ACK_FLUSH_AGE <= Instant::now().duration_since(last))
+                || {
+                    let reliable_layer = self.reliable_layer.lock().unwrap();
+                    reliable_layer
+                        .pkt_recv_space()
+                        .ack_history()
+                        .balls()
+                        .nth(1)
+                        .is_some()
+                }
+        };
         if should_flush {
             self.coord.resume_send.notify_one();
         }
@@ -437,7 +441,11 @@ mod tests {
     /// `fec` toggles FEC on; `enabled` toggles the `RTP_RTX_DUP` retransmit
     /// armor; `tuning` sets the per-connection FEC tuning (defaults to stock).
     fn harness(fec: bool, enabled: bool) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
-        harness_with_tuning(fec, enabled, crate::transmission::fec_tuning::FecTuning::default())
+        harness_with_tuning(
+            fec,
+            enabled,
+            crate::transmission::fec_tuning::FecTuning::default(),
+        )
     }
 
     fn harness_with_tuning(
@@ -461,8 +469,13 @@ mod tests {
         }
         let write = SharedWrite(recorder.clone());
         let read = BlackholeRead;
-        let ul =
-            crate::udp::wrap_fec_with_mss_and_fec_tuning(read, write, fec, crate::udp::NO_FEC_MSS, tuning);
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            read,
+            write,
+            fec,
+            crate::udp::NO_FEC_MSS,
+            tuning,
+        );
         let mut tl = TransmissionLayer::new(ul, None);
         tl.set_rtx_dup_for_test(enabled);
         (tl, recorder)
@@ -478,7 +491,10 @@ mod tests {
         let _seq = send_one_packet(&tl, Instant::now());
         wait_for_rtx_window().await;
         // Force the queue-building gate closed.
-        tl.reliable_layer().lock().unwrap().set_queue_building_for_test(true);
+        tl.reliable_layer()
+            .lock()
+            .unwrap()
+            .set_queue_building_for_test(true);
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
         // Exactly one datagram (the primary rtx/TLP); the dup was suppressed by
@@ -1064,7 +1080,12 @@ mod tests {
         // we can't easily count sample_rtt calls, we verify the test
         // doesn't panic and the recv completes.  The dedup unit test in
         // ts_echo.rs covers the exact "exactly once" assertion.
-        let rtt = tl.reliable_layer.lock().unwrap().pkt_send_space().smooth_rtt();
+        let rtt = tl
+            .reliable_layer
+            .lock()
+            .unwrap()
+            .pkt_send_space()
+            .smooth_rtt();
         // The echo was deduped, so only one RTT sample was fed.  The exact
         // SRTT value depends on the filter; we just assert it's positive
         // (one sample was processed).

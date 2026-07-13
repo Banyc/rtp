@@ -512,7 +512,11 @@ mod tests {
         use core::num::NonZeroUsize;
         use core::time::Duration;
         use primitive::ops::float::PosR;
-        let mut tb = TokenBucket::new(PosR::new(1.0).unwrap(), NonZeroUsize::new(usize::MAX).unwrap(), now);
+        let mut tb = TokenBucket::new(
+            PosR::new(1.0).unwrap(),
+            NonZeroUsize::new(usize::MAX).unwrap(),
+            now,
+        );
         // Force-fill then drain all tokens.
         let later = now + Duration::from_secs(1000);
         let _ = tb.gen_tokens(later);
@@ -791,8 +795,9 @@ mod tests {
 
         // Encode 8 distinct data symbols so we can identify which one was
         // recovered.  Each codec packet is a small unique payload.
-        let payloads: Vec<Vec<u8>> =
-            (0..INSTREAM_DATA_PER_GROUP).map(|i| vec![i as u8; 32]).collect();
+        let payloads: Vec<Vec<u8>> = (0..INSTREAM_DATA_PER_GROUP)
+            .map(|i| vec![i as u8; 32])
+            .collect();
         let mut sym_buf = vec![0u8; 8192];
         let mut wire_data_pkts = vec![];
         for p in &payloads {

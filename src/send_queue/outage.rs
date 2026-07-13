@@ -81,8 +81,7 @@ impl OutageEpoch {
     /// be ignored.  Used to prevent bogus blackout-spanning samples from
     /// collapsing the send rate back toward zero.
     pub(crate) fn should_censor_rate_sample(&self, prior_time: Instant) -> bool {
-        self.recovery_start.is_some()
-            && self.outage_loss_cut.is_some_and(|cut| prior_time < cut)
+        self.recovery_start.is_some() && self.outage_loss_cut.is_some_and(|cut| prior_time < cut)
     }
 
     /// Detect whether an outage-recovery epoch should start (or be re-armed).

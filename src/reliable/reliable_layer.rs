@@ -533,30 +533,28 @@ impl ReliableLayer {
             .checked_sub(crate::codec::frame_data_overhead())
             .unwrap();
 
-        let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) = match self
-            .pending_frames
-            .first_mut()
-        {
-            Some(pf) => {
-                let remaining = pf.data.len() - pf.offset;
-                let cap = if pf.offset == 0 {
-                    first_pkt_max_payload
-                } else {
-                    normal_max_payload
-                };
-                let take = remaining.min(cap);
-                (pf.data.len() as u32, pf.offset, take, pf.offset == 0)
-            }
-            None => {
-                if !matches!(self.send_fin_buf, SendFinBuf::Some) {
-                    return None;
+        let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) =
+            match self.pending_frames.first_mut() {
+                Some(pf) => {
+                    let remaining = pf.data.len() - pf.offset;
+                    let cap = if pf.offset == 0 {
+                        first_pkt_max_payload
+                    } else {
+                        normal_max_payload
+                    };
+                    let take = remaining.min(cap);
+                    (pf.data.len() as u32, pf.offset, take, pf.offset == 0)
                 }
-                if !no_pending {
-                    return None;
+                None => {
+                    if !matches!(self.send_fin_buf, SendFinBuf::Some) {
+                        return None;
+                    }
+                    if !no_pending {
+                        return None;
+                    }
+                    (0u32, 0usize, 0usize, false)
                 }
-                (0u32, 0usize, 0usize, false)
-            }
-        };
+            };
 
         if !self
             .send_rate_limiter
@@ -2086,7 +2084,9 @@ mod tests {
 
         // Send the first (and only) packet.
         let mut pkt = vec![0u8; mss];
-        let p = rl.send_data_pkt(&mut pkt, now).expect("must send first pkt");
+        let p = rl
+            .send_data_pkt(&mut pkt, now)
+            .expect("must send first pkt");
         assert!(p.frame_len.is_some(), "first packet must carry frame_len");
 
         let payload_len = match p.data_written {

@@ -1,5 +1,8 @@
 use core::time::Duration;
-use std::{sync::{Arc, Mutex}, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
@@ -11,11 +14,9 @@ use tokio::task::JoinSet;
 use crate::{
     codec::in_cmd_space,
     transmission::{
-        shared::{build_parts, Shared},
+        shared::{Shared, build_parts},
+        transmission_layer::{LogConfig, RecvBufs, SendBufs, SendKillPkt, UnreliableLayer},
         write_half::WriteHalf,
-        transmission_layer::{
-            LogConfig, RecvBufs, SendBufs, SendKillPkt, UnreliableLayer,
-        },
     },
 };
 
@@ -227,10 +228,7 @@ pub fn socket(
                 //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
-                let recv_pkts = match read_half
-                    .recv_pkts(&mut recv_bufs)
-                    .await
-                {
+                let recv_pkts = match read_half.recv_pkts(&mut recv_bufs).await {
                     Ok(recv_pkts) => recv_pkts,
                     Err((_e, should_send_kill_pkt)) => {
                         match should_send_kill_pkt {
@@ -567,9 +565,7 @@ pub async fn server_opening_handshake(
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     let due = Instant::now() + INIT_CONNECT_RTO;
-    let send_due = due
-        .checked_sub(2 * INIT_CONNECT_RTO)
-        .unwrap_or(due);
+    let send_due = due.checked_sub(2 * INIT_CONNECT_RTO).unwrap_or(due);
     handshake_send(&mut unreliable.utp_write, &challenge, send_due).await?;
 
     neg_challenge(&mut challenge);
@@ -764,9 +760,7 @@ mod tests {
     async fn test_fec_recovers_under_loss_with_mss_8192() {
         use crate::socket::socket;
         use crate::transmission::fec_tuning::FecTuning;
-        use crate::udp::testing::{
-            LossRate, wrap_fec_lossy_with_mss_and_fec_tuning,
-        };
+        use crate::udp::testing::{LossRate, wrap_fec_lossy_with_mss_and_fec_tuning};
 
         // 3% loss on each side.
         let rate_a = LossRate::new(300);
@@ -785,12 +779,10 @@ mod tests {
         // lossy read/write injected.  No post-construction overrides of
         // `.fec` or `.fec_tuning` — the test must exercise the real path so
         // a regression disabling FEC at non-default MSS fails here.
-        let a_layer = wrap_fec_lossy_with_mss_and_fec_tuning(
-            a.clone(), a, fec, mss, tuning, rate_a,
-        );
-        let b_layer = wrap_fec_lossy_with_mss_and_fec_tuning(
-            b.clone(), b, fec, mss, tuning, rate_b,
-        );
+        let a_layer =
+            wrap_fec_lossy_with_mss_and_fec_tuning(a.clone(), a, fec, mss, tuning, rate_a);
+        let b_layer =
+            wrap_fec_lossy_with_mss_and_fec_tuning(b.clone(), b, fec, mss, tuning, rate_b);
         let (a_r, a_w) = socket(a_layer, None);
         let (b_r, b_w) = socket(b_layer, None);
         let b_r = b_r;
@@ -967,12 +959,18 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
 
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            a.clone(), a, fec, mss,
+            a.clone(),
+            a,
+            fec,
+            mss,
             crate::transmission::fec_tuning::FecTuning::default(),
             fd,
         );
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            b.clone(), b, fec, mss,
+            b.clone(),
+            b,
+            fec,
+            mss,
             crate::transmission::fec_tuning::FecTuning::default(),
             fd,
         );
@@ -994,14 +992,11 @@ mod tests {
         });
 
         // Receive one frame on the receiver.
-        let frame = tokio::time::timeout(
-            Duration::from_secs(5),
-            b_r.recv_frame(),
-        )
-        .await
-        .expect("recv_frame timed out")
-        .expect("recv_frame failed")
-        .expect("expected a frame, got EOF");
+        let frame = tokio::time::timeout(Duration::from_secs(5), b_r.recv_frame())
+            .await
+            .expect("recv_frame timed out")
+            .expect("recv_frame failed")
+            .expect("expected a frame, got EOF");
 
         assert_eq!(
             frame.len(),
@@ -1021,8 +1016,8 @@ mod tests {
     /// a pending send future hung past the deadline indefinitely.
     #[tokio::test(flavor = "multi_thread")]
     async fn handshake_send_times_out_on_sustained_would_block() {
-        use async_trait::async_trait;
         use crate::transmission::transmission_layer::UnreliableWrite;
+        use async_trait::async_trait;
 
         struct AlwaysWouldBlock;
         #[async_trait]
@@ -1072,8 +1067,8 @@ mod tests {
     /// retrying the now-ready send).
     #[tokio::test(flavor = "multi_thread")]
     async fn handshake_send_completes_on_late_writability() {
-        use async_trait::async_trait;
         use crate::transmission::transmission_layer::UnreliableWrite;
+        use async_trait::async_trait;
 
         struct LateWritable {
             ready_at: Instant,

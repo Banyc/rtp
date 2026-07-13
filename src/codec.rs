@@ -58,7 +58,13 @@ pub fn encode_ack_data(
         wtr.write_u32::<BigEndian>(echo_ts)
             .pipe(wrap_insufficient_buffer_size_err)?;
     }
-    if let Some(EncodeData { seq, send_ts, frame_len, data }) = data {
+    if let Some(EncodeData {
+        seq,
+        send_ts,
+        frame_len,
+        data,
+    }) = data
+    {
         match (send_ts, frame_len) {
             (Some(send_ts), Some(frame_len)) => {
                 wtr.write_u8(FRAME_DATA_TS_CMD)

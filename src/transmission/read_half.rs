@@ -1,16 +1,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::{
-    codec::decode,
-    sack::AckBallSequence,
-};
 use super::shared::Shared;
 use super::transmission_layer::{
-    RecvBufs, RecvPkts, SendKillPkt, ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK,
+    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, RecvBufs, RecvPkts, SendKillPkt,
     UnreliableRead,
 };
 use super::ts_echo::{RecentEchoes, TsEcho};
+use crate::{codec::decode, sack::AckBallSequence};
 
 pub struct ReadHalf {
     pub(crate) utp_read: Box<dyn UnreliableRead>,

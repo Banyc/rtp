@@ -945,7 +945,8 @@ pub mod testing {
         R: UnreliableRead + Send + Sync + 'static,
         W: UnreliableWrite + Send + Sync + 'static,
     {
-        let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning, FrameDelivery::default());
+        let (mss, fec_state, tuning) =
+            checked_mss_and_fec(fec, mss, tuning, FrameDelivery::default());
         UnreliableLayer {
             utp_read: Box::new(LossyRead::new(read, rate.clone())),
             utp_write: Box::new(LossyWrite::new(write, rate)),
@@ -1203,15 +1204,16 @@ mod tests {
         }
 
         let mut buf = [0u8; 32];
-        let (n, from) = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            peer.recv_from(&mut buf),
-        )
-        .await
-        .expect("peer recv timed out")
-        .expect("peer recv failed");
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv_from(&mut buf))
+                .await
+                .expect("peer recv timed out")
+                .expect("peer recv failed");
         assert_eq!(&buf[..n], payload);
-        assert_eq!(from.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(
+            from.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        );
     }
 
     /// Fix #10: `frame_delivery_mss_to_small_for_first_frame_header_errors`

@@ -2,10 +2,7 @@ use std::collections::BTreeMap;
 
 use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
-use crate::{
-    sack::AckQueue,
-    transmission::frame_delivery::FrameDelivery,
-};
+use crate::{sack::AckQueue, transmission::frame_delivery::FrameDelivery};
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
 
@@ -125,24 +122,24 @@ impl PktRecvSpace {
                             return Some(collected_seqs);
                         }
                     } else {
-                    // Already inside a frame run.
-                    // A continuation slot with its own `frame_len` signals
-                    // a new frame — stop the current run.
-                    if let Some(fl) = pkt.frame_len {
-                        // Current frame is incomplete; reset and start
-                        // scanning from this new start.
-                        collected_seqs.clear();
-                        if fl == 0 {
-                            return Some(vec![seq]);
+                        // Already inside a frame run.
+                        // A continuation slot with its own `frame_len` signals
+                        // a new frame — stop the current run.
+                        if let Some(fl) = pkt.frame_len {
+                            // Current frame is incomplete; reset and start
+                            // scanning from this new start.
+                            collected_seqs.clear();
+                            if fl == 0 {
+                                return Some(vec![seq]);
+                            }
+                            target_len = Some(fl);
+                            collected_seqs.push(seq);
+                            collected = pkt.data.len();
+                            if collected >= fl as usize {
+                                return Some(collected_seqs);
+                            }
+                            continue;
                         }
-                        target_len = Some(fl);
-                        collected_seqs.push(seq);
-                        collected = pkt.data.len();
-                        if collected >= fl as usize {
-                            return Some(collected_seqs);
-                        }
-                        continue;
-                    }
                         // Continuation packet: must be consecutive.
                         let expected = *collected_seqs.last().unwrap() + 1;
                         if seq != expected {
@@ -358,10 +355,13 @@ mod tests {
         // Insert tombstones ahead of the cursor.
         space.slots.insert(0, RecvSlot::Tombstone);
         space.slots.insert(1, RecvSlot::Tombstone);
-        space.slots.insert(2, RecvSlot::Data(RecvPkt {
-            data: b"hello".to_vec(),
-            frame_len: None,
-        }));
+        space.slots.insert(
+            2,
+            RecvSlot::Data(RecvPkt {
+                data: b"hello".to_vec(),
+                frame_len: None,
+            }),
+        );
         space.next = Some(0);
         space.collapse_tombstone_prefix();
         assert_eq!(space.next, Some(2));
@@ -372,10 +372,13 @@ mod tests {
     fn pop_skips_head_tombstones() {
         let mut space = PktRecvSpace::new(FrameDelivery::default());
         space.slots.insert(0, RecvSlot::Tombstone);
-        space.slots.insert(1, RecvSlot::Data(RecvPkt {
-            data: b"world".to_vec(),
-            frame_len: None,
-        }));
+        space.slots.insert(
+            1,
+            RecvSlot::Data(RecvPkt {
+                data: b"world".to_vec(),
+                frame_len: None,
+            }),
+        );
         space.next = Some(0);
         // First pop skips tombstone at 0.
         assert_eq!(space.pop().unwrap(), b"world");

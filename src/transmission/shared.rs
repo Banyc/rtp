@@ -1,17 +1,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::reliable::reliable_layer::{ReliableLayer, SharedTokenBucket};
 use super::coordination::Coordination;
-use super::write_half::WriteHalf;
+use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::transmission_layer::{
-    AckFlushState, FirstError, Log, LogConfig, UnreliableLayer,
-    PRINT_DEBUG_MSGS,
-    rtx_dup_from_env, instream_group_fec_from_env, ReliableLayerLogger,
+    AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS, ReliableLayerLogger,
+    UnreliableLayer, instream_group_fec_from_env, rtx_dup_from_env,
 };
-use super::fec::FecState;
 use super::ts_echo::RecentEchoes;
+use super::write_half::WriteHalf;
+use crate::reliable::reliable_layer::{ReliableLayer, SharedTokenBucket};
 
 #[derive(Debug)]
 pub struct Shared {
@@ -33,8 +32,6 @@ pub fn build_parts(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (Arc<Shared>, Arc<WriteHalf>, ReadHalf) {
-    
-    
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
     let (reliable_layer, send_rate_limiter) =

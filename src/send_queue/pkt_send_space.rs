@@ -207,8 +207,7 @@ impl PktSendSpace {
     }
 
     pub fn stall_reason(&self, now: Instant) -> Option<super::liveness::PeerStall> {
-        self.liveness
-            .stall_reason(now, !self.no_pkts_in_flight())
+        self.liveness.stall_reason(now, !self.no_pkts_in_flight())
     }
 
     #[cfg(test)]
@@ -430,12 +429,7 @@ impl PktSendSpace {
             .any(|(s, p)| {
                 let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
                 let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
-                let time_based = p.is_rtx(
-                    is_seq_out_of_order,
-                    is_pre_outage_loss,
-                    rtx_window,
-                    now,
-                );
+                let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, rtx_window, now);
                 let fast_loss = fast_loss_armed && p.is_fast_loss();
                 time_based || fast_loss
             })
@@ -566,8 +560,7 @@ impl PktSendSpace {
                 .and_then(|o| o.as_ref())
                 .is_some();
             if still_in_flight {
-                self.loss_event_window
-                    .record_lost(1, now, smooth_rtt);
+                self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
             self.deferred_losses.swap_remove(i);
         }
@@ -640,7 +633,8 @@ impl PktSendSpace {
         ) {
             OutageDetection::NewEpoch => {
                 self.rtt_stats.reset_rto(rto);
-                self.loss_event_window.reset(now, self.rtt_stats.smooth_rtt());
+                self.loss_event_window
+                    .reset(now, self.rtt_stats.smooth_rtt());
                 true
             }
             OutageDetection::Rearming => true,
@@ -767,14 +761,13 @@ impl PktSendSpace {
             // cumulative ACK and never declared lost on the reorder path).
             if s < self.out_of_order_seq_end {
                 let rw_t = p.sent_time + rtx_window;
-                min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(rw_t)).unwrap_or(rw_t));
+                min_next_poll_time =
+                    Some(min_next_poll_time.map(|min| min.min(rw_t)).unwrap_or(rw_t));
             }
         }
         if let Some(seq) = self.tail_seq()
             && let Some(Some(p)) = self.send_wnd.get(&seq)
-            && let Some(t) = self
-                .tlp
-                .next_probe_time(p.sent_time, &self.rtt_stats)
+            && let Some(t) = self.tlp.next_probe_time(p.sent_time, &self.rtt_stats)
         {
             min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
         }
@@ -1698,9 +1691,7 @@ mod tests {
 
         // Fast-loss retransmit of seq 0 fires before the reorder window.
         let rtx_t = t0 + ms(30);
-        let rtx = space
-            .rtx(rtx_t)
-            .expect("fast loss should fire for seq 0");
+        let rtx = space.rtx(rtx_t).expect("fast loss should fire for seq 0");
         assert_eq!(rtx.seq, 0);
         // The retransmit is recorded as a fast-loss rtx for reordering检测.
         assert_eq!(
@@ -1779,9 +1770,7 @@ mod tests {
         );
 
         let rtx_t = t0 + ms(30);
-        let rtx = space
-            .rtx(rtx_t)
-            .expect("fast loss should fire for seq 0");
+        let rtx = space.rtx(rtx_t).expect("fast loss should fire for seq 0");
         assert_eq!(rtx.seq, 0);
 
         // A fast-loss retransmit is a genuine loss declaration, not a TLP
@@ -1861,7 +1850,10 @@ mod tests {
         let fast_deadline = t0 + fast;
         let stock_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
-        assert!(rtx_t < stock_deadline, "rtx_t must be before stock deadline");
+        assert!(
+            rtx_t < stock_deadline,
+            "rtx_t must be before stock deadline"
+        );
 
         // No loss event before the rtx.
         assert!(
@@ -2022,7 +2014,10 @@ mod tests {
         );
 
         let rtx_t = stock_deadline + ms(1);
-        assert!(space.has_rtx(rtx_t), "toggle off: stock rtx fires at stock deadline");
+        assert!(
+            space.has_rtx(rtx_t),
+            "toggle off: stock rtx fires at stock deadline"
+        );
         let rtx = space.rtx(rtx_t).expect("stock rtx at stock deadline");
         assert_eq!(rtx.seq, 0);
         assert!(
@@ -2122,9 +2117,7 @@ mod tests {
             no_progress.is_some_and(|d| d > Duration::from_secs(30)),
             "fresh SACKs beyond the hole must not reset cumulative progress; no_progress={no_progress:?}"
         );
-        assert!(
-            space.should_terminate_session(last_ack)
-        );
+        assert!(space.should_terminate_session(last_ack));
     }
 
     #[test]
@@ -2158,8 +2151,6 @@ mod tests {
             no_progress.is_some_and(|d| d > Duration::from_secs(30)),
             "the initial cumulative hole must age even before first progress; no_progress={no_progress:?}"
         );
-        assert!(
-            space.should_terminate_session(last_ack)
-        );
+        assert!(space.should_terminate_session(last_ack));
     }
 }
