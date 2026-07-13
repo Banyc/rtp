@@ -5,6 +5,12 @@ pub(crate) const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
 pub(crate) const MIN_NO_PROGRESS_FOR: Duration = Duration::from_secs(30);
 pub(crate) const MAX_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerStall {
+    NoResponse,
+    NoProgress,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WatchdogWait {
     started_at: Instant,
@@ -82,11 +88,22 @@ impl PeerLiveness {
         self.progress_wait.map(|wait| wait.elapsed(now))
     }
 
-    pub(crate) fn should_terminate_session(&self, now: Instant, has_in_flight: bool) -> bool {
+    pub(crate) fn stall_reason(&self, now: Instant, has_in_flight: bool) -> Option<PeerStall> {
         let response_dead = self.resp_wait.is_some_and(|wait| wait.expired(now));
         let progress_dead =
             has_in_flight && self.progress_wait.is_some_and(|wait| wait.expired(now));
-        response_dead || progress_dead
+        if response_dead {
+            Some(PeerStall::NoResponse)
+        } else if progress_dead {
+            Some(PeerStall::NoProgress)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn should_terminate_session(&self, now: Instant, has_in_flight: bool) -> bool {
+        self.stall_reason(now, has_in_flight).is_some()
     }
 }
 
@@ -184,6 +201,27 @@ mod tests {
         assert!(
             !liveness.should_terminate_session(now + Duration::from_secs(2), true),
             "first cumulative progress must replace the old progress deadline"
+        );
+    }
+
+    #[test]
+    fn stall_reason_distinguishes_response_and_progress_watchdogs() {
+        let now = Instant::now();
+        let rto = Duration::from_millis(100);
+        let mut no_response = PeerLiveness::new();
+        no_response.on_send(now - Duration::from_secs(31), rto);
+        assert_eq!(
+            no_response.stall_reason(now, false),
+            Some(PeerStall::NoResponse)
+        );
+        let mut no_progress = PeerLiveness::new();
+        no_progress.record_progress();
+        no_progress.on_send(now - Duration::from_secs(31), rto);
+        no_progress.refresh_waits(now - Duration::from_secs(31), rto);
+        no_progress.resp_wait = None;
+        assert_eq!(
+            no_progress.stall_reason(now, true),
+            Some(PeerStall::NoProgress)
         );
     }
 }

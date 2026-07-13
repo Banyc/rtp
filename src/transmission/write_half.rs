@@ -25,20 +25,32 @@ impl std::ops::Deref for WriteHalf {
 impl WriteHalf {
     pub(crate) fn proactively_terminate_stalled_session(&self) {
         let now = Instant::now();
-        let snapshot = {
+        let context = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
-            if !reliable_layer.pkt_send_space().should_terminate_session(now) {
+            let send_space = reliable_layer.pkt_send_space();
+            let Some(reason) = send_space.stall_reason(now) else {
                 return;
-            }
-            reliable_layer.log()
+            };
+            (
+                reason,
+                send_space
+                    .no_resp_for(now)
+                    .map(|duration| duration.as_millis()),
+                send_space
+                    .no_progress_for(now)
+                    .map(|duration| duration.as_millis()),
+                reliable_layer.log(),
+            )
         };
         if self
             .first_error
             .set_if_empty(std::io::ErrorKind::BrokenPipe)
         {
+            let (reason, no_response_for_ms, no_progress_for_ms, snapshot) = context;
             eprintln!(
-                "WARN rtp_session_terminated trigger=proactive_stall \
-                 error_kind=BrokenPipe snapshot={snapshot:?}"
+                "WARN rtp_session_terminated trigger=proactive_stall reason={reason:?} \
+                 error_kind=BrokenPipe no_response_for_ms={no_response_for_ms:?} \
+                 no_progress_for_ms={no_progress_for_ms:?} snapshot={snapshot:?}"
             );
         }
     }

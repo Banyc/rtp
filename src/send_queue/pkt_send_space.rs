@@ -198,19 +198,24 @@ impl PktSendSpace {
         &mut self.reused_buf
     }
 
-    #[cfg(test)]
     pub fn no_resp_for(&self, now: Instant) -> Option<Duration> {
         self.liveness.no_resp_for(now)
     }
 
-    #[cfg(test)]
     pub fn no_progress_for(&self, now: Instant) -> Option<Duration> {
         self.liveness.no_progress_for(now)
     }
 
+    pub fn stall_reason(&self, now: Instant) -> Option<super::liveness::PeerStall> {
+        self.liveness
+            .stall_reason(now, !self.no_pkts_in_flight())
+    }
+
+    #[cfg(test)]
     pub fn should_terminate_session(&self, now: Instant) -> bool {
         self.liveness
-            .should_terminate_session(now, !self.no_pkts_in_flight())
+            .stall_reason(now, !self.no_pkts_in_flight())
+            .is_some()
     }
 
     pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
