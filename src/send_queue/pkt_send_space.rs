@@ -208,13 +208,9 @@ impl PktSendSpace {
         self.liveness.no_progress_for(now)
     }
 
-    /// Terminate a stalled session using liveness policy constants.
     pub fn should_terminate_session(&self, now: Instant) -> bool {
-        self.liveness.should_terminate_session(
-            now,
-            self.rto_duration(),
-            !self.no_pkts_in_flight(),
-        )
+        self.liveness
+            .should_terminate_session(now, !self.no_pkts_in_flight())
     }
 
     pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
@@ -234,15 +230,6 @@ impl PktSendSpace {
             self.tlp.reset();
         }
 
-        // Evidence-gated fast loss — observed-reordering detection.
-        //
-        // If a packet that we retransmitted via the fast-loss path is acked,
-        // and the ACK arrives before the retransmit itself could plausibly
-        // have made a round trip (i.e. before `fast_loss_rtx_time + min_rtt`),
-        // the peer must have received the *original* — the link reorders, so
-        // fast loss is unsafe on this connection.  Hard-disable it for the
-        // life of the connection; the structural jitter gate alone is not
-        // enough to re-arm after a real reordering event.
         if !self.fast_loss_disabled
             && let Some(min_rtt) = self.rtt_stats.min_rtt()
         {
@@ -267,21 +254,9 @@ impl PktSendSpace {
                 self.send_wnd.pop().unwrap();
                 self.send_wnd.pop_none();
             }
-
-            // Jitter-tolerant fast-retransmit: the original (or the repair)
-            // was acked before the stock reorder-window deadline elapsed, so
-            // this was reordering, not loss — cancel any deferred loss-event
-            // recording for this seq so CC does not double-count it.
             if !self.deferred_losses.is_empty() {
                 self.deferred_losses.retain(|dl| dl.seq != s);
             }
-
-            // Do not use the ACK arrival time as an RTT sample: `sent_time` is
-            // refreshed on every retransmission, so an ACK for a retransmitted
-            // packet would be Karn-ambiguous; ACK decimation can hold ACKs for
-            // up to ACK_FLUSH_AGE, skewing the sample; and this path bypasses
-            // the outage-recovery censoring in `sample_rtt`.  All RTT samples
-            // come from peer-echoed send timestamps via `sample_rtt`.
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
@@ -294,23 +269,12 @@ impl PktSendSpace {
             self.liveness.record_progress();
         }
 
-        // Evidence-gated fast loss — SACK-pass accounting.
-        //
-        // For each SACK ball the peer reported, every older in-flight packet
-        // that the SACKed sequence passed gets its `sack_passes` counter
-        // incremented.  The counter is always maintained; the *declaration*
-        // (in `rtx`/`has_rtx`) is what is gated by the structural low-jitter
-        // arming condition and the observed-reordering hard-disable.
         for ball in recved.balls() {
             let ball_end = ball.start + ball.size.get();
             for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
                 if s < ball.start {
-                    // Every SACKed seq in this ball is newer than `s`; the
-                    // ball covers `ball.size.get()` packets past it.
                     p.sack_passes = p.sack_passes.saturating_add(ball.size.get() as u32);
                 } else if s < ball_end {
-                    // `s` is itself inside this SACKed ball and will be
-                    // acked above; no passes to count for it.
                 }
             }
         }
@@ -324,7 +288,8 @@ impl PktSendSpace {
             self.liveness.reset_waits();
             return;
         }
-        self.liveness.refresh_waits(now);
+        let rto = self.rtt_stats.rto_duration();
+        self.liveness.refresh_waits(now, rto);
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
@@ -417,6 +382,9 @@ impl PktSendSpace {
 
         self.max_pipe_seq = MinNoneOptCmp(Some(s));
 
+        let rto = self.rtt_stats.rto_duration();
+        self.liveness.on_send(now, rto);
+
         let p = TxingPkt {
             stats,
             sent_time: now,
@@ -434,7 +402,6 @@ impl PktSendSpace {
         self.send_wnd.push(Some(p));
         self.num_txing += 1;
         self.tlp.reset();
-        self.liveness.on_send(now);
 
         Pkt {
             seq: s,
@@ -661,7 +628,7 @@ impl PktSendSpace {
 
         match self.outage.detect(
             now,
-            self.liveness.ever_progressed(),
+            self.liveness.ever_progressed,
             no_progress_for,
             rto,
             has_loss_event,

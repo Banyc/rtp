@@ -1,99 +1,94 @@
 use std::time::{Duration, Instant};
 
-/// 16×RTO: response-watchdog and progress-watchdog multiplier.
 pub(crate) const RTO_WATCHDOG_MULTIPLIER: f64 = 16.0;
-/// Response watchdog floor: a peer must not be declared dead before this.
 pub(crate) const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
-/// Progress stall floor: zero forward progress for this long is terminal.
 pub(crate) const MIN_NO_PROGRESS_FOR: Duration = Duration::from_secs(30);
+pub(crate) const MAX_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Peer-liveness monitor: tracks forward-progress and response-watchdog
-/// clocks so the send space can detect a silent peer.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WatchdogWait {
+    started_at: Instant,
+    deadline: Instant,
+}
+
+impl WatchdogWait {
+    fn new(started_at: Instant, rto: Duration, floor: Duration) -> Self {
+        let timeout = rto
+            .mul_f64(RTO_WATCHDOG_MULTIPLIER)
+            .max(floor)
+            .min(MAX_WATCHDOG_TIMEOUT);
+        Self {
+            started_at,
+            deadline: started_at + timeout,
+        }
+    }
+
+    fn elapsed(self, now: Instant) -> Duration {
+        now.duration_since(self.started_at)
+    }
+
+    fn expired(self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PeerLiveness {
-    /// Detect if the peer has died.
-    resp_wait_start: Option<Instant>,
-    /// Has any packet ever been acked or have we ever had to wait?
-    ever_progressed: bool,
-    /// Start of the latest interval during which no forward progress was made.
-    progress_wait_start: Option<Instant>,
+    resp_wait: Option<WatchdogWait>,
+    pub(crate) ever_progressed: bool,
+    progress_wait: Option<WatchdogWait>,
 }
 
 impl PeerLiveness {
     pub(crate) fn new() -> Self {
         Self {
-            resp_wait_start: None,
+            resp_wait: None,
             ever_progressed: false,
-            progress_wait_start: None,
+            progress_wait: None,
         }
     }
 
-    /// Whether the peer has ever made forward progress.
-    pub(crate) fn ever_progressed(&self) -> bool {
-        self.ever_progressed
-    }
-
-    /// Call when an ACK delivered at least one new packet.
     pub(crate) fn record_progress(&mut self) {
-        self.ever_progressed = true;
-        self.progress_wait_start = None;
+        if self.ever_progressed {
+            self.progress_wait = None;
+        } else {
+            self.ever_progressed = true;
+        }
     }
 
-    /// Call when the send window becomes empty (no packets to track).
     pub(crate) fn reset_waits(&mut self) {
-        self.resp_wait_start = None;
-        self.progress_wait_start = None;
+        self.resp_wait = None;
+        self.progress_wait = None;
     }
 
-    /// Call after an ACK when the window is still non-empty: the peer has
-    /// responded, and if progress was made earlier the stall clock starts.
-    pub(crate) fn refresh_waits(&mut self, now: Instant) {
-        self.resp_wait_start = Some(now);
-        if self.progress_wait_start.is_none() {
-            self.progress_wait_start = Some(now);
+    pub(crate) fn refresh_waits(&mut self, now: Instant, rto: Duration) {
+        self.resp_wait = Some(WatchdogWait::new(now, rto, MIN_NO_RESP_FOR));
+        if self.progress_wait.is_none() {
+            self.progress_wait = Some(WatchdogWait::new(now, rto, MIN_NO_PROGRESS_FOR));
         }
     }
 
-    /// Call on every new packet send: starts the response watchdog if it was
-    /// idle, and the stall clock if the pipe was empty after prior progress.
-    pub(crate) fn on_send(&mut self, now: Instant) {
-        if self.resp_wait_start.is_none() {
-            self.resp_wait_start = Some(now);
+    pub(crate) fn on_send(&mut self, now: Instant, rto: Duration) {
+        if self.resp_wait.is_none() {
+            self.resp_wait = Some(WatchdogWait::new(now, rto, MIN_NO_RESP_FOR));
         }
-        if self.progress_wait_start.is_none() {
-            self.progress_wait_start = Some(now);
+        if self.progress_wait.is_none() {
+            self.progress_wait = Some(WatchdogWait::new(now, rto, MIN_NO_PROGRESS_FOR));
         }
     }
 
     pub(crate) fn no_resp_for(&self, now: Instant) -> Option<Duration> {
-        Some(now.duration_since(self.resp_wait_start?))
+        self.resp_wait.map(|wait| wait.elapsed(now))
     }
 
     pub(crate) fn no_progress_for(&self, now: Instant) -> Option<Duration> {
-        Some(now.duration_since(self.progress_wait_start?))
+        self.progress_wait.map(|wait| wait.elapsed(now))
     }
 
-    /// Terminate a stalled session: the peer has stopped responding
-    /// (response watchdog) or made zero cumulative forward progress for
-    /// longer than the progress watchdog allows.
-    ///
-    /// `now` is the current monotonic instant; `rto` is the PktSendSpace
-    /// RTO duration; `has_in_flight` must be true only when there are
-    /// packets in the send window.
-    pub(crate) fn should_terminate_session(
-        &self,
-        now: Instant,
-        rto: Duration,
-        has_in_flight: bool,
-    ) -> bool {
-        let rto_watchdog = rto.mul_f64(RTO_WATCHDOG_MULTIPLIER);
-        let response_dead = self
-            .resp_wait_start
-            .is_some_and(|start| now.duration_since(start) >= rto_watchdog.max(MIN_NO_RESP_FOR));
-        let progress_dead = has_in_flight
-            && self
-                .progress_wait_start
-                .is_some_and(|start| now.duration_since(start) >= rto_watchdog.max(MIN_NO_PROGRESS_FOR));
+    pub(crate) fn should_terminate_session(&self, now: Instant, has_in_flight: bool) -> bool {
+        let response_dead = self.resp_wait.is_some_and(|wait| wait.expired(now));
+        let progress_dead =
+            has_in_flight && self.progress_wait.is_some_and(|wait| wait.expired(now));
         response_dead || progress_dead
     }
 }
@@ -104,18 +99,63 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn watchdog_deadline_is_latched_and_capped() {
+        let now = Instant::now();
+
+        let mut latched = PeerLiveness::new();
+        latched.on_send(now, Duration::from_millis(100));
+        latched.on_send(
+            now + Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        assert!(
+            latched.should_terminate_session(now + Duration::from_secs(47), true)
+        );
+        assert!(
+            latched.should_terminate_session(now + Duration::from_secs(47), false)
+        );
+        assert!(
+            latched.should_terminate_session(now + MAX_WATCHDOG_TIMEOUT, true)
+        );
+
+        let mut capped = PeerLiveness::new();
+        capped.on_send(now, Duration::from_secs(30));
+        assert!(
+            !capped.should_terminate_session(now + Duration::from_secs(47), true)
+        );
+        assert!(
+            capped.should_terminate_session(
+                now + MAX_WATCHDOG_TIMEOUT + Duration::from_secs(1),
+                true,
+            )
+        );
+    }
+
+    #[test]
     fn response_watchdog_uses_rto_and_minimum_floor() {
         let mut l = PeerLiveness::new();
         let rto = Duration::from_millis(100);
         let now = Instant::now();
-        l.on_send(now - MIN_NO_RESP_FOR - Duration::from_millis(1));
-        assert!(l.should_terminate_session(now, rto, false));
+        l.on_send(
+            now - MIN_NO_RESP_FOR - Duration::from_millis(1),
+            rto,
+        );
+        assert!(l.should_terminate_session(now, false));
         let mut l2 = PeerLiveness::new();
-        l2.on_send(now - MIN_NO_RESP_FOR + Duration::from_millis(10));
-        assert!(!l2.should_terminate_session(now, rto, false));
+        l2.on_send(
+            now - MIN_NO_RESP_FOR + Duration::from_millis(10),
+            rto,
+        );
+        assert!(!l2.should_terminate_session(now, false));
         let mut l3 = PeerLiveness::new();
-        l3.on_send(now - MIN_NO_RESP_FOR - Duration::from_millis(1));
-        assert!(l3.should_terminate_session(now, Duration::from_millis(1), false), "floor enforces 30s minimum");
+        l3.on_send(
+            now - MIN_NO_RESP_FOR - Duration::from_millis(1),
+            rto,
+        );
+        assert!(
+            l3.should_terminate_session(now, false),
+            "floor enforces 30s minimum"
+        );
     }
 
     #[test]
@@ -124,10 +164,16 @@ mod tests {
         let rto = Duration::from_millis(100);
         let now = Instant::now();
         l.record_progress();
-        l.on_send(now - Duration::from_secs(31));
-        l.refresh_waits(now - Duration::from_millis(1));
-        assert!(!l.should_terminate_session(now, rto, false), "no in-flight => progress watchdog must stay silent");
-        assert!(l.should_terminate_session(now, rto, true), "in-flight + stale progress => terminate");
+        l.on_send(now - Duration::from_secs(31), rto);
+        l.refresh_waits(now - Duration::from_millis(1), rto);
+        assert!(
+            !l.should_terminate_session(now, false),
+            "no in-flight => progress watchdog must stay silent"
+        );
+        assert!(
+            l.should_terminate_session(now, true),
+            "in-flight + stale progress => terminate"
+        );
     }
 
     #[test]
@@ -136,7 +182,10 @@ mod tests {
         let rto = Duration::from_millis(100);
         let now = Instant::now();
         l.record_progress();
-        l.refresh_waits(now - Duration::from_millis(10));
-        assert!(!l.should_terminate_session(now, rto, true), "progress 10ms ago must fend off watchdog");
+        l.refresh_waits(now - Duration::from_millis(10), rto);
+        assert!(
+            !l.should_terminate_session(now, true),
+            "progress 10ms ago must fend off watchdog"
+        );
     }
 }

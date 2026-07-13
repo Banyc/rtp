@@ -473,15 +473,15 @@ mod tests {
     use crate::send_queue::liveness::PeerLiveness;
     use std::time::{Duration, Instant};
 
-    fn term(l: &PeerLiveness, now: Instant, rto: Duration, has_in_flight: bool) -> bool {
-        l.should_terminate_session(now, rto, has_in_flight)
+    fn term(l: &PeerLiveness, now: Instant, has_in_flight: bool) -> bool {
+        l.should_terminate_session(now, has_in_flight)
     }
 
-    #[test] fn inert_catcher() { let now = Instant::now(); let mut l = PeerLiveness::new(); l.refresh_waits(now - Duration::from_millis(5)); l.record_progress(); l.refresh_waits(now - Duration::from_secs(31)); l.refresh_waits(now - Duration::from_millis(1)); assert!(term(&l, now, Duration::from_millis(200), true), "progress branch must fire"); assert!(!term(&l, now, Duration::from_millis(200), false), "idle safety: must not fire with empty window"); }
+    #[test] fn inert_catcher() { let now = Instant::now(); let mut l = PeerLiveness::new(); let rto = Duration::from_millis(200); let long_ago = now - Duration::from_secs(31); l.on_send(long_ago, rto); l.record_progress(); l.refresh_waits(now - Duration::from_millis(1), rto); assert!(term(&l, now, true), "progress branch must fire"); assert!(!term(&l, now, false), "idle safety: must not fire with empty window"); }
 
-    #[test] fn idle_empty_queue_not_killed() { let rto = Duration::from_millis(100); let l = PeerLiveness::new(); assert!(!term(&l, Instant::now(), rto, false)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(1)); l2.on_send(Instant::now() - Duration::from_secs(999)); assert!(!term(&l2, Instant::now(), rto, false)); }
+    #[test] fn idle_empty_queue_not_killed() { let rto = Duration::from_millis(100); let l = PeerLiveness::new(); assert!(!term(&l, Instant::now(), false)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(1), rto); l2.on_send(Instant::now() - Duration::from_secs(999), rto); assert!(!term(&l2, Instant::now(), false)); }
 
-    #[test] fn slow_but_progressing_not_killed() { let rto = Duration::from_millis(100); let mut l = PeerLiveness::new(); l.refresh_waits(Instant::now() - Duration::from_millis(50)); l.record_progress(); assert!(!term(&l, Instant::now(), rto, true)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(50)); l2.record_progress(); l2.on_send(Instant::now() - Duration::from_secs(1)); assert!(!term(&l2, Instant::now(), rto, true)); }
+    #[test] fn slow_but_progressing_not_killed() { let rto = Duration::from_millis(100); let mut l = PeerLiveness::new(); l.refresh_waits(Instant::now() - Duration::from_millis(50), rto); l.record_progress(); assert!(!term(&l, Instant::now(), true)); let mut l2 = PeerLiveness::new(); l2.refresh_waits(Instant::now() - Duration::from_millis(50), rto); l2.record_progress(); l2.on_send(Instant::now() - Duration::from_secs(1), rto); assert!(!term(&l2, Instant::now(), true)); }
 
-    #[test] fn response_watchdog_still_fires() { let rto = Duration::from_millis(100); let mut l = PeerLiveness::new(); l.on_send(Instant::now() - Duration::from_secs(31)); assert!(term(&l, Instant::now(), rto, false)); let mut l2 = PeerLiveness::new(); l2.on_send(Instant::now() - Duration::from_secs(10)); assert!(!term(&l2, Instant::now(), rto, false)); }
+    #[test] fn response_watchdog_still_fires() { let rto = Duration::from_millis(100); let mut l = PeerLiveness::new(); l.on_send(Instant::now() - Duration::from_secs(31), rto); assert!(term(&l, Instant::now(), false)); let mut l2 = PeerLiveness::new(); l2.on_send(Instant::now() - Duration::from_secs(10), rto); assert!(!term(&l2, Instant::now(), false)); }
 }
