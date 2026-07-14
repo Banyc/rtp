@@ -204,6 +204,21 @@ pub(crate) struct ProactiveTerminationContext {
     pub(crate) snapshot: String,
 }
 
+impl std::fmt::Display for ProactiveTerminationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rtp_session_terminated trigger=proactive_stall reason={} no_response_for_ms={:?} no_progress_for_ms={:?} snapshot={}",
+            self.reason,
+            self.no_response_for_ms,
+            self.no_progress_for_ms,
+            self.snapshot
+        )
+    }
+}
+
+impl std::error::Error for ProactiveTerminationContext {}
+
 #[derive(Debug, Clone)]
 struct FirstErrorValue {
     kind: std::io::ErrorKind,
@@ -262,13 +277,17 @@ impl FirstError {
     }
 
     pub fn io_error(&self, kind: std::io::ErrorKind) -> std::io::Error {
-        let first_error = self.first_error.read().unwrap();
-        if let Some(val) = first_error.as_ref().filter(|v| v.kind == kind) {
-            if let Some(ctx) = &val.context {
-                return std::io::Error::new(kind, format!("{ctx:?}"));
-            }
+        let context = self
+            .first_error
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|error| error.kind == kind)
+            .and_then(|error| error.context.clone());
+        match context {
+            Some(context) => std::io::Error::new(kind, context),
+            None => std::io::Error::from(kind),
         }
-        std::io::Error::from(kind)
     }
 
     pub fn some(&self) -> &tokio_util::sync::CancellationToken {

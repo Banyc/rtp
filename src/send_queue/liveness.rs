@@ -107,9 +107,9 @@ impl PeerLiveness {
         }
     }
 
-    pub(crate) fn next_deadline(&self, _has_in_flight: bool) -> Option<Instant> {
-        let response = self.resp_wait.map(|wait| wait.deadline);
-        let progress = self.progress_wait.map(|wait| wait.deadline);
+    pub(crate) fn next_deadline(&self, has_in_flight: bool) -> Option<Instant> {
+        let response = self.resp_wait.map(|wait| wait.deadline());
+        let progress = has_in_flight.then(|| self.progress_wait.map(|w| w.deadline())).flatten();
         response.into_iter().chain(progress).min()
     }
 

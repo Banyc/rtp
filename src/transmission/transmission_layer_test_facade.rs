@@ -2,7 +2,6 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::read_half::ReadHalf;
 use super::shared::Shared;
 use super::shared::{self, build_parts};
 use super::transmission_layer::{
@@ -33,6 +32,21 @@ impl std::ops::Deref for TransmissionLayer {
 impl TransmissionLayer {
     pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
         let (shared, write_half, read_half) = build_parts(unreliable_layer, log_config);
+        Self {
+            shared,
+            write_half,
+            utp_read: tokio::sync::Mutex::new(read_half.utp_read),
+            recent_echoes: Mutex::new(read_half.recent_echoes),
+        }
+    }
+
+    pub fn new_with_watchdog_tuning(
+        unreliable_layer: UnreliableLayer,
+        log_config: Option<LogConfig>,
+        tuning: super::watchdog_tuning::WatchdogTuning,
+    ) -> Self {
+        let (shared, write_half, read_half) =
+            shared::build_parts_with_watchdog_tuning(unreliable_layer, log_config, tuning);
         Self {
             shared,
             write_half,
@@ -1017,6 +1031,92 @@ mod tests {
         assert!(
             tl.has_pending_acks(),
             "ACK work must survive a WouldBlock flush (still pending for retry)"
+        );
+    }
+
+    /// Proactive watchdog test: verifies that when a peer stalls, the
+    /// transmission layer emits a KILL datagram, stores a BrokenPipe error
+    /// with context, and the error message includes the stall reason.
+    #[tokio::test]
+    async fn proactive_watchdog_sends_kill_and_preserves_aggregate_context() {
+        use crate::transmission::watchdog_tuning::WatchdogTuning;
+        use crate::transmission::fec_tuning::FecTuning;
+
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        struct SharedWrite3(Arc<Mutex<RecordingWrite>>);
+        #[async_trait]
+        impl UnreliableWrite for SharedWrite3 {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+        }
+        impl std::fmt::Debug for SharedWrite3 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SharedWrite3").finish_non_exhaustive()
+            }
+        }
+
+        let tuning = WatchdogTuning::new(
+            1,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        );
+
+        let write = SharedWrite3(recorder.clone());
+        let read = BlackholeRead;
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            read,
+            write,
+            false,
+            crate::udp::NO_FEC_MSS,
+            FecTuning::default(),
+        );
+        let tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
+
+        // Shrink RTT so the RTO stabilises at 1 s (MIN_RTO).  The watchdog
+        // timeout is rto * rto_multiplier = 1 s, so the stall fires after 1 s.
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+
+        // Stage data so the first send_pkts arms the liveness watchdog.
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.send_data_buf(&[0u8; 100], Instant::now());
+        }
+
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+
+        // Wait for the 1-second watchdog to expire.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut bufs = SendBufs::new();
+        let result = tl.send_pkts(&mut bufs).await;
+
+        assert!(
+            result.is_err(),
+            "send_pkts must return an error when stalled"
+        );
+        assert_eq!(result.unwrap_err(), std::io::ErrorKind::BrokenPipe);
+
+        // The recording write should have captured a KILL datagram
+        // (a 1-byte packet with value KILL_CMD=2).
+        let dgs = recorder.lock().unwrap().datagrams();
+        let has_kill = dgs.iter().any(|dg| dg.len() == 1 && dg[0] == 2);
+        assert!(has_kill, "a KILL datagram must be emitted, got {:?}", dgs);
+
+        // The FirstError must contain context with the expected message.
+        let err = tl.first_error.io_error(std::io::ErrorKind::BrokenPipe);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trigger=proactive_stall"),
+            "error message must contain trigger=proactive_stall, got: {msg}"
+        );
+        assert!(
+            msg.contains("reason=no_response"),
+            "error message must contain reason=no_response, got: {msg}"
         );
     }
 

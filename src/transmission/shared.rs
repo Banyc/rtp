@@ -229,6 +229,7 @@ impl Shared {
 
     pub fn send_fin_buf(&self) {
         self.reliable_layer.lock().unwrap().send_fin_buf();
+        self.coord.resume_send.notify_one();
     }
 
     pub fn recv_fin(&self) -> &tokio_util::sync::CancellationToken {
