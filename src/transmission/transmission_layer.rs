@@ -257,15 +257,18 @@ impl FirstError {
         Ok(())
     }
 
-    pub fn io_error(&self) -> Option<std::io::Error> {
+    pub fn has_error(&self) -> bool {
+        self.first_error.read().unwrap().is_some()
+    }
+
+    pub fn io_error(&self, kind: std::io::ErrorKind) -> std::io::Error {
         let first_error = self.first_error.read().unwrap();
-        first_error.as_ref().map(|val| {
+        if let Some(val) = first_error.as_ref().filter(|v| v.kind == kind) {
             if let Some(ctx) = &val.context {
-                std::io::Error::new(val.kind, format!("{ctx:?}"))
-            } else {
-                std::io::Error::from(val.kind)
+                return std::io::Error::new(kind, format!("{ctx:?}"));
             }
-        })
+        }
+        std::io::Error::from(kind)
     }
 
     pub fn some(&self) -> &tokio_util::sync::CancellationToken {

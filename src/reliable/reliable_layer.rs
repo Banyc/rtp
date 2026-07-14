@@ -24,6 +24,7 @@ use crate::{
     sack::AckBallSequence,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::frame_delivery::FrameDelivery,
+    transmission::watchdog_tuning::WatchdogTuning,
 };
 
 const SEND_DATA_BUF_LEN: usize = 8 * 1024;
@@ -186,6 +187,49 @@ impl ReliableLayer {
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new(),
+            pkt_recv_space: PktRecvSpace::new(frame_delivery),
+            send_rate,
+            bucket_burst,
+            prev_sample_rate: None,
+            huge_data_loss_timer: Timer::new(),
+            rtt_floor: WindowedRttMin::new(now),
+            delivery_peak: WindowedDeliveryMax::new(now),
+            slow_start: true,
+            slow_start_acked_pkts: 0,
+            gentle: GentleMode::new(),
+            queue_building: false,
+            drain_floor_binding_since: None,
+            frame_delivery,
+            pending_frames: Vec::new(),
+            pkt_stats_buf: Vec::new(),
+            pkt_buf: Vec::new(),
+        };
+        (this, send_rate_limiter)
+    }
+
+    pub fn new_with_watchdog_tuning(
+        mss: NonZeroUsize,
+        frame_delivery: FrameDelivery,
+        now: Instant,
+        tuning: WatchdogTuning,
+    ) -> (Self, Arc<Mutex<TokenBucket>>) {
+        let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
+        let bucket_burst = burst_pkts(send_rate);
+        let send_rate_limiter = Arc::new(Mutex::new(token_bucket_with_tokens(
+            send_rate,
+            bucket_burst,
+            bucket_burst.get(),
+            now,
+        )));
+        let this = Self {
+            mss,
+            send_data_buf: CapVecQueue::new_vec(send_data_buf_len(mss)),
+            send_fin_buf: SendFinBuf::Empty,
+            recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUF_LEN),
+            recv_fin_buf: false,
+            send_rate_limiter: send_rate_limiter.clone(),
+            connection_stats: ConnectionState::new(now),
+            pkt_send_space: PktSendSpace::new().with_watchdog_tuning(tuning),
             pkt_recv_space: PktRecvSpace::new(frame_delivery),
             send_rate,
             bucket_burst,

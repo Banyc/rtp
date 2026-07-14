@@ -14,8 +14,9 @@ use tokio::task::JoinSet;
 use crate::{
     codec::in_cmd_space,
     transmission::{
-        shared::{Shared, build_parts},
+        shared::{Shared, build_parts, build_parts_with_watchdog_tuning},
         transmission_layer::{LogConfig, RecvBufs, SendBufs, SendKillPkt, UnreliableLayer},
+        watchdog_tuning::WatchdogTuning,
         write_half::WriteHalf,
     },
 };
@@ -211,8 +212,114 @@ pub fn socket(
         async move {
             let mut recv_bufs = RecvBufs::new();
             loop {
-                // Read shutdown status must be checked before moving pkts to the read buf
-                //   to prevent triggering sending kill pkt when the read shuts down right after the pkt moving.
+                let is_read_shutdown = read_shutdown.is_cancelled();
+
+                let recv_pkts = match read_half.recv_pkts(&mut recv_bufs).await {
+                    Ok(recv_pkts) => recv_pkts,
+                    Err((_e, should_send_kill_pkt)) => {
+                        match should_send_kill_pkt {
+                            SendKillPkt::Yes => {
+                                let mut send_bufs = SendBufs::new();
+                                let _ = write_half.send_kill_pkt(&mut send_bufs).await;
+                            }
+                            SendKillPkt::No => (),
+                        }
+                        return;
+                    }
+                };
+                if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
+                    let mut send_bufs = SendBufs::new();
+                    let _ = write_half.send_kill_pkt(&mut send_bufs).await;
+                }
+            }
+        }
+    });
+
+    tokio::spawn({
+        let read_shutdown = read_shutdown.clone();
+        let write_shutdown = write_shutdown.clone();
+        let shared = Arc::clone(&shared);
+        async move {
+            let _event_guard = events;
+
+            tokio::select! {
+                () = write_shutdown.cancelled() => {
+                    shared.send_fin_buf();
+                    shared.resume_send().notify_one();
+                }
+                () = shared.some_error().cancelled() => (),
+            }
+            tokio::select! {
+                () = read_shutdown.cancelled() => (),
+                () = shared.some_error().cancelled() => (),
+            }
+
+            tokio::select! {
+                () = shared.recv_fin().cancelled() => (),
+                () = shared.some_error().cancelled() => (),
+                () = tokio::time::sleep(Duration::from_secs(675)) => (),
+            }
+        }
+    });
+
+    let read = ReadSocket {
+        transmission_layer: Arc::clone(&shared),
+        frame_buf: Mutex::new(Vec::new()),
+        _shutdown_guard: read_shutdown.drop_guard(),
+    };
+    let write = WriteSocket {
+        transmission_layer: Arc::clone(&write_half),
+        send_bufs: SendBufs::new(),
+        no_delay: true,
+        _shutdown_guard: write_shutdown.drop_guard(),
+    };
+    (read, write)
+}
+
+pub fn socket_with_watchdog_tuning(
+    unreliable_layer: UnreliableLayer,
+    log_config: Option<LogConfig>,
+    tuning: WatchdogTuning,
+) -> (ReadSocket, WriteSocket) {
+    let read_shutdown = tokio_util::sync::CancellationToken::new();
+    let write_shutdown = tokio_util::sync::CancellationToken::new();
+    let (shared, write_half, read_half) = build_parts_with_watchdog_tuning(unreliable_layer, log_config, tuning);
+    let mut events = JoinSet::new();
+
+    // Send timer
+    events.spawn({
+        let write_half = Arc::clone(&write_half);
+        async move {
+            let mut send_bufs = SendBufs::new();
+            loop {
+                let resume_send = write_half.resume_send().notified();
+                let deadline = write_half.next_poll_send_time();
+                match deadline {
+                    Some(t) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(t.into()) => (),
+                            () = resume_send => (),
+                        }
+                    }
+                    None => {
+                        resume_send.await;
+                    }
+                }
+                if write_half.send_pkts(&mut send_bufs).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    // Recv
+    events.spawn({
+        let read_shutdown = read_shutdown.clone();
+        let write_half = Arc::clone(&write_half);
+        let mut read_half = read_half;
+        async move {
+            let mut recv_bufs = RecvBufs::new();
+            loop {
                 let is_read_shutdown = read_shutdown.is_cancelled();
 
                 let recv_pkts = match read_half.recv_pkts(&mut recv_bufs).await {
@@ -448,16 +555,21 @@ pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {
 
 impl AsyncAsyncRead for ReadSocket {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.recv(buf).await.map_err(std::io::Error::from)
+        self.recv(buf)
+            .await
+            .map_err(|kind| self.transmission_layer.first_error.io_error(kind))
     }
 }
 impl AsyncAsyncWrite for WriteSocket {
     async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.send(buf).await.map_err(std::io::Error::from)
+        self.send(buf)
+            .await
+            .map_err(|kind| self.transmission_layer.first_error.io_error(kind))
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
-        self.transmission_layer.throw_error()?;
+        self.transmission_layer.throw_error()
+            .map_err(|kind| self.transmission_layer.first_error.io_error(kind))?;
         Ok(())
     }
 

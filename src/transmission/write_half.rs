@@ -23,13 +23,19 @@ impl std::ops::Deref for WriteHalf {
 }
 
 impl WriteHalf {
-    pub(crate) fn proactively_terminate_stalled_session(&self) {
-        let now = Instant::now();
+    pub(crate) async fn proactively_terminate_stalled_session(
+        &self,
+        bufs: &mut SendBufs,
+    ) -> bool {
+        if self.first_error.has_error() {
+            return false;
+        }
         let ctx = {
+            let now = Instant::now();
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let send_space = reliable_layer.pkt_send_space();
             let Some(reason) = send_space.stall_reason(now) else {
-                return;
+                return false;
             };
             ProactiveTerminationContext {
                 reason: match reason {
@@ -45,11 +51,13 @@ impl WriteHalf {
                 snapshot: format!("{:?}", reliable_layer.log()),
             }
         };
-        let _ = self.set_with_context_if_empty(std::io::ErrorKind::BrokenPipe, Some(ctx));
+        let _ = self.send_kill_and_abort(bufs).await;
+        self.set_with_context_if_empty(std::io::ErrorKind::BrokenPipe, Some(ctx));
+        true
     }
 
     pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
-        self.proactively_terminate_stalled_session();
+        self.proactively_terminate_stalled_session(bufs).await;
 
         let mut written_bytes = 0;
         let mut written_fin = false;
@@ -425,11 +433,12 @@ impl WriteHalf {
             self.log("send_data_buf");
             if no_delay {
                 let made_progress = self.send_pkts(bufs).await?;
-                if !made_progress && 0 < written_bytes {
+                if !made_progress {
                     self.resume_send().notify_one();
                 }
             }
             if 0 < written_bytes {
+                self.resume_send().notify_one();
                 break written_bytes;
             }
             tokio::select! {
@@ -465,6 +474,7 @@ impl WriteHalf {
                             self.resume_send().notify_one();
                         }
                     }
+                    self.resume_send().notify_one();
                     return Ok(frame_len);
                 }
                 Err(std::io::ErrorKind::WouldBlock) => {
@@ -558,9 +568,8 @@ mod tests {
 
     #[test]
     fn idle_connection_has_no_send_timer_deadline() {
-        let now = Instant::now();
         let l = PeerLiveness::new();
-        assert!(l.next_deadline(now).is_none(), "idle connection has no deadline");
+        assert!(l.next_deadline(false).is_none(), "idle connection has no deadline");
     }
 
     #[test]
@@ -569,7 +578,7 @@ mod tests {
         let mut l = PeerLiveness::new();
         let rto = Duration::from_millis(100);
         l.on_send(now, rto);
-        let dl = l.next_deadline(now).unwrap();
+        let dl = l.next_deadline(false).unwrap();
         assert!(dl > now, "deadline must be in the future");
     }
 }

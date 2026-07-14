@@ -21,6 +21,7 @@ use crate::{
         rtt_stats::RttStats,
         tlp::TailLossProber,
     },
+    transmission::watchdog_tuning::WatchdogTuning,
 };
 
 pub const INIT_CWND: usize = 16;
@@ -148,6 +149,11 @@ impl PktSendSpace {
         let mut s = Self::new();
         s.jitter_cap = enabled;
         s
+    }
+
+    pub fn with_watchdog_tuning(mut self, tuning: WatchdogTuning) -> Self {
+        self.liveness = PeerLiveness::with_tuning(tuning);
+        self
     }
 
     fn unacked(
@@ -741,7 +747,8 @@ impl PktSendSpace {
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {
-        let mut min_next_poll_time: Option<Instant> = None;
+        let wd_dl = self.liveness.next_deadline(!self.no_pkts_in_flight());
+        let mut min_next_poll_time: Option<Instant> = wd_dl;
         let rtx_window = if self.jitter_cap {
             self.rtt_stats.fast_reorder_window()
         } else {
@@ -768,13 +775,6 @@ impl PktSendSpace {
                 min_next_poll_time
                     .map(|min| min.min(dl.stock_deadline))
                     .unwrap_or(dl.stock_deadline),
-            );
-        }
-        if let Some(wd) = self.liveness.next_watchdog_deadline(Instant::now()) {
-            min_next_poll_time = Some(
-                min_next_poll_time
-                    .map(|min| min.min(wd))
-                    .unwrap_or(wd),
             );
         }
         min_next_poll_time

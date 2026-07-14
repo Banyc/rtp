@@ -1,9 +1,6 @@
 use std::time::{Duration, Instant};
 
-pub(crate) const RTO_WATCHDOG_MULTIPLIER: f64 = 16.0;
-pub(crate) const MIN_NO_RESP_FOR: Duration = Duration::from_secs(30);
-pub(crate) const MIN_NO_PROGRESS_FOR: Duration = Duration::from_secs(30);
-pub(crate) const MAX_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
+use crate::transmission::watchdog_tuning::WatchdogTuning;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerStall {
@@ -22,11 +19,10 @@ impl WatchdogWait {
         self.deadline
     }
 
-    fn new(started_at: Instant, rto: Duration, floor: Duration) -> Self {
-        let timeout = rto
-            .mul_f64(RTO_WATCHDOG_MULTIPLIER)
+    fn new(started_at: Instant, rto: Duration, floor: Duration, tuning: WatchdogTuning) -> Self {
+        let timeout = (rto * tuning.rto_multiplier)
             .max(floor)
-            .min(MAX_WATCHDOG_TIMEOUT);
+            .min(tuning.max_timeout);
         Self {
             started_at,
             deadline: started_at + timeout,
@@ -47,14 +43,20 @@ pub(crate) struct PeerLiveness {
     resp_wait: Option<WatchdogWait>,
     pub(crate) ever_progressed: bool,
     progress_wait: Option<WatchdogWait>,
+    tuning: WatchdogTuning,
 }
 
 impl PeerLiveness {
     pub(crate) fn new() -> Self {
+        Self::with_tuning(WatchdogTuning::default())
+    }
+
+    pub(crate) fn with_tuning(tuning: WatchdogTuning) -> Self {
         Self {
             resp_wait: None,
             ever_progressed: false,
             progress_wait: None,
+            tuning,
         }
     }
 
@@ -69,18 +71,18 @@ impl PeerLiveness {
     }
 
     pub(crate) fn refresh_waits(&mut self, now: Instant, rto: Duration) {
-        self.resp_wait = Some(WatchdogWait::new(now, rto, MIN_NO_RESP_FOR));
+        self.resp_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_response, self.tuning));
         if self.progress_wait.is_none() {
-            self.progress_wait = Some(WatchdogWait::new(now, rto, MIN_NO_PROGRESS_FOR));
+            self.progress_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_progress, self.tuning));
         }
     }
 
     pub(crate) fn on_send(&mut self, now: Instant, rto: Duration) {
         if self.resp_wait.is_none() {
-            self.resp_wait = Some(WatchdogWait::new(now, rto, MIN_NO_RESP_FOR));
+            self.resp_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_response, self.tuning));
         }
         if self.progress_wait.is_none() {
-            self.progress_wait = Some(WatchdogWait::new(now, rto, MIN_NO_PROGRESS_FOR));
+            self.progress_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_progress, self.tuning));
         }
     }
 
@@ -105,20 +107,10 @@ impl PeerLiveness {
         }
     }
 
-    pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        let resp_dl = self.resp_wait.map(|w| w.deadline).filter(|&t| t > now);
-        let prog_dl = self.progress_wait.map(|w| w.deadline).filter(|&t| t > now);
-        [resp_dl, prog_dl].into_iter().flatten().min()
-    }
-
-    pub(crate) fn next_watchdog_deadline(&self, now: Instant) -> Option<Instant> {
-        let resp_dl = self.resp_wait.map(|w| w.deadline);
-        let prog_dl = self.progress_wait.map(|w| w.deadline);
-        [resp_dl, prog_dl]
-            .into_iter()
-            .flatten()
-            .filter(|&t| t > now)
-            .min()
+    pub(crate) fn next_deadline(&self, _has_in_flight: bool) -> Option<Instant> {
+        let response = self.resp_wait.map(|wait| wait.deadline);
+        let progress = self.progress_wait.map(|wait| wait.deadline);
+        response.into_iter().chain(progress).min()
     }
 
     #[cfg(test)]
@@ -132,8 +124,16 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    fn max_watchdog_timeout() -> Duration {
+        WatchdogTuning::default().max_timeout
+    }
+    fn min_no_resp_for() -> Duration {
+        WatchdogTuning::default().min_no_response
+    }
+
     #[test]
     fn watchdog_deadline_is_latched_and_capped() {
+        let max_wd = max_watchdog_timeout();
         let now = Instant::now();
 
         let mut latched = PeerLiveness::new();
@@ -141,14 +141,14 @@ mod tests {
         latched.on_send(now + Duration::from_secs(1), Duration::from_secs(30));
         assert!(latched.should_terminate_session(now + Duration::from_secs(47), true));
         assert!(latched.should_terminate_session(now + Duration::from_secs(47), false));
-        assert!(latched.should_terminate_session(now + MAX_WATCHDOG_TIMEOUT, true));
+        assert!(latched.should_terminate_session(now + max_wd, true));
 
         let mut capped = PeerLiveness::new();
         capped.on_send(now, Duration::from_secs(30));
         assert!(!capped.should_terminate_session(now + Duration::from_secs(47), true));
         assert!(
             capped.should_terminate_session(
-                now + MAX_WATCHDOG_TIMEOUT + Duration::from_secs(1),
+                now + max_wd + Duration::from_secs(1),
                 true,
             )
         );
@@ -156,16 +156,17 @@ mod tests {
 
     #[test]
     fn response_watchdog_uses_rto_and_minimum_floor() {
+        let min_resp = min_no_resp_for();
         let mut l = PeerLiveness::new();
         let rto = Duration::from_millis(100);
         let now = Instant::now();
-        l.on_send(now - MIN_NO_RESP_FOR - Duration::from_millis(1), rto);
+        l.on_send(now - min_resp - Duration::from_millis(1), rto);
         assert!(l.should_terminate_session(now, false));
         let mut l2 = PeerLiveness::new();
-        l2.on_send(now - MIN_NO_RESP_FOR + Duration::from_millis(10), rto);
+        l2.on_send(now - min_resp + Duration::from_millis(10), rto);
         assert!(!l2.should_terminate_session(now, false));
         let mut l3 = PeerLiveness::new();
-        l3.on_send(now - MIN_NO_RESP_FOR - Duration::from_millis(1), rto);
+        l3.on_send(now - min_resp - Duration::from_millis(1), rto);
         assert!(
             l3.should_terminate_session(now, false),
             "floor enforces 30s minimum"

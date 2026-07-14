@@ -5,12 +5,13 @@ use super::coordination::Coordination;
 use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::transmission_layer::{
-    ACK_FLUSH_AGE, AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS,
+    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS,
     ProactiveTerminationContext, ReliableLayerLogger, UnreliableLayer,
     instream_group_fec_from_env, rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
 use super::write_half::WriteHalf;
+use super::watchdog_tuning::WatchdogTuning;
 use crate::reliable::reliable_layer::{ReliableLayer, SharedTokenBucket};
 
 #[derive(Debug)]
@@ -37,6 +38,52 @@ pub fn build_parts(
     let frame_delivery = unreliable_layer.frame_delivery;
     let (reliable_layer, send_rate_limiter) =
         ReliableLayer::new(unreliable_layer.mss, frame_delivery, now);
+    let reliable_layer_logger = log_config.as_ref().map(|c| {
+        let file = std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&c.reliable_layer_log_path)
+            .expect("open log file");
+        Mutex::new(csv::WriterBuilder::new().from_writer(file))
+    });
+    let shared = Arc::new(Shared {
+        reliable_layer: Mutex::new(reliable_layer),
+        ack_flush: Mutex::new(AckFlushState::new()),
+        ack_flush_gate: tokio::sync::Mutex::new(()),
+        fec: unreliable_layer.fec.map(Mutex::new),
+        send_rate_limiter,
+        first_error: FirstError::new(),
+        coord: Coordination::new(),
+        rtx_dup: std::sync::atomic::AtomicBool::new(rtx_dup_from_env()),
+        fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
+        instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
+            instream_group_fec_from_env(),
+        ),
+        clock_epoch: now,
+        reliable_layer_logger,
+    });
+    let write_half = Arc::new(WriteHalf {
+        utp_write: tokio::sync::Mutex::new(unreliable_layer.utp_write),
+        shared: Arc::clone(&shared),
+    });
+    let read_half = ReadHalf {
+        utp_read: unreliable_layer.utp_read,
+        recent_echoes: RecentEchoes::new(),
+        shared: Arc::clone(&shared),
+    };
+    (shared, write_half, read_half)
+}
+
+pub fn build_parts_with_watchdog_tuning(
+    unreliable_layer: UnreliableLayer,
+    log_config: Option<LogConfig>,
+    tuning: WatchdogTuning,
+) -> (Arc<Shared>, Arc<WriteHalf>, ReadHalf) {
+    let now = Instant::now();
+    let frame_delivery = unreliable_layer.frame_delivery;
+    let (reliable_layer, send_rate_limiter) =
+        ReliableLayer::new_with_watchdog_tuning(unreliable_layer.mss, frame_delivery, now, tuning);
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -111,13 +158,12 @@ impl Shared {
         };
         let ack_deadline = {
             let ack = self.ack_flush.lock().unwrap();
-            if ack.pending_acks == 0 && !ack.fin_pending {
-                None
+            if ack.pending_acks >= ACK_FLUSH_COUNT || ack.fin_pending {
+                Some(now)
+            } else if ack.pending_acks > 0 {
+                ack.last_ack_flush.map_or(Some(now), |last| Some(last + ACK_FLUSH_AGE))
             } else {
-                Some(
-                    ack.last_ack_flush
-                        .map_or(now, |last| last + ACK_FLUSH_AGE),
-                )
+                None
             }
         };
         if let Some(ack_deadline) = ack_deadline {

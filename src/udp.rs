@@ -10,12 +10,16 @@ use tokio::net::UdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
-    socket::{ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket},
+    socket::{
+        ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket,
+        socket_with_watchdog_tuning,
+    },
     transmission::{
         fec::{FecConfig, FecState},
         fec_tuning::{FecTuning, fec_tuning_from_env},
         frame_delivery::{FrameDelivery, frame_delivery_from_env},
         transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
+        watchdog_tuning::WatchdogTuning,
     },
 };
 
@@ -447,6 +451,58 @@ pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
         peer_addr,
     })
 }
+
+/// Connect to `addr` with a custom MSS, [`FecTuning`], [`FrameDelivery`],
+/// and [`WatchdogTuning`].  This is the fully-explicit connect entrypoint
+/// used by tests that exercise watchdog behaviour under impairment.
+///
+/// # Panics
+/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
+/// overhead.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
+    bind: impl tokio::net::ToSocketAddrs,
+    addr: impl tokio::net::ToSocketAddrs,
+    log_config: Option<LogConfig<'_>>,
+    handshake: bool,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+    frame_delivery: FrameDelivery,
+    watchdog_tuning: WatchdogTuning,
+) -> std::io::Result<Connected> {
+    let udp = UdpSocket::bind(bind).await?;
+    udp.connect(addr).await?;
+    let local_addr = udp.local_addr()?;
+    let peer_addr = udp.peer_addr()?;
+    let log_config = match log_config {
+        Some(c) => Some(
+            c.transmission_layer_log_config(local_addr, peer_addr)
+                .await?,
+        ),
+        None => None,
+    };
+    let udp = Arc::new(udp);
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        Arc::clone(&udp),
+        udp,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+    );
+    if handshake {
+        client_opening_handshake(&mut unreliable_layer).await?;
+    }
+    let (read, write) = socket_with_watchdog_tuning(unreliable_layer, log_config, watchdog_tuning);
+    Ok(Connected {
+        read,
+        write,
+        local_addr,
+        peer_addr,
+    })
+}
+
 #[derive(Debug)]
 pub struct Connected {
     pub read: ReadSocket,
