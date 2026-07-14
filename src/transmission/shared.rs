@@ -5,8 +5,9 @@ use super::coordination::Coordination;
 use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::transmission_layer::{
-    AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS, ReliableLayerLogger,
-    UnreliableLayer, instream_group_fec_from_env, rtx_dup_from_env,
+    ACK_FLUSH_AGE, AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS,
+    ProactiveTerminationContext, ReliableLayerLogger, UnreliableLayer,
+    instream_group_fec_from_env, rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
 use super::write_half::WriteHalf;
@@ -97,8 +98,52 @@ impl Shared {
             .map(|fec| fec.lock().unwrap().recovered_symbols())
     }
 
-    pub fn next_poll_send_time(&self) -> Instant {
-        self.send_rate_limiter.lock().unwrap().next_token_time()
+    pub fn next_poll_send_time(&self) -> Option<Instant> {
+        let now = Instant::now();
+        let mut deadline = {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let mut deadline = reliable_layer.pkt_send_space().next_poll_time();
+            if !reliable_layer.is_send_buf_empty() && reliable_layer.pkt_send_space().accepts_new_pkt() {
+                let token = self.send_rate_limiter.lock().unwrap().next_token_time();
+                deadline = Some(deadline.map_or(token, |current| current.min(token)));
+            }
+            deadline
+        };
+        let ack_deadline = {
+            let ack = self.ack_flush.lock().unwrap();
+            if ack.pending_acks == 0 && !ack.fin_pending {
+                None
+            } else {
+                Some(
+                    ack.last_ack_flush
+                        .map_or(now, |last| last + ACK_FLUSH_AGE),
+                )
+            }
+        };
+        if let Some(ack_deadline) = ack_deadline {
+            deadline = Some(deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
+        }
+        deadline
+    }
+
+    pub fn set_with_context_if_empty(
+        &self,
+        kind: std::io::ErrorKind,
+        context: Option<ProactiveTerminationContext>,
+    ) -> bool {
+        self.first_error.set_with_context_if_empty(kind, context)
+    }
+
+    pub fn next_send_deadline(&self) -> Option<Instant> {
+        let pacing = self.send_rate_limiter.lock().unwrap().next_token_time();
+        let now = Instant::now();
+        let rl = self.reliable_layer.lock().unwrap();
+        let stock_deadline = rl.pkt_send_space().next_poll_time();
+        let deadlines: [Option<Instant>; 2] = [
+            if pacing > now { Some(pacing) } else { None },
+            stock_deadline,
+        ];
+        deadlines.into_iter().flatten().min()
     }
 
     pub(crate) fn wire_ts(&self, now: Instant) -> u32 {

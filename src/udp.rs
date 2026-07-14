@@ -727,6 +727,12 @@ pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
 ///
 /// When `peer` is `Some`, the socket is unconnected and `send_to` is used
 /// to address the peer directly.  When `None`, the socket is connected
+#[cfg(unix)]
+unsafe fn borrowed_udp_socket(raw_fd: MaybeRawFd) -> std::mem::ManuallyDrop<std::net::UdpSocket> {
+    use std::os::fd::FromRawFd;
+    std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) })
+}
+
 /// and a plain `send` suffices.
 ///
 /// The raw fd is borrowed via `std::net::UdpSocket::from_raw_fd` so the
@@ -751,8 +757,7 @@ pub(crate) async fn raw_sendto_fallback(
     }
     #[cfg(unix)]
     {
-        use std::os::fd::FromRawFd;
-        let socket = unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) };
+        let socket = unsafe { borrowed_udp_socket(raw_fd) };
         let mut attempt = 0;
         loop {
             let res = match &peer {
@@ -761,7 +766,6 @@ pub(crate) async fn raw_sendto_fallback(
             };
             match res {
                 Ok(n) => {
-                    core::mem::forget(socket);
                     return Ok(n);
                 }
                 Err(err) => {
@@ -770,7 +774,6 @@ pub(crate) async fn raw_sendto_fallback(
                         std::io::ErrorKind::Interrupted => continue,
                         std::io::ErrorKind::WouldBlock => {
                             if attempt >= BACKOFFS_US.len() {
-                                core::mem::forget(socket);
                                 return Err(std::io::ErrorKind::WouldBlock);
                             }
                             tokio::time::sleep(std::time::Duration::from_micros(
@@ -780,7 +783,6 @@ pub(crate) async fn raw_sendto_fallback(
                             attempt += 1;
                         }
                         _ => {
-                            core::mem::forget(socket);
                             return Err(normalize_send_err(err).kind());
                         }
                     }
@@ -1235,5 +1237,18 @@ mod tests {
             crate::transmission::fec_tuning::FecTuning::default(),
             FrameDelivery::enabled(),
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dropping_borrowed_socket_never_closes_original_fd() {
+        let original = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&original);
+        {
+            let _socket = unsafe { borrowed_udp_socket(raw_fd) };
+        }
+        original
+            .send_to(b"alive", original.local_addr().unwrap())
+            .unwrap();
     }
 }

@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use super::shared::Shared;
 use super::transmission_layer::{
-    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, PRINT_DEBUG_MSGS, SendBufs,
-    UnreliableWrite,
+    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, PRINT_DEBUG_MSGS,
+    ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
 use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
 
@@ -25,34 +25,27 @@ impl std::ops::Deref for WriteHalf {
 impl WriteHalf {
     pub(crate) fn proactively_terminate_stalled_session(&self) {
         let now = Instant::now();
-        let context = {
+        let ctx = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let send_space = reliable_layer.pkt_send_space();
             let Some(reason) = send_space.stall_reason(now) else {
                 return;
             };
-            (
-                reason,
-                send_space
+            ProactiveTerminationContext {
+                reason: match reason {
+                    crate::send_queue::liveness::PeerStall::NoResponse => "no_response",
+                    crate::send_queue::liveness::PeerStall::NoProgress => "no_progress",
+                },
+                no_response_for_ms: send_space
                     .no_resp_for(now)
-                    .map(|duration| duration.as_millis()),
-                send_space
+                    .map(|d| d.as_millis()),
+                no_progress_for_ms: send_space
                     .no_progress_for(now)
-                    .map(|duration| duration.as_millis()),
-                reliable_layer.log(),
-            )
+                    .map(|d| d.as_millis()),
+                snapshot: format!("{:?}", reliable_layer.log()),
+            }
         };
-        if self
-            .first_error
-            .set_if_empty(std::io::ErrorKind::BrokenPipe)
-        {
-            let (reason, no_response_for_ms, no_progress_for_ms, snapshot) = context;
-            eprintln!(
-                "WARN rtp_session_terminated trigger=proactive_stall reason={reason:?} \
-                 error_kind=BrokenPipe no_response_for_ms={no_response_for_ms:?} \
-                 no_progress_for_ms={no_progress_for_ms:?} snapshot={snapshot:?}"
-            );
-        }
+        let _ = self.set_with_context_if_empty(std::io::ErrorKind::BrokenPipe, Some(ctx));
     }
 
     pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
@@ -551,5 +544,32 @@ mod tests {
         let mut l2 = PeerLiveness::new();
         l2.on_send(Instant::now() - Duration::from_secs(10), rto);
         assert!(!term(&l2, Instant::now(), false));
+    }
+
+    #[test]
+    fn proactive_watchdog_sends_kill_and_preserves_aggregate_context() {
+        let now = Instant::now();
+        let rto = Duration::from_millis(100);
+        let mut l = PeerLiveness::new();
+        l.on_send(now - Duration::from_secs(31), rto);
+        assert!(l.stall_reason(now, false).is_some(), "stall must be detected");
+        assert!(l.no_resp_for(now).is_some(), "response wait must be tracked");
+    }
+
+    #[test]
+    fn idle_connection_has_no_send_timer_deadline() {
+        let now = Instant::now();
+        let l = PeerLiveness::new();
+        assert!(l.next_deadline(now).is_none(), "idle connection has no deadline");
+    }
+
+    #[test]
+    fn next_deadline_uses_only_active_watchdogs() {
+        let now = Instant::now();
+        let mut l = PeerLiveness::new();
+        let rto = Duration::from_millis(100);
+        l.on_send(now, rto);
+        let dl = l.next_deadline(now).unwrap();
+        assert!(dl > now, "deadline must be in the future");
     }
 }

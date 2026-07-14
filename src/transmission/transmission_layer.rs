@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::{fec::FecState, fec_tuning::FecTuning, frame_delivery::FrameDelivery, ts_echo::TsEcho};
 use crate::sack::AckBall;
 
+pub use crate::send_queue::liveness::PeerStall;
+
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
 pub(crate) const MAX_NUM_ACK: usize = 64;
@@ -194,11 +196,26 @@ pub trait UnreliableWrite: core::fmt::Debug + Sync + Send + 'static {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProactiveTerminationContext {
+    pub(crate) reason: &'static str,
+    pub(crate) no_response_for_ms: Option<u128>,
+    pub(crate) no_progress_for_ms: Option<u128>,
+    pub(crate) snapshot: String,
+}
+
+#[derive(Debug, Clone)]
+struct FirstErrorValue {
+    kind: std::io::ErrorKind,
+    context: Option<ProactiveTerminationContext>,
+}
+
 #[derive(Debug)]
 pub(crate) struct FirstError {
-    first_error: RwLock<Option<std::io::ErrorKind>>,
+    first_error: RwLock<Option<FirstErrorValue>>,
     pub(crate) some: tokio_util::sync::CancellationToken,
 }
+
 impl FirstError {
     pub fn new() -> Self {
         let first_error = RwLock::new(None);
@@ -207,16 +224,24 @@ impl FirstError {
     }
 
     pub fn set(&self, err: std::io::ErrorKind) {
-        let _ = self.set_if_empty(err);
+        let _ = self.set_with_context_if_empty(err, None);
     }
 
     pub fn set_if_empty(&self, err: std::io::ErrorKind) -> bool {
+        self.set_with_context_if_empty(err, None)
+    }
+
+    pub fn set_with_context_if_empty(
+        &self,
+        kind: std::io::ErrorKind,
+        context: Option<ProactiveTerminationContext>,
+    ) -> bool {
         let inserted = {
             let mut first_error = self.first_error.write().unwrap();
             if first_error.is_some() {
                 false
             } else {
-                *first_error = Some(err);
+                *first_error = Some(FirstErrorValue { kind, context });
                 true
             }
         };
@@ -226,10 +251,21 @@ impl FirstError {
 
     pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
         let first_error = self.first_error.read().unwrap();
-        if let Some(e) = &*first_error {
-            return Err(*e);
+        if let Some(val) = &*first_error {
+            return Err(val.kind);
         }
         Ok(())
+    }
+
+    pub fn io_error(&self) -> Option<std::io::Error> {
+        let first_error = self.first_error.read().unwrap();
+        first_error.as_ref().map(|val| {
+            if let Some(ctx) = &val.context {
+                std::io::Error::new(val.kind, format!("{ctx:?}"))
+            } else {
+                std::io::Error::from(val.kind)
+            }
+        })
     }
 
     pub fn some(&self) -> &tokio_util::sync::CancellationToken {

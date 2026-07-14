@@ -8,4 +8,5 @@ pub mod transmission_layer;
 #[cfg(test)]
 mod transmission_layer_test_facade;
 mod ts_echo;
+pub mod watchdog_tuning;
 pub(crate) mod write_half;

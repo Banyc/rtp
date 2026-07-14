@@ -6,7 +6,7 @@ pub(crate) const MIN_NO_PROGRESS_FOR: Duration = Duration::from_secs(30);
 pub(crate) const MAX_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PeerStall {
+pub enum PeerStall {
     NoResponse,
     NoProgress,
 }
@@ -18,6 +18,10 @@ pub(crate) struct WatchdogWait {
 }
 
 impl WatchdogWait {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     fn new(started_at: Instant, rto: Duration, floor: Duration) -> Self {
         let timeout = rto
             .mul_f64(RTO_WATCHDOG_MULTIPLIER)
@@ -99,6 +103,22 @@ impl PeerLiveness {
         } else {
             None
         }
+    }
+
+    pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let resp_dl = self.resp_wait.map(|w| w.deadline).filter(|&t| t > now);
+        let prog_dl = self.progress_wait.map(|w| w.deadline).filter(|&t| t > now);
+        [resp_dl, prog_dl].into_iter().flatten().min()
+    }
+
+    pub(crate) fn next_watchdog_deadline(&self, now: Instant) -> Option<Instant> {
+        let resp_dl = self.resp_wait.map(|w| w.deadline);
+        let prog_dl = self.progress_wait.map(|w| w.deadline);
+        [resp_dl, prog_dl]
+            .into_iter()
+            .flatten()
+            .filter(|&t| t > now)
+            .min()
     }
 
     #[cfg(test)]

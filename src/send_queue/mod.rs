@@ -1,4 +1,4 @@
-pub(crate) mod liveness;
+pub mod liveness;
 pub(crate) mod outage;
 pub(crate) mod pkt_send_space;
 pub(crate) mod rto;

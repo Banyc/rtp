@@ -742,23 +742,15 @@ impl PktSendSpace {
 
     pub fn next_poll_time(&self) -> Option<Instant> {
         let mut min_next_poll_time: Option<Instant> = None;
-        // Effective reorder-window deadline for rtx scheduling.  When the
-        // jitter-cap toggle is on, rtx timing uses the fast reorder window;
-        // otherwise the stock window.  The poll must honour this deadline so
-        // the fast-retransmit fires as soon as it is due.
         let rtx_window = if self.jitter_cap {
             self.rtt_stats.fast_reorder_window()
         } else {
             self.rtt_stats.reorder_window()
         };
         for (s, p) in Self::unacked(&self.send_wnd).take(self.cwnd.get()) {
-            // RTO deadline (sent_time + rto) — the hard retransmit fallback.
             let t = p.next_rto_time();
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
-            // Reorder-window deadline (sent_time + rtx_window) — only relevant
-            // for out-of-order packets (in-order packets are covered by the
-            // cumulative ACK and never declared lost on the reorder path).
             if s < self.out_of_order_seq_end {
                 let rw_t = p.sent_time + rtx_window;
                 min_next_poll_time =
@@ -771,14 +763,18 @@ impl PktSendSpace {
         {
             min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
         }
-        // Deferred-loss stock deadlines — `poll_deferred_loss` must run at or
-        // after each deadline so the deferred CC loss event is recorded
-        // promptly when the packet is genuinely still unacked.
         for dl in &self.deferred_losses {
             min_next_poll_time = Some(
                 min_next_poll_time
                     .map(|min| min.min(dl.stock_deadline))
                     .unwrap_or(dl.stock_deadline),
+            );
+        }
+        if let Some(wd) = self.liveness.next_watchdog_deadline(Instant::now()) {
+            min_next_poll_time = Some(
+                min_next_poll_time
+                    .map(|min| min.min(wd))
+                    .unwrap_or(wd),
             );
         }
         min_next_poll_time

@@ -20,8 +20,6 @@ use crate::{
     },
 };
 
-const TIMER_INTERVAL: Duration = Duration::from_millis(1);
-
 pub type ReadStream = PollRead<ReadSocket>;
 
 /// Async write stream that caps each staged slice at the reliable layer's
@@ -185,29 +183,18 @@ pub fn socket(
         async move {
             let mut send_bufs = SendBufs::new();
             loop {
-                // Register the resume_send notifier *before* reading the next
-                // poll time so that a notification arriving between the last
-                // send_pkts pass and this registration is stored as a permit
-                // and wakes us immediately.
                 let resume_send = write_half.resume_send().notified();
-                let now = Instant::now();
-                let next_poll_time = write_half.next_poll_send_time();
-                let fast_poll_time = now + TIMER_INTERVAL;
-                // When the rate limiter already has a token available (its
-                // `next_token_time` is now or in the past), honoring it would
-                // make `sleep_until` return immediately. If there is nothing
-                // to send at that moment (idle / cwnd full / no data), the loop
-                // would busy-spin on `Instant::now` + `send_pkts`. Fall back to
-                // the 1ms poll in that case so we only wake immediately when the
-                // limiter is actively pacing us.
-                let poll_time = if next_poll_time <= now {
-                    fast_poll_time
-                } else {
-                    next_poll_time.min(fast_poll_time)
-                };
-                tokio::select! {
-                    () = tokio::time::sleep_until(poll_time.into()) => (),
-                    () = resume_send => (),
+                let deadline = write_half.next_poll_send_time();
+                match deadline {
+                    Some(t) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(t.into()) => (),
+                            () = resume_send => (),
+                        }
+                    }
+                    None => {
+                        resume_send.await;
+                    }
                 }
                 if write_half.send_pkts(&mut send_bufs).await.is_err() {
                     return;
@@ -259,6 +246,7 @@ pub fn socket(
             tokio::select! {
                 () = write_shutdown.cancelled() => {
                     shared.send_fin_buf();
+                    shared.resume_send().notify_one();
                 }
                 () = shared.some_error().cancelled() => (),
             }
