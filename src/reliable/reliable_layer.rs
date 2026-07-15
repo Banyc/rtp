@@ -769,9 +769,11 @@ impl ReliableLayer {
             floor,
             self.pkt_send_space.smooth_rtt_var(),
             loss_event_rate,
-            QUEUE_RTT_FACTOR * GENTLE_ENTER_RTTVAR_FACTOR,
-            self.control_rtt(),
             now,
+            GentlePreambleConfig {
+                enter_coefficient: QUEUE_RTT_FACTOR * GENTLE_ENTER_RTTVAR_FACTOR,
+                control_rtt: self.control_rtt(),
+            },
         );
 
         // Gate hysteresis: while actively draining in gentle mode, use tol/2.

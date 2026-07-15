@@ -229,6 +229,20 @@ pub struct Accepted {
     pub write: WriteSocket,
     pub peer_addr: SocketAddr,
 }
+
+pub struct ConnectConfig<'a> {
+    pub log_config: Option<LogConfig<'a>>,
+    pub handshake: bool,
+    pub fec: bool,
+    pub mss: usize,
+    pub fec_tuning: FecTuning,
+    pub frame_delivery: FrameDelivery,
+}
+
+pub struct WatchdogConnectConfig<'a> {
+    pub connection: ConnectConfig<'a>,
+    pub watchdog: WatchdogTuning,
+}
 async fn accept(
     accepted: IdentityConn,
     handshake: bool,
@@ -277,12 +291,14 @@ pub async fn connect_without_handshake(
     connect_with_mss_fec_tuning_and_frame_delivery(
         bind,
         addr,
-        log_config,
-        handshake,
-        fec,
-        mss,
-        tuning,
-        frame_delivery,
+        ConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning: tuning,
+            frame_delivery,
+        },
     )
     .await
 }
@@ -299,12 +315,14 @@ pub async fn connect(
     connect_with_mss_fec_tuning_and_frame_delivery(
         bind,
         addr,
-        log_config,
-        handshake,
-        fec,
-        mss,
-        tuning,
-        frame_delivery,
+        ConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning: tuning,
+            frame_delivery,
+        },
     )
     .await
 }
@@ -321,12 +339,14 @@ pub async fn connect_without_handshake_with_mss(
     connect_with_mss_fec_tuning_and_frame_delivery(
         bind,
         addr,
-        log_config,
-        handshake,
-        fec,
-        mss,
-        tuning,
-        frame_delivery,
+        ConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning: tuning,
+            frame_delivery,
+        },
     )
     .await
 }
@@ -354,12 +374,14 @@ pub async fn connect_with_mss(
     connect_with_mss_fec_tuning_and_frame_delivery(
         bind,
         addr,
-        log_config,
-        handshake,
-        fec,
-        mss,
-        tuning,
-        frame_delivery,
+        ConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning: tuning,
+            frame_delivery,
+        },
     )
     .await
 }
@@ -392,12 +414,14 @@ pub async fn connect_with_mss_and_fec_tuning(
     connect_with_mss_fec_tuning_and_frame_delivery(
         bind,
         addr,
-        log_config,
-        handshake,
-        fec,
-        mss,
-        tuning,
-        frame_delivery,
+        ConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning: tuning,
+            frame_delivery,
+        },
     )
     .await
 }
@@ -409,17 +433,28 @@ pub async fn connect_with_mss_and_fec_tuning(
 /// # Panics
 /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
 /// overhead.
-#[allow(clippy::too_many_arguments)]
 pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    handshake: bool,
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-    frame_delivery: FrameDelivery,
+    config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
+    connect_configured(bind, addr, config, None).await
+}
+
+async fn connect_configured(
+    bind: impl tokio::net::ToSocketAddrs,
+    addr: impl tokio::net::ToSocketAddrs,
+    config: ConnectConfig<'_>,
+    watchdog: Option<WatchdogTuning>,
+) -> std::io::Result<Connected> {
+    let ConnectConfig {
+        log_config,
+        handshake,
+        fec,
+        mss,
+        fec_tuning,
+        frame_delivery,
+    } = config;
     let udp = UdpSocket::bind(bind).await?;
     udp.connect(addr).await?;
     let local_addr = udp.local_addr()?;
@@ -437,13 +472,18 @@ pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
         udp,
         fec,
         mss,
-        tuning,
+        fec_tuning,
         frame_delivery,
     );
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
-    let (read, write) = socket(unreliable_layer, log_config);
+    let (read, write) = match watchdog {
+        Some(tuning) => {
+            socket_with_watchdog_tuning(unreliable_layer, log_config, tuning)
+        }
+        None => socket(unreliable_layer, log_config),
+    };
     Ok(Connected {
         read,
         write,
@@ -459,48 +499,12 @@ pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
 /// # Panics
 /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
 /// overhead.
-#[allow(clippy::too_many_arguments)]
 pub async fn connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    handshake: bool,
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-    frame_delivery: FrameDelivery,
-    watchdog_tuning: WatchdogTuning,
+    config: WatchdogConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
-    let udp = UdpSocket::bind(bind).await?;
-    udp.connect(addr).await?;
-    let local_addr = udp.local_addr()?;
-    let peer_addr = udp.peer_addr()?;
-    let log_config = match log_config {
-        Some(c) => Some(
-            c.transmission_layer_log_config(local_addr, peer_addr)
-                .await?,
-        ),
-        None => None,
-    };
-    let udp = Arc::new(udp);
-    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Arc::clone(&udp),
-        udp,
-        fec,
-        mss,
-        tuning,
-        frame_delivery,
-    );
-    if handshake {
-        client_opening_handshake(&mut unreliable_layer).await?;
-    }
-    let (read, write) = socket_with_watchdog_tuning(unreliable_layer, log_config, watchdog_tuning);
-    Ok(Connected {
-        read,
-        write,
-        local_addr,
-        peer_addr,
-    })
+    connect_configured(bind, addr, config.connection, Some(config.watchdog)).await
 }
 
 #[derive(Debug)]

@@ -34,6 +34,12 @@ pub(crate) struct DrainEpisode {
     pub(crate) gap0: Duration,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GentlePreambleConfig {
+    pub(crate) enter_coefficient: f64,
+    pub(crate) control_rtt: Duration,
+}
+
 /// Gentle-mode congestion controller state.
 ///
 /// Wraps the delay-gated gentle-mode entry/exit, probe, drain-guard, and
@@ -72,17 +78,19 @@ impl GentleMode {
 
     /// Gentle-mode entry preamble: track whether the smoothed RTT is building a
     /// queue above the enter tolerance, check loss-exit, and try to enter.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn preamble(
         &mut self,
         smooth: Duration,
         floor: Duration,
         rttvar: Duration,
         loss_event_rate: Option<f64>,
-        enter_coefficient: f64,
-        control_rtt: Duration,
         now: Instant,
+        config: GentlePreambleConfig,
     ) {
+        let GentlePreambleConfig {
+            enter_coefficient,
+            control_rtt,
+        } = config;
         let enter_tol = rttvar
             .mul_f64(enter_coefficient)
             .max(floor.mul_f64(super::reliable_layer::QUEUE_TOL_RTT_FRACTION))
