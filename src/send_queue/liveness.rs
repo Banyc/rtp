@@ -71,18 +71,38 @@ impl PeerLiveness {
     }
 
     pub(crate) fn refresh_waits(&mut self, now: Instant, rto: Duration) {
-        self.resp_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_response, self.tuning));
+        self.resp_wait = Some(WatchdogWait::new(
+            now,
+            rto,
+            self.tuning.min_no_response,
+            self.tuning,
+        ));
         if self.progress_wait.is_none() {
-            self.progress_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_progress, self.tuning));
+            self.progress_wait = Some(WatchdogWait::new(
+                now,
+                rto,
+                self.tuning.min_no_progress,
+                self.tuning,
+            ));
         }
     }
 
     pub(crate) fn on_send(&mut self, now: Instant, rto: Duration) {
         if self.resp_wait.is_none() {
-            self.resp_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_response, self.tuning));
+            self.resp_wait = Some(WatchdogWait::new(
+                now,
+                rto,
+                self.tuning.min_no_response,
+                self.tuning,
+            ));
         }
         if self.progress_wait.is_none() {
-            self.progress_wait = Some(WatchdogWait::new(now, rto, self.tuning.min_no_progress, self.tuning));
+            self.progress_wait = Some(WatchdogWait::new(
+                now,
+                rto,
+                self.tuning.min_no_progress,
+                self.tuning,
+            ));
         }
     }
 
@@ -109,7 +129,9 @@ impl PeerLiveness {
 
     pub(crate) fn next_deadline(&self, has_in_flight: bool) -> Option<Instant> {
         let response = self.resp_wait.map(|wait| wait.deadline());
-        let progress = has_in_flight.then(|| self.progress_wait.map(|w| w.deadline())).flatten();
+        let progress = has_in_flight
+            .then(|| self.progress_wait.map(|w| w.deadline()))
+            .flatten();
         response.into_iter().chain(progress).min()
     }
 
@@ -146,12 +168,7 @@ mod tests {
         let mut capped = PeerLiveness::new();
         capped.on_send(now, Duration::from_secs(30));
         assert!(!capped.should_terminate_session(now + Duration::from_secs(47), true));
-        assert!(
-            capped.should_terminate_session(
-                now + max_wd + Duration::from_secs(1),
-                true,
-            )
-        );
+        assert!(capped.should_terminate_session(now + max_wd + Duration::from_secs(1), true,));
     }
 
     #[test]

@@ -2,6 +2,10 @@
 
 A userspace reliable transmission protocol whose congestion window is governed only by the delivery rate (i.e., bandwidth/throughput) and the data loss rate.
 
+## TCP-compatible transport semantics
+
+Treat RTP like TCP for behavior common to reliable stream transports. In particular, FIN is a graceful directional close and KILL/RST is an abort; EOF, half-close, and write-after-close behavior should follow the TCP model. When RTP intentionally defines different behavior, follow the RTP rule for that specific behavior and keep the difference inside the RTP implementation.
+
 ## Features
 
 - an async-free reliable layer

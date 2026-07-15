@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::shared::Shared;
 use super::transmission_layer::{
@@ -7,6 +7,8 @@ use super::transmission_layer::{
     ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
 use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
+
+const KILL_SEND_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct WriteHalf {
@@ -235,28 +237,57 @@ impl WriteHalf {
     }
 
     pub async fn send_kill_pkt(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+        let fec_enabled = self.send_kill_data_pkt(bufs).await?;
+        if fec_enabled {
+            self.flush_kill_fec_tail().await;
+        }
+        Ok(())
+    }
+
+    async fn send_kill_data_pkt(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
         let fec_enabled = self.fec.is_some();
         let res = self.send_with_fec(&buf, &mut bufs.fec).await;
-        if fec_enabled {
-            match res {
-                Ok(_) => {
-                    let now = Instant::now();
-                    let can_send_tail_fec =
-                        { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
-                    self.close_fec_burst(now, can_send_tail_fec).await;
-                }
-                Err(_) => self.skip_open_fec_group(),
-            }
+        if res.is_err() && fec_enabled {
+            self.skip_open_fec_group();
         }
         res?;
+        Ok(fec_enabled)
+    }
+
+    async fn flush_kill_fec_tail(&self) {
+        let now = Instant::now();
+        let can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+        self.close_fec_burst(now, can_send_tail_fec).await;
+    }
+
+    async fn send_kill_pkt_with_deadline(
+        &self,
+        bufs: &mut SendBufs,
+    ) -> Result<(), std::io::ErrorKind> {
+        let deadline = tokio::time::Instant::now() + KILL_SEND_DEADLINE;
+        let fec_enabled =
+            match tokio::time::timeout_at(deadline, self.send_kill_data_pkt(bufs)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.skip_open_fec_group();
+                    return Err(std::io::ErrorKind::TimedOut);
+                }
+            };
+        if fec_enabled
+            && tokio::time::timeout_at(deadline, self.flush_kill_fec_tail())
+                .await
+                .is_err()
+        {
+            self.skip_open_fec_group();
+        }
         Ok(())
     }
 
-    pub async fn send_kill_and_abort(&self, bufs: &mut SendBufs) {
-        let _ = self.send_kill_pkt(bufs).await;
+    pub async fn send_kill_and_abort(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         self.first_error.set(std::io::ErrorKind::BrokenPipe);
+        self.send_kill_pkt_with_deadline(bufs).await
     }
 
     pub fn has_pending_acks(&self) -> bool {
@@ -556,7 +587,10 @@ mod tests {
     #[test]
     fn idle_connection_has_no_send_timer_deadline() {
         let l = PeerLiveness::new();
-        assert!(l.next_deadline(false).is_none(), "idle connection has no deadline");
+        assert!(
+            l.next_deadline(false).is_none(),
+            "idle connection has no deadline"
+        );
     }
 
     #[test]

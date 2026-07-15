@@ -283,7 +283,8 @@ pub fn socket_with_watchdog_tuning(
 ) -> (ReadSocket, WriteSocket) {
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
-    let (shared, write_half, read_half) = build_parts_with_watchdog_tuning(unreliable_layer, log_config, tuning);
+    let (shared, write_half, read_half) =
+        build_parts_with_watchdog_tuning(unreliable_layer, log_config, tuning);
     let mut events = JoinSet::new();
 
     // Send timer
@@ -523,7 +524,8 @@ impl WriteSocket {
     }
 
     pub async fn send_kill_and_abort(&mut self) {
-        self.transmission_layer
+        let _ = self
+            .transmission_layer
             .send_kill_and_abort(&mut self.send_bufs)
             .await;
     }
@@ -568,7 +570,8 @@ impl AsyncAsyncWrite for WriteSocket {
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
-        self.transmission_layer.throw_error()
+        self.transmission_layer
+            .throw_error()
             .map_err(|kind| self.transmission_layer.first_error.io_error(kind))?;
         Ok(())
     }

@@ -209,10 +209,7 @@ impl std::fmt::Display for ProactiveTerminationContext {
         write!(
             f,
             "rtp_session_terminated trigger=proactive_stall reason={} no_response_for_ms={:?} no_progress_for_ms={:?} snapshot={}",
-            self.reason,
-            self.no_response_for_ms,
-            self.no_progress_for_ms,
-            self.snapshot
+            self.reason, self.no_response_for_ms, self.no_progress_for_ms, self.snapshot
         )
     }
 }

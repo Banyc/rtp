@@ -6,12 +6,12 @@ use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::transmission_layer::{
     ACK_FLUSH_AGE, ACK_FLUSH_COUNT, AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS,
-    ProactiveTerminationContext, ReliableLayerLogger, UnreliableLayer,
-    instream_group_fec_from_env, rtx_dup_from_env,
+    ProactiveTerminationContext, ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env,
+    rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
-use super::write_half::WriteHalf;
 use super::watchdog_tuning::WatchdogTuning;
+use super::write_half::WriteHalf;
 use crate::reliable::reliable_layer::{ReliableLayer, SharedTokenBucket};
 
 #[derive(Debug)]
@@ -150,7 +150,9 @@ impl Shared {
         let mut deadline = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let mut deadline = reliable_layer.pkt_send_space().next_poll_time();
-            if !reliable_layer.is_send_buf_empty() && reliable_layer.pkt_send_space().accepts_new_pkt() {
+            if !reliable_layer.is_send_buf_empty()
+                && reliable_layer.pkt_send_space().accepts_new_pkt()
+            {
                 let token = self.send_rate_limiter.lock().unwrap().next_token_time();
                 deadline = Some(deadline.map_or(token, |current| current.min(token)));
             }
@@ -161,7 +163,8 @@ impl Shared {
             if ack.pending_acks >= ACK_FLUSH_COUNT || ack.fin_pending {
                 Some(now)
             } else if ack.pending_acks > 0 {
-                ack.last_ack_flush.map_or(Some(now), |last| Some(last + ACK_FLUSH_AGE))
+                ack.last_ack_flush
+                    .map_or(Some(now), |last| Some(last + ACK_FLUSH_AGE))
             } else {
                 None
             }

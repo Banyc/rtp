@@ -1,12 +1,13 @@
 use core::time::Duration;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
+use super::read_half::ReadHalf;
 use super::shared::Shared;
-use super::shared::{self, build_parts};
+use super::shared::{build_parts, build_parts_with_watchdog_tuning};
 use super::transmission_layer::{
-    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, LogConfig, MAX_NUM_ACK, RecvBufs, RecvPkts,
-    SendBufs, SendKillPkt, UnreliableLayer, UnreliableRead, UnreliableWrite,
+    LogConfig, RecvBufs, RecvPkts, SendBufs, SendKillPkt, UnreliableLayer, UnreliableRead,
+    UnreliableWrite,
 };
 use super::write_half::WriteHalf;
 use async_trait::async_trait;
@@ -15,8 +16,7 @@ use async_trait::async_trait;
 pub struct TransmissionLayer {
     pub(crate) shared: Arc<Shared>,
     pub(crate) write_half: Arc<WriteHalf>,
-    pub(crate) utp_read: tokio::sync::Mutex<Box<dyn super::transmission_layer::UnreliableRead>>,
-    pub(crate) recent_echoes: Mutex<super::ts_echo::RecentEchoes>,
+    pub(crate) read_half: tokio::sync::Mutex<ReadHalf>,
 }
 
 #[cfg(test)]
@@ -35,23 +35,20 @@ impl TransmissionLayer {
         Self {
             shared,
             write_half,
-            utp_read: tokio::sync::Mutex::new(read_half.utp_read),
-            recent_echoes: Mutex::new(read_half.recent_echoes),
+            read_half: tokio::sync::Mutex::new(read_half),
         }
     }
 
     pub fn new_with_watchdog_tuning(
         unreliable_layer: UnreliableLayer,
-        log_config: Option<LogConfig>,
-        tuning: super::watchdog_tuning::WatchdogTuning,
+        tuning: crate::transmission::watchdog_tuning::WatchdogTuning,
     ) -> Self {
         let (shared, write_half, read_half) =
-            shared::build_parts_with_watchdog_tuning(unreliable_layer, log_config, tuning);
+            build_parts_with_watchdog_tuning(unreliable_layer, None, tuning);
         Self {
             shared,
             write_half,
-            utp_read: tokio::sync::Mutex::new(read_half.utp_read),
-            recent_echoes: Mutex::new(read_half.recent_echoes),
+            read_half: tokio::sync::Mutex::new(read_half),
         }
     }
 
@@ -104,7 +101,7 @@ impl TransmissionLayer {
         self.write_half.send_kill_pkt(bufs).await
     }
 
-    pub async fn send_kill_and_abort(&self, bufs: &mut SendBufs) {
+    pub async fn send_kill_and_abort(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         self.write_half.send_kill_and_abort(bufs).await
     }
 
@@ -126,249 +123,11 @@ impl TransmissionLayer {
         self.write_half.send_frame(frame, no_delay, bufs).await
     }
 
-    /// Receive and process incoming packets.  This is **drain-only**: it
-    /// reads datagrams, processes ACKs and data, records pending ACK work,
-    /// and wakes the send timer — it never sends on `utp_write`.  All ACK
-    /// transmission happens on the send path (`flush_acks`), so a blocked
-    /// `utp_write` cannot deadlock the recv task under bidirectional load.
     pub async fn recv_pkts(
         &self,
         bufs: &mut RecvBufs,
     ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
-        let first_error = &self.first_error;
-        let throw_error = |e: std::io::ErrorKind| {
-            first_error.set(e);
-            e
-        };
-        let mut recv_pkts = RecvPkts {
-            num_ack_segments: 0,
-            num_payload_segments: 0,
-            num_fin_segments: 0,
-        };
-
-        bufs.ack_to_peer.clear();
-        // Check the ACK flush deadline from shared state.  When it is due
-        // we stop reading and wake the send path so it can flush.
-        let ack_deadline = {
-            let s = self.ack_flush.lock().unwrap();
-            if 0 < s.pending_acks {
-                s.last_ack_flush.map(|last| last + ACK_FLUSH_AGE)
-            } else {
-                None
-            }
-        };
-        let mut ack_deadline_hit = false;
-        for _ in 0..MAX_NUM_ACK {
-            self.first_error
-                .throw_error()
-                .map_err(|e| (e, SendKillPkt::No))?;
-
-            // Read a raw UDP packet and FEC-decode it. If FEC is active, the
-            // raw packet is a FEC data/parity symbol; `fec.decode` strips the
-            // FEC header and returns the codec payload, or returns None for a
-            // parity symbol (recovered data is queued internally). If FEC is
-            // not active, the raw packet IS the codec payload.
-            let res = {
-                let mut utp_read = self.utp_read.lock().await;
-                match bufs.ack_to_peer.is_empty() {
-                    true => {
-                        if let Some(deadline) = ack_deadline {
-                            tokio::select! {
-                                res = utp_read.recv(&mut bufs.utp) => res,
-                                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                                    ack_deadline_hit = true;
-                                    break;
-                                }
-                            }
-                        } else {
-                            utp_read.recv(&mut bufs.utp).await
-                        }
-                    }
-                    false => {
-                        let res = utp_read.try_recv(&mut bufs.utp);
-                        if let Err(e) = &res
-                            && *e == std::io::ErrorKind::WouldBlock
-                        {
-                            break;
-                        }
-                        res
-                    }
-                }
-            };
-            let read_bytes = match res {
-                Ok(x) => x,
-                Err(e) => {
-                    return Err((throw_error(e), SendKillPkt::No));
-                }
-            };
-            let now = Instant::now();
-            let read_pkt = &bufs.utp[..read_bytes];
-
-            // FEC-decode the raw packet into `codec_pkts`, then process each.
-            // Also drain any packets recovered by parity.
-            bufs.codec_pkts.clear();
-            let mut orig_pkt = None;
-            match self.fec.as_ref() {
-                Some(fec) => {
-                    let mut fec = fec.lock().unwrap();
-                    if let Some(payload) = fec.decode(read_pkt) {
-                        bufs.codec_pkts.push(payload);
-                    }
-                    while let Some(recovered) = fec.pop_recovered() {
-                        bufs.codec_pkts.push(recovered);
-                    }
-                }
-                None => {
-                    orig_pkt = Some(read_pkt);
-                }
-            }
-
-            let mut end_of_acks = false;
-            use super::ts_echo::TsEcho;
-            use crate::codec::decode;
-            use crate::sack::AckBallSequence;
-            for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
-                bufs.ack_from_peer.clear();
-                let data = match decode(pkt, &mut bufs.ack_from_peer) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        if FEC_DEBUG {
-                            eprintln!("recv_pkts: decode error: {e:?}");
-                        }
-                        continue;
-                    }
-                };
-
-                if let Some(echo_ts) = data.echo_ts {
-                    let local_ts = self.wire_ts(now);
-                    if self
-                        .recent_echoes
-                        .lock()
-                        .unwrap()
-                        .should_sample(echo_ts, now)
-                        && let Some(rtt) = TsEcho::rtt_from_echo(local_ts, echo_ts)
-                    {
-                        self.reliable_layer.lock().unwrap().sample_rtt(rtt, now);
-                    }
-                }
-
-                if data.killed {
-                    let e = std::io::ErrorKind::BrokenPipe;
-                    throw_error(e);
-                    return Err((e, SendKillPkt::No));
-                }
-
-                let to_ack = {
-                    let mut reliable_layer = self.reliable_layer.lock().unwrap();
-
-                    // UDP local -{ACK}> reliable
-                    reliable_layer.recv_ack_pkt(AckBallSequence::new(&bufs.ack_from_peer), now);
-                    if FEC_DEBUG {
-                        eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
-                    }
-
-                    match &data.data {
-                        None => false,
-                        Some(data) => {
-                            // UDP local -{data}> reliable
-                            let to_ack = reliable_layer.recv_data_pkt(
-                                data.seq,
-                                data.frame_len,
-                                &pkt[data.buf_range.clone()],
-                            );
-                            if FEC_DEBUG {
-                                eprintln!(
-                                    "recv_data_pkt seq={} empty={} ack={}",
-                                    data.seq,
-                                    data.buf_range.is_empty(),
-                                    to_ack
-                                );
-                            }
-                            to_ack
-                        }
-                    }
-                };
-                recv_pkts.num_ack_segments += 1;
-                self.coord.sent_pkt_acked.notify_waiters();
-
-                let Some(data) = data.data else {
-                    self.log("recv_ack_pkt");
-                    continue;
-                };
-
-                if data.buf_range.is_empty() && data.frame_len.is_none() {
-                    recv_pkts.num_fin_segments += 1;
-                } else {
-                    recv_pkts.num_payload_segments += 1;
-                }
-                if to_ack {
-                    bufs.ack_to_peer.push(data.seq);
-                    if let Some(send_ts) = data.send_ts {
-                        self.ack_flush.lock().unwrap().ts_echo.set(send_ts);
-                    }
-                } else {
-                    end_of_acks = true;
-                }
-                self.log("recv_data_pkt");
-            }
-            if end_of_acks {
-                break;
-            }
-        }
-
-        // Record ACK work in shared state; the send path flushes it.
-        {
-            let mut s = self.ack_flush.lock().unwrap();
-            s.pending_acks += bufs.ack_to_peer.len();
-            if 0 < recv_pkts.num_fin_segments {
-                s.fin_pending = true;
-            }
-        }
-
-        // No new data received in the reliable layer
-        if bufs.ack_to_peer.is_empty() && !ack_deadline_hit {
-            // ACK processing may have freed cwnd or drained the send buffer
-            // enough that the send pump can make progress now. Wake the send
-            // timer exactly once per batch, after dropping the reliable layer
-            // lock. notify_one stores a permit, so a wake racing with the timer
-            // registering its next notified() is not lost.
-            let should_resume_send = {
-                let reliable_layer = self.reliable_layer.lock().unwrap();
-                !reliable_layer.is_send_buf_empty()
-                    && reliable_layer.pkt_send_space().accepts_new_pkt()
-            };
-            if should_resume_send {
-                self.coord.resume_send.notify_one();
-            }
-            return Ok(recv_pkts);
-        }
-
-        if !bufs.ack_to_peer.is_empty() {
-            self.coord.recv_data_pkt.notify_waiters();
-        }
-
-        // Wake the send path so it can flush pending ACKs.  The recv path
-        // never sends, so it cannot block on a stalled `utp_write`.
-        let should_flush = ack_deadline_hit || 0 < recv_pkts.num_fin_segments || {
-            let s = self.ack_flush.lock().unwrap();
-            ACK_FLUSH_COUNT <= s.pending_acks
-                || s.last_ack_flush
-                    .is_none_or(|last| ACK_FLUSH_AGE <= Instant::now().duration_since(last))
-                || {
-                    let reliable_layer = self.reliable_layer.lock().unwrap();
-                    reliable_layer
-                        .pkt_recv_space()
-                        .ack_history()
-                        .balls()
-                        .nth(1)
-                        .is_some()
-                }
-        };
-        if should_flush {
-            self.coord.resume_send.notify_one();
-        }
-
-        Ok(recv_pkts)
+        self.read_half.lock().await.recv_pkts(bufs).await
     }
 }
 
@@ -1039,8 +798,8 @@ mod tests {
     /// with context, and the error message includes the stall reason.
     #[tokio::test]
     async fn proactive_watchdog_sends_kill_and_preserves_aggregate_context() {
-        use crate::transmission::watchdog_tuning::WatchdogTuning;
         use crate::transmission::fec_tuning::FecTuning;
+        use crate::transmission::watchdog_tuning::WatchdogTuning;
 
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite3(Arc<Mutex<RecordingWrite>>);
@@ -1073,7 +832,7 @@ mod tests {
             crate::udp::NO_FEC_MSS,
             FecTuning::default(),
         );
-        let tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
+        let tl = TransmissionLayer::new_with_watchdog_tuning(ul, tuning);
 
         // Shrink RTT so the RTO stabilises at 1 s (MIN_RTO).  The watchdog
         // timeout is rto * rto_multiplier = 1 s, so the stall fires after 1 s.
@@ -1117,6 +876,45 @@ mod tests {
         assert!(
             msg.contains("reason=no_response"),
             "error message must contain reason=no_response, got: {msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sent_kill_succeeds_when_the_fec_tail_stalls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct KillThenStuckTail {
+            sends: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl UnreliableWrite for KillThenStuckTail {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                if self.sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(buf.len())
+                } else {
+                    std::future::pending().await
+                }
+            }
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let unreliable = crate::udp::wrap_fec(
+            BlackholeRead,
+            KillThenStuckTail {
+                sends: Arc::clone(&sends),
+            },
+            true,
+        );
+        let transmission = TransmissionLayer::new(unreliable, None);
+        let mut bufs = SendBufs::new();
+        let result = transmission.send_kill_and_abort(&mut bufs).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            transmission.throw_error(),
+            Err(std::io::ErrorKind::BrokenPipe)
         );
     }
 
