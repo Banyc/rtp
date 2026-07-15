@@ -129,6 +129,7 @@ impl OutageEpoch {
     /// `outage_loss_cut` intentionally stays in place so that late echoes of
     /// pre-outage packets are still discarded.  A second outage-length stall
     /// inside an already-closed epoch should refresh the cut via [`detect`].
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.recovery_start = None;
     }

@@ -6,7 +6,7 @@ use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::transmission_layer::{
     ACK_FLUSH_AGE, ACK_FLUSH_COUNT, AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS,
-    ProactiveTerminationContext, ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env,
+    ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env,
     rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
@@ -173,26 +173,6 @@ impl Shared {
             deadline = Some(deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
         }
         deadline
-    }
-
-    pub fn set_with_context_if_empty(
-        &self,
-        kind: std::io::ErrorKind,
-        context: Option<ProactiveTerminationContext>,
-    ) -> bool {
-        self.first_error.set_with_context_if_empty(kind, context)
-    }
-
-    pub fn next_send_deadline(&self) -> Option<Instant> {
-        let pacing = self.send_rate_limiter.lock().unwrap().next_token_time();
-        let now = Instant::now();
-        let rl = self.reliable_layer.lock().unwrap();
-        let stock_deadline = rl.pkt_send_space().next_poll_time();
-        let deadlines: [Option<Instant>; 2] = [
-            if pacing > now { Some(pacing) } else { None },
-            stock_deadline,
-        ];
-        deadlines.into_iter().flatten().min()
     }
 
     pub(crate) fn wire_ts(&self, now: Instant) -> u32 {

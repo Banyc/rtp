@@ -290,6 +290,7 @@ impl WriteHalf {
         self.send_kill_pkt_with_deadline(bufs).await
     }
 
+    #[cfg(test)]
     pub fn has_pending_acks(&self) -> bool {
         let s = self.ack_flush.lock().unwrap();
         0 < s.pending_acks || s.fin_pending

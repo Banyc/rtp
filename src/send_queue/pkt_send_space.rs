@@ -648,6 +648,7 @@ impl PktSendSpace {
         }
     }
 
+    #[cfg(test)]
     pub fn clear_outage_recovery(&mut self) {
         self.outage.clear();
     }
@@ -670,31 +671,6 @@ impl PktSendSpace {
             num_not_lost_txing_pkts: not_lost,
         }
     }
-    pub fn all_lost_pkts_rtxed(&self, now: Instant) -> bool {
-        for p in Self::unacked(&self.send_wnd)
-            .map(|(_, v)| v)
-            .take(self.cwnd.get())
-        {
-            if p.hits_rto(now) {
-                return false;
-            }
-        }
-        true
-    }
-    pub fn num_not_lost_txing_pkts(&self, now: Instant) -> usize {
-        let mut not_lost = 0;
-        for p in Self::unacked(&self.send_wnd)
-            .map(|(_, v)| v)
-            .take(self.cwnd.get())
-        {
-            if p.hits_rto(now) {
-                continue;
-            }
-            not_lost += 1;
-        }
-        not_lost
-    }
-
     pub fn num_txing_pkts(&self) -> usize {
         self.num_txing
     }
@@ -2039,10 +2015,10 @@ mod tests {
 
         let send_start = t0 + ms(11);
         for i in 0..22 {
-            send_packet(&mut space, send_start + ms(i * 1));
+            send_packet(&mut space, send_start + ms(i));
         }
 
-        let mut t = send_start + ms(22 * 1 + 1);
+        let mut t = send_start + ms(22 + 1);
         for _ in 0..320 {
             ack_one(&mut space, 0, t);
             t += ms(100);
@@ -2065,7 +2041,7 @@ mod tests {
         );
 
         for seq in 1..23 {
-            ack_one(&mut space, seq, t + ms((seq * 1) as u64));
+            ack_one(&mut space, seq, t + ms(seq));
         }
         assert_eq!(
             space.no_progress_for(t + Duration::from_secs(600)),

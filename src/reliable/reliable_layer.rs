@@ -339,6 +339,7 @@ impl ReliableLayer {
     }
 
     /// Store data in the inner data buffer
+    #[cfg(test)]
     pub fn send_data_buf_capacity(&self) -> usize {
         self.send_data_buf.capacity()
     }

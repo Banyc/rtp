@@ -93,34 +93,12 @@ impl TransmissionLayer {
         self.write_half.has_pending_acks()
     }
 
-    pub fn ack_flush_is_due(&self) -> bool {
-        self.write_half.ack_flush_is_due()
-    }
-
     pub async fn send_kill_pkt(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         self.write_half.send_kill_pkt(bufs).await
     }
 
     pub async fn send_kill_and_abort(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         self.write_half.send_kill_and_abort(bufs).await
-    }
-
-    pub async fn send(
-        &self,
-        data: &[u8],
-        no_delay: bool,
-        bufs: &mut SendBufs,
-    ) -> Result<usize, std::io::ErrorKind> {
-        self.write_half.send(data, no_delay, bufs).await
-    }
-
-    pub async fn send_frame(
-        &self,
-        frame: &[u8],
-        no_delay: bool,
-        bufs: &mut SendBufs,
-    ) -> Result<usize, std::io::ErrorKind> {
-        self.write_half.send_frame(frame, no_delay, bufs).await
     }
 
     pub async fn recv_pkts(

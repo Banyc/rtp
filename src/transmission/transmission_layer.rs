@@ -239,10 +239,6 @@ impl FirstError {
         let _ = self.set_with_context_if_empty(err, None);
     }
 
-    pub fn set_if_empty(&self, err: std::io::ErrorKind) -> bool {
-        self.set_with_context_if_empty(err, None)
-    }
-
     pub fn set_with_context_if_empty(
         &self,
         kind: std::io::ErrorKind,
