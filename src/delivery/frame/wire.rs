@@ -4,9 +4,7 @@
 //! In frame-delivery mode the first packet of each application frame is
 //! emitted with the `FRAME_DATA_TS` codec command: the same fields as the
 //! stock `DATA_TS` command plus a `u32 frame_len` (the total application
-//! frame length in bytes).  Continuation packets of the frame use the stock
-//! `DATA_TS` command.  The command is never emitted when frame-delivery mode
-//! is off, so stock connections stay byte-for-byte identical on the wire.
+//! frame length in bytes).  Continuation packets use the stock `DATA_TS`.
 
 use std::io::{self, Write};
 
@@ -18,16 +16,11 @@ use crate::codec::{
     wrap_insufficient_buffer_size_err,
 };
 
-/// First packet of a frame in frame-delivery mode.  Same fields as
-/// `DATA_TS_CMD` plus a `u32 frame_len` (the total application frame length in
-/// bytes).  Continuation packets of the frame use the stock `DATA_TS_CMD`.
-/// Never emitted when frame-delivery mode is off.
+/// Codec command byte for the first packet of a frame in frame-delivery mode.
 pub(crate) const FRAME_DATA_TS_CMD: u8 = 5;
 
-/// Per-packet wire overhead of a `FRAME_DATA_TS` (cmd 5) packet: the stock
-/// `data_overhead()` plus the `u32 frame_len` field.  Only the first packet of
-/// a frame pays this; continuation packets use `DATA_TS` and pay
-/// `data_overhead()`.
+/// Per-packet wire overhead of a `FRAME_DATA_TS` packet: stock
+/// `data_overhead()` plus the `u32 frame_len` field.
 pub const fn frame_data_overhead() -> usize {
     data_overhead() + std::mem::size_of::<u32>()
 }

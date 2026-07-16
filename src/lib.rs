@@ -1,5 +1,5 @@
 pub mod codec;
-pub mod frame_delivery;
+pub mod delivery;
 pub mod keyed_udp;
 pub mod mpudp;
 pub mod recv_queue;

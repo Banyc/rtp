@@ -5,8 +5,8 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tap::Pipe;
 use thiserror::Error;
 
-pub use crate::frame_delivery::wire::frame_data_overhead;
-use crate::frame_delivery::wire::{FRAME_DATA_TS_CMD, decode_frame_data_ts, encode_frame_data_ts};
+pub use crate::delivery::frame::wire::frame_data_overhead;
+use crate::delivery::frame::wire::{FRAME_DATA_TS_CMD, decode_frame_data_ts, encode_frame_data_ts};
 use crate::sack::{AckBall, AckQueue};
 
 const ACK_CMD: u8 = 0;
@@ -15,7 +15,7 @@ const KILL_CMD: u8 = 2;
 const DATA_TS_CMD: u8 = 3;
 const ECHO_TS_CMD: u8 = 4;
 // cmd 5 (`FRAME_DATA_TS_CMD`) belongs to frame-delivery mode; see
-// `crate::frame_delivery::wire`.
+// `crate::delivery::frame::wire`.
 
 pub fn in_cmd_space(buf: u8) -> bool {
     matches!(

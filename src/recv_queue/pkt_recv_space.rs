@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
 use crate::{
-    frame_delivery::{
+    delivery::frame::{
         FrameDelivery,
         recv::{RecvPkt, RecvSlot},
     },
@@ -87,10 +87,12 @@ impl PktRecvSpace {
     /// Pop one complete frame (possibly out of order past sequence holes).
     /// The consumed slots are replaced with `Tombstone`s, and a contiguous
     /// tombstone prefix at the in-order cursor is collapsed.  The scan and
-    /// extraction logic lives in [`crate::frame_delivery::recv`].
+    /// extraction logic lives in [`crate::delivery::frame::recv`].
     pub fn pop_complete_frame(&mut self) -> Option<Vec<u8>> {
-        let frame_bytes =
-            crate::frame_delivery::recv::pop_complete_frame(&mut self.slots, &mut self.reused_buf)?;
+        let frame_bytes = crate::delivery::frame::recv::pop_complete_frame(
+            &mut self.slots,
+            &mut self.reused_buf,
+        )?;
 
         self.collapse_tombstone_prefix();
 
@@ -137,7 +139,7 @@ impl PktRecvSpace {
     /// - that slot's payload is empty (`data.is_empty()`), and
     /// - that slot has no `frame_len` (it's a FIN, not a zero-length frame).
     pub fn fin_at_head(&self) -> bool {
-        crate::frame_delivery::recv::fin_at_head(self.next, &self.slots)
+        crate::delivery::frame::recv::fin_at_head(self.next, &self.slots)
     }
 
     pub fn pop(&mut self) -> Option<Vec<u8>> {

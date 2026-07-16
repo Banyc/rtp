@@ -1146,7 +1146,7 @@ mod tests {
     /// frames.
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_mode_async_write_produces_one_frame() {
-        use crate::frame_delivery::FrameDelivery;
+        use crate::delivery::frame::FrameDelivery;
         use tokio::io::AsyncWriteExt;
 
         let fec = false;
@@ -1340,7 +1340,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_delivery_io_preserves_frames_across_async_io() {
-        use crate::frame_delivery::FrameDelivery;
+        use crate::delivery::frame::FrameDelivery;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let fec = false;

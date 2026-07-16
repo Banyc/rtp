@@ -13,16 +13,18 @@ use primitive::{
         float::{PosR, UnitR},
         len::{Capacity, Len, LenExt},
     },
-    queue::cap_queue::CapVecQueue,
     time::timer::Timer,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::data_overhead,
-    frame_delivery::{
-        FrameDelivery,
-        send::{FrameSendStage, MAX_FRAME_LEN},
+    delivery::{
+        frame::{
+            FrameDelivery,
+            send::{FrameSendStage, MAX_FRAME_LEN},
+        },
+        stock::{recv::StockRecvStage, send::StockSendStage},
     },
     recv_queue::pkt_recv_space::PktRecvSpace,
     sack::AckBallSequence,
@@ -30,10 +32,9 @@ use crate::{
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
-const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
 /// The frame-delivery [`MAX_FRAME_LEN`] is defined in
-/// [`crate::frame_delivery::send`] and must stay equal to the stock
+/// [`crate::delivery::frame::send`] and must stay equal to the stock
 /// `MAX_SEND_DATA_BUF_LEN` so a frame can occupy the whole staging buffer.
 const _: () = assert!(MAX_FRAME_LEN == MAX_SEND_DATA_BUF_LEN);
 
@@ -105,9 +106,9 @@ enum SendFinBuf {
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
-    send_data_buf: CapVecQueue<u8>,
+    send_data_buf: StockSendStage,
     send_fin_buf: SendFinBuf,
-    recv_data_buf: CapVecQueue<u8>,
+    recv_data_buf: StockRecvStage,
     /// set-only
     recv_fin_buf: bool,
     send_rate_limiter: Arc<Mutex<TokenBucket>>,
@@ -147,7 +148,7 @@ pub struct ReliableLayer {
     /// byte-stream `recv`/`send` paths are unchanged).
     frame_delivery: FrameDelivery,
     /// Sender-side frame staging and frame-aligned packetization in
-    /// frame-delivery mode (see [`crate::frame_delivery::send`]).  Empty when
+    /// frame-delivery mode (see [`crate::delivery::frame::send`]).  Empty when
     /// frame-delivery mode is off (the stock byte-stream path uses
     /// `send_data_buf` directly).
     frame_send_stage: FrameSendStage,
@@ -173,9 +174,9 @@ impl ReliableLayer {
         )));
         let this = Self {
             mss,
-            send_data_buf: CapVecQueue::new_vec(send_data_buf_len(mss)),
+            send_data_buf: StockSendStage::new(mss),
             send_fin_buf: SendFinBuf::Empty,
-            recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUF_LEN),
+            recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
@@ -216,9 +217,9 @@ impl ReliableLayer {
         )));
         let this = Self {
             mss,
-            send_data_buf: CapVecQueue::new_vec(send_data_buf_len(mss)),
+            send_data_buf: StockSendStage::new(mss),
             send_fin_buf: SendFinBuf::Empty,
-            recv_data_buf: CapVecQueue::new_vec(RECV_DATA_BUF_LEN),
+            recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
@@ -306,7 +307,7 @@ impl ReliableLayer {
     /// a full 8-symbol group.
     #[cfg(test)]
     pub(crate) fn enqueue_send_data_for_test(&mut self, buf: &[u8]) {
-        self.send_data_buf.batch_enqueue(buf);
+        self.send_data_buf.stage(buf, usize::MAX);
     }
 
     /// Test-only: shrink the congestion window so the send loop stops after a
@@ -359,10 +360,7 @@ impl ReliableLayer {
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap =
             (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(self.send_data_buf.capacity());
-        let free_bytes = cap.saturating_sub(self.send_data_buf.len());
-        let write_bytes = free_bytes.min(buf.len());
-        self.send_data_buf.batch_enqueue(&buf[..write_bytes]);
-        write_bytes
+        self.send_data_buf.stage(buf, cap)
     }
 
     /// Stage a whole application frame in frame-delivery mode.  The frame is
@@ -374,7 +372,7 @@ impl ReliableLayer {
         if !self.frame_delivery.enabled {
             return Err(std::io::ErrorKind::InvalidInput);
         }
-        crate::frame_delivery::send::validate_frame(frame)?;
+        crate::delivery::frame::send::validate_frame(frame)?;
         self.detect_application_limited_phases(now);
         // Rate-scale the soft staging cap exactly like the stock path so a
         // small interactive frame is not starved behind a bulk backlog
@@ -502,7 +500,7 @@ impl ReliableLayer {
             .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
 
         let mut buf = self.pkt_send_space.reused_buf().take();
-        self.send_data_buf.batch_dequeue_extend(pkt_bytes, &mut buf);
+        self.send_data_buf.dequeue_extend(pkt_bytes, &mut buf);
         let data = buf;
 
         pkt[..data.len()].copy_from_slice(&data);
@@ -520,7 +518,7 @@ impl ReliableLayer {
     }
 
     /// Frame-delivery-mode new-packet path.  Staging is via the frame send
-    /// stage ([`crate::frame_delivery::send`]); packetization is
+    /// stage ([`crate::delivery::frame::send`]); packetization is
     /// frame-aligned (a packet never carries bytes of two frames).  The
     /// first packet of a frame carries `Some(frame_len)`; the continuation
     /// packets carry `None`.  The `pkt` scratch buffer receives the payload
@@ -531,7 +529,7 @@ impl ReliableLayer {
         let first_pkt_max_payload = self
             .mss
             .get()
-            .checked_sub(crate::frame_delivery::wire::frame_data_overhead())
+            .checked_sub(crate::delivery::frame::wire::frame_data_overhead())
             .unwrap();
 
         let chunk = match self
@@ -892,14 +890,7 @@ impl ReliableLayer {
     ///
     /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
-        let read_bytes = buf.len().min(self.recv_data_buf.len());
-        let Some((a, b)) = self.recv_data_buf.batch_dequeue(read_bytes) else {
-            return 0;
-        };
-        buf[..a.len()].copy_from_slice(a);
-        if let Some(b) = b {
-            buf[a.len()..read_bytes].copy_from_slice(b);
-        }
+        let read_bytes = self.recv_data_buf.read(buf);
         self.move_recv_data();
         read_bytes
     }
@@ -969,7 +960,7 @@ impl ReliableLayer {
                 self.pkt_recv_space.reused_buf().put(p);
                 return;
             }
-            self.recv_data_buf.batch_enqueue(&p);
+            self.recv_data_buf.enqueue(&p);
             self.pkt_recv_space.reused_buf().put(p);
         }
     }
@@ -1054,15 +1045,6 @@ fn token_bucket_with_tokens(
 /// For the default MSS we keep the historical 8 KiB staging buffer. For larger
 /// MSS values we scale the buffer to whole packets so the send-data path never
 /// refills with a sub-MSS remainder that would sit in the buffer indefinitely.
-fn send_data_buf_len(mss: NonZeroUsize) -> usize {
-    if mss.get() <= crate::udp::NO_FEC_MSS {
-        return SEND_DATA_BUF_LEN;
-    }
-    let payload = mss.get() - data_overhead();
-    let pkts = MAX_SEND_DATA_BUF_LEN / payload;
-    pkts * payload
-}
-
 /// Token-bucket burst size for a given send rate.
 ///
 /// The burst is scaled with the send rate so high-rate flows can emit a larger
@@ -1274,9 +1256,10 @@ mod tests {
         GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS,
         INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN,
         QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET,
-        RTT_MIN_BUCKET_RTT_SCALE, SEND_DATA_BUF_LEN, WindowedRttMin, burst_pkts, send_data_buf_len,
-        token_bucket_with_tokens,
+        RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin, burst_pkts, token_bucket_with_tokens,
     };
+    use crate::delivery::stock::send::send_data_buf_len;
+    const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 
     const TEST_MSS: usize = 1200;
     use crate::{
@@ -1432,7 +1415,7 @@ mod tests {
     fn test_layer(now: Instant) -> super::ReliableLayer {
         super::ReliableLayer::new(
             NonZeroUsize::new(TEST_MSS).unwrap(),
-            crate::frame_delivery::FrameDelivery::default(),
+            crate::delivery::frame::FrameDelivery::default(),
             now,
         )
         .0
@@ -2058,7 +2041,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             NonZeroUsize::new(mss).unwrap(),
-            crate::frame_delivery::FrameDelivery::enabled(),
+            crate::delivery::frame::FrameDelivery::enabled(),
             now,
         )
         .0;
@@ -2080,7 +2063,7 @@ mod tests {
         };
 
         // The on-wire size of the first packet = frame_data_overhead + payload.
-        let on_wire_first = crate::frame_delivery::wire::frame_data_overhead() + payload_len;
+        let on_wire_first = crate::delivery::frame::wire::frame_data_overhead() + payload_len;
         assert!(
             on_wire_first <= mss,
             "first frame packet on-wire size {on_wire_first} must be <= MSS {mss}"
@@ -2098,7 +2081,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             NonZeroUsize::new(mss).unwrap(),
-            crate::frame_delivery::FrameDelivery::enabled(),
+            crate::delivery::frame::FrameDelivery::enabled(),
             now,
         )
         .0;
