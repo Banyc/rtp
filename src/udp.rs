@@ -11,8 +11,8 @@ use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
     socket::{
-        ReadSocket, WriteSocket, client_opening_handshake, server_opening_handshake, socket,
-        socket_with_watchdog_tuning,
+        FrameReader, FrameWriter, ReadSocket, WriteSocket, client_opening_handshake,
+        into_frame_io_parts, server_opening_handshake, socket, socket_with_watchdog_tuning,
     },
     transmission::{
         fec::{FecConfig, FecState},
@@ -29,6 +29,21 @@ pub const NO_FEC_MSS: usize = 1424;
 /// UDP sends fail with `EMSGSIZE` and are treated as fatal connection errors.
 pub const MAX_MSS: usize = 64 * 1024;
 const DISPATCHER_BUF_SIZE: usize = 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MssConfig {
+    #[default]
+    Default,
+    Custom(usize),
+}
+impl MssConfig {
+    const fn resolve(self) -> usize {
+        match self {
+            Self::Default => NO_FEC_MSS,
+            Self::Custom(mss) => mss,
+        }
+    }
+}
 
 type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
 type IdentityConn = Conn<UdpSocket, SocketAddr, Packet>;
@@ -96,6 +111,33 @@ impl Listener {
         let frame_delivery = frame_delivery_from_env();
         self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
             .await
+    }
+
+    pub async fn accept_frame_delivery(
+        &self,
+        config: FrameDeliveryAcceptConfig,
+    ) -> std::io::Result<FrameDeliveryAccept> {
+        let accepted = self.listener.accept().await?;
+        let raw_fd = self.raw_fd;
+        let local_addr = self.local_addr;
+        Ok(tokio::spawn(async move {
+            let accepted = accept(
+                accepted,
+                config.handshake,
+                config.fec,
+                config.mss.resolve(),
+                config.fec_tuning,
+                FrameDelivery::enabled(),
+                raw_fd,
+            )
+            .await?;
+            let Accepted {
+                read,
+                write,
+                peer_addr,
+            } = accepted;
+            make_frame_delivery_io(read, write, local_addr, peer_addr)
+        }))
     }
 
     /// [`Self::accept()`] but without handshake and with a custom MSS.
@@ -230,6 +272,21 @@ pub struct Accepted {
     pub peer_addr: SocketAddr,
 }
 
+#[derive(Debug)]
+pub struct FrameDeliveryIo {
+    pub read: FrameReader,
+    pub write: FrameWriter,
+    pub local_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
+}
+pub type FrameDeliveryAccept = tokio::task::JoinHandle<std::io::Result<FrameDeliveryIo>>;
+pub struct FrameDeliveryAcceptConfig {
+    pub handshake: bool,
+    pub fec: bool,
+    pub mss: MssConfig,
+    pub fec_tuning: FecTuning,
+}
+
 pub struct ConnectConfig<'a> {
     pub log_config: Option<LogConfig<'a>>,
     pub handshake: bool,
@@ -237,6 +294,14 @@ pub struct ConnectConfig<'a> {
     pub mss: usize,
     pub fec_tuning: FecTuning,
     pub frame_delivery: FrameDelivery,
+}
+
+pub struct FrameDeliveryConnectConfig<'a> {
+    pub log_config: Option<LogConfig<'a>>,
+    pub handshake: bool,
+    pub fec: bool,
+    pub mss: MssConfig,
+    pub fec_tuning: FecTuning,
 }
 
 pub struct WatchdogConnectConfig<'a> {
@@ -274,6 +339,21 @@ async fn accept(
     Ok(Accepted {
         read,
         write,
+        peer_addr,
+    })
+}
+
+fn make_frame_delivery_io(
+    read: ReadSocket,
+    write: WriteSocket,
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> std::io::Result<FrameDeliveryIo> {
+    let (read, write) = into_frame_io_parts(read, write)?.into_parts();
+    Ok(FrameDeliveryIo {
+        read,
+        write,
+        local_addr,
         peer_addr,
     })
 }
@@ -479,9 +559,7 @@ async fn connect_configured(
         client_opening_handshake(&mut unreliable_layer).await?;
     }
     let (read, write) = match watchdog {
-        Some(tuning) => {
-            socket_with_watchdog_tuning(unreliable_layer, log_config, tuning)
-        }
+        Some(tuning) => socket_with_watchdog_tuning(unreliable_layer, log_config, tuning),
         None => socket(unreliable_layer, log_config),
     };
     Ok(Connected {
@@ -513,6 +591,43 @@ pub struct Connected {
     pub write: WriteSocket,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
+}
+
+impl FrameDeliveryIo {
+    pub async fn connect(
+        bind: impl tokio::net::ToSocketAddrs,
+        addr: impl tokio::net::ToSocketAddrs,
+        config: FrameDeliveryConnectConfig<'_>,
+    ) -> std::io::Result<Self> {
+        let FrameDeliveryConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning,
+        } = config;
+        let connected = connect_configured(
+            bind,
+            addr,
+            ConnectConfig {
+                log_config,
+                handshake,
+                fec,
+                mss: mss.resolve(),
+                fec_tuning,
+                frame_delivery: FrameDelivery::enabled(),
+            },
+            None,
+        )
+        .await?;
+        let Connected {
+            read,
+            write,
+            local_addr,
+            peer_addr,
+        } = connected;
+        make_frame_delivery_io(read, write, local_addr, peer_addr)
+    }
 }
 
 pub(crate) fn wrap_fec(
@@ -1310,5 +1425,11 @@ mod tests {
         original
             .send_to(b"alive", original.local_addr().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn mss_config_resolves_default_and_custom_values() {
+        assert_eq!(MssConfig::Default.resolve(), NO_FEC_MSS);
+        assert_eq!(MssConfig::Custom(9_000).resolve(), 9_000);
     }
 }

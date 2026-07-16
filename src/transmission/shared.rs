@@ -6,8 +6,7 @@ use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::transmission_layer::{
     ACK_FLUSH_AGE, ACK_FLUSH_COUNT, AckFlushState, FirstError, Log, LogConfig, PRINT_DEBUG_MSGS,
-    ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env,
-    rtx_dup_from_env,
+    ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env, rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
 use super::watchdog_tuning::WatchdogTuning;

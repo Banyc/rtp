@@ -23,6 +23,7 @@ Treat RTP like TCP for behavior common to reliable stream transports. In particu
 - a user-facing I/O-agnostic socket wrapper
   - managing opening, closing, timer, async read/write for the transmission layer
   - perk: You are allowed to wait until or check if the send buf is empty!
+  - owning the validated frame-delivery-to-AsyncRead/AsyncWrite adaptation
   - main entry: [[src/socket.rs]]
 - a user-facing over-UDP implementation
   - exposing listening, accepting, and connecting APIs

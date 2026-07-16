@@ -162,11 +162,70 @@ impl tokio::io::AsyncWrite for IoStream {
     }
 }
 
+#[derive(Debug)]
+pub struct FrameReader {
+    inner: ReadStream,
+}
+impl tokio::io::AsyncRead for FrameReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[derive(Debug)]
+pub struct FrameWriter {
+    inner: WriteStream,
+}
+impl FrameWriter {
+    pub async fn send_kill_and_abort(&mut self) {
+        self.inner.send_kill_and_abort().await;
+    }
+}
+impl tokio::io::AsyncWrite for FrameWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FrameIoParts {
+    read: FrameReader,
+    write: FrameWriter,
+}
+impl FrameIoParts {
+    pub(crate) fn into_parts(self) -> (FrameReader, FrameWriter) {
+        (self.read, self.write)
+    }
+}
+
 const _: () = {
     fn assert_send<T: Send>() {}
     let _ = assert_send::<WriteStream>;
     let _ = assert_send::<ReadStream>;
     let _ = assert_send::<IoStream>;
+    let _ = assert_send::<FrameReader>;
+    let _ = assert_send::<FrameWriter>;
+    let _ = assert_send::<FrameIoParts>;
 };
 
 pub fn socket(
@@ -549,6 +608,44 @@ impl WriteSocket {
             max_stage,
         }
     }
+}
+
+pub(crate) fn into_frame_io_parts(
+    read: ReadSocket,
+    write: WriteSocket,
+) -> std::io::Result<FrameIoParts> {
+    if !Arc::ptr_eq(&read.transmission_layer, &write.transmission_layer.shared) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RTP read and write halves belong to different connections",
+        ));
+    }
+    let read_enabled = read
+        .transmission_layer
+        .reliable_layer()
+        .lock()
+        .unwrap()
+        .frame_delivery_enabled();
+    let write_enabled = write
+        .transmission_layer
+        .reliable_layer()
+        .lock()
+        .unwrap()
+        .frame_delivery_enabled();
+    if !read_enabled || !write_enabled {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "RTP connection is not configured for frame delivery",
+        ));
+    }
+    Ok(FrameIoParts {
+        read: FrameReader {
+            inner: read.into_async_read(),
+        },
+        write: FrameWriter {
+            inner: write.into_async_write(),
+        },
+    })
 }
 
 pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {
@@ -1218,5 +1315,91 @@ mod tests {
             ),
             Err(_) => panic!("handshake_send hung (should have completed)"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frame_delivery_io_conversion_rejects_stock_mode() {
+        let fec = false;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let a = wrap_fec(a.clone(), a, fec);
+        let b = wrap_fec(b.clone(), b, fec);
+        let (a_r, a_w) = socket(a, None);
+        let (_b_r, _b_w) = socket(b, None);
+        let result = into_frame_io_parts(a_r, a_w);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not configured for frame delivery"),
+            "stock-mode connections must be rejected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frame_delivery_io_preserves_frames_across_async_io() {
+        use crate::transmission::frame_delivery::FrameDelivery;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let fec = false;
+        let mss = crate::udp::NO_FEC_MSS;
+        let fd = FrameDelivery::enabled();
+
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+
+        let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            a.clone(),
+            a,
+            fec,
+            mss,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            fd,
+        );
+        let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            b.clone(),
+            b,
+            fec,
+            mss,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            fd,
+        );
+        let (a_r, a_w) = socket(a_layer, None);
+        let (b_r, b_w) = socket(b_layer, None);
+
+        let mut a_io = into_frame_io_parts(a_r, a_w)
+            .expect("frame delivery halves must convert")
+            .into_parts();
+        let mut b_io = into_frame_io_parts(b_r, b_w)
+            .expect("frame delivery halves must convert")
+            .into_parts();
+
+        let first = b"first";
+        let second = b"second-frame";
+
+        // Write both frames through the sender's frame writer.
+        a_io.1.write_all(first).await.unwrap();
+        a_io.1.write_all(second).await.unwrap();
+        a_io.1.flush().await.unwrap();
+        a_io.1.shutdown().await.ok();
+
+        // Two separately timed reads on the receiver must return exactly
+        // those two frame payloads without coalescing.
+        let mut buf = vec![0u8; 256];
+        let n1 = tokio::time::timeout(Duration::from_secs(5), b_io.0.read(&mut buf))
+            .await
+            .expect("first read timed out")
+            .expect("first read failed");
+        assert_eq!(&buf[..n1], first, "first frame must match");
+
+        let n2 = tokio::time::timeout(Duration::from_secs(5), b_io.0.read(&mut buf))
+            .await
+            .expect("second read timed out")
+            .expect("second read failed");
+        assert_eq!(&buf[..n2], second, "second frame must match");
     }
 }
