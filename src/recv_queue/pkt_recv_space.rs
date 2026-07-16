@@ -2,23 +2,15 @@ use std::collections::BTreeMap;
 
 use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
-use crate::{sack::AckQueue, transmission::frame_delivery::FrameDelivery};
+use crate::{
+    frame_delivery::{
+        FrameDelivery,
+        recv::{RecvPkt, RecvSlot},
+    },
+    sack::AckQueue,
+};
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
-
-#[derive(Debug, PartialEq, Eq)]
-enum RecvSlot {
-    Data(RecvPkt),
-    Tombstone,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct RecvPkt {
-    data: Vec<u8>,
-    /// `Some` only for the first packet of a frame; `None` for continuation
-    /// packets and for all packets when frame-delivery mode is off.
-    frame_len: Option<u32>,
-}
 
 #[derive(Debug)]
 pub struct PktRecvSpace {
@@ -92,113 +84,13 @@ impl PktRecvSpace {
         true
     }
 
-    /// Find the first complete frame in the slot map.  Scans for a
-    /// `Data` slot with `frame_len: Some(len)`, then walks
-    /// consecutive `Data` slots until the accumulated payload equals
-    /// `len`.  Returns `None` if no complete frame is found.
-    fn find_complete_frame(&self) -> Option<Vec<u64>> {
-        let mut collected_seqs: Vec<u64> = Vec::new();
-        let mut target_len: Option<u32> = None;
-        let mut collected: usize = 0;
-
-        for (&seq, slot) in self.slots.iter() {
-            match slot {
-                RecvSlot::Data(pkt) => {
-                    if collected_seqs.is_empty() {
-                        // Looking for a frame-start slot.
-                        let Some(fl) = pkt.frame_len else {
-                            continue;
-                        };
-                        if fl == 0 {
-                            // Zero-length frame in the slot map — shouldn't
-                            // happen (FIN is an empty-payload packet with no
-                            // frame_len), but handle gracefully.
-                            return Some(vec![seq]);
-                        }
-                        target_len = Some(fl);
-                        collected_seqs.push(seq);
-                        collected += pkt.data.len();
-                        if collected >= fl as usize {
-                            return Some(collected_seqs);
-                        }
-                    } else {
-                        // Already inside a frame run.
-                        // A continuation slot with its own `frame_len` signals
-                        // a new frame — stop the current run.
-                        if let Some(fl) = pkt.frame_len {
-                            // Current frame is incomplete; reset and start
-                            // scanning from this new start.
-                            collected_seqs.clear();
-                            if fl == 0 {
-                                return Some(vec![seq]);
-                            }
-                            target_len = Some(fl);
-                            collected_seqs.push(seq);
-                            collected = pkt.data.len();
-                            if collected >= fl as usize {
-                                return Some(collected_seqs);
-                            }
-                            continue;
-                        }
-                        // Continuation packet: must be consecutive.
-                        let expected = *collected_seqs.last().unwrap() + 1;
-                        if seq != expected {
-                            // Gap in the frame run — frame is incomplete.
-                            collected_seqs.clear();
-                            target_len = None;
-                            collected = 0;
-                            continue;
-                        }
-                        collected_seqs.push(seq);
-                        collected += pkt.data.len();
-                        // Check if we've collected the full frame.
-                        if let Some(tl) = target_len
-                            && collected >= tl as usize
-                        {
-                            return Some(collected_seqs);
-                        }
-                    }
-                }
-                RecvSlot::Tombstone => {
-                    // Tombstones break frame contiguity.
-                    if !collected_seqs.is_empty() {
-                        collected_seqs.clear();
-                        target_len = None;
-                        collected = 0;
-                    }
-                }
-            }
-        }
-        None
-    }
-
     /// Pop one complete frame (possibly out of order past sequence holes).
     /// The consumed slots are replaced with `Tombstone`s, and a contiguous
-    /// tombstone prefix at the in-order cursor is collapsed.
+    /// tombstone prefix at the in-order cursor is collapsed.  The scan and
+    /// extraction logic lives in [`crate::frame_delivery::recv`].
     pub fn pop_complete_frame(&mut self) -> Option<Vec<u8>> {
-        let seqs = self.find_complete_frame()?;
-        let mut frame_bytes = Vec::new();
-
-        for &seq in &seqs {
-            let slot = self.slots.remove(&seq).unwrap();
-            match slot {
-                RecvSlot::Data(pkt) => {
-                    frame_bytes.extend_from_slice(&pkt.data);
-                    self.reused_buf.put(pkt.data);
-                }
-                RecvSlot::Tombstone => {
-                    // Shouldn't happen (find_complete_frame skips tombstones),
-                    // but be defensive.
-                    self.slots.insert(seq, RecvSlot::Tombstone);
-                }
-            }
-        }
-
-        // Re-insert tombstones for the consumed slots so window accounting
-        // still bounds memory.
-        for seq in seqs.iter() {
-            self.slots.insert(*seq, RecvSlot::Tombstone);
-        }
+        let frame_bytes =
+            crate::frame_delivery::recv::pop_complete_frame(&mut self.slots, &mut self.reused_buf)?;
 
         self.collapse_tombstone_prefix();
 
@@ -245,13 +137,7 @@ impl PktRecvSpace {
     /// - that slot's payload is empty (`data.is_empty()`), and
     /// - that slot has no `frame_len` (it's a FIN, not a zero-length frame).
     pub fn fin_at_head(&self) -> bool {
-        let Some(next) = self.next else {
-            return false;
-        };
-        match self.slots.get(&next) {
-            Some(RecvSlot::Data(pkt)) => pkt.data.is_empty() && pkt.frame_len.is_none(),
-            _ => false,
-        }
+        crate::frame_delivery::recv::fin_at_head(self.next, &self.slots)
     }
 
     pub fn pop(&mut self) -> Option<Vec<u8>> {

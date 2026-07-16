@@ -20,20 +20,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     codec::data_overhead,
+    frame_delivery::{
+        FrameDelivery,
+        send::{FrameSendStage, MAX_FRAME_LEN},
+    },
     recv_queue::pkt_recv_space::PktRecvSpace,
     sack::AckBallSequence,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
-    transmission::frame_delivery::FrameDelivery,
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
 const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
-/// Maximum application bytes in a single frame in frame-delivery mode.  Set
-/// equal to the stock `MAX_SEND_DATA_BUF_LEN` so a frame can occupy the whole
-/// staging buffer; the per-packet payload cap (`max_data_size_per_pkt`) still
-/// governs how many packets a frame is split into.
-const MAX_FRAME_LEN: usize = MAX_SEND_DATA_BUF_LEN;
+/// The frame-delivery [`MAX_FRAME_LEN`] is defined in
+/// [`crate::frame_delivery::send`] and must stay equal to the stock
+/// `MAX_SEND_DATA_BUF_LEN` so a frame can occupy the whole staging buffer.
+const _: () = assert!(MAX_FRAME_LEN == MAX_SEND_DATA_BUF_LEN);
 
 /// Cap on newly accepted staging bytes, in units of a pacing window.
 ///
@@ -144,26 +146,17 @@ pub struct ReliableLayer {
     /// byte-for-byte stock (no `FRAME_DATA_TS` is ever emitted, the
     /// byte-stream `recv`/`send` paths are unchanged).
     frame_delivery: FrameDelivery,
-    /// Pending (not yet fully packetized) frames in frame-delivery mode.
-    /// Each entry is a frame whose bytes have been accepted by
-    /// `send_frame_buf` but not yet fully drained into `pkt_send_space`.
-    /// `offset` is the number of bytes already packetized from `data`.
-    /// Empty when frame-delivery mode is off (the stock byte-stream path uses
+    /// Sender-side frame staging and frame-aligned packetization in
+    /// frame-delivery mode (see [`crate::frame_delivery::send`]).  Empty when
+    /// frame-delivery mode is off (the stock byte-stream path uses
     /// `send_data_buf` directly).
-    pending_frames: Vec<PendingFrame>,
+    frame_send_stage: FrameSendStage,
 
     // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
     pkt_buf: Vec<dre::Packet>,
 }
 
-/// A frame accepted by `send_frame_buf` but not yet fully packetized.
-/// `offset` is the number of bytes already sent in earlier packets.
-#[derive(Debug, Clone)]
-struct PendingFrame {
-    data: Vec<u8>,
-    offset: usize,
-}
 impl ReliableLayer {
     pub fn new(
         mss: NonZeroUsize,
@@ -200,7 +193,7 @@ impl ReliableLayer {
             queue_building: false,
             drain_floor_binding_since: None,
             frame_delivery,
-            pending_frames: Vec::new(),
+            frame_send_stage: FrameSendStage::new(),
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
@@ -243,7 +236,7 @@ impl ReliableLayer {
             queue_building: false,
             drain_floor_binding_since: None,
             frame_delivery,
-            pending_frames: Vec::new(),
+            frame_send_stage: FrameSendStage::new(),
             pkt_stats_buf: Vec::new(),
             pkt_buf: Vec::new(),
         };
@@ -266,9 +259,9 @@ impl ReliableLayer {
                 SendFinBuf::Empty | SendFinBuf::EmptyAndBlocked
             );
         if self.frame_delivery.enabled {
-            // In frame mode the staging buffer is unused; `pending_frames` is
-            // the source of truth for unsent application bytes.
-            stock_empty && self.pending_frames.is_empty()
+            // In frame mode the staging buffer is unused; the frame send
+            // stage is the source of truth for unsent application bytes.
+            stock_empty && self.frame_send_stage.is_empty()
         } else {
             stock_empty
         }
@@ -373,65 +366,28 @@ impl ReliableLayer {
     }
 
     /// Stage a whole application frame in frame-delivery mode.  The frame is
-    /// queued in `pending_frames` and packetized frame-aligned by subsequent
-    /// `send_data_pkt` calls (a packet never carries bytes of two frames).
-    /// Returns `Ok(())` on success, or `Err(InvalidInput)` when the mode is
-    /// off, the frame is empty, or the frame exceeds `MAX_FRAME_LEN`.
+    /// queued in the frame send stage and packetized frame-aligned by
+    /// subsequent `send_data_pkt` calls (a packet never carries bytes of two
+    /// frames).  Returns `Ok(())` on success, or `Err(InvalidInput)` when the
+    /// mode is off, the frame is empty, or the frame exceeds `MAX_FRAME_LEN`.
     pub fn send_frame_buf(&mut self, frame: &[u8], now: Instant) -> Result<(), std::io::ErrorKind> {
         if !self.frame_delivery.enabled {
             return Err(std::io::ErrorKind::InvalidInput);
         }
-        if frame.is_empty() {
-            return Err(std::io::ErrorKind::InvalidInput);
-        }
-        if frame.len() > MAX_FRAME_LEN {
-            return Err(std::io::ErrorKind::InvalidInput);
-        }
+        crate::frame_delivery::send::validate_frame(frame)?;
         self.detect_application_limited_phases(now);
-        // Respect the same staging-cap discipline as the stock path so a small
-        // interactive frame is not starved behind a bulk backlog already on
-        // the stage.  Pending bytes (bytes of in-progress frames still to be
-        // packetized) count against the cap.
-        //
-        // **Empty-stage bypass:** when the stage is empty (no pending frames),
-        // admit any legal frame (up to MAX_FRAME_LEN) regardless of the soft
-        // cap.  Without this, a frame larger than the ~2-packet initial stage
-        // cap is rejected on an empty stage and waits forever for a send
-        // notification that never comes (the send path only notifies after
-        // draining, which can't start because the frame was never admitted).
+        // Rate-scale the soft staging cap exactly like the stock path so a
+        // small interactive frame is not starved behind a bulk backlog
+        // already on the stage.
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap = (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(MAX_FRAME_LEN);
-        let pending_bytes: usize = self
-            .pending_frames
-            .iter()
-            .map(|pf| pf.data.len() - pf.offset)
-            .sum();
-        if pending_bytes == 0 {
-            // Empty stage: admit any legal frame.
-            self.pending_frames.push(PendingFrame {
-                data: frame.to_vec(),
-                offset: 0,
-            });
-            return Ok(());
-        }
-        let free_bytes = cap.saturating_sub(pending_bytes);
-        if free_bytes < frame.len() {
-            return Err(std::io::ErrorKind::WouldBlock);
-        }
-        self.pending_frames.push(PendingFrame {
-            data: frame.to_vec(),
-            offset: 0,
-        });
-        Ok(())
+        self.frame_send_stage.stage_frame(frame, cap)
     }
 
     /// Total bytes of pending (not yet fully packetized) frames in
     /// frame-delivery mode.  Zero when the mode is off.
     pub fn pending_frame_bytes(&self) -> usize {
-        self.pending_frames
-            .iter()
-            .map(|pf| pf.data.len() - pf.offset)
-            .sum()
+        self.frame_send_stage.pending_bytes()
     }
 
     /// Move data from inner data buffer to inner packet space and return one of the packets if possible
@@ -563,43 +519,33 @@ impl ReliableLayer {
         })
     }
 
-    /// Frame-delivery-mode new-packet path.  Staging is via `pending_frames`;
-    /// packetization is frame-aligned (a packet never carries bytes of two
-    /// frames).  The first packet of a frame carries `Some(frame_len)`; the
-    /// continuation packets carry `None`.  The `pkt` scratch buffer receives
-    /// the payload bytes; the returned `DataPkt.frame_len` tells the
-    /// transmission layer which codec command to emit.
+    /// Frame-delivery-mode new-packet path.  Staging is via the frame send
+    /// stage ([`crate::frame_delivery::send`]); packetization is
+    /// frame-aligned (a packet never carries bytes of two frames).  The
+    /// first packet of a frame carries `Some(frame_len)`; the continuation
+    /// packets carry `None`.  The `pkt` scratch buffer receives the payload
+    /// bytes; the returned `DataPkt.frame_len` tells the transmission layer
+    /// which codec command to emit.
     fn send_data_pkt_frame(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
-        let no_pending = self.pending_frames.is_empty();
         let normal_max_payload = self.max_data_size_per_pkt();
         let first_pkt_max_payload = self
             .mss
             .get()
-            .checked_sub(crate::codec::frame_data_overhead())
+            .checked_sub(crate::frame_delivery::wire::frame_data_overhead())
             .unwrap();
 
-        let (frame_len, _offset, take_bytes, _is_first_pkt_of_frame) =
-            match self.pending_frames.first_mut() {
-                Some(pf) => {
-                    let remaining = pf.data.len() - pf.offset;
-                    let cap = if pf.offset == 0 {
-                        first_pkt_max_payload
-                    } else {
-                        normal_max_payload
-                    };
-                    let take = remaining.min(cap);
-                    (pf.data.len() as u32, pf.offset, take, pf.offset == 0)
+        let chunk = match self
+            .frame_send_stage
+            .next_chunk_len(first_pkt_max_payload, normal_max_payload)
+        {
+            Some(chunk) => Some(chunk),
+            None => {
+                if !matches!(self.send_fin_buf, SendFinBuf::Some) {
+                    return None;
                 }
-                None => {
-                    if !matches!(self.send_fin_buf, SendFinBuf::Some) {
-                        return None;
-                    }
-                    if !no_pending {
-                        return None;
-                    }
-                    (0u32, 0usize, 0usize, false)
-                }
-            };
+                None
+            }
+        };
 
         if !self
             .send_rate_limiter
@@ -610,7 +556,7 @@ impl ReliableLayer {
             return None;
         }
 
-        if take_bytes == 0 {
+        let Some(chunk) = chunk else {
             self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
             let stats = self
                 .connection_stats
@@ -623,23 +569,15 @@ impl ReliableLayer {
                 frame_len: None,
                 was_repair: false,
             });
-        }
+        };
 
         let stats = self
             .connection_stats
             .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
 
         let mut buf = self.pkt_send_space.reused_buf().take();
-        let pf = self.pending_frames.first_mut().unwrap();
-        buf.extend_from_slice(&pf.data[pf.offset..pf.offset + take_bytes]);
-        pf.offset += take_bytes;
-        let frame_done = pf.offset == pf.data.len();
-        let is_first = pf.offset == take_bytes;
-        let frame_len_val = if is_first { Some(frame_len) } else { None };
-        let frame_len = frame_len_val;
-        if frame_done {
-            self.pending_frames.remove(0);
-        }
+        let take_bytes = chunk.take_bytes;
+        let frame_len = self.frame_send_stage.pop_chunk(chunk, &mut buf);
 
         pkt[..buf.len()].copy_from_slice(&buf);
         let p = self.pkt_send_space.send(buf, stats, frame_len, now);
@@ -1494,7 +1432,7 @@ mod tests {
     fn test_layer(now: Instant) -> super::ReliableLayer {
         super::ReliableLayer::new(
             NonZeroUsize::new(TEST_MSS).unwrap(),
-            crate::transmission::frame_delivery::FrameDelivery::default(),
+            crate::frame_delivery::FrameDelivery::default(),
             now,
         )
         .0
@@ -2120,7 +2058,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             NonZeroUsize::new(mss).unwrap(),
-            crate::transmission::frame_delivery::FrameDelivery::enabled(),
+            crate::frame_delivery::FrameDelivery::enabled(),
             now,
         )
         .0;
@@ -2142,7 +2080,7 @@ mod tests {
         };
 
         // The on-wire size of the first packet = frame_data_overhead + payload.
-        let on_wire_first = crate::codec::frame_data_overhead() + payload_len;
+        let on_wire_first = crate::frame_delivery::wire::frame_data_overhead() + payload_len;
         assert!(
             on_wire_first <= mss,
             "first frame packet on-wire size {on_wire_first} must be <= MSS {mss}"
@@ -2160,7 +2098,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             NonZeroUsize::new(mss).unwrap(),
-            crate::transmission::frame_delivery::FrameDelivery::enabled(),
+            crate::frame_delivery::FrameDelivery::enabled(),
             now,
         )
         .0;

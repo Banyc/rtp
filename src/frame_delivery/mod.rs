@@ -1,4 +1,5 @@
-//! Per-connection frame-delivery mode (`FrameDelivery`).
+//! Per-connection frame-delivery mode (`FrameDelivery`) — the single home
+//! for all frame-delivery logic in rtp.
 //!
 //! Stock rtp exposes a strict in-order byte stream: the receive queue is a
 //! `SeqQueue` keyed by packet sequence, and a single lost packet stalls every
@@ -25,6 +26,17 @@
 //! path allocations are unchanged, and the `FRAME_DATA_TS` command is never
 //! emitted.
 //!
+//! # Module layout
+//!
+//! - [`self`] (this file) — the per-connection [`FrameDelivery`] configuration
+//!   and its env-var default ([`frame_delivery_from_env`]).
+//! - [`wire`] — the `FRAME_DATA_TS` wire command: encode/decode and the
+//!   per-packet overhead of the first packet of a frame.
+//! - [`send`] — sender-side staging and frame-aligned packetization
+//!   ([`send::FrameSendStage`]).
+//! - [`recv`] — receiver-side out-of-order frame reassembly over the receive
+//!   queue's slot map (complete-frame scan, FIN-at-head EOF detection).
+//!
 //! # Both peers must enable together
 //!
 //! There is no in-band negotiation — same coupling as the FEC flag.  Both
@@ -33,6 +45,10 @@
 //! a framing desync.  The env var `RTP_FRAME_DELIVERY=1` only feeds the default
 //! for A/B comparison — it is never read as the live setting, so it cannot
 //! silently apply to every connection in the process.
+
+pub(crate) mod recv;
+pub(crate) mod send;
+pub(crate) mod wire;
 
 /// Per-connection frame-delivery configuration.
 ///

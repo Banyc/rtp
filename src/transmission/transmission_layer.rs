@@ -8,7 +8,8 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{fec::FecState, fec_tuning::FecTuning, frame_delivery::FrameDelivery, ts_echo::TsEcho};
+use super::{fec::FecState, fec_tuning::FecTuning, ts_echo::TsEcho};
+use crate::frame_delivery::FrameDelivery;
 use crate::sack::AckBall;
 
 pub use crate::send_queue::liveness::PeerStall;

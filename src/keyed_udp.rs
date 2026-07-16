@@ -34,7 +34,7 @@ fn checked_keyed_mss<K: DispatchKey>(
             panic!("mss {mss_after_fec} leaves no room for the {key_size}-byte dispatch key")
         });
     let overhead = if frame_delivery.enabled {
-        crate::codec::frame_data_overhead()
+        crate::frame_delivery::wire::frame_data_overhead()
     } else {
         crate::codec::data_overhead()
     };
@@ -690,8 +690,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "leaves no payload room")]
     fn frame_mode_rejects_undersized_mss() {
+        use crate::frame_delivery::FrameDelivery;
         use crate::transmission::fec_tuning::FecTuning;
-        use crate::transmission::frame_delivery::FrameDelivery;
         use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
         use crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
 

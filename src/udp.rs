@@ -10,6 +10,7 @@ use tokio::net::UdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
+    frame_delivery::{FrameDelivery, frame_delivery_from_env},
     socket::{
         FrameReader, FrameWriter, ReadSocket, WriteSocket, client_opening_handshake,
         into_frame_io_parts, server_opening_handshake, socket, socket_with_watchdog_tuning,
@@ -17,7 +18,6 @@ use crate::{
     transmission::{
         fec::{FecConfig, FecState},
         fec_tuning::{FecTuning, fec_tuning_from_env},
-        frame_delivery::{FrameDelivery, frame_delivery_from_env},
         transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
         watchdog_tuning::WatchdogTuning,
     },
@@ -734,7 +734,7 @@ fn checked_mss_and_fec(
     // packets.
     if frame_delivery.enabled {
         assert!(
-            crate::codec::frame_data_overhead() < mss,
+            crate::frame_delivery::wire::frame_data_overhead() < mss,
             "mss {mss} leaves no room for the first-frame header"
         );
     }
@@ -1400,7 +1400,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "first-frame header")]
     fn frame_delivery_mss_to_small_for_first_frame_header_errors() {
-        use crate::transmission::frame_delivery::FrameDelivery;
+        use crate::frame_delivery::FrameDelivery;
         // An MSS that is large enough for `data_overhead` but too small for
         // `frame_data_overhead` (data_overhead + 4).
         let mss = crate::codec::data_overhead() + 1;
