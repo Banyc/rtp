@@ -28,6 +28,10 @@ impl StockRecvStage {
         self.buf.len()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.buf.len() == 0
+    }
+
     pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
         let read_bytes = out.len().min(self.buf.len());
         let Some((a, b)) = self.buf.batch_dequeue(read_bytes) else {

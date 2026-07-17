@@ -1,11 +1,10 @@
 use std::{io, net::SocketAddr, num::NonZeroUsize};
-use tokio::sync::Mutex as TokioMutex;
 
 use async_trait::async_trait;
 use mpudp::{conn::MpUdpConn, listen::MpUdpListener, read::MpUdpRead, write::MpUdpWrite};
 
 use crate::{
-    socket::{ReadSocket, WriteSocket, socket},
+    socket::{ReadSocket, SessionSupervisor, WriteSocket, socket},
     transmission::{
         fec_tuning::FecTuning,
         frame_delivery::{FrameDelivery, frame_delivery_from_env},
@@ -38,10 +37,6 @@ impl Listener {
         convert_conn(conn, None, FecTuning::default(), frame_delivery).await
     }
 
-    /// [`Self::accept_without_handshake()`] with a per-connection
-    /// [`FecTuning`].  mpudp carries no FEC today (`fec` is always `None`),
-    /// so the tuning is currently inert; the variant is exposed for API
-    /// parity with `udp`/`keyed_udp`.
     pub async fn accept_without_handshake_with_fec_tuning(
         &mut self,
         tuning: FecTuning,
@@ -51,10 +46,6 @@ impl Listener {
         convert_conn(conn, None, tuning, frame_delivery).await
     }
 
-    /// [`Self::accept_without_handshake()`] with a per-connection
-    /// [`FecTuning`] and an explicit [`FrameDelivery`].  mpudp carries no
-    /// FEC today (`fec` is always `None`), so the tuning is currently inert;
-    /// the variant is exposed for API parity with `udp`/`keyed_udp`.
     pub async fn accept_without_handshake_with_fec_tuning_and_frame_delivery(
         &mut self,
         tuning: FecTuning,
@@ -68,6 +59,9 @@ impl Listener {
 pub struct Conn {
     pub read: ReadSocket,
     pub write: WriteSocket,
+    pub supervisor: SessionSupervisor,
+    pub local_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
 }
 impl Conn {
     pub async fn connect_without_handshake(
@@ -79,10 +73,6 @@ impl Conn {
         convert_conn(conn, log_config, FecTuning::default(), frame_delivery).await
     }
 
-    /// [`Self::connect_without_handshake()`] with a per-connection
-    /// [`FecTuning`].  mpudp carries no FEC today (`fec` is always `None`),
-    /// so the tuning is currently inert; the variant is exposed for API
-    /// parity with `udp`/`keyed_udp`.
     pub async fn connect_without_handshake_with_fec_tuning(
         addrs: impl Iterator<Item = SocketAddr>,
         log_config: Option<LogConfig<'_>>,
@@ -93,12 +83,6 @@ impl Conn {
         convert_conn(conn, log_config, tuning, frame_delivery).await
     }
 
-    /// [`Self::connect_without_handshake()`] with a per-connection
-    /// [`FecTuning`] and an explicit [`FrameDelivery`].  Both peers must
-    /// enable frame delivery together; there is no in-band negotiation.
-    /// mpudp carries no FEC today (`fec` is always `None`), so the tuning
-    /// is currently inert; the variant is exposed for API parity with
-    /// `udp`/`keyed_udp`.
     pub async fn connect_without_handshake_with_fec_tuning_and_frame_delivery(
         addrs: impl Iterator<Item = SocketAddr>,
         log_config: Option<LogConfig<'_>>,
@@ -128,14 +112,23 @@ async fn convert_conn(
     let (r, w) = conn.into_split();
     let unreliable_layer = UnreliableLayer {
         utp_read: Box::new(r),
-        utp_write: Box::new(AtomicMpUdpWrite::new(w)),
+        utp_write: Box::new(w),
+        post_open_handshake: None,
         mss: NonZeroUsize::new(MSS).unwrap(),
         fec: None,
         fec_tuning: tuning,
         frame_delivery,
     };
-    let (read, write) = socket(unreliable_layer, log_config);
-    let conn = Conn { read, write };
+    let (read, write, supervisor) = socket(unreliable_layer, log_config);
+    let local_addr = "0.0.0.0:0".parse().unwrap();
+    let peer_addr = "0.0.0.0:0".parse().unwrap();
+    let conn = Conn {
+        read,
+        write,
+        supervisor,
+        local_addr,
+        peer_addr,
+    };
     Ok(conn)
 }
 
@@ -159,22 +152,10 @@ impl UnreliableRead for MpUdpRead {
     }
 }
 
-#[derive(Debug)]
-pub struct AtomicMpUdpWrite {
-    write: TokioMutex<MpUdpWrite>,
-}
-impl AtomicMpUdpWrite {
-    pub fn new(write: MpUdpWrite) -> Self {
-        Self {
-            write: TokioMutex::new(write),
-        }
-    }
-}
 #[async_trait]
-impl UnreliableWrite for AtomicMpUdpWrite {
+impl UnreliableWrite for MpUdpWrite {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        let mut w = self.write.lock().await;
-        w.send(buf).await.map_err(|e| e.kind())
+        MpUdpWrite::send(self, buf).await.map_err(|e| e.kind())
     }
 }
 
@@ -206,7 +187,7 @@ mod tests {
                 });
             }
         });
-        let connected = Conn::connect_without_handshake(
+        let mut connected = Conn::connect_without_handshake(
             addrs.into_iter(),
             Some(LogConfig {
                 log_dir_path: Path::new("target/tests"),

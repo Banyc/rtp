@@ -1,26 +1,18 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::shared::Shared;
+use super::shared::{ReceivedBatch, Shared};
 use super::transmission_layer::{
-    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, RecvBufs, RecvPkts, SendKillPkt,
-    UnreliableRead,
+    ACK_FLUSH_AGE, FEC_DEBUG, MAX_NUM_ACK, RecvBufs, RecvPkts, SendKillPkt, UnreliableRead,
 };
 use super::ts_echo::{RecentEchoes, TsEcho};
+use crate::recv_queue::pkt_recv_space::RecvDisposition;
 use crate::{codec::decode, sack::AckBallSequence};
 
 pub struct ReadHalf {
     pub(crate) utp_read: Box<dyn UnreliableRead>,
     pub(crate) recent_echoes: RecentEchoes,
     pub(crate) shared: Arc<Shared>,
-}
-
-impl std::ops::Deref for ReadHalf {
-    type Target = Shared;
-
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
 }
 
 impl ReadHalf {
@@ -34,9 +26,8 @@ impl ReadHalf {
             shared,
         } = self;
         let shared: &Shared = shared.as_ref();
-        let first_error = &shared.first_error;
         let throw_error = |e: std::io::ErrorKind| {
-            first_error.set(e);
+            shared.set_error(e);
             e
         };
         let mut recv_pkts = RecvPkts {
@@ -55,9 +46,11 @@ impl ReadHalf {
             }
         };
         let mut ack_deadline_hit = false;
+        let mut batch = ReceivedBatch::default();
+
         for _ in 0..MAX_NUM_ACK {
             shared
-                .first_error
+                .termination
                 .throw_error()
                 .map_err(|e| (e, SendKillPkt::No))?;
 
@@ -96,6 +89,22 @@ impl ReadHalf {
             let now = Instant::now();
             let read_pkt = &bufs.utp[..read_bytes];
 
+            // Intercept handshake packets before FEC/RTP decode.
+            match shared.observe_post_open_handshake(read_pkt) {
+                crate::handshake::Observation::ReplyQueued => {
+                    shared.coord.resume_send.notify_one();
+                    continue;
+                }
+                crate::handshake::Observation::Complete => {
+                    shared.coord.resume_send.notify_one();
+                    continue;
+                }
+                crate::handshake::Observation::Filtered => {
+                    continue;
+                }
+                crate::handshake::Observation::NotHandshake => {}
+            }
+
             bufs.codec_pkts.clear();
             let mut orig_pkt = None;
             match shared.fec.as_ref() {
@@ -114,6 +123,7 @@ impl ReadHalf {
             }
 
             let mut end_of_acks = false;
+            let mut had_data = false;
             for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
                 bufs.ack_from_peer.clear();
                 let data = match decode(pkt, &mut bufs.ack_from_peer) {
@@ -133,6 +143,7 @@ impl ReadHalf {
                     {
                         shared.reliable_layer.lock().unwrap().sample_rtt(rtt, now);
                     }
+                    batch.record_echo_ts(Some(echo_ts));
                 }
 
                 if data.killed {
@@ -141,7 +152,7 @@ impl ReadHalf {
                     return Err((e, SendKillPkt::No));
                 }
 
-                let to_ack = {
+                let disposition = {
                     let mut reliable_layer = shared.reliable_layer.lock().unwrap();
 
                     reliable_layer.recv_ack_pkt(AckBallSequence::new(&bufs.ack_from_peer), now);
@@ -150,22 +161,22 @@ impl ReadHalf {
                     }
 
                     match &data.data {
-                        None => false,
+                        None => RecvDisposition::Rejected,
                         Some(data) => {
-                            let to_ack = reliable_layer.recv_data_pkt(
+                            let disposition = reliable_layer.recv_data_pkt(
                                 data.seq,
                                 data.frame_len,
                                 &pkt[data.buf_range.clone()],
                             );
                             if FEC_DEBUG {
                                 eprintln!(
-                                    "recv_data_pkt seq={} empty={} ack={}",
+                                    "recv_data_pkt seq={} empty={} disposition={:?}",
                                     data.seq,
                                     data.buf_range.is_empty(),
-                                    to_ack
+                                    disposition
                                 );
                             }
-                            to_ack
+                            disposition
                         }
                     }
                 };
@@ -174,36 +185,43 @@ impl ReadHalf {
 
                 let Some(data) = data.data else {
                     shared.log("recv_ack_pkt");
+                    had_data = true;
                     continue;
                 };
 
-                if data.buf_range.is_empty() && data.frame_len.is_none() {
-                    recv_pkts.num_fin_segments += 1;
-                } else {
-                    recv_pkts.num_payload_segments += 1;
-                }
-                if to_ack {
+                // Record normal processing for every should_ack
+                if disposition.should_ack() {
                     bufs.ack_to_peer.push(data.seq);
                     if let Some(send_ts) = data.send_ts {
-                        shared.ack_flush.lock().unwrap().ts_echo.set(send_ts);
+                        batch.record_echo_ts(Some(send_ts));
                     }
+                    batch.record_ack();
+
+                    if data.buf_range.is_empty() && data.frame_len.is_none() {
+                        recv_pkts.num_fin_segments += 1;
+                        batch.record_inserted_fin();
+                    } else {
+                        recv_pkts.num_payload_segments += 1;
+                    }
+
+                    shared.publish_recv_eof(reliable_layer_has_eof(shared));
                 } else {
                     end_of_acks = true;
                 }
+                had_data = true;
                 shared.log("recv_data_pkt");
+            }
+            if !had_data {
+                shared.coord.session_outbound_progress.notify_one();
+                shared.commit_received_batch(std::mem::take(&mut batch));
+                batch = ReceivedBatch::default();
             }
             if end_of_acks {
                 break;
             }
         }
 
-        {
-            let mut s = shared.ack_flush.lock().unwrap();
-            s.pending_acks += bufs.ack_to_peer.len();
-            if 0 < recv_pkts.num_fin_segments {
-                s.fin_pending = true;
-            }
-        }
+        shared.commit_received_batch(batch);
 
         if bufs.ack_to_peer.is_empty() && !ack_deadline_hit {
             let should_resume_send = {
@@ -221,25 +239,10 @@ impl ReadHalf {
             shared.coord.recv_data_pkt.notify_waiters();
         }
 
-        let should_flush = ack_deadline_hit || 0 < recv_pkts.num_fin_segments || {
-            let s = shared.ack_flush.lock().unwrap();
-            ACK_FLUSH_COUNT <= s.pending_acks
-                || s.last_ack_flush
-                    .is_none_or(|last| ACK_FLUSH_AGE <= Instant::now().duration_since(last))
-                || {
-                    let reliable_layer = shared.reliable_layer.lock().unwrap();
-                    reliable_layer
-                        .pkt_recv_space()
-                        .ack_history()
-                        .balls()
-                        .nth(1)
-                        .is_some()
-                }
-        };
-        if should_flush {
-            shared.coord.resume_send.notify_one();
-        }
-
         Ok(recv_pkts)
     }
+}
+
+fn reliable_layer_has_eof(shared: &Shared) -> bool {
+    shared.reliable_layer.lock().unwrap().recv_eof_ready()
 }

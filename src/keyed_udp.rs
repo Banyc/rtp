@@ -8,7 +8,7 @@ use tokio_util::bytes::Buf;
 use udp_listener::{ConnWrite, Packet, UtpListener};
 
 use crate::{
-    socket::{ReadSocket, WriteSocket, socket},
+    socket::{ReadSocket, SessionSupervisor, WriteSocket, socket},
     transmission::{
         fec_tuning::{FecTuning, fec_tuning_from_env},
         frame_delivery::{FrameDelivery, frame_delivery_from_env},
@@ -54,6 +54,7 @@ fn apply_keyed_mss<K: DispatchKey>(layer: UnreliableLayer) -> UnreliableLayer {
     UnreliableLayer {
         utp_read: layer.utp_read,
         utp_write: layer.utp_write,
+        post_open_handshake: layer.post_open_handshake,
         mss: checked_keyed_mss::<K>(layer.mss, frame_delivery),
         fec: layer.fec,
         fec_tuning: layer.fec_tuning,
@@ -151,10 +152,11 @@ impl<K: DispatchKey> Server<K> {
             frame_delivery,
         );
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
-        let (read, write) = socket(unreliable_layer, None);
+        let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
             write,
+            supervisor,
             dispatch_key: conn_key,
         })
     }
@@ -170,10 +172,11 @@ impl<K: DispatchKey> Server<K> {
         };
         let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
-        let (read, write) = socket(unreliable_layer, None);
+        let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
             write,
+            supervisor,
             dispatch_key: conn_key,
         })
     }
@@ -182,6 +185,7 @@ impl<K: DispatchKey> Server<K> {
 pub struct Accepted<K> {
     pub read: ReadSocket,
     pub write: WriteSocket,
+    pub supervisor: SessionSupervisor,
     pub dispatch_key: K,
 }
 
@@ -275,8 +279,16 @@ impl<K: DispatchKey> Client<K> {
             frame_delivery,
         );
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
-        let (read, write) = socket(unreliable_layer, None);
-        Some(Connected { read, write })
+        let (read, write, supervisor) = socket(unreliable_layer, None);
+        let local_addr = "0.0.0.0:0".parse().unwrap();
+        let peer_addr = "0.0.0.0:0".parse().unwrap();
+        Some(Connected {
+            read,
+            write,
+            supervisor,
+            local_addr,
+            peer_addr,
+        })
     }
 
     pub fn open_without_handshake(&self, dispatch_key: K, fec: bool) -> Option<Connected> {
@@ -285,14 +297,25 @@ impl<K: DispatchKey> Client<K> {
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
         let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
-        let (read, write) = socket(unreliable_layer, None);
-        Some(Connected { read, write })
+        let (read, write, supervisor) = socket(unreliable_layer, None);
+        let local_addr = "0.0.0.0:0".parse().unwrap();
+        let peer_addr = "0.0.0.0:0".parse().unwrap();
+        Some(Connected {
+            read,
+            write,
+            supervisor,
+            local_addr,
+            peer_addr,
+        })
     }
 }
 #[derive(Debug)]
 pub struct Connected {
     pub read: ReadSocket,
     pub write: WriteSocket,
+    pub supervisor: SessionSupervisor,
+    pub local_addr: SocketAddr,
+    pub peer_addr: SocketAddr,
 }
 
 #[derive(Debug)]

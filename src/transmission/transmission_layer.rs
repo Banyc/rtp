@@ -1,9 +1,5 @@
 use core::{num::NonZeroUsize, time::Duration};
-use std::{
-    path::PathBuf,
-    sync::{Mutex, RwLock},
-    time::Instant,
-};
+use std::{path::PathBuf, sync::Mutex, time::Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -159,17 +155,11 @@ impl AckFlushState {
 pub struct UnreliableLayer {
     pub utp_read: Box<dyn UnreliableRead>,
     pub utp_write: Box<dyn UnreliableWrite>,
+    #[doc(hidden)]
+    pub post_open_handshake: Option<crate::handshake::PostOpenHandshake>,
     pub mss: NonZeroUsize,
     pub fec: Option<FecState>,
-    /// Per-connection FEC tuning.  Consumed at construction to drive the
-    /// data-burst force-flush (`instream_flush`) and the single-symbol
-    /// interactive parity depth.  Stock `FecTuning::default()` preserves the
-    /// behaviour byte-for-byte.
     pub fec_tuning: FecTuning,
-    /// Per-connection frame-delivery mode.  When `enabled`, application data
-    /// is staged as whole frames and the receiver may deliver complete frames
-    /// out of order past sequence holes.  Both peers must enable together (no
-    /// in-band negotiation).  `Default` is `enabled: false` — stock.
     pub frame_delivery: FrameDelivery,
 }
 
@@ -231,78 +221,6 @@ impl std::fmt::Display for ProactiveTerminationContext {
 }
 
 impl std::error::Error for ProactiveTerminationContext {}
-
-#[derive(Debug, Clone)]
-struct FirstErrorValue {
-    kind: std::io::ErrorKind,
-    context: Option<ProactiveTerminationContext>,
-}
-
-#[derive(Debug)]
-pub(crate) struct FirstError {
-    first_error: RwLock<Option<FirstErrorValue>>,
-    pub(crate) some: tokio_util::sync::CancellationToken,
-}
-
-impl FirstError {
-    pub fn new() -> Self {
-        let first_error = RwLock::new(None);
-        let some = tokio_util::sync::CancellationToken::new();
-        Self { first_error, some }
-    }
-
-    pub fn set(&self, err: std::io::ErrorKind) {
-        let _ = self.set_with_context_if_empty(err, None);
-    }
-
-    pub fn set_with_context_if_empty(
-        &self,
-        kind: std::io::ErrorKind,
-        context: Option<ProactiveTerminationContext>,
-    ) -> bool {
-        let inserted = {
-            let mut first_error = self.first_error.write().unwrap();
-            if first_error.is_some() {
-                false
-            } else {
-                *first_error = Some(FirstErrorValue { kind, context });
-                true
-            }
-        };
-        self.some.cancel();
-        inserted
-    }
-
-    pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
-        let first_error = self.first_error.read().unwrap();
-        if let Some(val) = &*first_error {
-            return Err(val.kind);
-        }
-        Ok(())
-    }
-
-    pub fn has_error(&self) -> bool {
-        self.first_error.read().unwrap().is_some()
-    }
-
-    pub fn io_error(&self, kind: std::io::ErrorKind) -> std::io::Error {
-        let context = self
-            .first_error
-            .read()
-            .unwrap()
-            .as_ref()
-            .filter(|error| error.kind == kind)
-            .and_then(|error| error.context.clone());
-        match context {
-            Some(context) => std::io::Error::new(kind, context),
-            None => std::io::Error::from(kind),
-        }
-    }
-
-    pub fn some(&self) -> &tokio_util::sync::CancellationToken {
-        &self.some
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct LogConfig {

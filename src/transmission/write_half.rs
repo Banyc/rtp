@@ -1,31 +1,57 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::shared::Shared;
+use super::termination::{PeerReset, TerminationWriter};
 use super::transmission_layer::{
     ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, PRINT_DEBUG_MSGS,
     ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
 use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
 
-const KILL_SEND_DEADLINE: Duration = Duration::from_secs(1);
-
 #[derive(Debug)]
 pub struct WriteHalf {
-    pub(crate) utp_write: tokio::sync::Mutex<Box<dyn UnreliableWrite>>,
+    pub(crate) utp_write: Box<dyn UnreliableWrite>,
     pub(crate) shared: Arc<Shared>,
+    pub(crate) termination_writer: TerminationWriter,
 }
 
 impl std::ops::Deref for WriteHalf {
     type Target = Shared;
-
     fn deref(&self) -> &Self::Target {
         &self.shared
     }
 }
 
 impl WriteHalf {
-    pub(crate) async fn proactively_terminate_stalled_session(&self, bufs: &mut SendBufs) {
+    pub(crate) fn kill_requested(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.termination_writer.kill_requested()
+    }
+
+    async fn try_send_requested_kill(
+        &mut self,
+        bufs: &mut SendBufs,
+    ) -> Option<Result<(), std::io::ErrorKind>> {
+        let attempt = self.termination_writer.take_kill_attempt()?;
+        let result = self.send_kill_pkt(bufs).await;
+        drop(attempt);
+        Some(result)
+    }
+
+    async fn throw_error_after_requested_kill(
+        &mut self,
+        bufs: &mut SendBufs,
+    ) -> Result<(), std::io::ErrorKind> {
+        match self.termination.throw_error() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.try_send_requested_kill(bufs).await;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn proactively_terminate_stalled_session(&self) {
         let now = Instant::now();
         let context = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
@@ -47,27 +73,30 @@ impl WriteHalf {
                 snapshot: format!("{:?}", reliable_layer.log()),
             }
         };
-        if self.first_error.has_error() {
+        if self.termination.has_error() {
             return;
         }
-        let _ = self.send_kill_pkt(bufs).await;
-        self.first_error
-            .set_with_context_if_empty(std::io::ErrorKind::BrokenPipe, Some(context));
+        self.termination
+            .press_broken_pipe(PeerReset::SendKill, Some(context));
     }
 
-    pub async fn send_pkts(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
-        self.proactively_terminate_stalled_session(bufs).await;
+    pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
+        self.proactively_terminate_stalled_session();
 
-        let mut written_bytes = 0;
-        let mut written_fin = false;
+        if let Some(result) = self.try_send_requested_kill(bufs).await {
+            result?;
+            let _ = self.throw_error_after_requested_kill(bufs).await;
+        }
+
+        let mut wrote_something = false;
         loop {
-            self.first_error.throw_error()?;
+            self.shared.termination.throw_error()?;
             let now = Instant::now();
             let res = {
-                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+                let mut reliable_layer = self.shared.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_pkt(&mut bufs.data, now)
             };
-            self.log("send_data_pkt");
+            self.shared.log("send_data_pkt");
             let Some(p) = res else {
                 if FEC_DEBUG {
                     eprintln!("send_data_pkt: no pkt to send (rtx=None, cwnd full or no tokens)");
@@ -76,19 +105,19 @@ impl WriteHalf {
             };
             let data_written = match p.data_written {
                 crate::reliable::reliable_layer::DataPktPayload::Data(data_written) => {
-                    written_bytes += data_written.get();
+                    wrote_something = true;
                     data_written.get()
                 }
                 crate::reliable::reliable_layer::DataPktPayload::Fin => {
-                    written_fin = true;
+                    wrote_something = true;
                     0
                 }
             };
             let was_repair = p.was_repair;
-            let queue_building = self.reliable_layer.lock().unwrap().queue_building();
+            let queue_building = self.shared.reliable_layer.lock().unwrap().queue_building();
             let data = EncodeData {
                 seq: p.seq,
-                send_ts: Some(self.wire_ts(now)),
+                send_ts: Some(self.shared.wire_ts(now)),
                 frame_len: p.frame_len,
                 data: &bufs.data[..data_written],
             };
@@ -97,9 +126,9 @@ impl WriteHalf {
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
-            let instream = self.instream_group_fec_enabled();
+            let instream = self.shared.instream_group_fec_enabled();
             let send_buf: &[u8] = {
-                match self.fec.as_ref() {
+                match self.shared.fec.as_ref() {
                     Some(fec) => {
                         let mut fec = fec.lock().unwrap();
                         let fec_n = fec.encode_data(utp_pkt, &mut bufs.fec, instream);
@@ -108,24 +137,22 @@ impl WriteHalf {
                     None => utp_pkt,
                 }
             };
-            let primary_res = {
-                let mut guard = self.utp_write.lock().await;
-                guard.send(send_buf).await
-            };
+            let primary_res = self.utp_write.send(send_buf).await;
             match primary_res {
                 Ok(_) => {
-                    if self.fec.is_some() && instream {
+                    if self.shared.fec.is_some() && instream {
                         self.maybe_flush_full_fec_group(Instant::now()).await;
                     }
-                    if self.rtx_dup() && was_repair && !queue_building {
+                    if self.shared.rtx_dup() && was_repair && !queue_building {
                         let now = Instant::now();
                         let token_taken = self
+                            .shared
                             .send_rate_limiter
                             .lock()
                             .unwrap()
                             .take_exact_tokens(1, now);
                         if token_taken {
-                            match self.utp_write.lock().await.send(send_buf).await {
+                            match self.utp_write.send(send_buf).await {
                                 Ok(_) => {}
                                 Err(std::io::ErrorKind::WouldBlock) => {
                                     if FEC_DEBUG {
@@ -133,7 +160,7 @@ impl WriteHalf {
                                     }
                                 }
                                 Err(e) => {
-                                    self.first_error.set(e);
+                                    self.shared.set_error(e);
                                     return Err(e);
                                 }
                             }
@@ -148,40 +175,46 @@ impl WriteHalf {
                     continue;
                 }
                 Err(e) => {
-                    self.first_error.set(e);
+                    self.shared.set_error(e);
                     return Err(e);
                 }
             }
         }
-        if 0 < written_bytes || written_fin {
+        if wrote_something {
             if PRINT_DEBUG_MSGS {
-                println!("send_pkts: {{ data: {written_bytes}; fin: {written_fin} }}");
+                println!("send_pkts: wrote data/fin");
             }
-            self.coord.sent_data_pkt.notify_waiters();
+            self.shared.coord.sent_data_pkt.notify_waiters();
         }
-        if self.fec.is_some() {
+        if self.shared.fec.is_some() {
             let now = Instant::now();
-            let stock_can_send_tail_fec =
-                { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+            let stock_can_send_tail_fec = {
+                self.shared
+                    .reliable_layer
+                    .lock()
+                    .unwrap()
+                    .can_send_tail_fec(now)
+            };
             let data_path = true;
-            let can_send_tail_fec = self.fec_instream_flush
+            let can_send_tail_fec = self.shared.fec_instream_flush
                 || stock_can_send_tail_fec
-                || (data_path && self.instream_group_fec_enabled());
+                || (data_path && self.shared.instream_group_fec_enabled());
             self.close_fec_burst(now, can_send_tail_fec).await;
         }
         if self.ack_flush_is_due() {
             let _ = self.flush_acks(bufs).await;
         }
-        Ok(0 < written_bytes || written_fin)
+        self.send_due_post_open_response().await;
+        Ok(wrote_something)
     }
 
-    async fn maybe_flush_full_fec_group(&self, now: Instant) {
-        let Some(fec) = self.fec.as_ref() else {
+    async fn maybe_flush_full_fec_group(&mut self, now: Instant) {
+        let Some(fec) = self.shared.fec.as_ref() else {
             return;
         };
         let should_flush = {
             let fec = fec.lock().unwrap();
-            fec.group_data_full(self.instream_group_fec_enabled())
+            fec.group_data_full(self.shared.instream_group_fec_enabled())
         };
         if !should_flush {
             return;
@@ -189,8 +222,8 @@ impl WriteHalf {
         self.flush_fec_parities(now).await;
     }
 
-    async fn close_fec_burst(&self, now: Instant, can_send_tail_fec: bool) {
-        let Some(fec) = self.fec.as_ref() else {
+    async fn close_fec_burst(&mut self, now: Instant, can_send_tail_fec: bool) {
+        let Some(fec) = self.shared.fec.as_ref() else {
             return;
         };
         {
@@ -207,23 +240,23 @@ impl WriteHalf {
     }
 
     fn skip_open_fec_group(&self) {
-        let Some(fec) = self.fec.as_ref() else {
+        let Some(fec) = self.shared.fec.as_ref() else {
             return;
         };
         fec.lock().unwrap().skip_open_group();
     }
 
-    async fn flush_fec_parities(&self, now: Instant) {
-        let Some(fec) = self.fec.as_ref() else {
+    async fn flush_fec_parities(&mut self, now: Instant) {
+        let Some(fec) = self.shared.fec.as_ref() else {
             return;
         };
         let parity_pkts = {
             let mut fec = fec.lock().unwrap();
-            let mut tb = self.send_rate_limiter.lock().unwrap();
-            fec.maybe_flush_parities(&mut tb, now, self.instream_group_fec_enabled())
+            let mut tb = self.shared.send_rate_limiter.lock().unwrap();
+            fec.maybe_flush_parities(&mut tb, now, self.shared.instream_group_fec_enabled())
         };
         for pkt in parity_pkts {
-            match self.utp_write.lock().await.send(&pkt).await {
+            match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
                 Err(std::io::ErrorKind::WouldBlock) => {
                     if FEC_DEBUG {
@@ -236,7 +269,19 @@ impl WriteHalf {
         }
     }
 
-    pub async fn send_kill_pkt(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    async fn send_due_post_open_response(&mut self) -> std::io::Result<()> {
+        let Some(response) = self.shared.claim_open_response() else {
+            return Ok(());
+        };
+        let _len = response.bytes.len();
+        match self.utp_write.send(&response.bytes).await {
+            Ok(_) | Err(std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+        Ok(())
+    }
+
+    pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         let fec_enabled = self.send_kill_data_pkt(bufs).await?;
         if fec_enabled {
             self.flush_kill_fec_tail().await;
@@ -244,7 +289,10 @@ impl WriteHalf {
         Ok(())
     }
 
-    async fn send_kill_data_pkt(&self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
+    async fn send_kill_data_pkt(
+        &mut self,
+        bufs: &mut SendBufs,
+    ) -> Result<bool, std::io::ErrorKind> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
         let fec_enabled = self.fec.is_some();
@@ -256,48 +304,33 @@ impl WriteHalf {
         Ok(fec_enabled)
     }
 
-    async fn flush_kill_fec_tail(&self) {
+    async fn flush_kill_fec_tail(&mut self) {
         let now = Instant::now();
         let can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
-        self.close_fec_burst(now, can_send_tail_fec).await;
+        let _ = self.close_fec_burst(now, can_send_tail_fec).await;
     }
 
-    async fn send_kill_pkt_with_deadline(
-        &self,
+    #[cfg(test)]
+    pub async fn send_kill_and_abort(
+        &mut self,
         bufs: &mut SendBufs,
     ) -> Result<(), std::io::ErrorKind> {
-        let deadline = tokio::time::Instant::now() + KILL_SEND_DEADLINE;
-        let fec_enabled =
-            match tokio::time::timeout_at(deadline, self.send_kill_data_pkt(bufs)).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    self.skip_open_fec_group();
-                    return Err(std::io::ErrorKind::TimedOut);
-                }
-            };
-        if fec_enabled
-            && tokio::time::timeout_at(deadline, self.flush_kill_fec_tail())
-                .await
-                .is_err()
-        {
-            self.skip_open_fec_group();
+        self.termination
+            .press_broken_pipe(PeerReset::SendKill, None);
+        match self.try_send_requested_kill(bufs).await {
+            Some(result) => result,
+            None => self.termination.throw_error(),
         }
-        Ok(())
-    }
-
-    pub async fn send_kill_and_abort(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
-        self.first_error.set(std::io::ErrorKind::BrokenPipe);
-        self.send_kill_pkt_with_deadline(bufs).await
     }
 
     #[cfg(test)]
     pub fn has_pending_acks(&self) -> bool {
-        let s = self.ack_flush.lock().unwrap();
+        let s = self.shared.ack_flush.lock().unwrap();
         0 < s.pending_acks || s.fin_pending
     }
 
     pub fn ack_flush_is_due(&self) -> bool {
-        let s = self.ack_flush.lock().unwrap();
+        let s = self.shared.ack_flush.lock().unwrap();
         if s.pending_acks == 0 && !s.fin_pending {
             return false;
         }
@@ -308,13 +341,9 @@ impl WriteHalf {
                 .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
     }
 
-    pub async fn flush_acks(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
-        let _gate = self.ack_flush_gate.try_lock();
-        if _gate.is_err() {
-            return Ok(());
-        }
+    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         {
-            let s = self.ack_flush.lock().unwrap();
+            let s = self.shared.ack_flush.lock().unwrap();
             if s.pending_acks == 0 && !s.fin_pending {
                 return Ok(());
             }
@@ -322,27 +351,27 @@ impl WriteHalf {
         self.flush_acks_inner(bufs).await
     }
 
-    async fn flush_acks_inner(&self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    async fn flush_acks_inner(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         let now = Instant::now();
         let (cursor, history_count) = {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let reliable_layer = self.shared.reliable_layer.lock().unwrap();
             let queue = reliable_layer.pkt_recv_space().ack_history();
             let count = queue.balls().count();
-            let s = self.ack_flush.lock().unwrap();
+            let s = self.shared.ack_flush.lock().unwrap();
             (s.ack_page_cursor.max(MAX_NUM_ACK).min(count), count)
         };
 
-        let mut echo_ts = self.ack_flush.lock().unwrap().ts_echo.take();
+        let mut echo_ts = self.shared.ack_flush.lock().unwrap().ts_echo.take();
         let echo_backup = echo_ts;
-        let claimed_acks = self.ack_flush.lock().unwrap().pending_acks;
+        let claimed_acks = self.shared.ack_flush.lock().unwrap().pending_acks;
         let mut page_0 = true;
         let mut skip = 0;
-        let fec_enabled = self.fec.is_some();
+        let fec_enabled = self.shared.fec.is_some();
         let mut pages_sent: usize = 0;
 
         'ack_pages: loop {
             let written_bytes = {
-                let reliable_layer = self.reliable_layer.lock().unwrap();
+                let reliable_layer = self.shared.reliable_layer.lock().unwrap();
                 let queue = reliable_layer.pkt_recv_space().ack_history();
                 let ack = EncodeAck {
                     queue,
@@ -358,25 +387,32 @@ impl WriteHalf {
             match res {
                 Ok(_) => {
                     pages_sent += 1;
+                    self.shared.coord.session_outbound_progress.notify_one();
                     if fec_enabled {
                         let now = Instant::now();
-                        let can_send_tail_fec =
-                            { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+                        let can_send_tail_fec = {
+                            self.shared
+                                .reliable_layer
+                                .lock()
+                                .unwrap()
+                                .can_send_tail_fec(now)
+                        };
                         self.close_fec_burst(now, can_send_tail_fec).await;
                     }
                 }
                 Err(std::io::ErrorKind::WouldBlock) => {
                     if let Some(ts) = echo_ts.take().or(echo_backup) {
-                        self.ack_flush.lock().unwrap().ts_echo.restore(ts);
+                        self.shared.ack_flush.lock().unwrap().ts_echo.restore(ts);
                     }
-                    let mut s = self.ack_flush.lock().unwrap();
+                    let mut s = self.shared.ack_flush.lock().unwrap();
                     s.complete_claim(pages_sent * MAX_NUM_ACK, false);
+                    self.shared.coord.session_outbound_progress.notify_one();
                     break 'ack_pages;
                 }
                 Err(e) => {
-                    self.first_error.set(e);
+                    self.shared.set_error(e);
                     if let Some(ts) = echo_ts.take().or(echo_backup) {
-                        self.ack_flush.lock().unwrap().ts_echo.restore(ts);
+                        self.shared.ack_flush.lock().unwrap().ts_echo.restore(ts);
                     }
                     return Err(e);
                 }
@@ -385,7 +421,7 @@ impl WriteHalf {
             if page_0 {
                 page_0 = false;
                 if history_count < MAX_NUM_ACK {
-                    let mut s = self.ack_flush.lock().unwrap();
+                    let mut s = self.shared.ack_flush.lock().unwrap();
                     s.ack_page_cursor = MAX_NUM_ACK;
                     s.complete_claim(claimed_acks, true);
                     s.last_ack_flush = Some(now);
@@ -393,14 +429,14 @@ impl WriteHalf {
                 }
                 skip = cursor;
                 if skip > history_count {
-                    let mut s = self.ack_flush.lock().unwrap();
+                    let mut s = self.shared.ack_flush.lock().unwrap();
                     s.ack_page_cursor = MAX_NUM_ACK;
                     s.complete_claim(claimed_acks, true);
                     s.last_ack_flush = Some(now);
                     break;
                 }
             } else {
-                let mut s = self.ack_flush.lock().unwrap();
+                let mut s = self.shared.ack_flush.lock().unwrap();
                 if cursor + MAX_NUM_ACK < history_count {
                     s.ack_page_cursor = cursor + MAX_NUM_ACK;
                 } else {
@@ -411,16 +447,17 @@ impl WriteHalf {
                 break;
             }
         }
+        self.shared.coord.session_outbound_progress.notify_one();
         Ok(())
     }
 
     async fn send_with_fec(
-        &self,
+        &mut self,
         codec_pkt: &[u8],
         fec_buf: &mut [u8],
     ) -> Result<usize, std::io::ErrorKind> {
         let send_buf: &[u8] = {
-            match self.fec.as_ref() {
+            match self.shared.fec.as_ref() {
                 Some(fec) => {
                     let mut fec = fec.lock().unwrap();
                     let n = fec.encode_data(codec_pkt, fec_buf, false);
@@ -429,97 +466,7 @@ impl WriteHalf {
                 None => codec_pkt,
             }
         };
-        self.utp_write.lock().await.send(send_buf).await
-    }
-
-    pub async fn send(
-        &self,
-        data: &[u8],
-        no_delay: bool,
-        bufs: &mut SendBufs,
-    ) -> Result<usize, std::io::ErrorKind> {
-        if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
-            self.send_frame(data, no_delay, bufs).await
-        } else {
-            self.send_stock(data, no_delay, bufs).await
-        }
-    }
-
-    async fn send_stock(
-        &self,
-        data: &[u8],
-        no_delay: bool,
-        bufs: &mut SendBufs,
-    ) -> Result<usize, std::io::ErrorKind> {
-        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
-        let written_bytes = loop {
-            self.first_error.throw_error()?;
-            let now = Instant::now();
-            let written_bytes = {
-                let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_buf(data, now)
-            };
-            self.log("send_data_buf");
-            if no_delay {
-                let made_progress = self.send_pkts(bufs).await?;
-                if !made_progress {
-                    self.resume_send().notify_one();
-                }
-            }
-            if 0 < written_bytes {
-                self.resume_send().notify_one();
-                break written_bytes;
-            }
-            tokio::select! {
-                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
-                () = self.first_error.some().cancelled() => (),
-            }
-            sent_data_pkt = self.coord.sent_data_pkt.notified();
-        };
-        Ok(written_bytes)
-    }
-
-    pub async fn send_frame(
-        &self,
-        frame: &[u8],
-        no_delay: bool,
-        bufs: &mut SendBufs,
-    ) -> Result<usize, std::io::ErrorKind> {
-        let frame_len = frame.len();
-        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
-        loop {
-            self.first_error.throw_error()?;
-            let now = Instant::now();
-            let res = {
-                let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_frame_buf(frame, now)
-            };
-            match res {
-                Ok(()) => {
-                    self.log("send_frame_buf");
-                    if no_delay {
-                        let made_progress = self.send_pkts(bufs).await?;
-                        if !made_progress {
-                            self.resume_send().notify_one();
-                        }
-                    }
-                    self.resume_send().notify_one();
-                    return Ok(frame_len);
-                }
-                Err(std::io::ErrorKind::WouldBlock) => {
-                    if no_delay {
-                        self.send_pkts(bufs).await?;
-                    }
-                    tokio::select! {
-                        _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
-                        () = self.first_error.some().cancelled() => (),
-                    }
-                    sent_data_pkt = self.coord.sent_data_pkt.notified();
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.utp_write.send(send_buf).await
     }
 }
 

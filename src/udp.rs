@@ -11,9 +11,10 @@ use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
     delivery::frame::{FrameDelivery, frame_delivery_from_env},
+    handshake::{client_opening_handshake, server_opening_handshake},
     socket::{
-        FrameReader, FrameWriter, ReadSocket, WriteSocket, client_opening_handshake,
-        into_frame_io_parts, server_opening_handshake, socket, socket_with_watchdog_tuning,
+        FrameReader, FrameWriter, ReadSocket, SessionSupervisor, WriteSocket, into_frame_io_parts,
+        socket, socket_with_watchdog_tuning,
     },
     transmission::{
         fec::{FecConfig, FecState},
@@ -129,14 +130,17 @@ impl Listener {
                 config.fec_tuning,
                 FrameDelivery::enabled(),
                 raw_fd,
+                local_addr,
             )
             .await?;
             let Accepted {
                 read,
                 write,
                 peer_addr,
+                supervisor,
+                local_addr: _accepted_local_addr,
             } = accepted;
-            make_frame_delivery_io(read, write, local_addr, peer_addr)
+            make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr)
         }))
     }
 
@@ -231,6 +235,7 @@ impl Listener {
             tuning,
             frame_delivery,
             self.raw_fd,
+            self.local_addr,
         )
         .await
     }
@@ -262,6 +267,7 @@ impl Listener {
             tuning,
             frame_delivery,
             self.raw_fd,
+            self.local_addr,
         )))
     }
 }
@@ -269,6 +275,8 @@ impl Listener {
 pub struct Accepted {
     pub read: ReadSocket,
     pub write: WriteSocket,
+    pub supervisor: SessionSupervisor,
+    pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
 }
 
@@ -276,6 +284,7 @@ pub struct Accepted {
 pub struct FrameDeliveryIo {
     pub read: FrameReader,
     pub write: FrameWriter,
+    pub supervisor: SessionSupervisor,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
 }
@@ -316,6 +325,7 @@ async fn accept(
     tuning: FecTuning,
     frame_delivery: FrameDelivery,
     raw_fd: MaybeRawFd,
+    local_addr: SocketAddr,
 ) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
@@ -335,10 +345,12 @@ async fn accept(
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
-    let (read, write) = socket(unreliable_layer, None);
+    let (read, write, supervisor) = socket(unreliable_layer, None);
     Ok(Accepted {
         read,
         write,
+        supervisor,
+        local_addr,
         peer_addr,
     })
 }
@@ -346,6 +358,7 @@ async fn accept(
 fn make_frame_delivery_io(
     read: ReadSocket,
     write: WriteSocket,
+    supervisor: SessionSupervisor,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
 ) -> std::io::Result<FrameDeliveryIo> {
@@ -353,6 +366,7 @@ fn make_frame_delivery_io(
     Ok(FrameDeliveryIo {
         read,
         write,
+        supervisor,
         local_addr,
         peer_addr,
     })
@@ -558,13 +572,14 @@ async fn connect_configured(
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
-    let (read, write) = match watchdog {
+    let (read, write, supervisor) = match watchdog {
         Some(tuning) => socket_with_watchdog_tuning(unreliable_layer, log_config, tuning),
         None => socket(unreliable_layer, log_config),
     };
     Ok(Connected {
         read,
         write,
+        supervisor,
         local_addr,
         peer_addr,
     })
@@ -589,6 +604,7 @@ pub async fn connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
 pub struct Connected {
     pub read: ReadSocket,
     pub write: WriteSocket,
+    pub supervisor: SessionSupervisor,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
 }
@@ -623,16 +639,17 @@ impl FrameDeliveryIo {
         let Connected {
             read,
             write,
+            supervisor,
             local_addr,
             peer_addr,
         } = connected;
-        make_frame_delivery_io(read, write, local_addr, peer_addr)
+        make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr)
     }
 }
 
 pub(crate) fn wrap_fec(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    write: impl UnreliableWrite + Send + Sync + 'static,
     fec: bool,
 ) -> UnreliableLayer {
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
@@ -648,7 +665,7 @@ pub(crate) fn wrap_fec(
 #[allow(dead_code)] // used in tests; kept as a pub(crate) convenience wrapper
 pub(crate) fn wrap_fec_with_mss(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    write: impl UnreliableWrite + Send + Sync + 'static,
     fec: bool,
     mss: usize,
 ) -> UnreliableLayer {
@@ -665,7 +682,7 @@ pub(crate) fn wrap_fec_with_mss(
 #[allow(dead_code)] // used in tests
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    write: impl UnreliableWrite + Send + Sync + 'static,
     fec: bool,
     mss: usize,
     tuning: FecTuning,
@@ -682,7 +699,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
 
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    write: impl UnreliableWrite + Send + Sync + 'static,
     fec: bool,
     mss: usize,
     tuning: FecTuning,
@@ -692,6 +709,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     UnreliableLayer {
         utp_read: Box::new(read),
         utp_write: Box::new(write),
+        post_open_handshake: None,
         mss,
         fec: fec_state,
         fec_tuning: tuning,
@@ -1058,12 +1076,12 @@ pub mod testing {
     /// (the data is "written" then silently discarded), simulating a packet
     /// lost in flight after the sender's kernel has accepted it.
     #[derive(Debug)]
-    pub struct LossyWrite<W: UnreliableWrite> {
+    pub struct LossyWrite<W: UnreliableWrite + Send + Sync + 'static> {
         inner: W,
         rate: LossRate,
     }
 
-    impl<W: UnreliableWrite> LossyWrite<W> {
+    impl<W: UnreliableWrite + Send + Sync + 'static> LossyWrite<W> {
         pub fn new(write: W, rate: LossRate) -> Self {
             Self { inner: write, rate }
         }
@@ -1127,6 +1145,7 @@ pub mod testing {
         UnreliableLayer {
             utp_read: Box::new(LossyRead::new(read, rate.clone())),
             utp_write: Box::new(LossyWrite::new(write, rate)),
+            post_open_handshake: None,
             mss,
             fec: fec_state,
             fec_tuning: tuning,
@@ -1174,7 +1193,7 @@ mod tests {
                 });
             }
         });
-        let connected = connect(
+        let mut connected = connect(
             "0.0.0.0:0",
             addr,
             Some(LogConfig {

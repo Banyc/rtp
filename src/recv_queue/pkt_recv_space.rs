@@ -12,6 +12,23 @@ use crate::{
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecvDisposition {
+    Rejected,
+    Duplicate,
+    Inserted,
+}
+
+impl RecvDisposition {
+    pub(crate) fn should_ack(self) -> bool {
+        matches!(self, Self::Duplicate | Self::Inserted)
+    }
+
+    pub(crate) fn is_new(self) -> bool {
+        matches!(self, Self::Inserted)
+    }
+}
+
 #[derive(Debug)]
 pub struct PktRecvSpace {
     /// In-order cursor: the next sequence number the byte-stream delivery
@@ -50,38 +67,49 @@ impl PktRecvSpace {
         &mut self.reused_buf
     }
 
-    /// Return `false` if the data is rejected due to window capacity.
-    /// ACK semantics are bit-for-bit stock: this bool drives `to_ack`
-    /// in `transmission_layer.rs` and must not be modified by the frame
-    /// path.
+    /// Return the disposition of the received packet.
     pub fn recv(&mut self, seq: u64, data: Vec<u8>, frame_len: Option<u32>) -> bool {
+        let disposition = self.recv_disposition(seq, data, frame_len);
+        disposition.should_ack()
+    }
+
+    /// Return the disposition of the received packet:
+    /// `Rejected` for closed/out-of-window,
+    /// `Duplicate` for stale/already-present,
+    /// `Inserted` only after slot insertion and ack-history insertion.
+    pub(crate) fn recv_disposition(
+        &mut self,
+        seq: u64,
+        data: Vec<u8>,
+        frame_len: Option<u32>,
+    ) -> RecvDisposition {
         let Some(next) = self.next else {
             self.reused_buf.put(data);
-            return false;
+            return RecvDisposition::Rejected;
         };
 
         // Stale: seq is already behind the in-order cursor.
         if seq < next {
             self.reused_buf.put(data);
-            return true;
+            return RecvDisposition::Duplicate;
         }
 
         // Window check.
         if seq - next >= MAX_NUM_RECVING_PKTS as u64 {
             self.reused_buf.put(data);
-            return false;
+            return RecvDisposition::Rejected;
         }
 
         // In-window duplicate: already have this slot.
         if self.slots.contains_key(&seq) {
             self.reused_buf.put(data);
-            return true;
+            return RecvDisposition::Duplicate;
         }
 
         self.slots
             .insert(seq, RecvSlot::Data(RecvPkt { data, frame_len }));
         self.ack_history.insert(seq);
-        true
+        RecvDisposition::Inserted
     }
 
     /// Pop one complete frame (possibly out of order past sequence holes).

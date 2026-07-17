@@ -25,7 +25,7 @@ use crate::{
         },
         stock::{recv::StockRecvStage, send::StockSendStage},
     },
-    recv_queue::pkt_recv_space::PktRecvSpace,
+    recv_queue::pkt_recv_space::{PktRecvSpace, RecvDisposition},
     sack::AckBallSequence,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::watchdog_tuning::WatchdogTuning,
@@ -125,6 +125,11 @@ pub struct ReliableLayer {
     // Gentle-mode congestion controller state.
     pub(crate) gentle: GentleMode,
 
+    /// Whether the write half has been closed/finished (local FIN sent,
+    /// local writer dropped). After this is set, further sends/reliable
+    /// staging return `BrokenPipe`.
+    write_closed: bool,
+
     /// Whether the bottleneck queue is currently building per delivery-rate
     /// estimation (`smooth > floor + gate_tol`).  Updated on every ACK rate
     /// sample in `adjust_send_rate_exponential`.  Read by the transmission
@@ -189,6 +194,7 @@ impl ReliableLayer {
             slow_start: true,
             slow_start_acked_pkts: 0,
             gentle: GentleMode::new(),
+            write_closed: false,
             queue_building: false,
             drain_floor_binding_since: None,
             frame_delivery,
@@ -232,6 +238,7 @@ impl ReliableLayer {
             slow_start: true,
             slow_start_acked_pkts: 0,
             gentle: GentleMode::new(),
+            write_closed: false,
             queue_building: false,
             drain_floor_binding_since: None,
             frame_delivery,
@@ -323,6 +330,18 @@ impl ReliableLayer {
         self.pkt_send_space.sample_rtt(rtt, now);
     }
 
+    pub(crate) fn ensure_write_open(&self) -> Result<(), std::io::ErrorKind> {
+        if self.write_closed {
+            return Err(std::io::ErrorKind::BrokenPipe);
+        }
+        Ok(())
+    }
+
+    /// Close the local write-half (no further data staging allowed).
+    pub fn close_write(&mut self) {
+        self.write_closed = true;
+    }
+
     pub fn send_fin_buf(&mut self) {
         if matches!(self.send_fin_buf, SendFinBuf::EmptyAndBlocked) {
             return;
@@ -352,13 +371,15 @@ impl ReliableLayer {
         }
     }
 
-    pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> usize {
+    pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> Result<usize, std::io::ErrorKind> {
+        self.ensure_write_open()?;
         self.detect_application_limited_phases(now);
 
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap =
             (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(self.send_data_buf.capacity());
-        self.send_data_buf.stage(buf, cap)
+        let staged = self.send_data_buf.stage(buf, cap);
+        Ok(staged)
     }
 
     /// Stage a whole application frame in frame-delivery mode.  The frame is
@@ -367,6 +388,7 @@ impl ReliableLayer {
     /// frames).  Returns `Ok(())` on success, or `Err(InvalidInput)` when the
     /// mode is off, the frame is empty, or the frame exceeds `MAX_FRAME_LEN`.
     pub fn send_frame_buf(&mut self, frame: &[u8], now: Instant) -> Result<(), std::io::ErrorKind> {
+        self.ensure_write_open()?;
         if !self.frame_delivery.enabled {
             return Err(std::io::ErrorKind::InvalidInput);
         }
@@ -884,6 +906,18 @@ impl ReliableLayer {
         self.recv_fin_buf
     }
 
+    /// In frame-delivery mode, EOF is when a FIN is at the in-order head
+    /// of the receive space (all preceding data has been delivered). In
+    /// stock mode, EOF is when a FIN has been latched AND the byte receive
+    /// buffer is empty.
+    pub(crate) fn recv_eof_ready(&self) -> bool {
+        if self.frame_delivery.enabled {
+            self.recv_fin_buf
+        } else {
+            self.pkt_recv_space.fin_at_head()
+        }
+    }
+
     /// Return data from the inner data buffer and inner packet space
     ///
     /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
@@ -895,21 +929,24 @@ impl ReliableLayer {
 
     /// Take a pkt from the unreliable layer
     ///
-    /// Return `false` if the data is rejected due to window capacity
-    pub fn recv_data_pkt(&mut self, seq: u64, frame_len: Option<u32>, pkt: &[u8]) -> bool {
+    /// Returns the `RecvDisposition` for this packet.
+    pub fn recv_data_pkt(
+        &mut self,
+        seq: u64,
+        frame_len: Option<u32>,
+        pkt: &[u8],
+    ) -> RecvDisposition {
         let mut buf = self.pkt_recv_space.reused_buf().take();
         buf.extend(pkt);
-        if !self.pkt_recv_space.recv(seq, buf, frame_len) {
-            return false;
+        let disposition = self.pkt_recv_space.recv_disposition(seq, buf, frame_len);
+        if !disposition.is_new() {
+            return disposition;
         }
         if self.frame_delivery.enabled {
-            // In frame mode, complete frames may be delivered out of order;
-            // the receive queue handles reassembly.  The byte-stream buffer
-            // (`recv_data_buf`) is bypassed entirely in frame mode.
-            return true;
+            return RecvDisposition::Inserted;
         }
         self.move_recv_data();
-        true
+        RecvDisposition::Inserted
     }
 
     /// Pop one complete frame from the receive queue in frame-delivery mode.
@@ -1422,7 +1459,7 @@ mod tests {
         for _ in 0..n {
             assert_eq!(
                 rl.send_data_buf(&payload, now),
-                payload.len(),
+                Ok(payload.len()),
                 "send_data_buf must accept the 100-byte payload"
             );
             assert!(
@@ -1439,7 +1476,7 @@ mod tests {
         let mut sent = 0;
         for _ in 0..20_000 {
             let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
-            if free >= payload_len && rl.send_data_buf(&payload, now) < payload.len() {
+            if free >= payload_len && rl.send_data_buf(&payload, now).unwrap_or(0) < payload_len {
                 break;
             }
             if rl.send_data_pkt(&mut pkt, now).is_none() {
@@ -1470,7 +1507,7 @@ mod tests {
         let mut pkt = vec![0u8; TEST_MSS];
         assert_eq!(
             rl.send_data_buf(&payload, now),
-            payload.len(),
+            Ok(payload.len()),
             "send_data_buf must accept the 100-byte payload"
         );
         let p = rl
@@ -1509,7 +1546,7 @@ mod tests {
         for _ in 0..n {
             let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
             if free >= payload_len {
-                rl.send_data_buf(&payload, now);
+                let _ = rl.send_data_buf(&payload, now);
             }
             if rl.send_data_pkt(&mut pkt, now).is_none() {
                 break;
