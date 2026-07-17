@@ -188,12 +188,27 @@ pub enum SendKillPkt {
 
 #[async_trait]
 pub trait UnreliableRead: core::fmt::Debug + Sync + Send + 'static {
+    /// Attempt to receive one datagram without creating a pending asynchronous
+    /// I/O operation. `WouldBlock` means that no datagram is currently ready.
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
-
+    /// Receive one datagram.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Dropping a pending `recv` future must leave this reader valid for a
+    /// subsequent `recv` and must not leave an operation referencing `buf`
+    /// after the future is dropped. Cancellation may consume or lose a
+    /// datagram: this is an unreliable transport, so packet preservation and
+    /// gap-free delivery are deliberately not part of the contract.
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind>;
 }
+
 #[async_trait]
-pub trait UnreliableWrite: core::fmt::Debug + Sync + Send + 'static {
+pub trait UnreliableWrite: core::fmt::Debug + Send + 'static {
+    /// Send one datagram.
+    ///
+    /// This future is not required to be cancellation-safe. A caller that
+    /// cancels it must drop this writer instead of using it for another send.
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
 }
 

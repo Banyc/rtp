@@ -8,6 +8,7 @@ pub mod frame_delivery {
 }
 pub(crate) mod read_half;
 pub(crate) mod shared;
+pub(crate) mod termination;
 pub mod transmission_layer;
 #[cfg(test)]
 mod transmission_layer_test_facade;
