@@ -1,17 +1,20 @@
 //! Sender-side frame staging and frame-aligned packetization.
 
+use std::collections::VecDeque;
+
+use primitive::{ops::len::Len, queue::cap_queue::CapVecQueue};
+
 /// Maximum application bytes in a single frame in frame-delivery mode.
 /// Set equal to the stock `MAX_SEND_DATA_BUF_LEN` so a frame can occupy
 /// the whole staging buffer.
 pub(crate) const MAX_FRAME_LEN: usize = 64 * 1024;
 
-/// A frame accepted by `FrameSendStage::stage_frame` but not yet fully
-/// packetized.  `offset` is the number of bytes already sent in earlier
-/// packets.
+const MAX_PENDING_FRAMES: usize = 1024;
+
 #[derive(Debug, Clone)]
 struct PendingFrame {
-    data: Vec<u8>,
-    offset: usize,
+    total_len: usize,
+    remaining: usize,
 }
 
 /// The next frame-aligned packet payload to emit.
@@ -20,16 +23,23 @@ pub(crate) struct FrameChunk {
     pub(crate) take_bytes: usize,
 }
 
-/// Pending (not yet fully packetized) frames in frame-delivery mode.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct FrameSendStage {
-    pending_frames: Vec<PendingFrame>,
+    data: CapVecQueue<u8>,
+    pending_frames: VecDeque<PendingFrame>,
+}
+
+impl Default for FrameSendStage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameSendStage {
     pub(crate) fn new() -> Self {
         Self {
-            pending_frames: Vec::new(),
+            data: CapVecQueue::new_vec(MAX_FRAME_LEN),
+            pending_frames: VecDeque::with_capacity(MAX_PENDING_FRAMES),
         }
     }
 
@@ -38,10 +48,7 @@ impl FrameSendStage {
     }
 
     pub(crate) fn pending_bytes(&self) -> usize {
-        self.pending_frames
-            .iter()
-            .map(|pf| pf.data.len() - pf.offset)
-            .sum()
+        self.data.len()
     }
 
     pub(crate) fn stage_frame(
@@ -51,21 +58,23 @@ impl FrameSendStage {
     ) -> Result<(), std::io::ErrorKind> {
         validate_frame(frame)?;
         let pending_bytes = self.pending_bytes();
-        if pending_bytes == 0 {
-            // Empty-stage bypass: admit any legal frame regardless of soft cap.
-            self.pending_frames.push(PendingFrame {
-                data: frame.to_vec(),
-                offset: 0,
-            });
-            return Ok(());
+        if self.pending_frames.len() == MAX_PENDING_FRAMES {
+            return Err(std::io::ErrorKind::WouldBlock);
         }
-        let free_bytes = soft_cap.saturating_sub(pending_bytes);
+        let free_bytes = if pending_bytes == 0 {
+            MAX_FRAME_LEN
+        } else {
+            soft_cap
+                .saturating_sub(pending_bytes)
+                .min(MAX_FRAME_LEN - pending_bytes)
+        };
         if free_bytes < frame.len() {
             return Err(std::io::ErrorKind::WouldBlock);
         }
-        self.pending_frames.push(PendingFrame {
-            data: frame.to_vec(),
-            offset: 0,
+        self.data.batch_enqueue(frame);
+        self.pending_frames.push_back(PendingFrame {
+            total_len: frame.len(),
+            remaining: frame.len(),
         });
         Ok(())
     }
@@ -75,15 +84,14 @@ impl FrameSendStage {
         first_pkt_max_payload: usize,
         normal_max_payload: usize,
     ) -> Option<FrameChunk> {
-        let pf = self.pending_frames.first()?;
-        let remaining = pf.data.len() - pf.offset;
-        let cap = if pf.offset == 0 {
+        let pf = self.pending_frames.front()?;
+        let cap = if pf.remaining == pf.total_len {
             first_pkt_max_payload
         } else {
             normal_max_payload
         };
         Some(FrameChunk {
-            take_bytes: remaining.min(cap),
+            take_bytes: pf.remaining.min(cap),
         })
     }
 
@@ -91,15 +99,15 @@ impl FrameSendStage {
     /// packet of its frame (caller emits `FRAME_DATA_TS`).
     pub(crate) fn pop_chunk(&mut self, chunk: FrameChunk, out: &mut Vec<u8>) -> Option<u32> {
         let take_bytes = chunk.take_bytes;
-        let pf = self.pending_frames.first_mut().unwrap();
-        let frame_len = pf.data.len() as u32;
-        out.extend_from_slice(&pf.data[pf.offset..pf.offset + take_bytes]);
-        pf.offset += take_bytes;
-        let frame_done = pf.offset == pf.data.len();
-        let is_first = pf.offset == take_bytes;
-        let frame_len = if is_first { Some(frame_len) } else { None };
+        let pf = self.pending_frames.front_mut().unwrap();
+        assert!(take_bytes <= pf.remaining);
+        let is_first = pf.remaining == pf.total_len;
+        self.data.batch_dequeue_extend(take_bytes, out);
+        pf.remaining -= take_bytes;
+        let frame_done = pf.remaining == 0;
+        let frame_len = is_first.then_some(pf.total_len as u32);
         if frame_done {
-            self.pending_frames.remove(0);
+            self.pending_frames.pop_front();
         }
         frame_len
     }
@@ -136,6 +144,32 @@ mod tests {
         let err = stage.stage_frame(&[2u8; 1_000], 1_000).unwrap_err();
         assert_eq!(err, std::io::ErrorKind::WouldBlock);
         stage.stage_frame(&[3u8; 900], 1_000).unwrap();
+    }
+
+    #[test]
+    fn pending_frame_count_is_bounded() {
+        let mut stage = FrameSendStage::new();
+        for _ in 0..MAX_PENDING_FRAMES {
+            stage.stage_frame(&[1], usize::MAX).unwrap();
+        }
+        assert_eq!(
+            stage.stage_frame(&[1], usize::MAX).unwrap_err(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(stage.pending_bytes(), MAX_PENDING_FRAMES);
+    }
+
+    #[test]
+    fn pending_payload_bytes_are_bounded() {
+        let mut stage = FrameSendStage::new();
+        stage
+            .stage_frame(&vec![0; MAX_FRAME_LEN], usize::MAX)
+            .unwrap();
+        assert_eq!(
+            stage.stage_frame(&[1], usize::MAX).unwrap_err(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(stage.pending_bytes(), MAX_FRAME_LEN);
     }
 
     #[test]

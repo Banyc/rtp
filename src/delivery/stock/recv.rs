@@ -1,7 +1,7 @@
 //! Recv-side byte-stream buffer (stock mode).
 
 use primitive::{
-    ops::len::{Capacity, Len, LenExt},
+    ops::len::{Capacity, Len},
     queue::cap_queue::CapVecQueue,
 };
 

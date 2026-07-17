@@ -11,7 +11,6 @@ use primitive::{
     ops::{
         clear::Clear,
         float::{PosR, UnitR},
-        len::{Capacity, Len, LenExt},
     },
     time::timer::Timer,
 };
@@ -48,7 +47,6 @@ const _: () = assert!(MAX_FRAME_LEN == MAX_SEND_DATA_BUF_LEN);
 /// low send rate.  After a rate spike occupancy may sit above the cap until it
 /// drains; this is intentional and is why we gate acceptance, not eviction.
 const STAGE_WINDOW_SECS: f64 = 0.005;
-const RECV_DATA_BUF_LEN: usize = 2 << 16;
 const MAX_BURST_PKTS: usize = 64;
 const MAX_BURST_PKTS_CEIL: usize = 512;
 const SEND_TIMER_INTERVAL_SECS: f64 = 0.001;
@@ -1246,10 +1244,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
-    use primitive::ops::{
-        float::PosR,
-        len::{Capacity, Len},
-    };
+    use primitive::ops::float::PosR;
 
     use super::{
         DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS,
