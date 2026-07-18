@@ -406,9 +406,17 @@ fn copy_datagram(datagram: &[u8], buf: &mut [u8]) -> Result<usize, io::ErrorKind
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{socket::socket, udp::wrap_fec};
+    use crate::{
+        codec,
+        socket::socket,
+        transmission::fec::{FecConfig, FecState},
+        udp::wrap_fec,
+    };
     use async_trait::async_trait;
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use tokio::sync::mpsc;
 
     #[test]
@@ -428,10 +436,15 @@ mod tests {
             assert_eq!(Packet::decode(&encoded), Some(packet));
             let mut overlong = encoded.to_vec();
             overlong.push(0);
-            assert!(Packet::decode(&overlong).is_none());
-            let mut cmd_space = encoded;
-            cmd_space[0] = 0;
-            assert!(Packet::decode(&cmd_space).is_none());
+            assert_eq!(Packet::decode(&overlong), None);
+            assert!(!codec::in_cmd_space(encoded[0]));
+            assert!(codec::decode(&encoded, &mut Vec::new()).is_err());
+
+            let mut fec = FecState::new(FecConfig {
+                symbol_size: 1_424,
+                interactive_parity_depth: 1,
+            });
+            assert!(fec.decode(&encoded).is_none());
         }
     }
 
@@ -1062,5 +1075,111 @@ mod tests {
                 .map_err(|_| io::ErrorKind::BrokenPipe)?;
             Ok(buf.len())
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_times_out_on_sustained_would_block() {
+        #[derive(Debug)]
+        struct AlwaysWouldBlock(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait]
+        impl UnreliableWrite for AlwaysWouldBlock {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, io::ErrorKind> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(io::ErrorKind::WouldBlock)
+            }
+        }
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writer: Box<dyn UnreliableWrite> =
+            Box::new(AlwaysWouldBlock(Arc::clone(&attempts)));
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let started = Instant::now();
+        let result = send(&mut writer, b"x", deadline).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= Duration::from_millis(5));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_completes_on_late_writability() {
+        #[derive(Debug)]
+        struct LateWritable {
+            ready_at: Instant,
+        }
+        #[async_trait]
+        impl UnreliableWrite for LateWritable {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+                if Instant::now() >= self.ready_at {
+                    Ok(buf.len())
+                } else {
+                    Err(io::ErrorKind::WouldBlock)
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut writer: Box<dyn UnreliableWrite> = Box::new(LateWritable {
+            ready_at: Instant::now() + Duration::from_millis(150),
+        });
+        tokio::time::timeout(Duration::from_secs(2), send(&mut writer, b"x", deadline))
+            .await
+            .expect("send hung")
+            .expect("send missed late writability");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_does_not_cancel_pending_write_at_retry_deadline() {
+        #[derive(Debug)]
+        struct PendingWrite {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            cancelled: Arc<AtomicBool>,
+        }
+        struct CancelProbe {
+            cancelled: Arc<AtomicBool>,
+            completed: bool,
+        }
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        #[async_trait]
+        impl UnreliableWrite for PendingWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+                let mut probe = CancelProbe {
+                    cancelled: Arc::clone(&self.cancelled),
+                    completed: false,
+                };
+                self.started.notify_one();
+                self.release.notified().await;
+                probe.completed = true;
+                Ok(buf.len())
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let cancelled = Arc::clone(&cancelled);
+            async move {
+                let mut writer: Box<dyn UnreliableWrite> = Box::new(PendingWrite {
+                    started,
+                    release,
+                    cancelled,
+                });
+                send(&mut writer, b"x", Instant::now() + Duration::from_millis(5)).await
+            }
+        });
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished());
+        assert!(!cancelled.load(Ordering::SeqCst));
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(!cancelled.load(Ordering::SeqCst));
     }
 }
