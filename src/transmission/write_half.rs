@@ -247,7 +247,7 @@ impl WriteHalf {
         fec.lock().unwrap().skip_open_group();
     }
 
-    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), io::ErrorKind> {
+    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), std::io::ErrorKind> {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
@@ -259,7 +259,7 @@ impl WriteHalf {
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
-                Err(io::ErrorKind::WouldBlock) => {
+                Err(std::io::ErrorKind::WouldBlock) => {
                     if FEC_DEBUG {
                         eprintln!("flush_fec_parities: WouldBlock (transient)");
                     }
@@ -351,10 +351,12 @@ impl WriteHalf {
                 .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
     }
 
-    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), io::ErrorKind> {
+    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
         {
             let s = self.ack_flush.lock().unwrap();
-            if s.pending_acks == 0 && !s.fin_pending { return Ok(()); }
+            if s.pending_acks == 0 && !s.fin_pending {
+                return Ok(());
+            }
         }
         self.flush_acks_inner(bufs).await
     }
@@ -460,7 +462,7 @@ impl WriteHalf {
         &mut self,
         codec_pkt: &[u8],
         fec_buf: &mut [u8],
-    ) -> Result<usize, io::ErrorKind> {
+    ) -> Result<usize, std::io::ErrorKind> {
         let send_buf: &[u8] = {
             match self.fec.as_ref() {
                 Some(fec) => {

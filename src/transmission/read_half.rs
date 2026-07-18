@@ -31,7 +31,7 @@ impl ReadHalf {
     pub async fn recv_pkts(
         &mut self,
         bufs: &mut RecvBufs,
-    ) -> Result<RecvPkts, (io::ErrorKind, SendKillPkt)> {
+    ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
         let Self {
             utp_read,
             recent_echoes,
@@ -39,7 +39,7 @@ impl ReadHalf {
         } = self;
         let shared: &Shared = shared.as_ref();
         let termination = &shared.termination;
-        let throw_error = |e: io::ErrorKind| {
+        let throw_error = |e: std::io::ErrorKind| {
             termination.press_error(e);
             e
         };
@@ -55,16 +55,18 @@ impl ReadHalf {
                 .termination
                 .throw_error()
                 .map_err(|e| (e, SendKillPkt::No))?;
-            let res = match bufs.ack_to_peer.is_empty() {
-                true => utp_read.recv(&mut bufs.utp).await,
-                false => {
-                    let res = utp_read.try_recv(&mut bufs.utp);
-                    if let Err(e) = &res
-                        && *e == io::ErrorKind::WouldBlock
-                    {
-                        break;
+            let res = {
+                match bufs.ack_to_peer.is_empty() {
+                    true => utp_read.recv(&mut bufs.utp).await,
+                    false => {
+                        let res = utp_read.try_recv(&mut bufs.utp);
+                        if let Err(e) = &res
+                            && *e == std::io::ErrorKind::WouldBlock
+                        {
+                            break;
+                        }
+                        res
                     }
-                    res
                 }
             };
             let read_bytes = match res {
@@ -122,7 +124,7 @@ impl ReadHalf {
                     }
                 }
                 if data.killed {
-                    let e = io::ErrorKind::BrokenPipe;
+                    let e = std::io::ErrorKind::BrokenPipe;
                     throw_error(e);
                     return Err((e, SendKillPkt::No));
                 }

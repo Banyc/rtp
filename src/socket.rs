@@ -1,10 +1,5 @@
-use std::{
-    future::Future,
-    io,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::sync::Arc;
+use std::{future::Future, pin::Pin, task::Poll};
 
 use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
@@ -64,28 +59,31 @@ impl std::convert::AsMut<WriteSocket> for WriteStream {
 
 impl tokio::io::AsyncWrite for WriteStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
         let max_stage = self.max_stage;
         let buf = if buf.len() > max_stage {
             &buf[..max_stage]
         } else {
             buf
         };
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -120,32 +118,35 @@ impl IoStream {
 
 impl tokio::io::AsyncRead for IoStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.read).poll_read(cx, buf)
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
     }
 }
 
 impl tokio::io::AsyncWrite for IoStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.write).poll_write(cx, buf)
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.write).poll_flush(cx)
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.write).poll_shutdown(cx)
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
     }
 }
 
@@ -155,11 +156,11 @@ pub struct FrameReader {
 }
 impl tokio::io::AsyncRead for FrameReader {
     fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -174,17 +175,23 @@ impl FrameWriter {
 }
 impl tokio::io::AsyncWrite for FrameWriter {
     fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -571,7 +578,7 @@ pub(crate) fn into_frame_io_parts(
 }
 
 impl AsyncAsyncRead for ReadSocket {
-    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.recv(buf)
             .await
             .map_err(|kind| self.transmission_layer.termination.io_error(kind))
@@ -579,13 +586,13 @@ impl AsyncAsyncRead for ReadSocket {
 }
 
 impl AsyncAsyncWrite for WriteSocket {
-    async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.send(buf)
             .await
             .map_err(|kind| self.transmission_layer.termination.io_error(kind))
     }
 
-    async fn flush(&mut self) -> io::Result<()> {
+    async fn flush(&mut self) -> std::io::Result<()> {
         self.transmission_layer
             .throw_error()
             .map_err(|kind| self.transmission_layer.termination.io_error(kind))?;
@@ -672,21 +679,17 @@ mod tests {
     async fn event_task_panic_reaps_the_rest_of_the_rtp_session() {
         #[derive(Debug)]
         struct PanickingRead;
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PanickingRead {
             fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 panic!("injected RTP read panic")
             }
-
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 panic!("injected RTP read panic")
             }
         }
-
         #[derive(Debug)]
         struct DropProbeWrite(Option<tokio::sync::oneshot::Sender<()>>);
-
         impl Drop for DropProbeWrite {
             fn drop(&mut self) {
                 if let Some(dropped) = self.0.take() {
@@ -694,14 +697,12 @@ mod tests {
                 }
             }
         }
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeWrite {
             async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
                 Ok(buf.len())
             }
         }
-
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
         let layer = wrap_fec(PanickingRead, DropProbeWrite(Some(dropped_tx)), false);
         let (_read, _write, supervisor) = socket(layer, None);
@@ -712,7 +713,7 @@ mod tests {
             .expect("writer drop probe was lost");
         let error = tokio::time::timeout(Duration::from_secs(1), owner)
             .await
-            .expect("RTP supervision did not finish joining its drivers")
+            .expect("RTP supervisor did not finish joining its drivers")
             .expect_err("RTP driver panic did not cascade to the owning task");
         assert!(error.is_panic());
     }
@@ -720,37 +721,31 @@ mod tests {
     #[tokio::test]
     async fn supervisor_signals_then_joins_without_cancelling_an_in_flight_send() {
         use std::sync::atomic::{AtomicBool, Ordering};
-
         #[derive(Debug)]
         struct GatedFailedRead {
             fail: Arc<tokio::sync::Notify>,
         }
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for GatedFailedRead {
             fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 Err(std::io::ErrorKind::WouldBlock)
             }
-
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 self.fail.notified().await;
                 Err(std::io::ErrorKind::ConnectionReset)
             }
         }
-
         #[derive(Debug)]
         struct GatedWrite {
             started: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
             dropped: Arc<AtomicBool>,
         }
-
         impl Drop for GatedWrite {
             fn drop(&mut self) {
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for GatedWrite {
             async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
@@ -759,7 +754,6 @@ mod tests {
                 Ok(buf.len())
             }
         }
-
         let fail = Arc::new(tokio::sync::Notify::new());
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -785,7 +779,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(
             !owner.is_finished(),
-            "supervisor returned before joining the in-flight writer"
+            "the supervisor returned before joining the in-flight writer"
         );
         assert!(
             !dropped.load(Ordering::SeqCst),
@@ -802,21 +796,17 @@ mod tests {
     #[tokio::test]
     async fn supervisor_waits_for_requested_kill_attempt_before_reaping() {
         use std::sync::atomic::{AtomicBool, Ordering};
-
         #[derive(Debug)]
         struct PendingRead;
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
             fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 Err(std::io::ErrorKind::WouldBlock)
             }
-
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
                 std::future::pending().await
             }
         }
-
         #[derive(Debug)]
         struct KillGateWrite {
             kill_started: Arc<tokio::sync::Notify>,
@@ -824,24 +814,21 @@ mod tests {
             dropped: Arc<tokio::sync::Notify>,
             was_dropped: Arc<AtomicBool>,
         }
-
         impl Drop for KillGateWrite {
             fn drop(&mut self) {
                 self.was_dropped.store(true, Ordering::SeqCst);
                 self.dropped.notify_one();
             }
         }
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for KillGateWrite {
             async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-                assert_eq!(buf, &[2], "the gated send must be the RTP KILL command");
+                assert_eq!(buf, [2], "the gated send must be the RTP KILL command");
                 self.kill_started.notify_one();
                 self.release_kill.notified().await;
                 Ok(buf.len())
             }
         }
-
         let kill_started = Arc::new(tokio::sync::Notify::new());
         let release_kill = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(tokio::sync::Notify::new());
@@ -922,7 +909,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn empty_stock_io_is_an_immediate_noop() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -954,7 +941,7 @@ mod tests {
         assert_eq!(&buf[..n], b"payload");
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn empty_generic_frame_io_is_a_noop_but_empty_frame_is_invalid() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1002,17 +989,14 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-
         let hello = b"hello";
         let world = b"world";
-
         let a = wrap_fec(a.clone(), a, fec);
         let b = wrap_fec(b.clone(), b, fec);
-        let (mut a_r, mut a_w, _sup_a) = socket(a, None);
-        let (mut b_r, mut b_w, _sup_b) = socket(b, None);
+        let (mut a_r, mut a_w, _a_supervisor) = socket(a, None);
+        let (mut b_r, mut b_w, _b_supervisor) = socket(b, None);
         a_w.send(hello).await.unwrap();
         b_w.send(world).await.unwrap();
-
         let mut recv_buf = [0; 1024 * 64];
         a_r.recv(&mut recv_buf).await.unwrap();
         assert_eq!(&recv_buf[..world.len()], world);
@@ -1029,12 +1013,10 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let a = wrap_fec(a.clone(), a, fec);
         let b = wrap_fec(b.clone(), b, fec);
-        let (a_r, a_w, _sup_a) = socket(a, None);
-        let (b_r, b_w, _sup_b) = socket(b, None);
-
+        let (a_r, a_w, _a_supervisor) = socket(a, None);
+        let (b_r, b_w, _b_supervisor) = socket(b, None);
         let mut send_buf = vec![0; 2 << 17];
         let mut recv_buf = send_buf.clone();
-
         for byte in &mut send_buf {
             *byte = rand::random();
         }
@@ -1065,10 +1047,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fec_recovers_under_loss() {
         use crate::udp::testing::{LossRate, wrap_fec_lossy};
-
         let rate_a = LossRate::new(300);
         let rate_b = LossRate::new(300);
-
         let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1076,19 +1056,16 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let a = wrap_fec_lossy(a.clone(), a, fec, rate_a);
         let b = wrap_fec_lossy(b.clone(), b, fec, rate_b);
-        let (a_r, a_w, _sup_a) = socket(a, None);
-        let (b_r, b_w, _sup_b) = socket(b, None);
-
+        let (a_r, a_w, _a_supervisor) = socket(a, None);
+        let (b_r, b_w, _b_supervisor) = socket(b, None);
         let mut send_buf = vec![0; 4 << 20];
         let mut recv_buf = send_buf.clone();
         for byte in &mut send_buf {
             *byte = rand::random();
         }
-
         let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
         let mut b_r = b_r.into_async_read();
         let b_w = b_w.into_async_write();
-
         let send_buf_clone = send_buf.clone();
         let recv_done = Arc::new(tokio::sync::Notify::new());
         let recv_done_clone = recv_done.clone();
@@ -1098,14 +1075,12 @@ mod tests {
             recv_done_clone.notified().await;
             a
         });
-
         b_r.read_exact(&mut recv_buf).await.unwrap();
         assert_eq!(send_buf, recv_buf);
         recv_done.notify_waiters();
         sender.await.unwrap();
-
         let recovered = b_r.inner().fec_recovered_symbols();
-        assert!(recovered.is_some(), "FEC should be enabled on the receiver");
+        assert!(recovered.is_some(), "FEC should be enabled on receiver");
         assert!(
             recovered.unwrap() > 0,
             "FEC should recover >0 symbols under 3% loss, got 0"
@@ -1117,10 +1092,8 @@ mod tests {
         use crate::socket::socket;
         use crate::transmission::fec_tuning::FecTuning;
         use crate::udp::testing::{LossRate, wrap_fec_lossy_with_mss_and_fec_tuning};
-
         let rate_a = LossRate::new(300);
         let rate_b = LossRate::new(300);
-
         let fec = true;
         let mss = 8192;
         let tuning = FecTuning::mindiv();
@@ -1128,18 +1101,16 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-
         let a_layer =
             wrap_fec_lossy_with_mss_and_fec_tuning(a.clone(), a, fec, mss, tuning, rate_a);
         let b_layer =
             wrap_fec_lossy_with_mss_and_fec_tuning(b.clone(), b, fec, mss, tuning, rate_b);
-        let (a_r, a_w, _sup_a) = socket(a_layer, None);
-        let (b_r, b_w, _sup_b) = socket(b_layer, None);
-        let mut a_r = a_r;
-        let mut a_w = a_w;
+        let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
+        let (b_r, b_w, _b_supervisor) = socket(b_layer, None);
         let mut b_r = b_r;
+        let mut a_w = a_w;
+        let mut a_r = a_r;
         let mut b_w = b_w;
-
         let msg_len = 256;
         let n_msgs = 512;
         let mut sent = Vec::with_capacity(n_msgs);
@@ -1150,7 +1121,6 @@ mod tests {
             }
             sent.push(m.clone());
         }
-
         let sent_for_server = sent.clone();
         let server_task = tokio::spawn(async move {
             let mut buf = vec![0u8; msg_len];
@@ -1161,7 +1131,6 @@ mod tests {
             }
             b_r.fec_recovered_symbols()
         });
-
         for m in &sent {
             a_w.send(m).await.unwrap();
             let mut echo = vec![0u8; m.len()];
@@ -1171,37 +1140,32 @@ mod tests {
         drop(a_w);
         drop(a_r);
         let recovered = server_task.await.unwrap();
-
         assert!(recovered.is_some(), "FEC should be enabled on the receiver");
         assert!(
             recovered.unwrap() > 0,
-            "FEC should recover >0 symbols at MSS 8192 under 3% loss with mindiv, got 0"
+            "FEC should recover >0 symbols under 3% loss, got 0"
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_max_stage_scales_with_mss() {
         use crate::udp::{wrap_fec, wrap_fec_with_mss};
-
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-
         let b_wrapped = wrap_fec(b.clone(), b, false);
-        let (_b_r, b_w, _sup_b) = socket(b_wrapped, None);
+        let (_b_r, b_w, _b_supervisor) = socket(b_wrapped, None);
         assert_eq!(
             b_w.into_async_write().max_stage(),
             8 * 1024,
             "default-MSS staging buffer must be exactly 8 KiB"
         );
-
         let mss = 9_000;
         let a = wrap_fec_with_mss(a.clone(), a, false, mss);
-        let (_a_r, a_w, _sup_a) = socket(a, None);
+        let (_a_r, a_w, _a_supervisor) = socket(a, None);
         let write_stream = a_w.into_async_write();
         let max_stage = write_stream.max_stage();
-
         let per_packet_payload = mss - crate::codec::data_overhead();
         assert_eq!(
             max_stage % per_packet_payload,
@@ -1212,7 +1176,6 @@ mod tests {
             8 * 1024 < max_stage,
             "max_stage {max_stage} should exceed the default staging buffer of 8 KiB"
         );
-
         drop(write_stream);
     }
 
@@ -1220,9 +1183,7 @@ mod tests {
     async fn write_stream_stages_at_most_the_send_buf_capacity() {
         use std::pin::Pin;
         use std::task::{Context, Poll};
-
         use tokio::io::AsyncWrite;
-
         let fec = false;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1230,21 +1191,17 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let a = wrap_fec(a.clone(), a, fec);
         let b = wrap_fec(b.clone(), b, fec);
-        let (a_r, a_w, _sup_a) = socket(a, None);
-        let (_b_r, b_w, _sup_b) = socket(b, None);
-
+        let (a_r, a_w, _a_supervisor) = socket(a, None);
+        let (_b_r, b_w, _b_supervisor) = socket(b, None);
         let _a_r = a_r;
-
         let capacity = a_w
             .transmission_layer
             .reliable_layer()
             .lock()
             .unwrap()
             .send_data_buf_capacity();
-
         let mut write_stream = a_w.into_async_write();
         let big = vec![0u8; capacity * 4];
-
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let pinned = Pin::new(&mut write_stream);
         let poll = pinned.poll_write(&mut cx, &big);
@@ -1257,7 +1214,6 @@ mod tests {
             n <= capacity,
             "poll_write consumed {n} bytes, but capacity is {capacity}"
         );
-
         drop(write_stream);
         drop(b_w);
     }
@@ -1266,16 +1222,13 @@ mod tests {
     async fn frame_mode_async_write_produces_one_frame() {
         use crate::delivery::frame::FrameDelivery;
         use tokio::io::AsyncWriteExt;
-
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
         let fd = FrameDelivery::enabled();
-
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             a.clone(),
             a,
@@ -1292,34 +1245,29 @@ mod tests {
             crate::transmission::fec_tuning::FecTuning::default(),
             fd,
         );
-        let (_a_r, a_w, _sup_a) = socket(a_layer, None);
-        let (mut b_r, _b_w, _sup_b) = socket(b_layer, None);
-
+        let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
+        let (mut b_r, _b_w, _b_supervisor) = socket(b_layer, None);
         let frame_size = 16 * 1024;
         let payload: Vec<u8> = (0..frame_size).map(|i| (i % 251) as u8).collect();
         let expected = payload.clone();
-
         let mut a_stream = a_w.into_async_write();
         let send_task = tokio::spawn(async move {
             a_stream.write_all(&payload).await.unwrap();
             a_stream.shutdown().await.ok();
             a_stream
         });
-
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), b_r.recv_frame())
+        let frame = tokio::time::timeout(Duration::from_secs(5), b_r.recv_frame())
             .await
             .expect("recv_frame timed out")
             .expect("recv_frame failed")
             .expect("expected a frame, got EOF");
-
         assert_eq!(
             frame.len(),
             frame_size,
             "receiver must get exactly one frame of the original size"
         );
         assert_eq!(frame, expected, "frame contents must match");
-
-        drop(_b_w);
+        drop(a_r);
         let _ = send_task.await;
     }
 
@@ -1332,8 +1280,8 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let a = wrap_fec(a.clone(), a, fec);
         let b = wrap_fec(b.clone(), b, fec);
-        let (a_r, a_w, _sup_a) = socket(a, None);
-        let (_b_r, _b_w, _sup_b) = socket(b, None);
+        let (a_r, a_w, _a_supervisor) = socket(a, None);
+        let (_b_r, _b_w, _b_supervisor) = socket(b, None);
         let result = into_frame_io_parts(a_r, a_w);
         assert!(
             result
@@ -1348,16 +1296,13 @@ mod tests {
     async fn frame_delivery_io_preserves_frames_across_async_io() {
         use crate::delivery::frame::FrameDelivery;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
         let fd = FrameDelivery::enabled();
-
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             a.clone(),
             a,
@@ -1374,32 +1319,27 @@ mod tests {
             crate::transmission::fec_tuning::FecTuning::default(),
             fd,
         );
-        let (a_r, a_w, _sup_a) = socket(a_layer, None);
-        let (b_r, b_w, _sup_b) = socket(b_layer, None);
-
+        let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
+        let (b_r, b_w, _b_supervisor) = socket(b_layer, None);
         let mut a_io = into_frame_io_parts(a_r, a_w)
             .expect("frame delivery halves must convert")
             .into_parts();
         let mut b_io = into_frame_io_parts(b_r, b_w)
             .expect("frame delivery halves must convert")
             .into_parts();
-
         let first = b"first";
         let second = b"second-frame";
-
         a_io.1.write_all(first).await.unwrap();
         a_io.1.write_all(second).await.unwrap();
         a_io.1.flush().await.unwrap();
         a_io.1.shutdown().await.ok();
-
         let mut buf = vec![0u8; 256];
-        let n1 = tokio::time::timeout(std::time::Duration::from_secs(5), b_io.0.read(&mut buf))
+        let n1 = tokio::time::timeout(Duration::from_secs(5), b_io.0.read(&mut buf))
             .await
             .expect("first read timed out")
             .expect("first read failed");
         assert_eq!(&buf[..n1], first, "first frame must match");
-
-        let n2 = tokio::time::timeout(std::time::Duration::from_secs(5), b_io.0.read(&mut buf))
+        let n2 = tokio::time::timeout(Duration::from_secs(5), b_io.0.read(&mut buf))
             .await
             .expect("second read timed out")
             .expect("second read failed");
@@ -1563,7 +1503,7 @@ mod tests {
         let peer_error = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
             .await
             .expect("peer did not receive RTP KILL")
-            .expect_err("post-close the RTP session");
+            .expect_err("post-close payload must reset the RTP session");
         assert_eq!(peer_error, std::io::ErrorKind::BrokenPipe);
         let local_error = a_write
             .send(b"after reset")
@@ -1798,10 +1738,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn abort_is_callable_while_poll_write_retains_the_write_socket() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-
         #[derive(Debug)]
         struct PendingRead;
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
             fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
@@ -1811,7 +1749,6 @@ mod tests {
                 std::future::pending().await
             }
         }
-
         #[derive(Debug)]
         struct WriteState {
             calls: AtomicUsize,
@@ -1819,10 +1756,8 @@ mod tests {
             release_first: tokio::sync::Notify,
             kill_started: tokio::sync::Notify,
         }
-
         #[derive(Debug)]
         struct BlockingFirstWrite(Arc<WriteState>);
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for BlockingFirstWrite {
             async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
@@ -1836,14 +1771,12 @@ mod tests {
                 Ok(buf.len())
             }
         }
-
         let state = Arc::new(WriteState {
             calls: AtomicUsize::new(0),
             first_started: tokio::sync::Notify::new(),
             release_first: tokio::sync::Notify::new(),
             kill_started: tokio::sync::Notify::new(),
         });
-
         let layer = wrap_fec(PendingRead, BlockingFirstWrite(Arc::clone(&state)), false);
         let (_read, write, _supervisor) = socket(layer, None);
         let mut write = write.into_async_write();
@@ -1856,9 +1789,7 @@ mod tests {
         for _ in 0..4 {
             match tokio::time::timeout(Duration::from_millis(20), write.write(&payload)).await {
                 Ok(Ok(n)) => assert!(n > 0),
-                Ok(Err(error)) => {
-                    panic!("staging failed unexpectedly: {error}")
-                }
+                Ok(Err(error)) => panic!("staging failed unexpectedly: {error}"),
                 Err(_) => {
                     retained_pending_write = true;
                     break;

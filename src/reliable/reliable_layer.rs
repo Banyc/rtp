@@ -1416,8 +1416,8 @@ mod tests {
         let mut pkt = vec![0u8; TEST_MSS];
         for _ in 0..n {
             assert_eq!(
-                rl.send_data_buf(&payload, now),
-                Ok(payload.len()),
+                rl.send_data_buf(&payload, now).unwrap(),
+                payload.len(),
                 "send_data_buf must accept the 100-byte payload"
             );
             assert!(
@@ -1434,7 +1434,7 @@ mod tests {
         let mut sent = 0;
         for _ in 0..20_000 {
             let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
-            if free >= payload_len && rl.send_data_buf(&payload, now).unwrap_or(0) < payload_len {
+            if free >= payload_len && rl.send_data_buf(&payload, now).unwrap() < payload.len() {
                 break;
             }
             if rl.send_data_pkt(&mut pkt, now).is_none() {
@@ -1464,8 +1464,8 @@ mod tests {
         let payload = vec![0u8; 100];
         let mut pkt = vec![0u8; TEST_MSS];
         assert_eq!(
-            rl.send_data_buf(&payload, now),
-            Ok(payload.len()),
+            rl.send_data_buf(&payload, now).unwrap(),
+            payload.len(),
             "send_data_buf must accept the 100-byte payload"
         );
         let p = rl
@@ -1525,7 +1525,7 @@ mod tests {
         for _ in 0..n {
             let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
             if free >= payload_len {
-                let _ = rl.send_data_buf(&payload, now);
+                rl.send_data_buf(&payload, now).unwrap();
             }
             if rl.send_data_pkt(&mut pkt, now).is_none() {
                 break;

@@ -464,7 +464,7 @@ impl Shared {
             self.publish_recv_eof(recv_eof);
             self.log("recv_data_buf");
             if PRINT_DEBUG_MSGS {
-                println!("recv:data:{read_bytes}");
+                println!("recv: data: {read_bytes}");
             }
             if 0 < read_bytes {
                 break read_bytes;
@@ -481,7 +481,7 @@ impl Shared {
         Ok(read_bytes)
     }
 
-    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, io::ErrorKind> {
+    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
         let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
@@ -499,7 +499,7 @@ impl Shared {
                 Ok(None) => {
                     return Ok(None);
                 }
-                Err(io::ErrorKind::WouldBlock) => {
+                Err(std::io::ErrorKind::WouldBlock) => {
                     tokio::select! {
                         () = recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),

@@ -476,7 +476,7 @@ mod tests {
             Packet::decode(&response.bytes),
             Some(Packet {
                 kind: Kind::ConfirmAck,
-                nonce
+                nonce,
             })
         );
         let late = established_at + Duration::from_secs(20);
@@ -506,12 +506,13 @@ mod tests {
             Packet::decode(&response.bytes),
             Some(Packet {
                 kind: Kind::Ready,
-                nonce
+                nonce,
             })
         );
         assert_eq!(
             recovery.next_send_time(established_at),
-            Some(established_at + POST_OPEN_LIFETIME)
+            Some(established_at + POST_OPEN_LIFETIME),
+            "the client must retain its nonce after an unacknowledged UDP send"
         );
         let confirm_ack = Packet {
             kind: Kind::ConfirmAck,
@@ -575,14 +576,14 @@ mod tests {
     async fn server_first_handshake_does_not_wait_for_rtp_traffic() {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
-        let mut server = wrap_fec(
-            ChannelRead(client_to_server_rx),
-            ChannelWrite::new(server_to_client_tx, None, false),
-            false,
-        );
         let mut client = wrap_fec(
             ChannelRead(server_to_client_rx),
             ChannelWrite::new(client_to_server_tx, None, false),
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            ChannelWrite::new(server_to_client_tx, None, false),
             false,
         );
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -888,13 +889,9 @@ mod tests {
     impl UnreliableRead for ChannelRead {
         fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
             match self.0.try_recv() {
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    Err(io::ErrorKind::BrokenPipe)
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    Err(io::ErrorKind::WouldBlock)
-                }
                 Ok(datagram) => copy_datagram(&datagram, buf),
+                Err(mpsc::error::TryRecvError::Empty) => Err(io::ErrorKind::WouldBlock),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(io::ErrorKind::BrokenPipe),
             }
         }
 
@@ -1057,23 +1054,21 @@ mod tests {
     #[async_trait]
     impl UnreliableWrite for ChannelWrite {
         async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
-            let kind = Packet::decode(buf).map(|p| p.kind);
-            if let Some(drop) = self.drop_once {
-                if kind == Some(drop) {
-                    self.drop_once = None;
-                    return Ok(buf.len());
-                }
+            let kind = Packet::decode(buf).map(|packet| packet.kind);
+            if kind.is_some() && self.drop_once == kind {
+                self.drop_once = None;
+                return Ok(buf.len());
             }
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
             if self.duplicate && kind.is_some() {
                 self.tx
                     .send(buf.to_vec())
                     .await
                     .map_err(|_| io::ErrorKind::BrokenPipe)?;
             }
-            self.tx
-                .send(buf.to_vec())
-                .await
-                .map_err(|_| io::ErrorKind::BrokenPipe)?;
             Ok(buf.len())
         }
     }
