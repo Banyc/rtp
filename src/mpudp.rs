@@ -60,8 +60,6 @@ pub struct Conn {
     pub read: ReadSocket,
     pub write: WriteSocket,
     pub supervisor: SessionSupervisor,
-    pub local_addr: SocketAddr,
-    pub peer_addr: SocketAddr,
 }
 impl Conn {
     pub async fn connect_without_handshake(
@@ -120,14 +118,10 @@ async fn convert_conn(
         frame_delivery,
     };
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
-    let local_addr = "0.0.0.0:0".parse().unwrap();
-    let peer_addr = "0.0.0.0:0".parse().unwrap();
     let conn = Conn {
         read,
         write,
         supervisor,
-        local_addr,
-        peer_addr,
     };
     Ok(conn)
 }

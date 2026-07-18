@@ -280,14 +280,10 @@ impl<K: DispatchKey> Client<K> {
         );
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write, supervisor) = socket(unreliable_layer, None);
-        let local_addr = "0.0.0.0:0".parse().unwrap();
-        let peer_addr = "0.0.0.0:0".parse().unwrap();
         Some(Connected {
             read,
             write,
             supervisor,
-            local_addr,
-            peer_addr,
         })
     }
 
@@ -298,14 +294,10 @@ impl<K: DispatchKey> Client<K> {
         let unreliable_layer = wrap_fec(read, write, fec);
         let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
         let (read, write, supervisor) = socket(unreliable_layer, None);
-        let local_addr = "0.0.0.0:0".parse().unwrap();
-        let peer_addr = "0.0.0.0:0".parse().unwrap();
         Some(Connected {
             read,
             write,
             supervisor,
-            local_addr,
-            peer_addr,
         })
     }
 }
@@ -314,8 +306,6 @@ pub struct Connected {
     pub read: ReadSocket,
     pub write: WriteSocket,
     pub supervisor: SessionSupervisor,
-    pub local_addr: SocketAddr,
-    pub peer_addr: SocketAddr,
 }
 
 #[derive(Debug)]
