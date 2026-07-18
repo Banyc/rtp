@@ -317,4 +317,113 @@ mod tests {
             .await
             .expect("a dead writer cannot complete a KILL attempt");
     }
+
+    #[tokio::test]
+    async fn graceful_close_waits_for_peer_fin_and_outbound_drain() {
+        let (_presser, _writer, reaper) = channel();
+        let peer_fin = CancellationToken::new();
+        let outbound_drained = CancellationToken::new();
+        let mut ready = Box::pin(reaper.ready_or_graceful_close(&peer_fin, async {
+            outbound_drained.cancelled().await;
+            Ok(())
+        }));
+        peer_fin.cancel();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut ready)
+                .await
+                .is_err()
+        );
+        outbound_drained.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(100), ready)
+            .await
+            .expect("peer FIN plus outbound drain must permit graceful reap");
+    }
+
+    #[tokio::test]
+    async fn graceful_close_does_not_poll_drain_before_peer_fin() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_presser, _writer, reaper) = channel();
+        let peer_fin = CancellationToken::new();
+        let drain_polled = Arc::new(AtomicBool::new(false));
+        let drain = {
+            let drain_polled = Arc::clone(&drain_polled);
+            std::future::poll_fn(move |_| {
+                drain_polled.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(()))
+            })
+        };
+        let mut ready = Box::pin(reaper.ready_or_graceful_close(&peer_fin, drain));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut ready)
+                .await
+                .is_err()
+        );
+        assert!(
+            !drain_polled.load(Ordering::SeqCst),
+            "outbound drain must not be observed before peer FIN"
+        );
+        peer_fin.cancel();
+        tokio::time::timeout(std::time::Duration::from_millis(100), ready)
+            .await
+            .expect("peer FIN must release the drain phase");
+        assert!(drain_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn drain_error_does_not_bypass_pending_kill() {
+        let (presser, writer, reaper) = channel();
+        let peer_fin = CancellationToken::new();
+        peer_fin.cancel();
+        presser.press_broken_pipe(PeerReset::SendKill, None);
+        let attempt = writer.take_kill_attempt().expect("KILL request");
+        let mut ready = Box::pin(
+            reaper
+                .ready_or_graceful_close(&peer_fin, async { Err(std::io::ErrorKind::BrokenPipe) }),
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut ready)
+                .await
+                .is_err()
+        );
+        drop(attempt);
+        tokio::time::timeout(std::time::Duration::from_millis(100), ready)
+            .await
+            .expect("drain failure must wait for the best-effort KILL attempt");
+    }
+
+    #[tokio::test]
+    async fn graceful_close_timeout_permits_reap() {
+        let (_presser, _writer, reaper) = channel();
+        let peer_fin = CancellationToken::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reaper.ready_or_graceful_close_with_timeout(
+                &peer_fin,
+                std::future::pending(),
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("the graceful-close ceiling must eventually permit reap");
+    }
+
+    #[tokio::test]
+    async fn graceful_close_timeout_still_applies_after_drain_error() {
+        let (presser, writer, reaper) = channel();
+        let peer_fin = CancellationToken::new();
+        peer_fin.cancel();
+        presser.press_broken_pipe(PeerReset::SendKill, None);
+        let attempt = writer.take_kill_attempt().expect("KILL request");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reaper.ready_or_graceful_close_with_timeout(
+                &peer_fin,
+                async { Err(std::io::ErrorKind::BrokenPipe) },
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("the close ceiling must bound a stalled KILL after drain failure");
+        drop(attempt);
+    }
 }
