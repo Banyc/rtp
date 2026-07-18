@@ -527,6 +527,60 @@ mod tests {
         complete_over_channels(None, true).await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_ignores_stale_rtp_before_and_during_opening() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        client_to_server_tx.send(Vec::new()).await.unwrap();
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            InjectStaleRtpAfterHelloWrite {
+                tx: client_to_server_tx,
+                injected: false,
+            },
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            ChannelWrite::new(server_to_client_tx, None, false),
+            false,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(
+                client_opening_handshake(&mut client),
+                server_opening_handshake(&mut server),
+            )
+        })
+        .await
+        .expect("stale RTP traffic stalled opening")
+        .expect("stale RTP traffic aborted opening");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_first_handshake_does_not_wait_for_rtp_traffic() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            ChannelWrite::new(server_to_client_tx, None, false),
+            false,
+        );
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            ChannelWrite::new(client_to_server_tx, None, false),
+            false,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(
+                client_opening_handshake(&mut client),
+                server_opening_handshake(&mut server),
+            )
+        })
+        .await
+        .expect("server handshake waited for post-handshake RTP traffic")
+        .expect("opening handshake failed");
+    }
+
     async fn complete_over_channels(dropped: Option<Kind>, duplicate: bool) {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
@@ -626,6 +680,32 @@ mod tests {
                 drop_once,
                 duplicate,
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct InjectStaleRtpAfterHelloWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        injected: bool,
+    }
+
+    #[async_trait]
+    impl UnreliableWrite for InjectStaleRtpAfterHelloWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            if !self.injected
+                && Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Hello)
+            {
+                self.injected = true;
+                self.tx
+                    .send(Vec::new())
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            }
+            Ok(buf.len())
         }
     }
 
