@@ -194,11 +194,10 @@ impl Shared {
         &self.coord.recv_eof
     }
 
-    pub(crate) fn observe_post_open_handshake(&self, datagram: &[u8]) -> Observation {
+    pub(crate) fn observe_post_open_handshake(&self, datagram: &[u8], now: Instant) -> Observation {
         if !self.post_open_handshake_active.load(Ordering::Acquire) {
             return Observation::NotHandshake;
         }
-        let now = Instant::now();
         let mut guard = self.post_open_handshake.lock().unwrap();
         let Some(handshake) = guard.as_mut() else {
             self.post_open_handshake_active

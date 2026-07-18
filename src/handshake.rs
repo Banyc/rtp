@@ -220,6 +220,10 @@ impl PostOpenHandshake {
     }
 }
 
+pub(crate) fn is_post_open_candidate(datagram: &[u8]) -> bool {
+    datagram.len() == PACKET_LEN && datagram[..MAGIC.len()] == MAGIC && datagram[8] == FEC_GUARD
+}
+
 enum Received {
     Handshake(Packet),
     NextProtocol,
