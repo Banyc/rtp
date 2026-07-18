@@ -119,7 +119,26 @@ impl TransmissionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug, Default)]
+    struct RecordingWrite {
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+    impl RecordingWrite {
+        fn push(&self, b: Vec<u8>) {
+            self.sent.lock().unwrap().push(b);
+        }
+        fn count(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+        fn datagrams(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
 
     #[derive(Debug)]
     struct BlackholeRead;
@@ -140,6 +159,25 @@ mod tests {
         for _ in 0..n {
             rl.sample_rtt(rtt, t);
             t += Duration::from_micros(100);
+        }
+    }
+
+    fn send_one_packet(tl: &TransmissionLayer, now: Instant) -> u64 {
+        let rl = tl.reliable_layer();
+        let mut rl = rl.lock().unwrap();
+        let payload = vec![0u8; 100];
+        assert_eq!(
+            rl.send_data_buf(&payload, now).unwrap(),
+            payload.len(),
+            "send_data_buf must accept the payload"
+        );
+        let mut pkt = vec![0u8; crate::udp::NO_FEC_MSS];
+        let p = rl
+            .send_data_pkt(&mut pkt, now)
+            .expect("send_data_pkt must send a packet");
+        match p.data_written {
+            crate::reliable::reliable_layer::DataPktPayload::Data(_) => p.seq,
+            _ => panic!("expected data packet"),
         }
     }
 
@@ -338,6 +376,49 @@ mod tests {
             .expect("successful FIN ACK did not release graceful reaping");
     }
 
+    async fn wait_for_rtx_window() {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    fn harness(fec: bool, enabled: bool) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        harness_with_tuning(
+            fec,
+            enabled,
+            crate::transmission::fec_tuning::FecTuning::default(),
+        )
+    }
+    fn harness_with_tuning(
+        fec: bool,
+        enabled: bool,
+        tuning: crate::transmission::fec_tuning::FecTuning,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        struct SharedWrite(Arc<Mutex<RecordingWrite>>);
+        #[async_trait]
+        impl UnreliableWrite for SharedWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+        }
+        impl std::fmt::Debug for SharedWrite {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SharedWrite").finish_non_exhaustive()
+            }
+        }
+        let write = SharedWrite(recorder.clone());
+        let read = BlackholeRead;
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            read,
+            write,
+            fec,
+            crate::udp::NO_FEC_MSS,
+            tuning,
+        );
+        let mut tl = TransmissionLayer::new(ul, None);
+        tl.set_rtx_dup_for_test(enabled);
+        (tl, recorder)
+    }
+
     #[derive(Debug)]
     struct FailAfterFirstWrite {
         attempts: Arc<AtomicUsize>,
@@ -432,6 +513,70 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             2,
             "the KILL datagram and its first parity datagram should be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtx_dup_queue_building_gate_suppresses_extra_copy() {
+        let (mut tl, recorder) = harness(false, true);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        tl.reliable_layer()
+            .lock()
+            .unwrap()
+            .set_queue_building_for_test(true);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "queue-building must suppress the duplicate copy"
+        );
+    }
+    #[tokio::test]
+    async fn fec_rtx_dup_reuses_identical_encoded_symbol() {
+        let (mut tl, recorder) = harness(true, true);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let dg = recorder.lock().unwrap().datagrams();
+        assert!(dg.len() >= 2, "primary + duplicate (got {})", dg.len());
+        assert_eq!(
+            dg[0], dg[1],
+            "dup must reuse the exact encoded symbol bytes (no re-encode)"
+        );
+    }
+    #[tokio::test]
+    async fn primary_rtx_bypasses_empty_bucket_and_dup_is_skipped() {
+        let (mut tl, recorder) = harness(false, true);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        let drained = tl.drain_rate_limiter_for_test(usize::MAX, Instant::now());
+        assert!(drained > 0, "bucket should have started with tokens");
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "primary sends from empty bucket; dup is skipped (no token)"
+        );
+    }
+    #[tokio::test]
+    async fn rtx_dup_disabled_sends_one_datagram() {
+        let (mut tl, recorder) = harness(false, false);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let _seq = send_one_packet(&tl, Instant::now());
+        wait_for_rtx_window().await;
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "toggle off must send exactly one datagram (stock)"
         );
     }
 }
