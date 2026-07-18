@@ -622,6 +622,315 @@ mod tests {
     use super::*;
     use core::time::Duration;
 
+    #[tokio::test]
+    async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct FailedRead;
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for FailedRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::ConnectionReset)
+            }
+
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::ConnectionReset)
+            }
+        }
+
+        #[derive(Debug)]
+        struct DropProbeWrite {
+            sends: Arc<AtomicUsize>,
+            dropped: Arc<tokio::sync::Notify>,
+        }
+
+        impl Drop for DropProbeWrite {
+            fn drop(&mut self) {
+                self.dropped.notify_one();
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                Ok(buf.len())
+            }
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let layer = wrap_fec(
+            FailedRead,
+            DropProbeWrite {
+                sends: Arc::clone(&sends),
+                dropped: Arc::clone(&dropped),
+            },
+            false,
+        );
+        let (_read, _write, _supervisor) = socket(layer, None);
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("a terminal read error without KILL must reap the writer immediately");
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn event_task_panic_reaps_the_rest_of_the_rtp_session() {
+        #[derive(Debug)]
+        struct PanickingRead;
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for PanickingRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                panic!("injected RTP read panic")
+            }
+
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                panic!("injected RTP read panic")
+            }
+        }
+
+        #[derive(Debug)]
+        struct DropProbeWrite(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropProbeWrite {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.0.take() {
+                    let _ = dropped.send(());
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Ok(buf.len())
+            }
+        }
+
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let layer = wrap_fec(PanickingRead, DropProbeWrite(Some(dropped_tx)), false);
+        let (_read, _write, supervisor) = socket(layer, None);
+        let owner = tokio::spawn(supervisor);
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("a panicked RTP event task left the peer task alive")
+            .expect("writer drop probe was lost");
+        let error = tokio::time::timeout(Duration::from_secs(1), owner)
+            .await
+            .expect("RTP supervision did not finish joining its drivers")
+            .expect_err("RTP driver panic did not cascade to the owning task");
+        assert!(error.is_panic());
+    }
+
+    #[tokio::test]
+    async fn supervisor_signals_then_joins_without_cancelling_an_in_flight_send() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct GatedFailedRead {
+            fail: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for GatedFailedRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                self.fail.notified().await;
+                Err(std::io::ErrorKind::ConnectionReset)
+            }
+        }
+
+        #[derive(Debug)]
+        struct GatedWrite {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for GatedWrite {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for GatedWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(buf.len())
+            }
+        }
+
+        let fail = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let layer = wrap_fec(
+            GatedFailedRead {
+                fail: Arc::clone(&fail),
+            },
+            GatedWrite {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                dropped: Arc::clone(&dropped),
+            },
+            false,
+        );
+        let (_read, mut write, supervisor) = socket(layer, None);
+        let owner = tokio::spawn(supervisor);
+        assert_eq!(write.send(b"payload").await.unwrap(), 7);
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("RTP writer did not start its unreliable send");
+        fail.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            !owner.is_finished(),
+            "supervisor returned before joining the in-flight writer"
+        );
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the suicide signal cancelled an in-flight unreliable send"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), owner)
+            .await
+            .expect("the supervisor did not join the released writer")
+            .expect("the supervisor failed after a clean cooperative stop");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn supervisor_waits_for_requested_kill_attempt_before_reaping() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug)]
+        struct PendingRead;
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                std::future::pending().await
+            }
+        }
+
+        #[derive(Debug)]
+        struct KillGateWrite {
+            kill_started: Arc<tokio::sync::Notify>,
+            release_kill: Arc<tokio::sync::Notify>,
+            dropped: Arc<tokio::sync::Notify>,
+            was_dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for KillGateWrite {
+            fn drop(&mut self) {
+                self.was_dropped.store(true, Ordering::SeqCst);
+                self.dropped.notify_one();
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for KillGateWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                assert_eq!(buf, &[2], "the gated send must be the RTP KILL command");
+                self.kill_started.notify_one();
+                self.release_kill.notified().await;
+                Ok(buf.len())
+            }
+        }
+
+        let kill_started = Arc::new(tokio::sync::Notify::new());
+        let release_kill = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let was_dropped = Arc::new(AtomicBool::new(false));
+        let layer = wrap_fec(
+            PendingRead,
+            KillGateWrite {
+                kill_started: Arc::clone(&kill_started),
+                release_kill: Arc::clone(&release_kill),
+                dropped: Arc::clone(&dropped),
+                was_dropped: Arc::clone(&was_dropped),
+            },
+            false,
+        );
+        let (_read, mut write, _supervisor) = socket(layer, None);
+        write.send_kill_and_abort().await;
+        tokio::time::timeout(Duration::from_secs(1), kill_started.notified())
+            .await
+            .expect("the writer must claim and start the requested KILL");
+        tokio::task::yield_now().await;
+        assert!(
+            !was_dropped.load(Ordering::SeqCst),
+            "the supervisor must leave the writer alive during the KILL attempt"
+        );
+        release_kill.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("the supervisor must reap after the KILL attempt completes");
+        assert!(was_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn graceful_drop_drains_response_after_peer_fin() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+
+        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+
+        let request = b"request";
+        let response = b"response";
+
+        assert_eq!(b_write.send(request).await.unwrap(), request.len());
+        drop(b_write);
+
+        let mut buf = [0; 64];
+        let request_len = tokio::time::timeout(Duration::from_secs(2), a_read.recv(&mut buf))
+            .await
+            .expect("request receive timed out")
+            .expect("request receive failed");
+        assert_eq!(&buf[..request_len], request);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            a_read.transmission_layer.recv_eof().cancelled(),
+        )
+        .await
+        .expect("consuming the final payload did not publish receive EOF");
+
+        assert_eq!(a_write.send(response).await.unwrap(), response.len());
+        drop(a_write);
+        drop(a_read);
+
+        let response_len = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+            .await
+            .expect("response receive timed out")
+            .expect("response receive failed");
+        assert_eq!(&buf[..response_len], response);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+                .await
+                .expect("local FIN receive timed out")
+                .expect("local FIN receive failed"),
+            0
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn empty_stock_io_is_an_immediate_noop() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
