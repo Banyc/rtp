@@ -105,3 +105,131 @@ impl TransmissionLayer {
         self.read_half.lock().await.recv_pkts(bufs).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::transmission_layer::{UnreliableRead, UnreliableWrite};
+    use super::*;
+    use async_trait::async_trait;
+
+    #[tokio::test]
+    async fn accepted_out_of_order_fin_publishes_fin_before_eof() {
+        #[derive(Debug)]
+        struct OneDatagramRead(Option<Vec<u8>>);
+
+        impl OneDatagramRead {
+            fn take(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                let Some(datagram) = self.0.take() else {
+                    return Err(std::io::ErrorKind::WouldBlock);
+                };
+                buf[..datagram.len()].copy_from_slice(&datagram);
+                Ok(datagram.len())
+            }
+        }
+
+        #[async_trait]
+        impl UnreliableRead for OneDatagramRead {
+            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                self.take(buf)
+            }
+
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                self.take(buf)
+            }
+        }
+
+        #[derive(Debug)]
+        struct ImmediateWrite;
+
+        #[async_trait]
+        impl UnreliableWrite for ImmediateWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Ok(buf.len())
+            }
+        }
+
+        let mut datagram = vec![0; 64];
+        let fin = crate::codec::EncodeData {
+            seq: 1,
+            send_ts: None,
+            frame_len: None,
+            data: &[],
+        };
+        let len = crate::codec::encode_ack_data(None, None, Some(fin), &mut datagram).unwrap();
+        datagram.truncate(len);
+        let layer = crate::udp::wrap_fec(OneDatagramRead(Some(datagram)), ImmediateWrite, false);
+        let transmission = TransmissionLayer::new(layer, None);
+        let mut recv_bufs = RecvBufs::new();
+        transmission.recv_pkts(&mut recv_bufs).await.unwrap();
+
+        assert!(
+            transmission.recv_fin().is_cancelled(),
+            "an accepted FIN must be published even while an earlier sequence is missing"
+        );
+        assert!(
+            !transmission.recv_eof().is_cancelled(),
+            "an accepted out-of-order FIN must not publish application EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_payload_sequence_reshaped_as_fin_does_not_publish_fin() {
+        #[derive(Debug)]
+        struct DatagramQueue(std::collections::VecDeque<Vec<u8>>);
+
+        impl DatagramQueue {
+            fn take(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                let Some(datagram) = self.0.pop_front() else {
+                    return Err(std::io::ErrorKind::WouldBlock);
+                };
+                buf[..datagram.len()].copy_from_slice(&datagram);
+                Ok(datagram.len())
+            }
+        }
+
+        #[async_trait]
+        impl UnreliableRead for DatagramQueue {
+            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                self.take(buf)
+            }
+
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                self.take(buf)
+            }
+        }
+
+        #[derive(Debug)]
+        struct ImmediateWrite;
+
+        #[async_trait]
+        impl UnreliableWrite for ImmediateWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Ok(buf.len())
+            }
+        }
+
+        let encode = |seq, data: &[u8]| {
+            let mut datagram = vec![0; 64];
+            let data = crate::codec::EncodeData {
+                seq,
+                send_ts: None,
+                frame_len: None,
+                data,
+            };
+            let len = crate::codec::encode_ack_data(None, None, Some(data), &mut datagram).unwrap();
+            datagram.truncate(len);
+            datagram
+        };
+
+        let datagrams = std::collections::VecDeque::from([encode(0, b"payload"), encode(0, b"")]);
+        let layer = crate::udp::wrap_fec(DatagramQueue(datagrams), ImmediateWrite, false);
+        let transmission = TransmissionLayer::new(layer, None);
+        let mut recv_bufs = RecvBufs::new();
+        transmission.recv_pkts(&mut recv_bufs).await.unwrap();
+
+        assert!(
+            !transmission.recv_fin().is_cancelled(),
+            "a duplicate sequence is not proof that the peer sent FIN"
+        );
+    }
+}

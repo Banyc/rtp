@@ -22,26 +22,25 @@ pub(crate) struct ReceivedBatch {
     pending_acks: usize,
     fin_ack: bool,
     echo_ts: Option<u32>,
+    recv_fin: bool,
     recv_eof: bool,
 }
 
 impl ReceivedBatch {
-    pub(crate) fn record_ack(&mut self) {
+    pub(crate) fn record_ack(&mut self, fin_ack: bool, echo_ts: Option<u32>) {
         self.pending_acks += 1;
-    }
-
-    pub(crate) fn record_echo_ts(&mut self, ts: Option<u32>) {
-        self.echo_ts = ts;
+        self.fin_ack |= fin_ack;
+        if echo_ts.is_some() {
+            self.echo_ts = echo_ts;
+        }
     }
 
     pub(crate) fn record_inserted_fin(&mut self) {
-        self.pending_acks += 1;
-        self.fin_ack = true;
-        self.recv_eof = true;
+        self.recv_fin = true;
     }
 
-    pub(crate) fn record_eof(&mut self) {
-        self.recv_eof = true;
+    pub(crate) fn record_eof(&mut self, recv_eof: bool) {
+        self.recv_eof |= recv_eof;
     }
 }
 
@@ -309,12 +308,6 @@ impl Shared {
         us as u32
     }
 
-    pub fn publish_recv_eof(&self, recv_eof: bool) {
-        if recv_eof {
-            self.coord.recv_eof.cancel();
-        }
-    }
-
     pub async fn no_data_to_send(&self) -> Result<(), std::io::ErrorKind> {
         let mut sent_pkt_acked = self.coord.sent_pkt_acked.notified();
         loop {
@@ -367,22 +360,32 @@ impl Shared {
     }
 
     pub fn commit_received_batch(&self, batch: ReceivedBatch) {
-        {
-            let mut ack = self.ack_flush.lock().unwrap();
-            if let Some(ts) = batch.echo_ts {
-                ack.ts_echo.set(ts);
-            }
-            ack.pending_acks += batch.pending_acks;
-            if batch.fin_ack {
-                ack.fin_pending = true;
+        let ack_work_added = batch.pending_acks > 0 || batch.fin_ack;
+        if ack_work_added {
+            let mut ack_flush = self.ack_flush.lock().unwrap();
+            ack_flush.pending_acks += batch.pending_acks;
+            ack_flush.fin_pending |= batch.fin_ack;
+            if let Some(echo_ts) = batch.echo_ts {
+                ack_flush.ts_echo.set(echo_ts);
             }
         }
-        self.coord.resume_send.notify_one();
-        if batch.recv_eof {
+        if ack_work_added {
+            self.coord.resume_send.notify_one();
+        }
+        if batch.recv_fin {
             self.coord.recv_fin.cancel();
-            self.coord.recv_eof.cancel();
         }
+        self.publish_recv_eof(batch.recv_eof);
         self.coord.session_outbound_progress.notify_one();
+    }
+
+    fn publish_recv_eof(&self, recv_eof: bool) {
+        if recv_eof && !self.coord.recv_eof.is_cancelled() {
+            self.coord.recv_eof.cancel();
+            if let Some(fec) = self.fec.as_ref() {
+                fec.lock().unwrap().debug_print_stats();
+            }
+        }
     }
 
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
