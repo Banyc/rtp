@@ -912,9 +912,9 @@ impl ReliableLayer {
     /// buffer is empty.
     pub(crate) fn recv_eof_ready(&self) -> bool {
         if self.frame_delivery.enabled {
-            self.recv_fin_buf
+            self.recv_fin_buf() || self.pkt_recv_space.fin_at_head()
         } else {
-            self.pkt_recv_space.fin_at_head()
+            self.recv_fin_buf() && self.recv_data_buf.is_empty()
         }
     }
 
