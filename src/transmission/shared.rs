@@ -195,37 +195,63 @@ impl Shared {
     }
 
     pub(crate) fn observe_post_open_handshake(&self, datagram: &[u8]) -> Observation {
-        let mut guard = self.post_open_handshake.lock().unwrap();
-        if let Some(ref mut handshake) = *guard {
-            let observation = handshake.observe(datagram, Instant::now());
-            if observation == Observation::Complete {
-                *guard = None;
-            }
-            observation
-        } else {
-            Observation::NotHandshake
+        if !self.post_open_handshake_active.load(Ordering::Acquire) {
+            return Observation::NotHandshake;
         }
+        let now = Instant::now();
+        let mut guard = self.post_open_handshake.lock().unwrap();
+        let Some(handshake) = guard.as_mut() else {
+            self.post_open_handshake_active
+                .store(false, Ordering::Release);
+            return Observation::NotHandshake;
+        };
+        let observation = handshake.observe(datagram, now);
+        if observation == Observation::Complete || handshake.expired(now) {
+            *guard = None;
+            self.post_open_handshake_active
+                .store(false, Ordering::Release);
+        }
+        observation
     }
 
     pub(crate) fn claim_open_response(&self) -> Option<ClaimedResponse> {
-        let mut guard = self.post_open_handshake.lock().unwrap();
-        let handshake = match guard.as_mut() {
-            Some(h) => h,
-            None => return None,
-        };
-        let now = Instant::now();
-        if let Some(response) = handshake.claim_response(now) {
-            return Some(response);
+        if !self.post_open_handshake_active.load(Ordering::Acquire) {
+            return None;
         }
+        let now = Instant::now();
+        let mut guard = self.post_open_handshake.lock().unwrap();
+        let Some(handshake) = guard.as_mut() else {
+            self.post_open_handshake_active
+                .store(false, Ordering::Release);
+            return None;
+        };
+        let response = handshake.claim_response(now);
         if handshake.expired(now) {
             *guard = None;
+            self.post_open_handshake_active
+                .store(false, Ordering::Release);
         }
-        None
+        response
     }
 
-    pub fn is_handshake_active(&self) -> bool {
-        self.post_open_handshake_active
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn retry_open_response(&self) {
+        if !self.post_open_handshake_active.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        let mut guard = self.post_open_handshake.lock().unwrap();
+        let Some(handshake) = guard.as_mut() else {
+            self.post_open_handshake_active
+                .store(false, Ordering::Release);
+            return;
+        };
+        if handshake.expired(now) {
+            *guard = None;
+            self.post_open_handshake_active
+                .store(false, Ordering::Release);
+        } else {
+            handshake.retry_response(now);
+        }
     }
 
     pub fn next_poll_send_time(&self) -> Option<Instant> {
@@ -255,18 +281,26 @@ impl Shared {
         if let Some(ack_deadline) = ack_deadline {
             deadline = Some(deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
         }
-        if self.is_handshake_active() {
-            if let Some(hs_deadline) = self
-                .post_open_handshake
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(|h| h.next_send_time(now))
-            {
-                deadline = Some(deadline.map_or(hs_deadline, |current| current.min(hs_deadline)));
+        if self.post_open_handshake_active.load(Ordering::Acquire) {
+            let mut guard = self.post_open_handshake.lock().unwrap();
+            match guard.as_mut() {
+                Some(handshake) if handshake.expired(now) => {
+                    *guard = None;
+                    self.post_open_handshake_active
+                        .store(false, Ordering::Release);
+                }
+                Some(handshake) => {
+                    if let Some(handshake_deadline) = handshake.next_send_time(now) {
+                        deadline = Some(deadline.map_or(handshake_deadline, |current| {
+                            current.min(handshake_deadline)
+                        }));
+                    }
+                }
+                None => {
+                    self.post_open_handshake_active
+                        .store(false, Ordering::Release);
+                }
             }
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
         }
         deadline
     }

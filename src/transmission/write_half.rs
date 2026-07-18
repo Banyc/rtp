@@ -170,7 +170,7 @@ impl WriteHalf {
                 }
                 Err(std::io::ErrorKind::WouldBlock) => {
                     if FEC_DEBUG {
-                        eprintln!("send_pkts: WouldBlock on data send (transient)");
+                        eprintln!("send_pkts: WouldBlock on data send (transient)")
                     }
                     continue;
                 }
@@ -204,7 +204,7 @@ impl WriteHalf {
         if self.ack_flush_is_due() {
             let _ = self.flush_acks(bufs).await;
         }
-        self.send_due_post_open_response().await;
+        self.send_due_post_open_response().await?;
         Ok(wrote_something)
     }
 
@@ -269,16 +269,21 @@ impl WriteHalf {
         }
     }
 
-    async fn send_due_post_open_response(&mut self) -> std::io::Result<()> {
+    async fn send_due_post_open_response(&mut self) -> Result<(), std::io::ErrorKind> {
         let Some(response) = self.shared.claim_open_response() else {
             return Ok(());
         };
-        let _len = response.bytes.len();
         match self.utp_write.send(&response.bytes).await {
-            Ok(_) | Err(std::io::ErrorKind::WouldBlock) => {}
-            Err(error) => return Err(std::io::Error::from(error)),
+            Ok(len) if len == response.bytes.len() => Ok(()),
+            Ok(_) | Err(std::io::ErrorKind::WouldBlock) => {
+                self.shared.retry_open_response();
+                Ok(())
+            }
+            Err(error) => {
+                self.shared.set_error(error);
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
