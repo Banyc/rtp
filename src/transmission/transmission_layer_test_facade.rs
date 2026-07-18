@@ -119,6 +119,29 @@ impl TransmissionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct BlackholeRead;
+    #[async_trait]
+    impl UnreliableRead for BlackholeRead {
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+    }
+
+    fn settle_rtt(tl: &TransmissionLayer, rtt: Duration, n: usize) {
+        let rl = tl.reliable_layer();
+        let mut rl = rl.lock().unwrap();
+        let mut t = Instant::now();
+        for _ in 0..n {
+            rl.sample_rtt(rtt, t);
+            t += Duration::from_micros(100);
+        }
+    }
 
     #[tokio::test]
     async fn accepted_out_of_order_fin_publishes_fin_before_eof() {
@@ -313,5 +336,102 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), reap)
             .await
             .expect("successful FIN ACK did not release graceful reaping");
+    }
+
+    #[derive(Debug)]
+    struct FailAfterFirstWrite {
+        attempts: Arc<AtomicUsize>,
+        error: std::io::ErrorKind,
+    }
+    #[async_trait]
+    impl UnreliableWrite for FailAfterFirstWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(buf.len())
+            } else {
+                Err(self.error)
+            }
+        }
+    }
+
+    fn parity_error_harness(error: std::io::ErrorKind) -> (TransmissionLayer, Arc<AtomicUsize>) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let unreliable = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            BlackholeRead,
+            FailAfterFirstWrite {
+                attempts: Arc::clone(&attempts),
+                error,
+            },
+            true,
+            crate::udp::NO_FEC_MSS,
+            crate::transmission::fec_tuning::FecTuning::mindiv(),
+        );
+        (TransmissionLayer::new(unreliable, None), attempts)
+    }
+
+    fn stage_small_message(tl: &TransmissionLayer) {
+        let payload = [0; 100];
+        let now = Instant::now();
+        let reliable = tl.reliable_layer();
+        assert_eq!(
+            reliable
+                .lock()
+                .unwrap()
+                .send_data_buf(&payload, now)
+                .unwrap(),
+            payload.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_regular_fec_parity_send_terminates_session() {
+        let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::ConnectionReset);
+        stage_small_message(&tl);
+        let mut bufs = SendBufs::new();
+        assert_eq!(
+            tl.send_pkts(&mut bufs).await,
+            Err(std::io::ErrorKind::ConnectionReset)
+        );
+        assert_eq!(tl.throw_error(), Err(std::io::ErrorKind::ConnectionReset));
+        assert!(tl.termination.terminal().is_cancelled());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            tl.send_pkts(&mut bufs).await,
+            Err(std::io::ErrorKind::ConnectionReset)
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "terminal RTP state must prevent another underlay send"
+        );
+    }
+
+    #[tokio::test]
+    async fn would_block_fec_parity_send_remains_non_terminal() {
+        let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::WouldBlock);
+        stage_small_message(&tl);
+        let mut bufs = SendBufs::new();
+        assert_eq!(tl.send_pkts(&mut bufs).await, Ok(true));
+        assert_eq!(tl.throw_error(), Ok(()));
+        assert!(!tl.termination.terminal().is_cancelled());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the primary data and first parity datagrams should be attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_tail_parity_error_preserves_original_terminal_error() {
+        let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::ConnectionReset);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let mut bufs = SendBufs::new();
+        assert_eq!(tl.send_kill_and_abort(&mut bufs).await, Ok(()));
+        assert_eq!(tl.throw_error(), Err(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the KILL datagram and its first parity datagram should be attempted"
+        );
     }
 }
