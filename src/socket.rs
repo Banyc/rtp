@@ -9,14 +9,17 @@ use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
     write::{AsyncAsyncWrite, PollWrite},
 };
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 
-pub use crate::handshake;
+pub use crate::handshake::{client_opening_handshake, server_opening_handshake};
 
 use crate::transmission::{
+    read_half::ReadHalf,
     shared::{Shared, build_parts, build_parts_with_watchdog_tuning},
+    termination::TerminationReaper,
     transmission_layer::{LogConfig, RecvBufs, SendBufs, SendKillPkt, UnreliableLayer},
     watchdog_tuning::WatchdogTuning,
+    write_half::WriteHalf,
 };
 
 pub type ReadStream = PollRead<ReadSocket>;
@@ -209,27 +212,27 @@ const _: () = {
     let _ = assert_send::<FrameReader>;
     let _ = assert_send::<FrameWriter>;
     let _ = assert_send::<FrameIoParts>;
+    let _ = assert_send::<SessionSupervisor>;
 };
 
 #[derive(Debug)]
 #[must_use = "the RTP session supervisor must be retained and awaited"]
 pub struct SessionSupervisor {
-    join: tokio::task::JoinHandle<()>,
+    join: JoinHandle<()>,
 }
 
 impl Future for SessionSupervisor {
     type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.join).poll(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(()),
-            Poll::Ready(Err(e)) => {
-                if e.is_panic() {
-                    std::panic::resume_unwind(e.into_panic());
-                }
-                panic!("RTP session supervisor was unexpectedly cancelled: {e}");
-            }
             Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(()),
+            Poll::Ready(Err(error)) if error.is_panic() => {
+                std::panic::resume_unwind(error.into_panic())
+            }
+            Poll::Ready(Err(error)) => {
+                panic!("RTP session supervisor was unexpectedly cancelled: {error}")
+            }
         }
     }
 }
@@ -238,7 +241,7 @@ pub fn socket(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (ReadSocket, WriteSocket, SessionSupervisor) {
-    socket_inner(unreliable_layer, log_config, None)
+    build_socket(build_parts(unreliable_layer, log_config))
 }
 
 pub fn socket_with_watchdog_tuning(
@@ -246,137 +249,132 @@ pub fn socket_with_watchdog_tuning(
     log_config: Option<LogConfig>,
     tuning: WatchdogTuning,
 ) -> (ReadSocket, WriteSocket, SessionSupervisor) {
-    socket_inner(unreliable_layer, log_config, Some(tuning))
+    build_socket(build_parts_with_watchdog_tuning(
+        unreliable_layer,
+        log_config,
+        tuning,
+    ))
 }
 
-fn next_event_exit(stop: &tokio_util::sync::CancellationToken) -> impl Future<Output = ()> + '_ {
-    stop.cancelled()
-}
+type SocketParts = (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper);
 
-async fn join_drivers(drivers: &mut JoinSet<()>) {
-    while let Some(result) = drivers.join_next().await {
-        match result {
-            Ok(()) => {}
-            Err(e) if e.is_panic() => {
-                std::panic::resume_unwind(e.into_panic());
-            }
-            Err(_) => {}
-        }
-    }
-}
-
-fn socket_inner(
-    unreliable_layer: UnreliableLayer,
-    log_config: Option<LogConfig>,
-    tuning: Option<WatchdogTuning>,
+fn build_socket(
+    (shared, write_half, read_half, termination_reaper): SocketParts,
 ) -> (ReadSocket, WriteSocket, SessionSupervisor) {
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
-    let (shared, mut write_half, mut read_half, reaper) = match tuning {
-        Some(t) => build_parts_with_watchdog_tuning(unreliable_layer, log_config, t),
-        None => build_parts(unreliable_layer, log_config),
-    };
+    let stop_drivers = tokio_util::sync::CancellationToken::new();
+    let mut events = JoinSet::new();
 
-    let write_half_shared = Arc::clone(&shared);
-    let read_half_shared = Arc::clone(&shared);
-    let read_shutdown_clone = read_shutdown.clone();
-    let read_shutdown_for_supervisor = read_shutdown.clone();
-    let write_shutdown_for_supervisor = write_shutdown.clone();
-    let reaper_clone = reaper.clone();
-
-    let mut drivers = JoinSet::new();
-
-    drivers.spawn(async move {
-        let mut send_bufs = SendBufs::new();
-        loop {
-            tokio::select! {
-                biased;
-                () = write_half_shared.recv_fin().cancelled() => return,
-                () = write_half_shared.recv_eof().cancelled() => return,
-                () = write_half_shared.resume_send().notified() => {},
-                () = async {
-                    if let Some(deadline) = write_half_shared.next_poll_send_time() {
-                        tokio::time::sleep_until(deadline.into()).await;
-                    } else {
-                        std::future::pending::<()>().await;
+    events.spawn({
+        let stop_drivers = stop_drivers.clone();
+        async move {
+            let mut write_half = write_half;
+            let mut send_bufs = SendBufs::new();
+            let kill_requested = write_half.kill_requested().clone();
+            loop {
+                let resume_send = write_half.resume_send().notified();
+                let deadline = write_half.next_poll_send_time();
+                match deadline {
+                    Some(t) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(t.into()) => (),
+                            () = resume_send => (),
+                            () = kill_requested.cancelled() => (),
+                            () = stop_drivers.cancelled() => return,
+                        }
                     }
-                } => {},
-            }
-            let kill_token = write_half.termination_writer.kill_requested();
-            if let Some(_kill_finished) = kill_token {
+                    None => {
+                        tokio::select! {
+                            () = resume_send => (),
+                            () = kill_requested.cancelled() => (),
+                            () = stop_drivers.cancelled() => return,
+                        }
+                    }
+                }
                 if write_half.send_pkts(&mut send_bufs).await.is_err() {
                     return;
                 }
-            } else if write_half.send_pkts(&mut send_bufs).await.is_err() {
-                return;
             }
         }
     });
 
-    let read_shared = Arc::clone(&shared);
-    drivers.spawn(async move {
-        let mut recv_bufs = RecvBufs::new();
-        loop {
-            let is_read_shutdown = read_shutdown_clone.is_cancelled();
-
-            tokio::select! {
-                biased;
-                () = read_shared.recv_fin().cancelled() => return,
-                () = read_shared.recv_eof().cancelled() => return,
-                result = read_half.recv_pkts(&mut recv_bufs) => {
-                    match result {
-                        Ok(recv_pkts) => {
-                            if is_read_shutdown && 0 < recv_pkts.num_payload_segments {
-                                use crate::transmission::termination::PeerReset;
-                                read_shared.termination.press_broken_pipe(PeerReset::SendKill, None);
-                            }
-                        }
-                        Err((_e, should_send_kill_pkt)) => {
-                            if let SendKillPkt::Yes = should_send_kill_pkt {
-                                use crate::transmission::termination::PeerReset;
-                                read_shared.termination.press_broken_pipe(PeerReset::SendKill, None);
-                            }
-                            return;
-                        }
+    events.spawn({
+        let read_shutdown = read_shutdown.clone();
+        let stop_drivers = stop_drivers.clone();
+        let shared = Arc::clone(&shared);
+        let mut read_half = read_half;
+        async move {
+            let mut recv_bufs = RecvBufs::new();
+            let mut read_closed = read_shutdown.is_cancelled();
+            loop {
+                let recv_result = if read_closed {
+                    tokio::select! {
+                        biased;
+                        () = stop_drivers.cancelled() => return,
+                        result = read_half.recv_pkts(&mut recv_bufs) => result,
                     }
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = stop_drivers.cancelled() => return,
+                        () = read_shutdown.cancelled() => {
+                            read_closed = true;
+                            continue;
+                        }
+                        result = read_half.recv_pkts(&mut recv_bufs) => result,
+                    }
+                };
+                let recv_pkts = match recv_result {
+                    Ok(recv_pkts) => recv_pkts,
+                    Err((_error, should_send_kill_pkt)) => {
+                        match should_send_kill_pkt {
+                            SendKillPkt::Yes => shared.request_kill_and_abort(),
+                            SendKillPkt::No => (),
+                        }
+                        return;
+                    }
+                };
+                if read_closed && 0 < recv_pkts.num_payload_segments {
+                    shared.request_kill_and_abort();
+                    return;
                 }
             }
         }
     });
 
-    let supervisor = tokio::spawn(async move {
-        let write_shutdown = write_shutdown_for_supervisor;
-        let read_shutdown = read_shutdown_for_supervisor;
-        tokio::select! {
-            () = write_shutdown.cancelled() => {
-                read_half_shared.send_fin_buf();
-                read_half_shared.resume_send().notify_one();
+    let supervisor = SessionSupervisor {
+        join: tokio::spawn({
+            let read_shutdown = read_shutdown.clone();
+            let write_shutdown = write_shutdown.clone();
+            let stop_drivers = stop_drivers.clone();
+            let shared = Arc::clone(&shared);
+            async move {
+                let mut events = events;
+                let first_exit = 'session: {
+                    tokio::select! {
+                        () = write_shutdown.cancelled() => {
+                            shared.send_fin_buf();
+                            shared.resume_send().notify_one();
+                        }
+                        () = termination_reaper.ready() => break 'session None,
+                        result = next_event_exit(&mut events) => break 'session Some(result),
+                    }
+                    tokio::select! {
+                        () = read_shutdown.cancelled() => (),
+                        () = termination_reaper.ready() => break 'session None,
+                        result = next_event_exit(&mut events) => break 'session Some(result),
+                    }
+                    tokio::select! {
+                        () = termination_reaper.ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained()) => break 'session None,
+                        result = next_event_exit(&mut events) => break 'session Some(result),
+                    }
+                };
+                stop_drivers.cancel();
+                join_drivers(events, first_exit, &shared).await;
             }
-            () = reaper_clone.ready() => return,
-        }
-        tokio::select! {
-            () = read_shutdown.cancelled() => (),
-            () = reaper_clone.ready() => return,
-        }
-
-        let peer_fin = read_half_shared.recv_fin().clone();
-        let outbound = read_half_shared.session_outbound_drained();
-        tokio::pin!(outbound);
-        let reaper_fut = reaper_clone.ready_or_graceful_close(&peer_fin, outbound);
-        tokio::pin!(reaper_fut);
-
-        tokio::select! {
-            () = reaper_fut => (),
-            () = reaper_clone.ready() => (),
-        }
-
-        join_drivers(&mut drivers).await;
-
-        assert!(
-            read_half_shared.termination.terminal().is_cancelled(),
-            "clean early driver exit must have published terminal state"
-        );
-    });
+        }),
+    };
 
     let read = ReadSocket {
         transmission_layer: Arc::clone(&shared),
@@ -387,7 +385,55 @@ fn socket_inner(
         transmission_layer: Arc::clone(&shared),
         _shutdown_guard: write_shutdown.drop_guard(),
     };
-    (read, write, SessionSupervisor { join: supervisor })
+    (read, write, supervisor)
+}
+
+async fn next_event_exit(events: &mut JoinSet<()>) -> Result<(), JoinError> {
+    events
+        .join_next()
+        .await
+        .expect("RTP event set became empty while the session was alive")
+}
+
+async fn join_drivers(
+    mut events: JoinSet<()>,
+    first_exit: Option<Result<(), JoinError>>,
+    shared: &Shared,
+) {
+    let unexpected_clean_exit =
+        first_exit.as_ref().is_some_and(Result::is_ok) && !shared.termination.has_error();
+    let mut panic_payload = None;
+    let mut cancelled = None;
+    let mut result = first_exit;
+    loop {
+        if let Some(result) = result.take() {
+            match result {
+                Ok(()) => {}
+                Err(error) if error.is_panic() => {
+                    if panic_payload.is_none() {
+                        panic_payload = Some(error.into_panic());
+                    }
+                }
+                Err(error) => {
+                    cancelled.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        result = events.join_next().await;
+        if result.is_none() {
+            break;
+        }
+    }
+    if let Some(payload) = panic_payload {
+        std::panic::resume_unwind(payload);
+    }
+    if let Some(error) = cancelled {
+        panic!("RTP driver task was unexpectedly cancelled: {error}");
+    }
+    assert!(
+        !unexpected_clean_exit,
+        "RTP driver task exited without publishing a terminal session state"
+    );
 }
 
 pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {

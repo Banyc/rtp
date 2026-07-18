@@ -24,7 +24,7 @@ impl std::ops::Deref for WriteHalf {
 }
 
 impl WriteHalf {
-    pub(crate) fn kill_requested(&self) -> Option<tokio_util::sync::CancellationToken> {
+    pub(crate) fn kill_requested(&self) -> &tokio_util::sync::CancellationToken {
         self.termination_writer.kill_requested()
     }
 

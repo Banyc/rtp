@@ -163,13 +163,8 @@ impl TerminationPresser {
 }
 
 impl TerminationWriter {
-    pub(crate) fn kill_requested(&self) -> Option<CancellationToken> {
-        let state = self.inner.state.lock().unwrap();
-        if matches!(state.kill, KillState::Requested | KillState::InProgress) {
-            Some(self.inner.kill_finished.clone())
-        } else {
-            None
-        }
+    pub(crate) fn kill_requested(&self) -> &CancellationToken {
+        &self.inner.kill_requested
     }
     pub(crate) fn take_kill_attempt(&self) -> Option<KillAttempt> {
         let mut state = self.inner.state.lock().unwrap();
