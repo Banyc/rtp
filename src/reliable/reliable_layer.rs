@@ -25,7 +25,7 @@ use crate::{
         },
         stock::{recv::StockRecvStage, send::StockSendStage},
     },
-    recv_queue::pkt_recv_space::{PktRecvSpace, RecvDisposition},
+    recv_queue::pkt_recv_space::PktRecvSpace,
     sack::AckBallSequence,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::watchdog_tuning::WatchdogTuning,
@@ -107,7 +107,6 @@ pub struct ReliableLayer {
     send_data_buf: StockSendStage,
     send_fin_buf: SendFinBuf,
     recv_data_buf: StockRecvStage,
-    /// set-only
     recv_fin_buf: bool,
     send_rate_limiter: Arc<Mutex<TokenBucket>>,
     connection_stats: ConnectionState,
@@ -121,42 +120,11 @@ pub struct ReliableLayer {
     delivery_peak: WindowedDeliveryMax,
     slow_start: bool,
     slow_start_acked_pkts: usize,
-
-    // Gentle-mode congestion controller state.
     pub(crate) gentle: GentleMode,
-
-    /// Whether the write half has been closed/finished (local FIN sent,
-    /// local writer dropped). After this is set, further sends/reliable
-    /// staging return `BrokenPipe`.
-    write_closed: bool,
-
-    /// Whether the bottleneck queue is currently building per delivery-rate
-    /// estimation (`smooth > floor + gate_tol`).  Updated on every ACK rate
-    /// sample in `adjust_send_rate_exponential`.  Read by the transmission
-    /// layer to suppress retransmission-armor duplicate copies
-    /// (`RTP_RTX_DUP`) — duplication under a building queue would worsen
-    /// the very congestion the dup is meant to recover from.
     queue_building: bool,
-
-    /// How long the drain floor has been continuously binding while the queue
-    /// builds.  Used to decay a stale peak delivery-rate floor after a genuine
-    /// capacity drop.
     drain_floor_binding_since: Option<Instant>,
-
-    /// Per-connection frame-delivery mode snapshot taken at construction.
-    /// When `enabled`, application data is staged as whole frames and
-    /// packetized frame-aligned; the receive path may deliver complete frames
-    /// out of order past sequence holes.  When disabled, the layer is
-    /// byte-for-byte stock (no `FRAME_DATA_TS` is ever emitted, the
-    /// byte-stream `recv`/`send` paths are unchanged).
     frame_delivery: FrameDelivery,
-    /// Sender-side frame staging and frame-aligned packetization in
-    /// frame-delivery mode (see [`crate::delivery::frame::send`]).  Empty when
-    /// frame-delivery mode is off (the stock byte-stream path uses
-    /// `send_data_buf` directly).
     frame_send_stage: FrameSendStage,
-
-    // Reused buffers
     pkt_stats_buf: Vec<PacketState>,
     pkt_buf: Vec<dre::Packet>,
 }
@@ -194,7 +162,6 @@ impl ReliableLayer {
             slow_start: true,
             slow_start_acked_pkts: 0,
             gentle: GentleMode::new(),
-            write_closed: false,
             queue_building: false,
             drain_floor_binding_since: None,
             frame_delivery,
@@ -238,7 +205,6 @@ impl ReliableLayer {
             slow_start: true,
             slow_start_acked_pkts: 0,
             gentle: GentleMode::new(),
-            write_closed: false,
             queue_building: false,
             drain_floor_binding_since: None,
             frame_delivery,
@@ -330,23 +296,19 @@ impl ReliableLayer {
         self.pkt_send_space.sample_rtt(rtt, now);
     }
 
-    pub(crate) fn ensure_write_open(&self) -> Result<(), std::io::ErrorKind> {
-        if self.write_closed {
-            return Err(std::io::ErrorKind::BrokenPipe);
-        }
-        Ok(())
-    }
-
-    /// Close the local write-half (no further data staging allowed).
-    pub fn close_write(&mut self) {
-        self.write_closed = true;
-    }
-
     pub fn send_fin_buf(&mut self) {
         if matches!(self.send_fin_buf, SendFinBuf::EmptyAndBlocked) {
             return;
         }
         self.send_fin_buf = SendFinBuf::Some;
+    }
+
+    pub(crate) fn ensure_write_open(&self) -> Result<(), std::io::ErrorKind> {
+        if matches!(self.send_fin_buf, SendFinBuf::Empty) {
+            Ok(())
+        } else {
+            Err(std::io::ErrorKind::BrokenPipe)
+        }
     }
 
     /// Store data in the inner data buffer
@@ -374,12 +336,10 @@ impl ReliableLayer {
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> Result<usize, std::io::ErrorKind> {
         self.ensure_write_open()?;
         self.detect_application_limited_phases(now);
-
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap =
             (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(self.send_data_buf.capacity());
-        let staged = self.send_data_buf.stage(buf, cap);
-        Ok(staged)
+        Ok(self.send_data_buf.stage(buf, cap))
     }
 
     /// Stage a whole application frame in frame-delivery mode.  The frame is
@@ -388,15 +348,12 @@ impl ReliableLayer {
     /// frames).  Returns `Ok(())` on success, or `Err(InvalidInput)` when the
     /// mode is off, the frame is empty, or the frame exceeds `MAX_FRAME_LEN`.
     pub fn send_frame_buf(&mut self, frame: &[u8], now: Instant) -> Result<(), std::io::ErrorKind> {
-        self.ensure_write_open()?;
         if !self.frame_delivery.enabled {
             return Err(std::io::ErrorKind::InvalidInput);
         }
+        self.ensure_write_open()?;
         crate::delivery::frame::send::validate_frame(frame)?;
         self.detect_application_limited_phases(now);
-        // Rate-scale the soft staging cap exactly like the stock path so a
-        // small interactive frame is not starved behind a bulk backlog
-        // already on the stage.
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap = (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(MAX_FRAME_LEN);
         self.frame_send_stage.stage_frame(frame, cap)
@@ -927,26 +884,27 @@ impl ReliableLayer {
         read_bytes
     }
 
-    /// Take a pkt from the unreliable layer
+    /// Take a pkt from the unreliable layer.
     ///
-    /// Returns the `RecvDisposition` for this packet.
-    pub fn recv_data_pkt(
+    /// Returns both ACK eligibility and whether this packet was newly inserted.
+    /// Duplicate and stale packets remain ACKable without becoming new data.
+    pub(crate) fn recv_data_pkt(
         &mut self,
         seq: u64,
         frame_len: Option<u32>,
         pkt: &[u8],
-    ) -> RecvDisposition {
+    ) -> crate::recv_queue::pkt_recv_space::RecvDisposition {
         let mut buf = self.pkt_recv_space.reused_buf().take();
         buf.extend(pkt);
         let disposition = self.pkt_recv_space.recv_disposition(seq, buf, frame_len);
-        if !disposition.is_new() {
+        if !disposition.should_ack() {
             return disposition;
         }
         if self.frame_delivery.enabled {
-            return RecvDisposition::Inserted;
+            return disposition;
         }
         self.move_recv_data();
-        RecvDisposition::Inserted
+        disposition
     }
 
     /// Pop one complete frame from the receive queue in frame-delivery mode.
@@ -1517,6 +1475,27 @@ mod tests {
             super::DataPktPayload::Data(_) => p.seq,
             _ => panic!("expected data packet"),
         }
+    }
+
+    #[test]
+    fn fin_latches_stock_and_frame_staging_closed() {
+        let now = Instant::now();
+        let mut stock = test_layer(now);
+        stock.send_fin_buf();
+        assert_eq!(
+            stock.send_data_buf(b"after FIN", now),
+            Err(std::io::ErrorKind::BrokenPipe)
+        );
+        let (mut frame, _) = super::ReliableLayer::new(
+            NonZeroUsize::new(TEST_MSS).unwrap(),
+            crate::delivery::frame::FrameDelivery::enabled(),
+            now,
+        );
+        frame.send_fin_buf();
+        assert_eq!(
+            frame.send_frame_buf(b"after FIN", now),
+            Err(std::io::ErrorKind::BrokenPipe)
+        );
     }
 
     fn ack_seq(rl: &mut super::ReliableLayer, seq: u64, rtt: Duration, now: Instant) {
