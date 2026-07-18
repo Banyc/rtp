@@ -1,11 +1,15 @@
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::coordination::Coordination;
 use super::fec::FecState;
 use super::read_half::ReadHalf;
-use super::termination::{TerminationPresser, TerminationReaper, channel};
+use super::termination::{
+    PeerReset, TerminationPresser, TerminationReaper, channel as termination_channel,
+};
 use super::transmission_layer::{
     ACK_FLUSH_AGE, ACK_FLUSH_COUNT, AckFlushState, Log, LogConfig, PRINT_DEBUG_MSGS,
     ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env, rtx_dup_from_env,
@@ -48,8 +52,8 @@ impl ReceivedBatch {
 pub struct Shared {
     pub(crate) reliable_layer: Mutex<ReliableLayer>,
     pub(crate) ack_flush: Mutex<AckFlushState>,
-    post_open_handshake: Mutex<Option<PostOpenHandshake>>,
-    post_open_handshake_active: std::sync::atomic::AtomicBool,
+    post_open_handshake: Option<Mutex<PostOpenHandshake>>,
+    post_open_handshake_active: AtomicBool,
     pub(crate) fec: Option<Mutex<FecState>>,
     pub(crate) send_rate_limiter: Arc<Mutex<SharedTokenBucket>>,
     pub(crate) termination: TerminationPresser,
@@ -65,30 +69,10 @@ pub fn build_parts(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper) {
-    build_parts_inner(unreliable_layer, log_config, None)
-}
-
-pub fn build_parts_with_watchdog_tuning(
-    unreliable_layer: UnreliableLayer,
-    log_config: Option<LogConfig>,
-    tuning: WatchdogTuning,
-) -> (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper) {
-    build_parts_inner(unreliable_layer, log_config, Some(tuning))
-}
-
-fn build_parts_inner(
-    unreliable_layer: UnreliableLayer,
-    log_config: Option<LogConfig>,
-    tuning: Option<WatchdogTuning>,
-) -> (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
-    let (reliable_layer, send_rate_limiter) = match tuning {
-        Some(t) => {
-            ReliableLayer::new_with_watchdog_tuning(unreliable_layer.mss, frame_delivery, now, t)
-        }
-        None => ReliableLayer::new(unreliable_layer.mss, frame_delivery, now),
-    };
+    let (reliable_layer, send_rate_limiter) =
+        ReliableLayer::new(unreliable_layer.mss, frame_delivery, now);
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -98,13 +82,13 @@ fn build_parts_inner(
             .expect("open log file");
         Mutex::new(csv::WriterBuilder::new().from_writer(file))
     });
-    let (termination, termination_writer, reaper) = channel();
+    let (termination, termination_writer, termination_reaper) = termination_channel();
     let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
     let shared = Arc::new(Shared {
         reliable_layer: Mutex::new(reliable_layer),
         ack_flush: Mutex::new(AckFlushState::new()),
-        post_open_handshake: Mutex::new(unreliable_layer.post_open_handshake),
-        post_open_handshake_active: std::sync::atomic::AtomicBool::new(post_open_handshake_active),
+        post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
+        post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
         fec: unreliable_layer.fec.map(Mutex::new),
         send_rate_limiter,
         termination,
@@ -127,7 +111,57 @@ fn build_parts_inner(
         recent_echoes: RecentEchoes::new(),
         shared: Arc::clone(&shared),
     };
-    (shared, write_half, read_half, reaper)
+    (shared, write_half, read_half, termination_reaper)
+}
+
+pub fn build_parts_with_watchdog_tuning(
+    unreliable_layer: UnreliableLayer,
+    log_config: Option<LogConfig>,
+    tuning: WatchdogTuning,
+) -> (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper) {
+    let now = Instant::now();
+    let frame_delivery = unreliable_layer.frame_delivery;
+    let (reliable_layer, send_rate_limiter) =
+        ReliableLayer::new_with_watchdog_tuning(unreliable_layer.mss, frame_delivery, now, tuning);
+    let reliable_layer_logger = log_config.as_ref().map(|c| {
+        let file = std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&c.reliable_layer_log_path)
+            .expect("open log file");
+        Mutex::new(csv::WriterBuilder::new().from_writer(file))
+    });
+    let (termination, termination_writer, termination_reaper) = termination_channel();
+    let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
+    let shared = Arc::new(Shared {
+        reliable_layer: Mutex::new(reliable_layer),
+        ack_flush: Mutex::new(AckFlushState::new()),
+        post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
+        post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
+        fec: unreliable_layer.fec.map(Mutex::new),
+        send_rate_limiter,
+        termination,
+        coord: Coordination::new(),
+        rtx_dup: std::sync::atomic::AtomicBool::new(rtx_dup_from_env()),
+        fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
+        instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
+            instream_group_fec_from_env(),
+        ),
+        clock_epoch: now,
+        reliable_layer_logger,
+    });
+    let write_half = WriteHalf {
+        utp_write: unreliable_layer.utp_write,
+        shared: Arc::clone(&shared),
+        termination_writer,
+    };
+    let read_half = ReadHalf {
+        utp_read: unreliable_layer.utp_read,
+        recent_echoes: RecentEchoes::new(),
+        shared: Arc::clone(&shared),
+    };
+    (shared, write_half, read_half, termination_reaper)
 }
 
 impl Shared {
@@ -171,7 +205,6 @@ impl Shared {
     }
 
     pub fn request_kill_and_abort(&self) {
-        use super::termination::PeerReset;
         self.termination
             .press_broken_pipe(PeerReset::SendKill, None);
     }
@@ -264,58 +297,37 @@ impl Shared {
         if !self.post_open_handshake_active.load(Ordering::Acquire) {
             return Observation::NotHandshake;
         }
-        let mut guard = self.post_open_handshake.lock().unwrap();
-        let Some(handshake) = guard.as_mut() else {
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
+        let Some(handshake) = &self.post_open_handshake else {
             return Observation::NotHandshake;
         };
+        let mut handshake = handshake.lock().unwrap();
         let observation = handshake.observe(datagram, now);
         if observation == Observation::Complete || handshake.expired(now) {
-            *guard = None;
             self.post_open_handshake_active
                 .store(false, Ordering::Release);
         }
         observation
     }
 
-    pub(crate) fn claim_open_response(&self) -> Option<ClaimedResponse> {
+    pub(crate) fn claim_post_open_response(&self, now: Instant) -> Option<ClaimedResponse> {
         if !self.post_open_handshake_active.load(Ordering::Acquire) {
             return None;
         }
-        let now = Instant::now();
-        let mut guard = self.post_open_handshake.lock().unwrap();
-        let Some(handshake) = guard.as_mut() else {
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
-            return None;
-        };
+        let handshake = self.post_open_handshake.as_ref()?;
+        let mut handshake = handshake.lock().unwrap();
         let response = handshake.claim_response(now);
         if handshake.expired(now) {
-            *guard = None;
             self.post_open_handshake_active
                 .store(false, Ordering::Release);
         }
         response
     }
 
-    pub(crate) fn retry_open_response(&self) {
-        if !self.post_open_handshake_active.load(Ordering::Acquire) {
-            return;
-        }
-        let now = Instant::now();
-        let mut guard = self.post_open_handshake.lock().unwrap();
-        let Some(handshake) = guard.as_mut() else {
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
-            return;
-        };
-        if handshake.expired(now) {
-            *guard = None;
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
-        } else {
-            handshake.retry_response(now);
+    pub(crate) fn retry_post_open_response(&self, now: Instant) {
+        if self.post_open_handshake_active.load(Ordering::Acquire)
+            && let Some(handshake) = &self.post_open_handshake
+        {
+            handshake.lock().unwrap().retry_response(now);
         }
     }
 
@@ -346,25 +358,17 @@ impl Shared {
         if let Some(ack_deadline) = ack_deadline {
             deadline = Some(deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
         }
-        if self.post_open_handshake_active.load(Ordering::Acquire) {
-            let mut guard = self.post_open_handshake.lock().unwrap();
-            match guard.as_mut() {
-                Some(handshake) if handshake.expired(now) => {
-                    *guard = None;
-                    self.post_open_handshake_active
-                        .store(false, Ordering::Release);
-                }
-                Some(handshake) => {
-                    if let Some(handshake_deadline) = handshake.next_send_time(now) {
-                        deadline = Some(deadline.map_or(handshake_deadline, |current| {
-                            current.min(handshake_deadline)
-                        }));
-                    }
-                }
-                None => {
-                    self.post_open_handshake_active
-                        .store(false, Ordering::Release);
-                }
+        if self.post_open_handshake_active.load(Ordering::Acquire)
+            && let Some(handshake) = &self.post_open_handshake
+        {
+            let handshake = handshake.lock().unwrap();
+            if handshake.expired(now) {
+                self.post_open_handshake_active
+                    .store(false, Ordering::Release);
+            } else if let Some(handshake_deadline) = handshake.next_send_time(now) {
+                deadline = Some(deadline.map_or(handshake_deadline, |current| {
+                    current.min(handshake_deadline)
+                }));
             }
         }
         deadline

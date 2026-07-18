@@ -270,17 +270,17 @@ impl WriteHalf {
     }
 
     async fn send_due_post_open_response(&mut self) -> Result<(), std::io::ErrorKind> {
-        let Some(response) = self.shared.claim_open_response() else {
+        let Some(response) = self.claim_post_open_response(Instant::now()) else {
             return Ok(());
         };
         match self.utp_write.send(&response.bytes).await {
             Ok(len) if len == response.bytes.len() => Ok(()),
             Ok(_) | Err(std::io::ErrorKind::WouldBlock) => {
-                self.shared.retry_open_response();
+                self.retry_post_open_response(Instant::now());
                 Ok(())
             }
             Err(error) => {
-                self.shared.set_error(error);
+                self.termination.press_error(error);
                 Err(error)
             }
         }
