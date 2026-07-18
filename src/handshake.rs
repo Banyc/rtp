@@ -805,6 +805,61 @@ mod tests {
         drop((client_socket, server_socket));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_rtp_datagram_cannot_retire_nonce_bound_recovery() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            InjectStaleRtpAfterFirstConfirmWrite {
+                tx: client_to_server_tx,
+                injected: false,
+            },
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            DropFirstConfirmationsWrite {
+                tx: server_to_client_tx,
+                remaining: 1,
+            },
+            false,
+        );
+        let (_, server_socket) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                async { client_opening_handshake(&mut client).await },
+                async {
+                    server_opening_handshake(&mut server).await?;
+                    Ok::<_, io::Error>(socket(server, None))
+                },
+            )
+        })
+        .await
+        .expect("stale RTP traffic retired opening recovery")
+        .expect("nonce-bound recovery failed after stale RTP traffic");
+        drop(server_socket);
+    }
+
+    #[tokio::test]
+    async fn client_cannot_succeed_without_a_delivered_confirmation() {
+        let (client_to_server_tx, _client_to_server_rx) = mpsc::channel(1);
+        let (_server_to_client_tx, server_to_client_rx) = mpsc::channel(1);
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            ChannelWrite::new(client_to_server_tx, None, false),
+            false,
+        );
+        let result = client_phase(
+            &mut client,
+            0x1234,
+            Kind::Confirm,
+            Kind::ConfirmAck,
+            Instant::now() + Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
     #[derive(Debug)]
     struct ChannelRead(mpsc::Receiver<Vec<u8>>);
 
@@ -916,6 +971,12 @@ mod tests {
         confirm_delivered: bool,
     }
 
+    #[derive(Debug)]
+    struct InjectStaleRtpAfterFirstConfirmWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        injected: bool,
+    }
+
     #[async_trait]
     impl UnreliableWrite for DeliverFirstConfirmOnlyWrite {
         async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
@@ -948,6 +1009,26 @@ mod tests {
                 .map_err(|_| io::ErrorKind::BrokenPipe)?;
             if !self.injected
                 && Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Hello)
+            {
+                self.injected = true;
+                self.tx
+                    .send(Vec::new())
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    #[async_trait]
+    impl UnreliableWrite for InjectStaleRtpAfterFirstConfirmWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            if !self.injected
+                && Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Confirm)
             {
                 self.injected = true;
                 self.tx
