@@ -67,10 +67,9 @@ impl PktRecvSpace {
         &mut self.reused_buf
     }
 
-    /// Return the disposition of the received packet.
+    #[cfg(test)]
     pub fn recv(&mut self, seq: u64, data: Vec<u8>, frame_len: Option<u32>) -> bool {
-        let disposition = self.recv_disposition(seq, data, frame_len);
-        disposition.should_ack()
+        self.recv_disposition(seq, data, frame_len).should_ack()
     }
 
     /// Return the disposition of the received packet:
@@ -227,12 +226,11 @@ mod tests {
         assert!(space.recv(0, b"a".to_vec(), None));
         let ack_count_after = space.ack_history().balls().count();
         space.pop();
-        // seq 0 is now behind next == Some(1)
-        assert!(space.recv(0, b"stale".to_vec(), None));
-        // Should not be in the slot map.
+        assert_eq!(
+            space.recv_disposition(0, b"stale".to_vec(), None),
+            RecvDisposition::Duplicate
+        );
         assert!(!space.slots.contains_key(&0));
-        // But it should still be acked (balls count unchanged — it's already
-        // merged into the same ball).
         assert_eq!(space.ack_history().balls().count(), ack_count_after);
     }
 
@@ -247,7 +245,10 @@ mod tests {
     fn duplicate_acked_but_not_reinserted() {
         let mut space = PktRecvSpace::new(FrameDelivery::default());
         assert!(space.recv(0, b"a".to_vec(), None));
-        assert!(space.recv(0, b"b".to_vec(), None));
+        assert_eq!(
+            space.recv_disposition(0, b"b".to_vec(), None),
+            RecvDisposition::Duplicate
+        );
         let pkt = space.slots.get(&0).unwrap();
         match pkt {
             RecvSlot::Data(p) => assert_eq!(p.data, b"a"),
