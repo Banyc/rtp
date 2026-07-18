@@ -643,6 +643,73 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_open_guard_recovers_after_three_lost_confirmations() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            ChannelWrite::new(client_to_server_tx, None, false),
+            true,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            DropFirstConfirmationsWrite {
+                tx: server_to_client_tx,
+                remaining: 3,
+            },
+            true,
+        );
+        let (_, server_socket) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                async { client_opening_handshake(&mut client).await },
+                async {
+                    server_opening_handshake(&mut server).await?;
+                    Ok::<_, io::Error>(socket(server, None))
+                },
+            )
+        })
+        .await
+        .expect("post-open duplicate confirmation recovery hung")
+        .expect("post-open duplicate confirmation recovery failed");
+        drop(server_socket);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_open_timer_recovers_without_another_client_confirmation() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            DeliverFirstConfirmOnlyWrite {
+                tx: client_to_server_tx,
+                confirm_delivered: false,
+            },
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            DropFirstConfirmationsWrite {
+                tx: server_to_client_tx,
+                remaining: 1,
+            },
+            false,
+        );
+        let (_, server_socket) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(
+                async { client_opening_handshake(&mut client).await },
+                async {
+                    server_opening_handshake(&mut server).await?;
+                    Ok::<_, io::Error>(socket(server, None))
+                },
+            )
+        })
+        .await
+        .expect("post-open scheduled confirmation recovery hung")
+        .expect("post-open scheduled confirmation recovery failed");
+        drop(server_socket);
+    }
+
     #[derive(Debug)]
     struct ChannelRead(mpsc::Receiver<Vec<u8>>);
 
@@ -680,6 +747,52 @@ mod tests {
                 drop_once,
                 duplicate,
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropFirstConfirmationsWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        remaining: usize,
+    }
+
+    #[async_trait]
+    impl UnreliableWrite for DropFirstConfirmationsWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            if self.remaining > 0
+                && Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::ConfirmAck)
+            {
+                self.remaining -= 1;
+                return Ok(buf.len());
+            }
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            Ok(buf.len())
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeliverFirstConfirmOnlyWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        confirm_delivered: bool,
+    }
+
+    #[async_trait]
+    impl UnreliableWrite for DeliverFirstConfirmOnlyWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            if Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Confirm) {
+                if self.confirm_delivered {
+                    return Ok(buf.len());
+                }
+                self.confirm_delivered = true;
+            }
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            Ok(buf.len())
         }
     }
 
