@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,7 +31,7 @@ impl ReadHalf {
     pub async fn recv_pkts(
         &mut self,
         bufs: &mut RecvBufs,
-    ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
+    ) -> Result<RecvPkts, (io::ErrorKind, SendKillPkt)> {
         let Self {
             utp_read,
             recent_echoes,
@@ -38,7 +39,7 @@ impl ReadHalf {
         } = self;
         let shared: &Shared = shared.as_ref();
         let termination = &shared.termination;
-        let throw_error = |e: std::io::ErrorKind| {
+        let throw_error = |e: io::ErrorKind| {
             termination.press_error(e);
             e
         };
@@ -59,7 +60,7 @@ impl ReadHalf {
                 false => {
                     let res = utp_read.try_recv(&mut bufs.utp);
                     if let Err(e) = &res
-                        && *e == std::io::ErrorKind::WouldBlock
+                        && *e == io::ErrorKind::WouldBlock
                     {
                         break;
                     }
@@ -68,7 +69,9 @@ impl ReadHalf {
             };
             let read_bytes = match res {
                 Ok(x) => x,
-                Err(e) => return Err((throw_error(e), SendKillPkt::No)),
+                Err(e) => {
+                    return Err((throw_error(e), SendKillPkt::No));
+                }
             };
             let now = Instant::now();
             let read_pkt = &bufs.utp[..read_bytes];
@@ -119,7 +122,7 @@ impl ReadHalf {
                     }
                 }
                 if data.killed {
-                    let e = std::io::ErrorKind::BrokenPipe;
+                    let e = io::ErrorKind::BrokenPipe;
                     throw_error(e);
                     return Err((e, SendKillPkt::No));
                 }
@@ -146,7 +149,7 @@ impl ReadHalf {
                                     "recv_data_pkt seq={} empty={} ack={}",
                                     data.seq,
                                     data.buf_range.is_empty(),
-                                    disposition.should_ack(),
+                                    disposition.should_ack()
                                 );
                             }
                             Some(disposition)
@@ -201,7 +204,9 @@ impl ReadHalf {
             }
             return Ok(recv_pkts);
         }
-        shared.coord.recv_data_pkt.notify_waiters();
+        if !bufs.ack_to_peer.is_empty() {
+            shared.coord.recv_data_pkt.notify_waiters();
+        }
         Ok(recv_pkts)
     }
 }

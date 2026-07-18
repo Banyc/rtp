@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -66,7 +67,7 @@ impl tokio::io::AsyncWrite for WriteStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, io::Error>> {
         let max_stage = self.max_stage;
         let buf = if buf.len() > max_stage {
             &buf[..max_stage]
@@ -76,17 +77,14 @@ impl tokio::io::AsyncWrite for WriteStream {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -125,7 +123,7 @@ impl tokio::io::AsyncRead for IoStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.read).poll_read(cx, buf)
     }
 }
@@ -135,21 +133,18 @@ impl tokio::io::AsyncWrite for IoStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, io::Error>> {
         Pin::new(&mut self.write).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.write).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    ) -> Poll<Result<(), io::Error>> {
         Pin::new(&mut self.write).poll_shutdown(cx)
     }
 }
@@ -163,7 +158,7 @@ impl tokio::io::AsyncRead for FrameReader {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -182,13 +177,13 @@ impl tokio::io::AsyncWrite for FrameWriter {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<Result<usize, io::Error>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -265,7 +260,6 @@ fn build_socket(
     let write_shutdown = tokio_util::sync::CancellationToken::new();
     let stop_drivers = tokio_util::sync::CancellationToken::new();
     let mut events = JoinSet::new();
-
     events.spawn({
         let stop_drivers = stop_drivers.clone();
         async move {
@@ -298,7 +292,6 @@ fn build_socket(
             }
         }
     });
-
     events.spawn({
         let read_shutdown = read_shutdown.clone();
         let stop_drivers = stop_drivers.clone();
@@ -318,18 +311,17 @@ fn build_socket(
                     tokio::select! {
                         biased;
                         () = stop_drivers.cancelled() => return,
-                        () = read_shutdown.cancelled() => {
-                            read_closed = true;
-                            continue;
-                        }
+                        () = read_shutdown.cancelled() => { read_closed = true; continue; }
                         result = read_half.recv_pkts(&mut recv_bufs) => result,
                     }
                 };
                 let recv_pkts = match recv_result {
                     Ok(recv_pkts) => recv_pkts,
-                    Err((_error, should_send_kill_pkt)) => {
+                    Err((_e, should_send_kill_pkt)) => {
                         match should_send_kill_pkt {
-                            SendKillPkt::Yes => shared.request_kill_and_abort(),
+                            SendKillPkt::Yes => {
+                                shared.request_kill_and_abort();
+                            }
                             SendKillPkt::No => (),
                         }
                         return;
@@ -342,7 +334,6 @@ fn build_socket(
             }
         }
     });
-
     let supervisor = SessionSupervisor {
         join: tokio::spawn({
             let read_shutdown = read_shutdown.clone();
@@ -375,7 +366,6 @@ fn build_socket(
             }
         }),
     };
-
     let read = ReadSocket {
         transmission_layer: Arc::clone(&shared),
         frame_buf: Vec::new(),
@@ -581,24 +571,24 @@ pub(crate) fn into_frame_io_parts(
 }
 
 impl AsyncAsyncRead for ReadSocket {
-    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.recv(buf)
             .await
-            .map_err(|kind| self.transmission_layer.io_error(kind))
+            .map_err(|kind| self.transmission_layer.termination.io_error(kind))
     }
 }
 
 impl AsyncAsyncWrite for WriteSocket {
-    async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    async fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.send(buf)
             .await
-            .map_err(|kind| self.transmission_layer.io_error(kind))
+            .map_err(|kind| self.transmission_layer.termination.io_error(kind))
     }
 
-    async fn flush(&mut self) -> std::io::Result<()> {
+    async fn flush(&mut self) -> io::Result<()> {
         self.transmission_layer
             .throw_error()
-            .map_err(|kind| self.transmission_layer.io_error(kind))?;
+            .map_err(|kind| self.transmission_layer.termination.io_error(kind))?;
         Ok(())
     }
 

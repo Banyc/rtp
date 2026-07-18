@@ -1,5 +1,6 @@
 use std::{
     io,
+    mem::size_of,
     time::{Duration, Instant},
 };
 
@@ -231,7 +232,7 @@ enum Received {
 }
 
 pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::Result<()> {
-    let mut nonce_bytes = [0; std::mem::size_of::<u64>()];
+    let mut nonce_bytes = [0; size_of::<u64>()];
     rand::rngs::SysRng
         .try_fill_bytes(&mut nonce_bytes)
         .expect("operating-system randomness unavailable");

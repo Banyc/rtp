@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -240,13 +241,13 @@ impl WriteHalf {
     }
 
     fn skip_open_fec_group(&self) {
-        let Some(fec) = self.shared.fec.as_ref() else {
+        let Some(fec) = self.fec.as_ref() else {
             return;
         };
         fec.lock().unwrap().skip_open_group();
     }
 
-    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), std::io::ErrorKind> {
+    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), io::ErrorKind> {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
@@ -257,8 +258,8 @@ impl WriteHalf {
         };
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {
-                Ok(_) => {}
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Ok(_) => (),
+                Err(io::ErrorKind::WouldBlock) => {
                     if FEC_DEBUG {
                         eprintln!("flush_fec_parities: WouldBlock (transient)");
                     }
@@ -334,12 +335,12 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub fn has_pending_acks(&self) -> bool {
-        let s = self.shared.ack_flush.lock().unwrap();
+        let s = self.ack_flush.lock().unwrap();
         0 < s.pending_acks || s.fin_pending
     }
 
     pub fn ack_flush_is_due(&self) -> bool {
-        let s = self.shared.ack_flush.lock().unwrap();
+        let s = self.ack_flush.lock().unwrap();
         if s.pending_acks == 0 && !s.fin_pending {
             return false;
         }
@@ -350,12 +351,10 @@ impl WriteHalf {
                 .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
     }
 
-    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), io::ErrorKind> {
         {
-            let s = self.shared.ack_flush.lock().unwrap();
-            if s.pending_acks == 0 && !s.fin_pending {
-                return Ok(());
-            }
+            let s = self.ack_flush.lock().unwrap();
+            if s.pending_acks == 0 && !s.fin_pending { return Ok(()); }
         }
         self.flush_acks_inner(bufs).await
     }
@@ -461,9 +460,9 @@ impl WriteHalf {
         &mut self,
         codec_pkt: &[u8],
         fec_buf: &mut [u8],
-    ) -> Result<usize, std::io::ErrorKind> {
+    ) -> Result<usize, io::ErrorKind> {
         let send_buf: &[u8] = {
-            match self.shared.fec.as_ref() {
+            match self.fec.as_ref() {
                 Some(fec) => {
                     let mut fec = fec.lock().unwrap();
                     let n = fec.encode_data(codec_pkt, fec_buf, false);

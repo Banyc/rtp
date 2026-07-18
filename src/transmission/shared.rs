@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -192,18 +193,6 @@ impl Shared {
         self.termination.throw_error()
     }
 
-    pub fn some_error(&self) -> &tokio_util::sync::CancellationToken {
-        self.termination.terminal()
-    }
-
-    pub fn has_error(&self) -> bool {
-        self.termination.has_error()
-    }
-
-    pub fn io_error(&self, kind: std::io::ErrorKind) -> std::io::Error {
-        self.termination.io_error(kind)
-    }
-
     pub fn request_kill_and_abort(&self) {
         self.termination
             .press_broken_pipe(PeerReset::SendKill, None);
@@ -276,10 +265,6 @@ impl Shared {
         }
     }
 
-    pub(crate) fn set_error(&self, kind: std::io::ErrorKind) {
-        self.termination.press_error(kind);
-    }
-
     pub fn send_fin_buf(&self) {
         self.reliable_layer.lock().unwrap().send_fin_buf();
         self.coord.resume_send.notify_one();
@@ -289,6 +274,7 @@ impl Shared {
         &self.coord.recv_fin
     }
 
+    #[cfg(test)]
     pub fn recv_eof(&self) -> &tokio_util::sync::CancellationToken {
         &self.coord.recv_eof
     }
@@ -495,7 +481,7 @@ impl Shared {
         Ok(read_bytes)
     }
 
-    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, io::ErrorKind> {
         let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
@@ -510,13 +496,16 @@ impl Shared {
                     self.log("recv_frame_buf");
                     return Ok(Some(frame));
                 }
-                Ok(None) => return Ok(None),
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Ok(None) => {
+                    return Ok(None);
+                }
+                Err(io::ErrorKind::WouldBlock) => {
                     tokio::select! {
                         () = recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
                     recv_data_pkt = self.coord.recv_data_pkt.notified();
+                    continue;
                 }
                 Err(e) => return Err(e),
             }
