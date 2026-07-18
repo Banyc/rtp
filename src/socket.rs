@@ -621,6 +621,7 @@ mod tests {
 
     use super::*;
     use core::time::Duration;
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
@@ -1413,5 +1414,475 @@ mod tests {
             .expect("second read timed out")
             .expect("second read failed");
         assert_eq!(&buf[..n2], second, "second frame must match");
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_later_write_and_preserves_read_half() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let (mut a_read, a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let mut a_write = a_write.into_async_write();
+        a_write.write_all(b"request").await.unwrap();
+        a_write.shutdown().await.unwrap();
+        assert_eq!(
+            a_write.write(b"after FIN").await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            a_write.write(&[]).await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let mut buf = [0; 64];
+        let request_len = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+            .await
+            .expect("request receive timed out")
+            .expect("request receive failed");
+        assert_eq!(&buf[..request_len], b"request");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+                .await
+                .expect("FIN receive timed out")
+                .expect("FIN receive failed"),
+            0
+        );
+        assert_eq!(b_write.send(b"response").await.unwrap(), 8);
+        let response_len = tokio::time::timeout(Duration::from_secs(2), a_read.recv(&mut buf))
+            .await
+            .expect("response receive timed out")
+            .expect("write shutdown must preserve the RTP read half");
+        assert_eq!(&buf[..response_len], b"response");
+    }
+
+    #[tokio::test]
+    async fn recv_frame_discards_a_partially_consumed_frame_tail() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let frame_delivery = crate::delivery::frame::FrameDelivery::enabled();
+        let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            a.clone(),
+            a,
+            false,
+            crate::udp::NO_FEC_MSS,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            frame_delivery,
+        );
+        let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            b.clone(),
+            b,
+            false,
+            crate::udp::NO_FEC_MSS,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            frame_delivery,
+        );
+        let (mut a_read, _a_write, _a_supervisor) = socket(a_layer, None);
+        let (_b_read, mut b_write, _b_supervisor) = socket(b_layer, None);
+        assert_eq!(b_write.send_frame(b"abcdef").await.unwrap(), 6);
+        assert_eq!(b_write.send_frame(b"XYZ").await.unwrap(), 3);
+        let mut prefix = [0; 2];
+        assert_eq!(a_read.recv(&mut prefix).await.unwrap(), 2);
+        assert_eq!(&prefix, b"ab");
+        let next = tokio::time::timeout(Duration::from_secs(2), a_read.recv_frame())
+            .await
+            .expect("next frame receive timed out")
+            .expect("frame receive failed")
+            .expect("unexpected EOF");
+        assert_eq!(next, b"XYZ");
+        assert_eq!(b_write.send_frame(b"next").await.unwrap(), 4);
+        let mut next = [0; 4];
+        assert_eq!(a_read.recv(&mut next).await.unwrap(), 4);
+        assert_eq!(&next, b"next");
+    }
+
+    #[tokio::test]
+    async fn read_drop_with_unread_payload_reaps_after_peer_fin() {
+        #[derive(Debug)]
+        struct DropProbeUdpWrite {
+            socket: Arc<UdpSocket>,
+            dropped: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl Drop for DropProbeUdpWrite {
+            fn drop(&mut self) {
+                if let Some(dropped) = self.dropped.take() {
+                    let _ = dropped.send(());
+                }
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeUdpWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                UdpSocket::send(&self.socket, buf)
+                    .await
+                    .map_err(|error| error.kind())
+            }
+        }
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (a_read, a_write, _a_supervisor) = socket(
+            wrap_fec(
+                Arc::clone(&a),
+                DropProbeUdpWrite {
+                    socket: a,
+                    dropped: Some(dropped_tx),
+                },
+                false,
+            ),
+            None,
+        );
+        let (b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        assert_eq!(b_write.send(b"unread").await.unwrap(), 6);
+        drop(b_write);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            a_read.transmission_layer.recv_fin().cancelled(),
+        )
+        .await
+        .expect("peer FIN was not published");
+        assert!(
+            !a_read.transmission_layer.recv_eof().is_cancelled(),
+            "unread payload must prevent application EOF"
+        );
+        drop(a_write);
+        drop(a_read);
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("RTP session waited for application EOF after its read half was dropped")
+            .expect("writer drop probe was lost");
+        drop(b_read);
+    }
+
+    #[tokio::test]
+    async fn first_payload_after_read_drop_resets_rtp_session() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let (a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        drop(a_read);
+        tokio::task::yield_now().await;
+        assert_eq!(b_write.send(b"late payload").await.unwrap(), 12);
+        let mut buf = [0; 64];
+        let peer_error = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+            .await
+            .expect("peer did not receive RTP KILL")
+            .expect_err("post-close the RTP session");
+        assert_eq!(peer_error, std::io::ErrorKind::BrokenPipe);
+        let local_error = a_write
+            .send(b"after reset")
+            .await
+            .expect_err("the RTP KILL sender must also be locally aborted");
+        assert_eq!(local_error, std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn payload_consumed_before_read_drop_does_not_reset_write_half() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let request = b"request";
+        let response = b"response";
+        assert_eq!(b_write.send(request).await.unwrap(), request.len());
+        let mut buf = [0; 64];
+        let request_len = tokio::time::timeout(Duration::from_secs(2), a_read.recv(&mut buf))
+            .await
+            .expect("request receive timed out")
+            .expect("request receive failed");
+        assert_eq!(&buf[..request_len], request);
+        drop(a_read);
+        assert_eq!(a_write.send(response).await.unwrap(), response.len());
+        let response_len = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+            .await
+            .expect("response receive timed out")
+            .expect("read drop falsely reset the RTP write half");
+        assert_eq!(&buf[..response_len], response);
+    }
+
+    #[tokio::test]
+    async fn duplicate_payload_after_read_drop_is_acked_without_reset() {
+        #[derive(Debug)]
+        struct ProbeUdpWrite {
+            socket: Arc<UdpSocket>,
+            sent: Arc<Mutex<Vec<Vec<u8>>>>,
+            sent_notify: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for ProbeUdpWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                let written = UdpSocket::send(&self.socket, buf)
+                    .await
+                    .map_err(|error| error.kind())?;
+                self.sent.lock().unwrap().push(buf.to_vec());
+                self.sent_notify.notify_waiters();
+                Ok(written)
+            }
+        }
+        async fn wait_for_sends(
+            sent: &Mutex<Vec<Vec<u8>>>,
+            sent_notify: &tokio::sync::Notify,
+            target: usize,
+        ) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let notified = sent_notify.notified();
+                    if sent.lock().unwrap().len() >= target {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("RTP writer did not emit the expected datagram");
+        }
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let a_sent = Arc::new(Mutex::new(Vec::new()));
+        let a_sent_notify = Arc::new(tokio::sync::Notify::new());
+        let b_sent = Arc::new(Mutex::new(Vec::new()));
+        let b_sent_notify = Arc::new(tokio::sync::Notify::new());
+        let (mut a_read, mut a_write, _a_supervisor) = socket(
+            wrap_fec(
+                Arc::clone(&a),
+                ProbeUdpWrite {
+                    socket: Arc::clone(&a),
+                    sent: Arc::clone(&a_sent),
+                    sent_notify: Arc::clone(&a_sent_notify),
+                },
+                false,
+            ),
+            None,
+        );
+        let (mut b_read, mut b_write, _b_supervisor) = socket(
+            wrap_fec(
+                Arc::clone(&b),
+                ProbeUdpWrite {
+                    socket: Arc::clone(&b),
+                    sent: Arc::clone(&b_sent),
+                    sent_notify: Arc::clone(&b_sent_notify),
+                },
+                false,
+            ),
+            None,
+        );
+        let request = b"request";
+        assert_eq!(b_write.send(request).await.unwrap(), request.len());
+        wait_for_sends(&b_sent, &b_sent_notify, 1).await;
+        let mut buf = [0; 64];
+        let request_len = tokio::time::timeout(Duration::from_secs(2), a_read.recv(&mut buf))
+            .await
+            .expect("request receive timed out")
+            .expect("request receive failed");
+        assert_eq!(&buf[..request_len], request);
+        wait_for_sends(&a_sent, &a_sent_notify, 1).await;
+        drop(a_read);
+        tokio::task::yield_now().await;
+        let duplicate = b_sent.lock().unwrap()[0].clone();
+        let sends_before_duplicate = a_sent.lock().unwrap().len();
+        b.send(&duplicate).await.unwrap();
+        wait_for_sends(&a_sent, &a_sent_notify, sends_before_duplicate + 1).await;
+        let response = b"response";
+        assert_eq!(a_write.send(response).await.unwrap(), response.len());
+        let response_len = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+            .await
+            .expect("response receive timed out")
+            .expect("duplicate payload falsely reset the RTP session");
+        assert_eq!(&buf[..response_len], response);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_public_send_does_not_cancel_driver_io() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct PendingRead;
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                std::future::pending().await
+            }
+        }
+
+        #[derive(Debug)]
+        struct WriteState {
+            calls: AtomicUsize,
+            first_started: tokio::sync::Notify,
+            release_first: tokio::sync::Notify,
+            first_completed: tokio::sync::Notify,
+            first_cancelled: AtomicBool,
+        }
+
+        struct CancelProbe {
+            state: Arc<WriteState>,
+            completed: bool,
+        }
+
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.state.first_cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct DriverWrite {
+            state: Arc<WriteState>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for DriverWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                if self.state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut probe = CancelProbe {
+                        state: Arc::clone(&self.state),
+                        completed: false,
+                    };
+                    self.state.first_started.notify_one();
+                    self.state.release_first.notified().await;
+                    probe.completed = true;
+                    self.state.first_completed.notify_one();
+                }
+                Ok(buf.len())
+            }
+        }
+
+        let state = Arc::new(WriteState {
+            calls: AtomicUsize::new(0),
+            first_started: tokio::sync::Notify::new(),
+            release_first: tokio::sync::Notify::new(),
+            first_completed: tokio::sync::Notify::new(),
+            first_cancelled: AtomicBool::new(false),
+        });
+
+        let layer = wrap_fec(
+            PendingRead,
+            DriverWrite {
+                state: Arc::clone(&state),
+            },
+            false,
+        );
+        let (_read, mut write, _supervisor) = socket(layer, None);
+        let payload = vec![7; 64 * 1024];
+        assert!(write.send(&payload).await.unwrap() > 0);
+        tokio::time::timeout(Duration::from_millis(100), state.first_started.notified())
+            .await
+            .expect("writer driver must start the first unreliable send");
+        assert!(write.send(&payload).await.unwrap() > 0);
+        let mut blocked_send = Box::pin(write.send(&payload));
+        tokio::select! {
+            result = &mut blocked_send => panic!("send queue unexpectedly had capacity: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => (),
+        }
+        drop(blocked_send);
+        assert!(
+            !state.first_cancelled.load(Ordering::SeqCst),
+            "cancelling a public send waiter must not cancel driver-owned I/O"
+        );
+        state.release_first.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), state.first_completed.notified())
+            .await
+            .expect("released driver I/O must complete");
+        assert!(!state.first_cancelled.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), write.send(b"after cancellation"))
+            .await
+            .expect("send queue must resume after driver progress")
+            .expect("send after cancellation must succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_is_callable_while_poll_write_retains_the_write_socket() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct PendingRead;
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                std::future::pending().await
+            }
+        }
+
+        #[derive(Debug)]
+        struct WriteState {
+            calls: AtomicUsize,
+            first_started: tokio::sync::Notify,
+            release_first: tokio::sync::Notify,
+            kill_started: tokio::sync::Notify,
+        }
+
+        #[derive(Debug)]
+        struct BlockingFirstWrite(Arc<WriteState>);
+
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for BlockingFirstWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                let call = self.0.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    self.0.first_started.notify_one();
+                    self.0.release_first.notified().await;
+                } else {
+                    self.0.kill_started.notify_one();
+                }
+                Ok(buf.len())
+            }
+        }
+
+        let state = Arc::new(WriteState {
+            calls: AtomicUsize::new(0),
+            first_started: tokio::sync::Notify::new(),
+            release_first: tokio::sync::Notify::new(),
+            kill_started: tokio::sync::Notify::new(),
+        });
+
+        let layer = wrap_fec(PendingRead, BlockingFirstWrite(Arc::clone(&state)), false);
+        let (_read, write, _supervisor) = socket(layer, None);
+        let mut write = write.into_async_write();
+        let payload = vec![7; write.max_stage()];
+        assert!(write.write(&payload).await.unwrap() > 0);
+        tokio::time::timeout(Duration::from_secs(1), state.first_started.notified())
+            .await
+            .expect("driver did not start its first unreliable write");
+        let mut retained_pending_write = false;
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_millis(20), write.write(&payload)).await {
+                Ok(Ok(n)) => assert!(n > 0),
+                Ok(Err(error)) => {
+                    panic!("staging failed unexpectedly: {error}")
+                }
+                Err(_) => {
+                    retained_pending_write = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            retained_pending_write,
+            "test did not leave PollWrite owning a pending WriteSocket"
+        );
+        write.send_kill_and_abort().await;
+        state.release_first.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), state.kill_started.notified())
+            .await
+            .expect("driver did not observe the out-of-band abort request");
     }
 }
