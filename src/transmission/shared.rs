@@ -394,6 +394,25 @@ impl Shared {
         }
     }
 
+    pub(crate) async fn session_outbound_drained(&self) -> Result<(), std::io::ErrorKind> {
+        loop {
+            let progress = self.coord.session_outbound_progress.notified();
+            self.termination.throw_error()?;
+            let reliable_drained = self.reliable_layer.lock().unwrap().is_no_data_to_send();
+            let ack_drained = {
+                let ack_flush = self.ack_flush.lock().unwrap();
+                ack_flush.pending_acks == 0 && !ack_flush.fin_pending
+            };
+            if reliable_drained && ack_drained {
+                return Ok(());
+            }
+            tokio::select! {
+                () = progress => (),
+                () = self.termination.terminal().cancelled() => (),
+            }
+        }
+    }
+
     pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
         let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
         loop {
@@ -409,28 +428,7 @@ impl Shared {
         }
     }
 
-    pub async fn session_outbound_drained(&self) -> Result<(), std::io::ErrorKind> {
-        loop {
-            self.termination.throw_error()?;
-            let outbound_empty = {
-                let reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.is_send_buf_empty()
-            };
-            let acks_empty = {
-                let ack = self.ack_flush.lock().unwrap();
-                ack.pending_acks == 0 && !ack.fin_pending
-            };
-            if outbound_empty && acks_empty {
-                return Ok(());
-            }
-            tokio::select! {
-                () = self.coord.session_outbound_progress.notified() => (),
-                () = self.termination.terminal().cancelled() => (),
-            }
-        }
-    }
-
-    pub fn commit_received_batch(&self, batch: ReceivedBatch) {
+    pub(crate) fn commit_received_batch(&self, batch: ReceivedBatch) {
         let ack_work_added = batch.pending_acks > 0 || batch.fin_ack;
         if ack_work_added {
             let mut ack_flush = self.ack_flush.lock().unwrap();
