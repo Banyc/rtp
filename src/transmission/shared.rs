@@ -1,4 +1,3 @@
-use std::io;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
