@@ -579,4 +579,592 @@ mod tests {
             "toggle off must send exactly one datagram (stock)"
         );
     }
+
+    #[tokio::test]
+    async fn single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
+        use crate::transmission::fec_tuning::FecTuning;
+        let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::mindiv());
+        let payload = vec![0u8; 100];
+        let now = Instant::now();
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            assert_eq!(rl.send_data_buf(&payload, now).unwrap(), payload.len());
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 4,
+            "mindiv single-symbol burst must emit 1 data + 3 parity = 4 datagrams, got {n}"
+        );
+    }
+
+    fn stage_n_packets(tl: &TransmissionLayer, n: usize) -> usize {
+        let mss = 8192usize;
+        let post_fec_mss = mss - 11 - 2;
+        let payload_len = post_fec_mss - crate::codec::data_overhead();
+        let rl = tl.reliable_layer();
+        let mut rl = rl.lock().unwrap();
+        for _ in 0..n {
+            let payload = vec![0u8; payload_len];
+            rl.enqueue_send_data_for_test(&payload);
+        }
+        payload_len
+    }
+
+    fn harness_with_mss(
+        fec: bool,
+        enabled: bool,
+        mss: usize,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        struct SharedWrite(Arc<Mutex<RecordingWrite>>);
+        #[async_trait]
+        impl UnreliableWrite for SharedWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.0.lock().unwrap().push(buf.to_vec());
+                Ok(buf.len())
+            }
+        }
+        impl std::fmt::Debug for SharedWrite {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SharedWrite").finish_non_exhaustive()
+            }
+        }
+        let write = SharedWrite(recorder.clone());
+        let read = BlackholeRead;
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            read,
+            write,
+            fec,
+            mss,
+            crate::transmission::fec_tuning::FecTuning::default(),
+        );
+        let mut tl = TransmissionLayer::new(ul, None);
+        tl.set_rtx_dup_for_test(enabled);
+        (tl, recorder)
+    }
+
+    #[tokio::test]
+    async fn full_group_flushes_four_parities_inline_mid_burst() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        tl.set_instream_group_fec_for_test(true);
+        stage_n_packets(&tl, 8);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 12,
+            "full in-stream group must emit 8 data + 4 parity = 12 datagrams, got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        tl.set_instream_group_fec_for_test(true);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.set_cwnd_for_test(std::num::NonZeroUsize::new(3).unwrap());
+        }
+        stage_n_packets(&tl, 3);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.enqueue_send_data_for_test(&[0u8; 100]);
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 7,
+            "partial data burst with toggle on and stock gate closed must flush 3 data + 4 parity = 7 datagrams, got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_data_burst_skipped_when_toggle_off_and_gate_closed() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.set_cwnd_for_test(std::num::NonZeroUsize::new(3).unwrap());
+        }
+        stage_n_packets(&tl, 3);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.enqueue_send_data_for_test(&[0u8; 100]);
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 3,
+            "partial data burst with toggle off and stock gate closed must emit 3 data + 0 parity = 3 datagrams, got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_burst_keeps_stock_tail_gate_when_blocked() {
+        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        tl.set_instream_group_fec_for_test(true);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.enqueue_send_data_for_test(&[0u8; 100]);
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_kill_pkt(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 1,
+            "ACK/kill burst with stock tail gate blocked must emit 1 datagram (no parity), got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toggle_off_wire_byte_identical_to_stock() {
+        let (mut tl_off, recorder_off) = harness_with_mss(true, false, 8192);
+        stage_n_packets(&tl_off, 8);
+        let mut bufs = SendBufs::new();
+        let _ = tl_off.send_pkts(&mut bufs).await;
+        let n_off = recorder_off.lock().unwrap().count();
+        let (mut tl_stock, recorder_stock) = harness_with_mss(true, false, 8192);
+        stage_n_packets(&tl_stock, 8);
+        let mut bufs2 = SendBufs::new();
+        let _ = tl_stock.send_pkts(&mut bufs2).await;
+        let n_stock = recorder_stock.lock().unwrap().count();
+        assert_eq!(
+            n_off, n_stock,
+            "toggle off must produce identical datagram count to stock (got {n_off} vs {n_stock})"
+        );
+        assert!(
+            n_off <= 8 + 5,
+            "toggle off must not emit inline mid-burst parity (got {n_off} > 13)"
+        );
+        assert_ne!(
+            n_off, 12,
+            "toggle off must NOT emit 8 data + 4 inline parity = 12 (inline flush must not fire)"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_drains_with_blocked_utp_write() {
+        use async_trait::async_trait;
+        #[derive(Debug)]
+        struct OnePktRead {
+            sent: Mutex<bool>,
+        }
+        #[async_trait]
+        impl UnreliableRead for OnePktRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                let mut sent = self.sent.lock().unwrap();
+                if *sent {
+                    return Err(std::io::ErrorKind::UnexpectedEof);
+                }
+                *sent = true;
+                let payload = b"hi";
+                let mut pkt = vec![0u8; 1 + 8 + 4 + 2 + payload.len()];
+                pkt[0] = 3;
+                pkt[1..9].copy_from_slice(&0u64.to_be_bytes());
+                pkt[9..13].copy_from_slice(&100u32.to_be_bytes());
+                pkt[13..15].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                pkt[15..].copy_from_slice(payload);
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+        }
+        #[derive(Debug)]
+        struct BlockedWrite;
+        #[async_trait]
+        impl UnreliableWrite for BlockedWrite {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+        }
+        let read = OnePktRead {
+            sent: Mutex::new(false),
+        };
+        let write = BlockedWrite;
+        let ul = crate::udp::wrap_fec(read, write, false);
+        let mut tl = TransmissionLayer::new(ul, None);
+        let mut recv_bufs = RecvBufs::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tl.recv_pkts(&mut recv_bufs),
+        )
+        .await;
+        match result {
+            Ok(Ok(pkts)) => assert!(pkts.num_payload_segments > 0 || pkts.num_ack_segments > 0),
+            Ok(Err((e, _))) => panic!("recv_pkts failed with blocked write: {e:?}"),
+            Err(_) => panic!("recv_pkts hung with blocked utp_write (deadlock)"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_deadline_does_not_cancel_or_reuse_async_read() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct ReadState {
+            calls: AtomicUsize,
+            third_started: tokio::sync::Notify,
+            release_third: tokio::sync::Notify,
+            third_cancelled: AtomicBool,
+        }
+        struct CancelProbe {
+            state: Arc<ReadState>,
+            completed: bool,
+        }
+        impl Drop for CancelProbe {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.state.third_cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        #[derive(Debug)]
+        struct CancellationSensitiveRead {
+            state: Arc<ReadState>,
+        }
+        #[async_trait]
+        impl UnreliableRead for CancellationSensitiveRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                let call = self.state.calls.fetch_add(1, Ordering::SeqCst);
+                let mut probe = (call == 2).then(|| CancelProbe {
+                    state: Arc::clone(&self.state),
+                    completed: false,
+                });
+                if call == 2 {
+                    self.state.third_started.notify_one();
+                    self.state.release_third.notified().await;
+                }
+                let payload = [call as u8];
+                let data = crate::codec::EncodeData {
+                    seq: call as u64,
+                    send_ts: Some(100 + call as u32),
+                    frame_len: None,
+                    data: &payload,
+                };
+                let n = crate::codec::encode_ack_data(None, None, Some(data), buf).unwrap();
+                if let Some(probe) = probe.as_mut() {
+                    probe.completed = true;
+                }
+                Ok(n)
+            }
+        }
+        #[derive(Debug)]
+        struct ImmediateWrite;
+        #[async_trait]
+        impl UnreliableWrite for ImmediateWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Ok(buf.len())
+            }
+        }
+        let state = Arc::new(ReadState {
+            calls: AtomicUsize::new(0),
+            third_started: tokio::sync::Notify::new(),
+            release_third: tokio::sync::Notify::new(),
+            third_cancelled: AtomicBool::new(false),
+        });
+        let layer = crate::udp::wrap_fec(
+            CancellationSensitiveRead {
+                state: Arc::clone(&state),
+            },
+            ImmediateWrite,
+            false,
+        );
+        let mut transmission = TransmissionLayer::new(layer, None);
+        let mut recv_bufs = RecvBufs::new();
+        let mut send_bufs = SendBufs::new();
+        transmission.recv_pkts(&mut recv_bufs).await.unwrap();
+        transmission.resume_send().notified().await;
+        transmission.flush_acks(&mut send_bufs).await.unwrap();
+        assert!(!transmission.has_pending_acks());
+        transmission.recv_pkts(&mut recv_bufs).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transmission.resume_send().notified(),
+        )
+        .await
+        .expect("new ACK work must wake the send timer");
+        assert!(transmission.has_pending_acks());
+        let mut third_recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
+        tokio::select! {
+            result = &mut third_recv => panic!("receive returned before the test released it: {result:?}"),
+            () = state.third_started.notified() => (),
+        }
+        tokio::select! {
+            result = &mut third_recv => panic!("ACK deadline cancelled the asynchronous receive: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => (),
+        }
+        assert!(
+            !state.third_cancelled.load(Ordering::SeqCst),
+            "ACK timing must not cancel the asynchronous reader"
+        );
+        state.release_third.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), &mut third_recv)
+            .await
+            .expect("released receive must finish")
+            .expect("released receive must succeed");
+        assert!(!state.third_cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ack_flush_survives_wouldblock() {
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+        #[derive(Debug)]
+        struct WouldBlockWrite {
+            call_count: Mutex<usize>,
+        }
+        #[async_trait]
+        impl UnreliableWrite for WouldBlockWrite {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                let mut c = self.call_count.lock().unwrap();
+                *c += 1;
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+        }
+        #[derive(Debug)]
+        struct OnePktRead2 {
+            sent: Mutex<bool>,
+        }
+        #[async_trait]
+        impl UnreliableRead for OnePktRead2 {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                let mut sent = self.sent.lock().unwrap();
+                if *sent {
+                    return Err(std::io::ErrorKind::UnexpectedEof);
+                }
+                *sent = true;
+                let payload = b"x";
+                let mut pkt = vec![0u8; 1 + 8 + 4 + 2 + payload.len()];
+                pkt[0] = 3;
+                pkt[1..9].copy_from_slice(&0u64.to_be_bytes());
+                pkt[9..13].copy_from_slice(&100u32.to_be_bytes());
+                pkt[13..15].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                pkt[15..].copy_from_slice(payload);
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+        }
+        let read = OnePktRead2 {
+            sent: Mutex::new(false),
+        };
+        let write = WouldBlockWrite {
+            call_count: Mutex::new(0),
+        };
+        let ul = crate::udp::wrap_fec(read, write, false);
+        let mut tl = TransmissionLayer::new(ul, None);
+        let mut recv_bufs = RecvBufs::new();
+        let _ = tl.recv_pkts(&mut recv_bufs).await;
+        assert!(
+            tl.has_pending_acks(),
+            "ACK work must be recorded after recv"
+        );
+        let mut send_bufs = SendBufs::new();
+        let _ = tl.flush_acks(&mut send_bufs).await;
+        assert!(
+            tl.has_pending_acks(),
+            "ACK work must survive a WouldBlock flush (still pending for retry)"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_watchdog_aborts_locally_before_best_effort_kill_completes() {
+        use crate::transmission::fec_tuning::FecTuning;
+        use crate::transmission::watchdog_tuning::WatchdogTuning;
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        let kill_started = Arc::new(tokio::sync::Notify::new());
+        struct PendingKillWrite {
+            recorder: Arc<Mutex<RecordingWrite>>,
+            kill_started: Arc<tokio::sync::Notify>,
+        }
+        impl std::fmt::Debug for PendingKillWrite {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("PendingKillWrite").finish_non_exhaustive()
+            }
+        }
+        #[async_trait]
+        impl UnreliableWrite for PendingKillWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.recorder.lock().unwrap().push(buf.to_vec());
+                if buf == [2] {
+                    self.kill_started.notify_one();
+                    std::future::pending().await
+                } else {
+                    Ok(buf.len())
+                }
+            }
+        }
+        let tuning = WatchdogTuning::new(
+            1,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+        );
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
+            BlackholeRead,
+            PendingKillWrite {
+                recorder: Arc::clone(&recorder),
+                kill_started: Arc::clone(&kill_started),
+            },
+            false,
+            crate::udp::NO_FEC_MSS,
+            FecTuning::default(),
+        );
+        let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, tuning);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        {
+            let rl = tl.reliable_layer();
+            let mut rl = rl.lock().unwrap();
+            rl.send_data_buf(&[0u8; 100], Instant::now()).unwrap();
+        }
+        let mut bufs = SendBufs::new();
+        assert!(tl.send_pkts(&mut bufs).await.is_ok());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let shared = Arc::clone(&tl.shared);
+        let send = tokio::spawn(async move {
+            let mut bufs = SendBufs::new();
+            tl.send_pkts(&mut bufs).await
+        });
+        kill_started.notified().await;
+        assert_eq!(
+            shared.throw_error(),
+            Err(std::io::ErrorKind::BrokenPipe),
+            "local fatal state must be visible while KILL delivery is blocked"
+        );
+        assert!(
+            shared.termination.terminal().is_cancelled(),
+            "session cancellation must be published before KILL delivery completes"
+        );
+        assert!(!send.is_finished(), "KILL delivery must still be pending");
+        let err = shared.termination.io_error(std::io::ErrorKind::BrokenPipe);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trigger=proactive_stall"),
+            "error message must contain trigger=proactive_stall, got: {msg}"
+        );
+        assert!(
+            msg.contains("reason=no_response"),
+            "error message must contain reason=no_response, got: {msg}"
+        );
+        let datagrams = recorder.lock().unwrap().datagrams();
+        assert!(
+            datagrams.iter().any(|datagram| datagram.as_slice() == [2]),
+            "a KILL datagram must be attempted, got {datagrams:?}"
+        );
+        send.abort();
+        assert!(send.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn send_kill_and_abort_publishes_error_before_stalled_fec_tail() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct KillThenStuckTail {
+            sends: Arc<AtomicUsize>,
+            tail_started: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl UnreliableWrite for KillThenStuckTail {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                if self.sends.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(buf.len())
+                } else {
+                    self.tail_started.notify_one();
+                    std::future::pending().await
+                }
+            }
+        }
+        let sends = Arc::new(AtomicUsize::new(0));
+        let tail_started = Arc::new(tokio::sync::Notify::new());
+        let unreliable = crate::udp::wrap_fec(
+            BlackholeRead,
+            KillThenStuckTail {
+                sends: Arc::clone(&sends),
+                tail_started: Arc::clone(&tail_started),
+            },
+            true,
+        );
+        let mut transmission = TransmissionLayer::new(unreliable, None);
+        let shared = Arc::clone(&transmission.shared);
+        let send = tokio::spawn(async move {
+            let mut bufs = SendBufs::new();
+            transmission.send_kill_and_abort(&mut bufs).await
+        });
+        tail_started.notified().await;
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert_eq!(shared.throw_error(), Err(std::io::ErrorKind::BrokenPipe));
+        assert!(shared.termination.terminal().is_cancelled());
+        assert!(!send.is_finished());
+        send.abort();
+        assert!(send.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn duplicate_echo_updates_rtt_once() {
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+        #[derive(Debug)]
+        struct DupEchoRead {
+            sent: Mutex<usize>,
+        }
+        #[async_trait]
+        impl UnreliableRead for DupEchoRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                let mut sent = self.sent.lock().unwrap();
+                if *sent >= 2 {
+                    return Err(std::io::ErrorKind::UnexpectedEof);
+                }
+                *sent += 1;
+                let mut pkt = [0u8; 1 + 4];
+                pkt[0] = 4;
+                pkt[1..5].copy_from_slice(&1000u32.to_be_bytes());
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+        }
+        #[derive(Debug)]
+        struct OkWrite;
+        #[async_trait]
+        impl UnreliableWrite for OkWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                Ok(buf.len())
+            }
+        }
+        let read = DupEchoRead {
+            sent: Mutex::new(0),
+        };
+        let write = OkWrite;
+        let ul = crate::udp::wrap_fec(read, write, false);
+        let mut tl = TransmissionLayer::new(ul, None);
+        let mut recv_bufs = RecvBufs::new();
+        let _ = tl.recv_pkts(&mut recv_bufs).await;
+        let rtt = tl
+            .reliable_layer
+            .lock()
+            .unwrap()
+            .pkt_send_space()
+            .smooth_rtt();
+        let _ = rtt;
+    }
 }
