@@ -395,8 +395,20 @@ fn timeout() -> io::Error {
 }
 
 #[cfg(test)]
+fn copy_datagram(datagram: &[u8], buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
+    if datagram.len() > buf.len() {
+        return Err(io::ErrorKind::InvalidInput);
+    }
+    buf[..datagram.len()].copy_from_slice(datagram);
+    Ok(datagram.len())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{socket::socket, udp::wrap_fec};
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
 
     #[test]
     fn packets_are_framed_and_rejected_by_both_rtp_wire_modes() {
@@ -501,5 +513,143 @@ mod tests {
             server.observe(&response.bytes, established_at),
             Observation::Complete
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_handshake_leg_recovers_from_one_lost_datagram() {
+        for dropped in [Kind::Hello, Kind::HelloAck, Kind::Confirm, Kind::ConfirmAck] {
+            complete_over_channels(Some(dropped), false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicated_handshake_datagrams_are_idempotent() {
+        complete_over_channels(None, true).await;
+    }
+
+    async fn complete_over_channels(dropped: Option<Kind>, duplicate: bool) {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let drop_client = dropped.filter(|kind| matches!(kind, Kind::Hello | Kind::Confirm));
+        let drop_server = dropped.filter(|kind| matches!(kind, Kind::HelloAck | Kind::ConfirmAck));
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            ChannelWrite::new(client_to_server_tx, drop_client, duplicate),
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            ChannelWrite::new(server_to_client_tx, drop_server, duplicate),
+            false,
+        );
+        if dropped == Some(Kind::ConfirmAck) {
+            let (_, server_socket) =
+                tokio::time::timeout(OPENING_TIMEOUT + Duration::from_secs(1), async {
+                    tokio::try_join!(
+                        async { client_opening_handshake(&mut client).await },
+                        async {
+                            server_opening_handshake(&mut server).await?;
+                            Ok::<_, io::Error>(socket(server, None))
+                        },
+                    )
+                })
+                .await
+                .expect("post-open confirmation recovery hung")
+                .expect("post-open confirmation recovery failed");
+            drop(server_socket);
+            return;
+        }
+
+        let next_protocol = b"first RTP datagram";
+        tokio::time::timeout(OPENING_TIMEOUT + Duration::from_secs(1), async {
+            tokio::try_join!(
+                async {
+                    client_opening_handshake(&mut client).await?;
+                    client
+                        .utp_write
+                        .send(next_protocol)
+                        .await
+                        .map_err(io::Error::from)?;
+                    Ok::<_, io::Error>(())
+                },
+                server_opening_handshake(&mut server),
+            )
+        })
+        .await
+        .expect("opening handshake hung")
+        .expect("opening handshake failed");
+
+        let mut received = [0; 64];
+        loop {
+            let len = server.utp_read.try_recv(&mut received).unwrap();
+            if Packet::decode(&received[..len]).is_none() {
+                assert_eq!(&received[..len], next_protocol);
+                break;
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChannelRead(mpsc::Receiver<Vec<u8>>);
+
+    #[derive(Debug)]
+    struct ChannelWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        drop_once: Option<Kind>,
+        duplicate: bool,
+    }
+
+    #[async_trait]
+    impl UnreliableRead for ChannelRead {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
+            match self.0.try_recv() {
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Err(io::ErrorKind::BrokenPipe)
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    Err(io::ErrorKind::WouldBlock)
+                }
+                Ok(datagram) => copy_datagram(&datagram, buf),
+            }
+        }
+
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
+            let datagram = self.0.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
+            copy_datagram(&datagram, buf)
+        }
+    }
+
+    impl ChannelWrite {
+        fn new(tx: mpsc::Sender<Vec<u8>>, drop_once: Option<Kind>, duplicate: bool) -> Self {
+            Self {
+                tx,
+                drop_once,
+                duplicate,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl UnreliableWrite for ChannelWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            let kind = Packet::decode(buf).map(|p| p.kind);
+            if let Some(drop) = self.drop_once {
+                if kind == Some(drop) {
+                    self.drop_once = None;
+                    return Ok(buf.len());
+                }
+            }
+            if self.duplicate && kind.is_some() {
+                self.tx
+                    .send(buf.to_vec())
+                    .await
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            }
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            Ok(buf.len())
+        }
     }
 }
