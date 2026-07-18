@@ -408,6 +408,7 @@ mod tests {
     use super::*;
     use crate::{socket::socket, udp::wrap_fec};
     use async_trait::async_trait;
+    use std::sync::{Arc, atomic::Ordering};
     use tokio::sync::mpsc;
 
     #[test]
@@ -710,6 +711,100 @@ mod tests {
         drop(server_socket);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nonce_bound_ready_retires_post_open_retransmissions() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let confirmation_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            ChannelWrite::new(client_to_server_tx, None, false),
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            CountingChannelWrite {
+                tx: server_to_client_tx,
+                confirmation_attempts: Arc::clone(&confirmation_attempts),
+            },
+            false,
+        );
+
+        let (client_socket, server_socket) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(
+                async {
+                    client_opening_handshake(&mut client).await?;
+                    Ok::<_, io::Error>(socket(client, None))
+                },
+                async {
+                    server_opening_handshake(&mut server).await?;
+                    Ok::<_, io::Error>(socket(server, None))
+                },
+            )
+        })
+        .await
+        .expect("opening handshake hung")
+        .expect("opening handshake failed");
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            confirmation_attempts.load(Ordering::SeqCst),
+            1,
+            "post-open confirmation timer survived nonce-bound readiness"
+        );
+        drop((client_socket, server_socket));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lost_ready_is_recovered_by_a_duplicate_confirmation() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let ready_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let confirmation_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = wrap_fec(
+            ChannelRead(server_to_client_rx),
+            DropFirstReadyWrite {
+                tx: client_to_server_tx,
+                ready_attempts: Arc::clone(&ready_attempts),
+                dropped: false,
+            },
+            false,
+        );
+        let mut server = wrap_fec(
+            ChannelRead(client_to_server_rx),
+            CountingChannelWrite {
+                tx: server_to_client_tx,
+                confirmation_attempts: Arc::clone(&confirmation_attempts),
+            },
+            false,
+        );
+
+        let (client_socket, server_socket) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(
+                async {
+                    client_opening_handshake(&mut client).await?;
+                    Ok::<_, io::Error>(socket(client, None))
+                },
+                async {
+                    server_opening_handshake(&mut server).await?;
+                    Ok::<_, io::Error>(socket(server, None))
+                },
+            )
+        })
+        .await
+        .expect("opening handshake hung")
+        .expect("opening handshake failed");
+
+        tokio::time::sleep(Duration::from_millis(3_200)).await;
+        assert_eq!(ready_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            confirmation_attempts.load(Ordering::SeqCst),
+            2,
+            "server recovery continued after receiving the retried readiness packet"
+        );
+        drop((client_socket, server_socket));
+    }
+
     #[derive(Debug)]
     struct ChannelRead(mpsc::Receiver<Vec<u8>>);
 
@@ -747,6 +842,48 @@ mod tests {
                 drop_once,
                 duplicate,
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingChannelWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        confirmation_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[derive(Debug)]
+    struct DropFirstReadyWrite {
+        tx: mpsc::Sender<Vec<u8>>,
+        ready_attempts: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: bool,
+    }
+    #[async_trait]
+    impl UnreliableWrite for DropFirstReadyWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            if Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Ready) {
+                self.ready_attempts.fetch_add(1, Ordering::SeqCst);
+                if !self.dropped {
+                    self.dropped = true;
+                    return Ok(buf.len());
+                }
+            }
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            Ok(buf.len())
+        }
+    }
+    #[async_trait]
+    impl UnreliableWrite for CountingChannelWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            if Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::ConfirmAck) {
+                self.confirmation_attempts.fetch_add(1, Ordering::SeqCst);
+            }
+            self.tx
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            Ok(buf.len())
         }
     }
 
