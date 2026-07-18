@@ -130,15 +130,13 @@ impl Listener {
                 config.fec_tuning,
                 FrameDelivery::enabled(),
                 raw_fd,
-                local_addr,
             )
             .await?;
             let Accepted {
                 read,
                 write,
-                peer_addr,
                 supervisor,
-                local_addr: _accepted_local_addr,
+                peer_addr,
             } = accepted;
             make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr)
         }))
@@ -235,7 +233,6 @@ impl Listener {
             tuning,
             frame_delivery,
             self.raw_fd,
-            self.local_addr,
         )
         .await
     }
@@ -267,7 +264,6 @@ impl Listener {
             tuning,
             frame_delivery,
             self.raw_fd,
-            self.local_addr,
         )))
     }
 }
@@ -276,7 +272,6 @@ pub struct Accepted {
     pub read: ReadSocket,
     pub write: WriteSocket,
     pub supervisor: SessionSupervisor,
-    pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
 }
 
@@ -325,7 +320,6 @@ async fn accept(
     tuning: FecTuning,
     frame_delivery: FrameDelivery,
     raw_fd: MaybeRawFd,
-    local_addr: SocketAddr,
 ) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
@@ -350,7 +344,6 @@ async fn accept(
         read,
         write,
         supervisor,
-        local_addr,
         peer_addr,
     })
 }
@@ -649,7 +642,7 @@ impl FrameDeliveryIo {
 
 pub(crate) fn wrap_fec(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite + Send + Sync + 'static,
+    write: impl UnreliableWrite,
     fec: bool,
 ) -> UnreliableLayer {
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
@@ -662,10 +655,10 @@ pub(crate) fn wrap_fec(
     )
 }
 
-#[allow(dead_code)] // used in tests; kept as a pub(crate) convenience wrapper
+#[allow(dead_code)]
 pub(crate) fn wrap_fec_with_mss(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite + Send + Sync + 'static,
+    write: impl UnreliableWrite,
     fec: bool,
     mss: usize,
 ) -> UnreliableLayer {
@@ -679,10 +672,10 @@ pub(crate) fn wrap_fec_with_mss(
     )
 }
 
-#[allow(dead_code)] // used in tests
+#[allow(dead_code)]
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite + Send + Sync + 'static,
+    write: impl UnreliableWrite,
     fec: bool,
     mss: usize,
     tuning: FecTuning,
@@ -699,7 +692,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
 
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     read: impl UnreliableRead,
-    write: impl UnreliableWrite + Send + Sync + 'static,
+    write: impl UnreliableWrite,
     fec: bool,
     mss: usize,
     tuning: FecTuning,
@@ -1076,19 +1069,19 @@ pub mod testing {
     /// (the data is "written" then silently discarded), simulating a packet
     /// lost in flight after the sender's kernel has accepted it.
     #[derive(Debug)]
-    pub struct LossyWrite<W: UnreliableWrite + Send + Sync + 'static> {
+    pub struct LossyWrite<W: UnreliableWrite> {
         inner: W,
         rate: LossRate,
     }
 
-    impl<W: UnreliableWrite + Send + Sync + 'static> LossyWrite<W> {
+    impl<W: UnreliableWrite> LossyWrite<W> {
         pub fn new(write: W, rate: LossRate) -> Self {
             Self { inner: write, rate }
         }
     }
 
     #[async_trait]
-    impl<W: UnreliableWrite + Send + Sync + 'static> UnreliableWrite for LossyWrite<W> {
+    impl<W: UnreliableWrite> UnreliableWrite for LossyWrite<W> {
         async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
             if self.rate.roll() {
                 return Ok(buf.len());
@@ -1103,7 +1096,7 @@ pub mod testing {
     pub fn wrap_fec_lossy<R, W>(read: R, write: W, fec: bool, rate: LossRate) -> UnreliableLayer
     where
         R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite + Send + Sync + 'static,
+        W: UnreliableWrite,
     {
         wrap_fec_lossy_with_mss(read, write, fec, NO_FEC_MSS, rate)
     }
@@ -1117,7 +1110,7 @@ pub mod testing {
     ) -> UnreliableLayer
     where
         R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite + Send + Sync + 'static,
+        W: UnreliableWrite,
     {
         wrap_fec_lossy_with_mss_and_fec_tuning(read, write, fec, mss, fec_tuning_from_env(), rate)
     }
@@ -1138,7 +1131,7 @@ pub mod testing {
     ) -> UnreliableLayer
     where
         R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite + Send + Sync + 'static,
+        W: UnreliableWrite,
     {
         let (mss, fec_state, tuning) =
             checked_mss_and_fec(fec, mss, tuning, FrameDelivery::default());
