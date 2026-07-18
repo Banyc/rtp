@@ -3,7 +3,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
 };
 
 use async_async_io::{
@@ -458,74 +457,11 @@ pub struct WriteSocket {
 
 impl WriteSocket {
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        self.transmission_layer.termination.throw_error()?;
-        {
-            let rl = self.transmission_layer.reliable_layer.lock().unwrap();
-            rl.ensure_write_open()?;
-        }
-        if self
-            .transmission_layer
-            .reliable_layer()
-            .lock()
-            .unwrap()
-            .frame_delivery_enabled()
-        {
-            self.send_frame(data).await
-        } else {
-            self.send_stock(data).await
-        }
-    }
-
-    async fn send_stock(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        let mut sent_data_pkt = self.transmission_layer.coord.sent_data_pkt.notified();
-        let written_bytes = loop {
-            self.transmission_layer.termination.throw_error()?;
-            let now = Instant::now();
-            let written_bytes = {
-                let mut reliable_layer = self.transmission_layer.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_buf(data, now)?
-            };
-            self.transmission_layer.log("send_data_buf");
-            if 0 < written_bytes {
-                self.transmission_layer.resume_send().notify_one();
-                break written_bytes;
-            }
-            tokio::select! {
-                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
-                () = self.transmission_layer.termination.terminal().cancelled() => (),
-            }
-            sent_data_pkt = self.transmission_layer.coord.sent_data_pkt.notified();
-        };
-        Ok(written_bytes)
+        self.transmission_layer.send(data).await
     }
 
     pub async fn send_frame(&mut self, frame: &[u8]) -> Result<usize, std::io::ErrorKind> {
-        let frame_len = frame.len();
-        let mut sent_data_pkt = self.transmission_layer.coord.sent_data_pkt.notified();
-        loop {
-            self.transmission_layer.termination.throw_error()?;
-            let now = Instant::now();
-            let res = {
-                let mut reliable_layer = self.transmission_layer.reliable_layer.lock().unwrap();
-                reliable_layer.send_frame_buf(frame, now)
-            };
-            match res {
-                Ok(()) => {
-                    self.transmission_layer.log("send_frame_buf");
-                    self.transmission_layer.resume_send().notify_one();
-                    return Ok(frame_len);
-                }
-                Err(std::io::ErrorKind::WouldBlock) => {
-                    tokio::select! {
-                        _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
-                        () = self.transmission_layer.termination.terminal().cancelled() => (),
-                    }
-                    sent_data_pkt = self.transmission_layer.coord.sent_data_pkt.notified();
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        self.transmission_layer.send_frame(frame).await
     }
 
     pub fn is_send_buf_empty(&self) -> bool {
@@ -638,6 +574,81 @@ mod tests {
     use crate::udp::wrap_fec;
 
     use super::*;
+    use core::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_stock_io_is_an_immediate_noop() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
+        let (_b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), a_write.send(&[]))
+                .await
+                .expect("empty stock write waited")
+                .unwrap(),
+            0
+        );
+        let mut empty = [];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), a_read.recv(&mut empty))
+                .await
+                .expect("empty stock read waited")
+                .unwrap(),
+            0
+        );
+        assert_eq!(b_write.send(b"payload").await.unwrap(), 7);
+        let mut buf = [0; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), a_read.recv(&mut buf))
+            .await
+            .expect("payload receive timed out")
+            .expect("empty read disturbed the RTP receive path");
+        assert_eq!(&buf[..n], b"payload");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_generic_frame_io_is_a_noop_but_empty_frame_is_invalid() {
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let frame_delivery = crate::delivery::frame::FrameDelivery::enabled();
+        let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            a.clone(),
+            a,
+            false,
+            crate::udp::NO_FEC_MSS,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            frame_delivery,
+        );
+        let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            b.clone(),
+            b,
+            false,
+            crate::udp::NO_FEC_MSS,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            frame_delivery,
+        );
+        let (mut a_read, mut a_write, _a_supervisor) = socket(a_layer, None);
+        let (_b_read, mut b_write, _b_supervisor) = socket(b_layer, None);
+        assert_eq!(a_write.send(&[]).await.unwrap(), 0);
+        assert_eq!(
+            a_write.send_frame(&[]).await,
+            Err(std::io::ErrorKind::InvalidInput)
+        );
+        let mut empty = [];
+        assert_eq!(a_read.recv(&mut empty).await.unwrap(), 0);
+        assert_eq!(b_write.send_frame(b"frame").await.unwrap(), 5);
+        let frame = tokio::time::timeout(Duration::from_secs(2), a_read.recv_frame())
+            .await
+            .expect("frame receive timed out")
+            .expect("empty generic read disturbed frame delivery")
+            .expect("empty generic read falsely exposed EOF");
+        assert_eq!(frame, b"frame");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_async_io() {
         let fec = true;

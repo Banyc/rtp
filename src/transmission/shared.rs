@@ -176,6 +176,73 @@ impl Shared {
             .press_broken_pipe(PeerReset::SendKill, None);
     }
 
+    pub async fn send(&self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        self.termination.throw_error()?;
+        if data.is_empty() {
+            self.reliable_layer.lock().unwrap().ensure_write_open()?;
+            return Ok(0);
+        }
+        let result = if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
+            self.send_frame(data).await
+        } else {
+            self.send_stock(data).await
+        };
+        self.termination.throw_error()?;
+        result
+    }
+
+    async fn send_stock(&self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
+        loop {
+            self.termination.throw_error()?;
+            let written_bytes = {
+                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+                reliable_layer.send_data_buf(data, Instant::now())
+            }?;
+            self.log("send_data_buf");
+            if 0 < written_bytes {
+                self.coord.resume_send.notify_one();
+                return Ok(written_bytes);
+            }
+            self.termination.throw_error()?;
+            tokio::select! {
+                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
+                () = self.termination.terminal().cancelled() => (),
+            }
+            self.termination.throw_error()?;
+            sent_data_pkt = self.coord.sent_data_pkt.notified();
+        }
+    }
+
+    pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        let frame_len = frame.len();
+        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
+        loop {
+            self.termination.throw_error()?;
+            let result = {
+                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+                reliable_layer.send_frame_buf(frame, Instant::now())
+            };
+            match result {
+                Ok(()) => {
+                    self.log("send_frame_buf");
+                    self.coord.resume_send.notify_one();
+                    return Ok(frame_len);
+                }
+                Err(std::io::ErrorKind::WouldBlock) => {
+                    self.termination.throw_error()?;
+                    tokio::select! {
+                        _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
+                        () = self.termination.terminal().cancelled() => (),
+                    }
+                    self.termination.throw_error()?;
+                    sent_data_pkt = self.coord.sent_data_pkt.notified();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(crate) fn set_error(&self, kind: std::io::ErrorKind) {
         self.termination.press_error(kind);
     }
@@ -389,29 +456,33 @@ impl Shared {
     }
 
     pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        if data.is_empty() {
+            return Ok(0);
+        }
         if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
             return Err(std::io::ErrorKind::InvalidInput);
         }
         let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
         let read_bytes = loop {
             self.termination.throw_error()?;
-
-            let (read_bytes, read_fin) = {
+            if self.coord.recv_eof.is_cancelled() {
+                return Ok(0);
+            }
+            let (read_bytes, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                (
-                    reliable_layer.recv_data_buf(data),
-                    reliable_layer.recv_eof_ready(),
-                )
+                let read_bytes = reliable_layer.recv_data_buf(data);
+                (read_bytes, reliable_layer.recv_eof_ready())
             };
+            self.publish_recv_eof(recv_eof);
             self.log("recv_data_buf");
             if PRINT_DEBUG_MSGS {
-                println!("recv: data: {read_bytes}");
+                println!("recv:data:{read_bytes}");
             }
             if 0 < read_bytes {
                 break read_bytes;
             }
-            if read_fin {
-                return Ok(0);
+            if recv_eof {
+                continue;
             }
             tokio::select! {
                 () = recv_data_pkt => (),
@@ -426,29 +497,24 @@ impl Shared {
         let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
-
-            let res = {
+            let (res, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.recv_frame_buf()
+                let res = reliable_layer.recv_frame_buf();
+                (res, reliable_layer.recv_eof_ready())
             };
+            self.publish_recv_eof(recv_eof);
             match res {
                 Ok(Some(frame)) => {
                     self.log("recv_frame_buf");
                     return Ok(Some(frame));
                 }
-                Ok(None) => {
-                    if let Some(fec) = self.fec.as_ref() {
-                        fec.lock().unwrap().debug_print_stats();
-                    }
-                    return Ok(None);
-                }
+                Ok(None) => return Ok(None),
                 Err(std::io::ErrorKind::WouldBlock) => {
                     tokio::select! {
                         () = recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
                     recv_data_pkt = self.coord.recv_data_pkt.notified();
-                    continue;
                 }
                 Err(e) => return Err(e),
             }
@@ -486,5 +552,80 @@ impl Shared {
             .unwrap()
             .serialize(&log)
             .expect("write CSV log");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::num::NonZeroUsize;
+    use std::time::Instant;
+
+    use async_trait::async_trait;
+
+    use crate::delivery::frame::FrameDelivery;
+    use crate::delivery::frame::send::MAX_FRAME_LEN;
+    use crate::transmission::fec_tuning::FecTuning;
+    use crate::transmission::transmission_layer::{
+        UnreliableLayer, UnreliableRead, UnreliableWrite,
+    };
+
+    use super::build_parts;
+
+    #[derive(Debug)]
+    struct PendingRead;
+
+    #[derive(Debug)]
+    struct PendingWrite;
+
+    #[async_trait]
+    impl UnreliableRead for PendingRead {
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl UnreliableWrite for PendingWrite {
+        async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_pipe_outranks_full_frame_queue() {
+        let layer = UnreliableLayer {
+            utp_read: Box::new(PendingRead),
+            utp_write: Box::new(PendingWrite),
+            post_open_handshake: None,
+            mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
+            fec: None,
+            fec_tuning: FecTuning::default(),
+            frame_delivery: FrameDelivery::enabled(),
+        };
+        let (shared, _write_half, _read_half, _reaper) = build_parts(layer, None);
+        let full_frame = vec![0; MAX_FRAME_LEN];
+        shared
+            .reliable_layer
+            .lock()
+            .unwrap()
+            .send_frame_buf(&full_frame, Instant::now())
+            .unwrap();
+        let one_byte_frame = [1];
+        let mut blocked_send = Box::pin(shared.send_frame(&one_byte_frame));
+        tokio::select! {
+            result = &mut blocked_send => panic!("full frame queue unexpectedly accepted data: {result:?}"),
+            () = tokio::task::yield_now() => (),
+        }
+        shared
+            .termination
+            .press_error(std::io::ErrorKind::BrokenPipe);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), blocked_send)
+            .await
+            .expect("BrokenPipe must wake a sender waiting for frame-queue capacity");
+        assert_eq!(result, Err(std::io::ErrorKind::BrokenPipe));
     }
 }
