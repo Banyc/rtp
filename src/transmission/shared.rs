@@ -17,9 +17,10 @@ use super::transmission_layer::{
 use super::ts_echo::RecentEchoes;
 use super::watchdog_tuning::WatchdogTuning;
 use super::write_half::WriteHalf;
-use crate::handshake::{ClaimedResponse, Observation, PostOpenHandshake};
 
-use crate::reliable::reliable_layer::{ReliableLayer, SharedTokenBucket};
+use crate::handshake::{ClaimedResponse, Observation, PostOpenHandshake};
+use crate::pacer::{SendPacer, SendWake};
+use crate::reliable::reliable_layer::ReliableLayer;
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceivedBatch {
@@ -55,7 +56,7 @@ pub struct Shared {
     post_open_handshake: Option<Mutex<PostOpenHandshake>>,
     post_open_handshake_active: AtomicBool,
     pub(crate) fec: Option<Mutex<FecState>>,
-    pub(crate) send_rate_limiter: Arc<Mutex<SharedTokenBucket>>,
+    pub(crate) send_rate_limiter: Arc<Mutex<SendPacer>>,
     pub(crate) termination: TerminationPresser,
     pub(crate) coord: Coordination,
     pub(crate) rtx_dup: std::sync::atomic::AtomicBool,
@@ -316,18 +317,13 @@ impl Shared {
         }
     }
 
-    pub fn next_poll_send_time(&self) -> Option<Instant> {
-        let now = Instant::now();
-        let mut deadline = {
+    pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
+        let (mut protocol_deadline, pacing_deadline) = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
-            let mut deadline = reliable_layer.pkt_send_space().next_poll_time();
-            if !reliable_layer.is_send_buf_empty()
-                && reliable_layer.pkt_send_space().accepts_new_pkt()
-            {
-                let token = self.send_rate_limiter.lock().unwrap().next_token_time();
-                deadline = Some(deadline.map_or(token, |current| current.min(token)));
-            }
-            deadline
+            (
+                reliable_layer.pkt_send_space().next_poll_time(),
+                reliable_layer.next_pacing_deadline(now),
+            )
         };
         let ack_deadline = {
             let ack = self.ack_flush.lock().unwrap();
@@ -341,7 +337,8 @@ impl Shared {
             }
         };
         if let Some(ack_deadline) = ack_deadline {
-            deadline = Some(deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
+            protocol_deadline =
+                Some(protocol_deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
         }
         if self.post_open_handshake_active.load(Ordering::Acquire)
             && let Some(handshake) = &self.post_open_handshake
@@ -351,12 +348,12 @@ impl Shared {
                 self.post_open_handshake_active
                     .store(false, Ordering::Release);
             } else if let Some(handshake_deadline) = handshake.next_send_time(now) {
-                deadline = Some(deadline.map_or(handshake_deadline, |current| {
+                protocol_deadline = Some(protocol_deadline.map_or(handshake_deadline, |current| {
                     current.min(handshake_deadline)
                 }));
             }
         }
-        deadline
+        SendWake::after_send_pass(now, pacing_deadline, protocol_deadline)
     }
 
     pub(crate) fn wire_ts(&self, now: Instant) -> u32 {
@@ -554,6 +551,7 @@ mod tests {
 
     use crate::delivery::frame::FrameDelivery;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
+    use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::transmission_layer::{
         UnreliableLayer, UnreliableRead, UnreliableWrite,
@@ -566,6 +564,18 @@ mod tests {
 
     #[derive(Debug)]
     struct PendingWrite;
+
+    fn pending_layer(frame_delivery: FrameDelivery) -> UnreliableLayer {
+        UnreliableLayer {
+            utp_read: Box::new(PendingRead),
+            utp_write: Box::new(PendingWrite),
+            post_open_handshake: None,
+            mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
+            fec: None,
+            fec_tuning: FecTuning::default(),
+            frame_delivery,
+        }
+    }
 
     #[async_trait]
     impl UnreliableRead for PendingRead {
@@ -587,15 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn broken_pipe_outranks_full_frame_queue() {
-        let layer = UnreliableLayer {
-            utp_read: Box::new(PendingRead),
-            utp_write: Box::new(PendingWrite),
-            post_open_handshake: None,
-            mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
-            fec: None,
-            fec_tuning: FecTuning::default(),
-            frame_delivery: FrameDelivery::enabled(),
-        };
+        let layer = pending_layer(FrameDelivery::enabled());
         let (shared, _write_half, _read_half, _reaper) = build_parts(layer, None);
         let full_frame = vec![0; MAX_FRAME_LEN];
         shared
@@ -617,5 +619,56 @@ mod tests {
             .await
             .expect("BrokenPipe must wake a sender waiting for frame-queue capacity");
         assert_eq!(result, Err(std::io::ErrorKind::BrokenPipe));
+    }
+
+    #[test]
+    fn idle_sender_waits_for_an_event_without_a_timer() {
+        let now = Instant::now();
+        let (shared, _write_half, _read_half, _reaper) =
+            build_parts(pending_layer(FrameDelivery::default()), None);
+        assert_eq!(shared.next_send_wake(now), SendWake::Event);
+    }
+
+    #[test]
+    fn pacing_block_uses_a_one_shot_batch_deadline() {
+        let now = Instant::now();
+        let (shared, _write_half, _read_half, _reaper) =
+            build_parts(pending_layer(FrameDelivery::default()), None);
+        let payload = vec![0; crate::udp::NO_FEC_MSS * 2];
+        assert!(
+            shared
+                .reliable_layer
+                .lock()
+                .unwrap()
+                .send_data_buf(&payload, now)
+                .unwrap()
+                > 0
+        );
+        shared
+            .send_rate_limiter
+            .lock()
+            .unwrap()
+            .take_at_most_tokens(usize::MAX, now);
+        let SendWake::Pacing(deadline) = shared.next_send_wake(now) else {
+            panic!("staged, sendable data must wait on pacing");
+        };
+        assert!(deadline > now);
+    }
+
+    #[test]
+    fn congestion_window_block_waits_for_ack_or_protocol_deadline() {
+        let now = Instant::now();
+        let (shared, _write_half, _read_half, _reaper) =
+            build_parts(pending_layer(FrameDelivery::default()), None);
+        let mut reliable = shared.reliable_layer.lock().unwrap();
+        reliable.set_cwnd_for_test(NonZeroUsize::new(1).unwrap());
+        let payload = vec![0; crate::udp::NO_FEC_MSS * 2];
+        assert!(reliable.send_data_buf(&payload, now).unwrap() > 0);
+        let mut packet = vec![0; crate::udp::NO_FEC_MSS];
+        assert!(reliable.send_data_pkt(&mut packet, now).is_some());
+        assert!(!reliable.is_send_buf_empty());
+        assert!(!reliable.pkt_send_space().accepts_new_pkt());
+        drop(reliable);
+        assert!(matches!(shared.next_send_wake(now), SendWake::Protocol(_)));
     }
 }

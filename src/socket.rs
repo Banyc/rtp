@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin, task::Poll};
 
 use async_async_io::{
@@ -18,18 +17,6 @@ use crate::transmission::{
     watchdog_tuning::WatchdogTuning,
     write_half::WriteHalf,
 };
-
-const ACTIVE_SEND_POLL_INTERVAL: Duration = Duration::from_millis(1);
-fn active_send_poll_time(now: Instant, deadline: Instant, has_staged_data: bool) -> Instant {
-    let fallback = now + ACTIVE_SEND_POLL_INTERVAL;
-    if deadline <= now {
-        fallback
-    } else if has_staged_data {
-        deadline.min(fallback)
-    } else {
-        deadline
-    }
-}
 
 pub type ReadStream = PollRead<ReadSocket>;
 
@@ -287,18 +274,15 @@ fn build_socket(
             let mut send_bufs = SendBufs::new();
             let kill_requested = write_half.kill_requested().clone();
             loop {
+                let pass = match write_half.send_pass(&mut send_bufs).await {
+                    Ok(pass) => pass,
+                    Err(_) => return,
+                };
                 let resume_send = write_half.resume_send().notified();
-                let deadline = write_half.next_poll_send_time();
-                match deadline {
+                match pass.wake.deadline() {
                     Some(t) => {
-                        let has_staged_data = !write_half
-                            .reliable_layer()
-                            .lock()
-                            .unwrap()
-                            .is_send_buf_empty();
-                        let poll_time = active_send_poll_time(Instant::now(), t, has_staged_data);
                         tokio::select! {
-                            () = tokio::time::sleep_until(poll_time.into()) => (),
+                            () = tokio::time::sleep_until(t.into()) => (),
                             () = resume_send => (),
                             () = kill_requested.cancelled() => (),
                             () = stop_drivers.cancelled() => return,
@@ -311,9 +295,6 @@ fn build_socket(
                             () = stop_drivers.cancelled() => return,
                         }
                     }
-                }
-                if write_half.send_pkts(&mut send_bufs).await.is_err() {
-                    return;
                 }
             }
         }
@@ -635,25 +616,6 @@ mod tests {
     use super::*;
     use core::time::Duration;
     use std::sync::Mutex;
-
-    #[test]
-    fn active_send_poll_bounds_future_and_stale_deadlines() {
-        let now = Instant::now();
-        let near = now + Duration::from_micros(500);
-        assert_eq!(active_send_poll_time(now, near, true), near);
-        assert_eq!(
-            active_send_poll_time(now, now + Duration::from_secs(1), true),
-            now + ACTIVE_SEND_POLL_INTERVAL
-        );
-        assert_eq!(
-            active_send_poll_time(now, now + Duration::from_secs(1), false),
-            now + Duration::from_secs(1)
-        );
-        assert_eq!(
-            active_send_poll_time(now, now - Duration::from_secs(1), false),
-            now + ACTIVE_SEND_POLL_INTERVAL
-        );
-    }
 
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {

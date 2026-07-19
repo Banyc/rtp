@@ -8,6 +8,13 @@ use super::transmission_layer::{
     ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
 use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
+use crate::pacer::SendWake;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SendPass {
+    pub(crate) made_progress: bool,
+    pub(crate) wake: SendWake,
+}
 
 #[derive(Debug)]
 pub struct WriteHalf {
@@ -80,7 +87,23 @@ impl WriteHalf {
             .press_broken_pipe(PeerReset::SendKill, Some(context));
     }
 
+    #[cfg(test)]
     pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
+        self.send_pkts_inner(bufs).await
+    }
+
+    pub(crate) async fn send_pass(
+        &mut self,
+        bufs: &mut SendBufs,
+    ) -> Result<SendPass, std::io::ErrorKind> {
+        let made_progress = self.send_pkts_inner(bufs).await?;
+        Ok(SendPass {
+            made_progress,
+            wake: self.next_send_wake(Instant::now()),
+        })
+    }
+
+    async fn send_pkts_inner(&mut self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
         if self.try_send_requested_kill(bufs).await.is_some() {
             return Err(std::io::ErrorKind::BrokenPipe);
         }
@@ -253,7 +276,11 @@ impl WriteHalf {
         let parity_pkts = {
             let mut fec = fec.lock().unwrap();
             let mut tb = self.send_rate_limiter.lock().unwrap();
-            fec.maybe_flush_parities(&mut tb, now, self.instream_group_fec_enabled())
+            fec.maybe_flush_parities(
+                tb.token_bucket_mut(),
+                now,
+                self.instream_group_fec_enabled(),
+            )
         };
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {

@@ -5,9 +5,7 @@ use std::{
 };
 
 use dre::{ConnectionState, PacketState};
-pub(crate) use primitive::io::token_bucket::TokenBucket as SharedTokenBucket;
 use primitive::{
-    io::token_bucket::TokenBucket,
     ops::{
         clear::Clear,
         float::{PosR, UnitR},
@@ -25,6 +23,7 @@ use crate::{
         },
         stock::{recv::StockRecvStage, send::StockSendStage},
     },
+    pacer::SendPacer,
     recv_queue::pkt_recv_space::PktRecvSpace,
     sack::AckBallSequence,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
@@ -47,9 +46,6 @@ const _: () = assert!(MAX_FRAME_LEN == MAX_SEND_DATA_BUF_LEN);
 /// low send rate.  After a rate spike occupancy may sit above the cap until it
 /// drains; this is intentional and is why we gate acceptance, not eviction.
 const STAGE_WINDOW_SECS: f64 = 0.005;
-const MAX_BURST_PKTS: usize = 64;
-const MAX_BURST_PKTS_CEIL: usize = 512;
-const SEND_TIMER_INTERVAL_SECS: f64 = 0.001;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 pub(crate) const INIT_SEND_RATE: f64 = 128.;
@@ -108,12 +104,11 @@ pub struct ReliableLayer {
     send_fin_buf: SendFinBuf,
     recv_data_buf: StockRecvStage,
     recv_fin_buf: bool,
-    send_rate_limiter: Arc<Mutex<TokenBucket>>,
+    send_rate_limiter: Arc<Mutex<SendPacer>>,
     connection_stats: ConnectionState,
     pkt_send_space: PktSendSpace,
     pkt_recv_space: PktRecvSpace,
     send_rate: PosR<f64>,
-    bucket_burst: NonZeroUsize,
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
     rtt_floor: WindowedRttMin,
@@ -134,15 +129,9 @@ impl ReliableLayer {
         mss: NonZeroUsize,
         frame_delivery: FrameDelivery,
         now: Instant,
-    ) -> (Self, Arc<Mutex<TokenBucket>>) {
+    ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
-        let bucket_burst = burst_pkts(send_rate);
-        let send_rate_limiter = Arc::new(Mutex::new(token_bucket_with_tokens(
-            send_rate,
-            bucket_burst,
-            bucket_burst.get(),
-            now,
-        )));
+        let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
         let this = Self {
             mss,
             send_data_buf: StockSendStage::new(mss),
@@ -154,7 +143,6 @@ impl ReliableLayer {
             pkt_send_space: PktSendSpace::new(),
             pkt_recv_space: PktRecvSpace::new(frame_delivery),
             send_rate,
-            bucket_burst,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             rtt_floor: WindowedRttMin::new(now),
@@ -177,15 +165,9 @@ impl ReliableLayer {
         frame_delivery: FrameDelivery,
         now: Instant,
         tuning: WatchdogTuning,
-    ) -> (Self, Arc<Mutex<TokenBucket>>) {
+    ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
-        let bucket_burst = burst_pkts(send_rate);
-        let send_rate_limiter = Arc::new(Mutex::new(token_bucket_with_tokens(
-            send_rate,
-            bucket_burst,
-            bucket_burst.get(),
-            now,
-        )));
+        let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
         let this = Self {
             mss,
             send_data_buf: StockSendStage::new(mss),
@@ -197,7 +179,6 @@ impl ReliableLayer {
             pkt_send_space: PktSendSpace::new().with_watchdog_tuning(tuning),
             pkt_recv_space: PktRecvSpace::new(frame_delivery),
             send_rate,
-            bucket_burst,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             rtt_floor: WindowedRttMin::new(now),
@@ -237,6 +218,40 @@ impl ReliableLayer {
         } else {
             stock_empty
         }
+    }
+
+    pub(crate) fn next_pacing_deadline(&self, now: Instant) -> Option<Instant> {
+        let max_sendable_packets =
+            if self.pkt_send_space.in_outage_recovery() && self.pkt_send_space.has_rtx(now) {
+                self.pkt_send_space.num_txing_pkts().max(1)
+            } else {
+                let cwnd_headroom = self
+                    .pkt_send_space
+                    .cwnd()
+                    .get()
+                    .saturating_sub(self.pkt_send_space.num_txing_pkts());
+                self.pending_new_packets().min(cwnd_headroom)
+            };
+        if max_sendable_packets == 0 {
+            return None;
+        }
+        Some(
+            self.send_rate_limiter
+                .lock()
+                .unwrap()
+                .next_batch_time(now, max_sendable_packets),
+        )
+    }
+
+    fn pending_new_packets(&self) -> usize {
+        let pending_bytes = if self.frame_delivery.enabled {
+            self.frame_send_stage.pending_bytes()
+        } else {
+            self.send_data_buf.len()
+        };
+        let data_packets = pending_bytes.div_ceil(self.max_data_size_per_pkt());
+        let pending_fin = usize::from(matches!(self.send_fin_buf, SendFinBuf::Some));
+        data_packets.saturating_add(pending_fin)
     }
 
     pub fn can_send_tail_fec(&self, now: Instant) -> bool {
@@ -980,57 +995,9 @@ impl ReliableLayer {
         self.pkt_send_space.set_send_rate(send_rate);
         let send_rate = PosR::new(MIN_SEND_RATE).unwrap().max(send_rate);
         self.send_rate = send_rate;
-
         let mut limiter = self.send_rate_limiter.lock().unwrap();
-        limiter.set_thruput(send_rate, now);
-        let tokens = limiter.outdated_coined_tokens();
-        let bucket_burst = burst_pkts(send_rate);
-        *limiter =
-            token_bucket_with_tokens(send_rate, bucket_burst, tokens.min(bucket_burst.get()), now);
-        self.bucket_burst = bucket_burst;
+        limiter.set_rate(send_rate, now);
     }
-}
-
-/// Build a `TokenBucket` that starts with `tokens` already credited while
-/// keeping `last_update` anchored at `now` so the send-timer deadline is not
-/// stale.
-///
-/// The primitive `TokenBucket` constructor starts empty, so a fresh connection
-/// stalls waiting for the first tokens to accrue. We simulate a prefill by
-/// constructing the bucket at an earlier instant (backdated by the time it
-/// would take to earn the requested tokens) and then immediately calling
-/// `gen_tokens(now)` to credit that interval. This leaves `last_update = now`,
-/// satisfying the invariant that `next_token_time() >= now`.
-fn token_bucket_with_tokens(
-    thruput: PosR<f64>,
-    max_tokens: NonZeroUsize,
-    tokens: usize,
-    now: Instant,
-) -> TokenBucket {
-    let max_tokens = max_tokens.get();
-    let tokens = tokens.min(max_tokens);
-    let backdate = Duration::from_secs_f64((tokens as f64 + 0.5) / thruput.get());
-
-    let mut backdate = backdate;
-    let start = loop {
-        match now.checked_sub(backdate) {
-            Some(start) => break start,
-            None => {
-                backdate /= 2;
-                if backdate.is_zero() {
-                    break now;
-                }
-            }
-        }
-    };
-
-    let mut bucket = TokenBucket::new(
-        thruput,
-        NonZeroUsize::new(max_tokens).unwrap_or_else(|| NonZeroUsize::new(1).unwrap()),
-        start,
-    );
-    bucket.gen_tokens(now);
-    bucket
 }
 
 /// Send staging buffer size for a given MSS.
@@ -1038,17 +1005,6 @@ fn token_bucket_with_tokens(
 /// For the default MSS we keep the historical 8 KiB staging buffer. For larger
 /// MSS values we scale the buffer to whole packets so the send-data path never
 /// refills with a sub-MSS remainder that would sit in the buffer indefinitely.
-/// Token-bucket burst size for a given send rate.
-///
-/// The burst is scaled with the send rate so high-rate flows can emit a larger
-/// paced window, while low-rate flows keep the historical 64-packet floor. The
-/// value is clamped to [`MAX_BURST_PKTS_CEIL`] to avoid runaway kernel buffers.
-fn burst_pkts(send_rate: PosR<f64>) -> NonZeroUsize {
-    let burst = (send_rate.get() * 2. * SEND_TIMER_INTERVAL_SECS).floor() as usize;
-    let burst = burst.clamp(MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL);
-    NonZeroUsize::new(burst).unwrap()
-}
-
 impl ReliableLayer {
     fn control_rtt(&self) -> Duration {
         self.pkt_send_space
@@ -1239,14 +1195,11 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
-    use primitive::ops::float::PosR;
-
     use super::{
         DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS,
         GENTLE_ENTER_RTTVAR_FACTOR, GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS,
-        INIT_SEND_RATE, MAX_BURST_PKTS, MAX_BURST_PKTS_CEIL, MAX_SEND_DATA_BUF_LEN,
-        QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET,
-        RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin, burst_pkts, token_bucket_with_tokens,
+        INIT_SEND_RATE, MAX_SEND_DATA_BUF_LEN, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR,
+        QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
     };
     use crate::delivery::stock::send::send_data_buf_len;
     const SEND_DATA_BUF_LEN: usize = 8 * 1024;
@@ -1336,33 +1289,6 @@ mod tests {
             w.update(t1, Duration::from_millis(100)),
             Duration::from_millis(100)
         );
-    }
-
-    #[test]
-    fn token_bucket_with_tokens_prefills_without_stale_deadline() {
-        let now = std::time::Instant::now();
-        let thruput = PosR::new(128.0).unwrap();
-        let max_tokens = std::num::NonZeroUsize::new(MAX_BURST_PKTS).unwrap();
-
-        let mut bucket = token_bucket_with_tokens(thruput, max_tokens, 8, now);
-
-        // All prefilled tokens are immediately available.
-        assert_eq!(bucket.gen_tokens(now), 8);
-        // The deadline is anchored at `now`, not in the past.
-        assert!(bucket.next_token_time() >= now);
-    }
-
-    #[test]
-    fn token_bucket_with_tokens_clamps_prefill_to_capacity() {
-        let now = std::time::Instant::now();
-        let thruput = PosR::new(128.0).unwrap();
-        let max_tokens = std::num::NonZeroUsize::new(4).unwrap();
-
-        let mut bucket = token_bucket_with_tokens(thruput, max_tokens, 100, now);
-
-        // The requested prefill is clamped to the bucket capacity.
-        assert_eq!(bucket.gen_tokens(now), 4);
-        assert!(bucket.next_token_time() >= now);
     }
 
     #[test]
@@ -1545,20 +1471,6 @@ mod tests {
             size: NonZeroU64::new(hi).unwrap(),
         }];
         rl.recv_ack_pkt(AckBallSequence::new(&acks), now).is_some()
-    }
-
-    #[test]
-    fn burst_pkts_scales_with_send_rate() {
-        let low = PosR::new(INIT_SEND_RATE).unwrap();
-        assert_eq!(burst_pkts(low).get(), MAX_BURST_PKTS);
-
-        let mid = PosR::new(100_000.0).unwrap();
-        let mid_burst = burst_pkts(mid).get();
-        assert!(mid_burst > MAX_BURST_PKTS);
-        assert!(mid_burst < MAX_BURST_PKTS_CEIL);
-
-        let high = PosR::new(1_000_000.0).unwrap();
-        assert_eq!(burst_pkts(high).get(), MAX_BURST_PKTS_CEIL);
     }
 
     #[test]

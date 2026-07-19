@@ -3,6 +3,7 @@ pub mod delivery;
 pub mod handshake;
 pub mod keyed_udp;
 pub mod mpudp;
+mod pacer;
 pub mod recv_queue;
 pub mod reliable;
 mod sack;
