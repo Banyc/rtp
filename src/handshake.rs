@@ -454,15 +454,37 @@ mod tests {
         let established_at = Instant::now();
         let nonce = 0x0123_4567_89ab_cdef;
         let mut recovery = PostOpenHandshake::server(nonce, established_at);
-        assert_eq!(recovery.next_send_time(established_at), Some(established_at + Duration::from_secs(1)));
-        let confirm = Packet { kind: Kind::Confirm, nonce }.encode();
-        assert_eq!(recovery.observe(&confirm, established_at), Observation::ReplyQueued);
-        assert_eq!(recovery.next_send_time(established_at), Some(established_at));
+        assert_eq!(
+            recovery.next_send_time(established_at),
+            Some(established_at + Duration::from_secs(1))
+        );
+        let confirm = Packet {
+            kind: Kind::Confirm,
+            nonce,
+        }
+        .encode();
+        assert_eq!(
+            recovery.observe(&confirm, established_at),
+            Observation::ReplyQueued
+        );
+        assert_eq!(
+            recovery.next_send_time(established_at),
+            Some(established_at)
+        );
         let response = recovery.claim_response(established_at).unwrap();
-        assert_eq!(Packet::decode(&response.bytes), Some(Packet { kind: Kind::ConfirmAck, nonce }));
+        assert_eq!(
+            Packet::decode(&response.bytes),
+            Some(Packet {
+                kind: Kind::ConfirmAck,
+                nonce
+            })
+        );
         let late = established_at + Duration::from_secs(20);
         assert!(recovery.claim_response(late).is_some());
-        assert_eq!(recovery.next_send_time(late), Some(established_at + Duration::from_secs(31)));
+        assert_eq!(
+            recovery.next_send_time(late),
+            Some(established_at + Duration::from_secs(31))
+        );
         let final_retry = established_at + Duration::from_secs(31);
         assert!(recovery.claim_response(final_retry).is_some());
         let expired = established_at + POST_OPEN_LIFETIME;
