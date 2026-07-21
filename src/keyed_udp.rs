@@ -340,6 +340,10 @@ impl KeyedConnWrite {
     pub async fn send(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.drain(self.data_offset..);
         self.buf.extend(data);
+        self.send_buf().await
+    }
+
+    async fn send_buf(&mut self) -> std::io::Result<usize> {
         match self.write.try_send(&self.buf) {
             Ok(n) => Ok(n),
             Err(e) if should_wait_after_try_send(&e) => {
@@ -362,6 +366,21 @@ impl KeyedConnWrite {
 impl UnreliableWrite for KeyedConnWrite {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         Self::send(self, buf)
+            .await
+            .map_err(|e| crate::udp::normalize_send_err(e).kind())
+    }
+
+    async fn send_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize, std::io::ErrorKind> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        let total_payload: usize = bufs.iter().map(|b| b.len()).sum();
+        self.buf.drain(self.data_offset..);
+        self.buf.reserve(total_payload);
+        for b in bufs {
+            self.buf.extend_from_slice(b);
+        }
+        self.send_buf()
             .await
             .map_err(|e| crate::udp::normalize_send_err(e).kind())
     }

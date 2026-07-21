@@ -1,3 +1,4 @@
+use std::io::IoSlice;
 use std::sync::Arc;
 use std::{future::Future, pin::Pin, task::Poll};
 
@@ -72,6 +73,20 @@ impl tokio::io::AsyncWrite for WriteStream {
         std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let max_stage = self.max_stage;
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+            .map(|r| r.map(|n| n.min(max_stage)))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -135,6 +150,18 @@ impl tokio::io::AsyncWrite for IoStream {
         std::pin::Pin::new(&mut self.write).poll_write(cx, buf)
     }
 
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.write).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.write.is_write_vectored()
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -180,6 +207,16 @@ impl tokio::io::AsyncWrite for FrameWriter {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,

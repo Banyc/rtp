@@ -1,5 +1,5 @@
 use core::{num::NonZeroUsize, time::Duration};
-use std::{path::PathBuf, sync::Mutex, time::Instant};
+use std::{io::IoSlice, path::PathBuf, sync::Mutex, time::Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -200,6 +200,27 @@ pub trait UnreliableWrite: core::fmt::Debug + Send + 'static {
     /// This future is not required to be cancellation-safe. A caller that
     /// cancels it must drop this writer instead of using it for another send.
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind>;
+
+    /// Send one datagram from a set of buffers (vectored / scatter-gather I/O).
+    ///
+    /// The default concatenates all non-empty buffers and delegates to
+    /// [`send`](Self::send). Implementations that can issue a true
+    /// vectored send (e.g. `sendmsg`) SHOULD override this to avoid the
+    /// intermediate copy.
+    async fn send_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize, std::io::ErrorKind> {
+        match bufs.len() {
+            0 => Ok(0),
+            1 => self.send(&bufs[0]).await,
+            _ => {
+                let total: usize = bufs.iter().map(|b| b.len()).sum();
+                let mut buf = Vec::with_capacity(total);
+                for b in bufs {
+                    buf.extend_from_slice(b);
+                }
+                self.send(&buf).await
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
