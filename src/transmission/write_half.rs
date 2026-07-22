@@ -147,23 +147,59 @@ impl WriteHalf {
                 frame_len: p.frame_len,
                 data: &bufs.data[..data_written],
             };
-            let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
-            let utp_pkt = &bufs.utp[..n];
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
             let instream = self.instream_group_fec_enabled();
-            let send_buf: &[u8] = {
-                match self.fec.as_ref() {
+            let has_fec = self.fec.is_some() || instream;
+
+            let (primary_res, send_buf): (_, &[u8]) = if !has_fec {
+                // Fast path: non-FEC, data-only packet — avoid copying the
+                // payload by encoding just the protocol header on the stack
+                // and issuing a single vectored send.
+                let ts = data.send_ts.unwrap_or(0);
+                let cmd: u8 = match data.frame_len {
+                    Some(_) => crate::delivery::frame::wire::FRAME_DATA_TS_CMD,
+                    None => 3, // DATA_TS_CMD
+                };
+                let mut hdr = [0u8; 19];
+                let hdr_len = if let Some(frame_len) = data.frame_len {
+                    hdr[0] = cmd;
+                    hdr[1..9].copy_from_slice(&data.seq.to_be_bytes());
+                    hdr[9..13].copy_from_slice(&ts.to_be_bytes());
+                    hdr[13..17].copy_from_slice(&frame_len.to_be_bytes());
+                    hdr[17..19].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
+                    19
+                } else {
+                    hdr[0] = cmd;
+                    hdr[1..9].copy_from_slice(&data.seq.to_be_bytes());
+                    hdr[9..13].copy_from_slice(&ts.to_be_bytes());
+                    hdr[13..15].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
+                    15
+                };
+                let payload = &bufs.data[..data_written];
+                let iov = [std::io::IoSlice::new(&hdr[..hdr_len]), std::io::IoSlice::new(payload)];
+                let res = self.utp_write.send_vectored(&iov).await;
+                // For the rtx_dup path the caller needs the raw wire bytes.
+                // Concatenate into bufs.utp on demand (rare).
+                let dup_buf = {
+                    let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
+                    &bufs.utp[..n]
+                };
+                (res, dup_buf)
+            } else {
+                let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
+                let utp_pkt = &bufs.utp[..n];
+                let send_buf: &[u8] = match self.fec.as_ref() {
                     Some(fec) => {
                         let mut fec = fec.lock().unwrap();
                         let fec_n = fec.encode_data(utp_pkt, &mut bufs.fec, instream);
                         &bufs.fec[..fec_n]
                     }
                     None => utp_pkt,
-                }
+                };
+                (self.utp_write.send(send_buf).await, send_buf)
             };
-            let primary_res = self.utp_write.send(send_buf).await;
             match primary_res {
                 Ok(_) => {
                     if self.fec.is_some() && instream {
