@@ -20,6 +20,7 @@ tap = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "rt"] }
 tokio-util = "0.7"
+tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.1" }
 udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.13" }
 
 [features]
@@ -29,6 +30,11 @@ default = []
 clap = { version = "4", features = ["derive"] }
 file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.0.6" }
 tokio = { version = "1", features = ["test-util"] }
+
+[patch."https://github.com/Banyc/udp_listener.git"]
+udp_listener = { path = "../udp_listener" }
+[patch."https://github.com/Banyc/tokio_udp.git"]
+tokio_udp = { path = "../tokio_udp" }
 
 [profile.profiling]
 inherits = "release"

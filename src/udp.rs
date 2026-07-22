@@ -851,6 +851,46 @@ impl UnreliableWrite for Arc<UdpSocket> {
     }
 }
 
+// ── tokio_udp integration ─────────────────────────────────────────────
+// Use fully-qualified inherent methods to avoid recursive trait calls.
+
+#[async_trait]
+impl UnreliableRead for std::sync::Arc<tokio_udp::UdpSocket> {
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        tokio_udp::UdpSocket::try_recv(self, buf).map_err(|e| normalize_send_err(e).kind())
+    }
+
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        tokio_udp::UdpSocket::recv(self, buf)
+            .await
+            .map_err(|e| normalize_send_err(e).kind())
+    }
+}
+
+#[async_trait]
+impl UnreliableWrite for std::sync::Arc<tokio_udp::UdpSocket> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        match tokio_udp::UdpSocket::try_send(self, buf) {
+            Ok(n) => Ok(n),
+            Err(e) if should_wait_after_try_send(&e) => {
+                tokio_udp::UdpSocket::send(self, buf)
+                    .await
+                    .map_err(|e| normalize_send_err(e).kind())
+            }
+            Err(e) => Err(normalize_send_err(e).kind()),
+        }
+    }
+
+    async fn send_vectored(
+        &mut self,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Result<usize, std::io::ErrorKind> {
+        tokio_udp::UdpSocket::send_vectored(self, bufs)
+            .await
+            .map_err(|e| normalize_send_err(e).kind())
+    }
+}
+
 /// Returns `true` if `code` is the raw OS errno for `ENOBUFS` on the current
 /// platform (macOS `55`, Linux `105`).
 fn is_enobufs_raw_os_error(code: i32) -> bool {
