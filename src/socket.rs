@@ -2,6 +2,8 @@ use std::io::IoSlice;
 use std::sync::Arc;
 use std::{future::Future, pin::Pin, task::Poll};
 
+const MAX_STAGE_SIZE: usize = 64 * 1024;
+
 use async_async_io::{
     read::{AsyncAsyncRead, PollRead},
     write::{AsyncAsyncWrite, PollWrite},
@@ -74,17 +76,34 @@ impl tokio::io::AsyncWrite for WriteStream {
     }
 
     fn poll_write_vectored(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        let max_stage = self.max_stage;
-        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-            .map(|r| r.map(|n| n.min(max_stage)))
+        // The reliable layer operates on individual data packets, not
+        // scatter-gather I/O.  Concatenate up to max_stage bytes from all
+        // slices into one poll_write call so the caller's multi-buffer
+        // layout doesn't cause multiple reliable-layer framing passes.
+        let max_stage = self.max_stage.min(MAX_STAGE_SIZE);
+        let mut total = 0usize;
+        let mut buf = [0u8; MAX_STAGE_SIZE];
+        for slice in bufs {
+            let take = (max_stage - total).min(slice.len());
+            if take == 0 {
+                break;
+            }
+            buf[total..total + take].copy_from_slice(&slice[..take]);
+            total += take;
+        }
+        if total == 0 {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        let me = unsafe { self.get_unchecked_mut() };
+        std::pin::Pin::new(&mut me.inner).poll_write(cx, &buf[..total])
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
+        false
     }
 
     fn poll_flush(
