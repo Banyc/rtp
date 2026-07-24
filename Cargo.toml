@@ -18,7 +18,7 @@ self_assign = { git = "https://github.com/Banyc/self_assign.git", tag = "v0.0.3"
 serde = { version = "1", features = ["derive"] }
 tap = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "rt"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt"] }
 tokio-util = "0.7"
 tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.1" }
 udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.13" }

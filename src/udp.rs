@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use async_trait::async_trait;
 use fec::proto::{data_mss, symbol_size};
 use tokio::net::UdpSocket;
+use tokio_udp::UdpSocket as VectoredUdpSocket;
 use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
@@ -46,19 +47,59 @@ impl MssConfig {
     }
 }
 
-type IdentityUdpListener = UtpListener<UdpSocket, SocketAddr, Packet>;
-type IdentityConn = Conn<UdpSocket, SocketAddr, Packet>;
+type IdentityUdpListener = UtpListener<VectoredUdpSocket, SocketAddr, Packet>;
+type IdentityConn = Conn<VectoredUdpSocket, SocketAddr, Packet>;
 type IdentityConnRead = ConnRead<Packet>;
+
+async fn resolve_socket_addrs(
+    addr: impl tokio::net::ToSocketAddrs,
+) -> std::io::Result<Vec<SocketAddr>> {
+    let addrs = tokio::net::lookup_host(addr).await?.collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "address resolved to no socket addresses",
+        ));
+    }
+    Ok(addrs)
+}
+
+async fn bind_udp(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<VectoredUdpSocket> {
+    let mut last_error = None;
+    for addr in resolve_socket_addrs(addr).await? {
+        match VectoredUdpSocket::bind(addr).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("resolve_socket_addrs returned at least one address"))
+}
+
+async fn connect_udp(
+    socket: &VectoredUdpSocket,
+    addr: impl tokio::net::ToSocketAddrs,
+) -> std::io::Result<()> {
+    let mut last_error = None;
+    for addr in resolve_socket_addrs(addr).await? {
+        match socket.connect(addr) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("resolve_socket_addrs returned at least one address"))
+}
 
 #[cfg(unix)]
 pub type MaybeRawFd = RawFd;
 #[cfg(not(unix))]
 pub type MaybeRawFd = ();
-pub fn maybe_raw_fd(udp: &UdpSocket) -> MaybeRawFd {
-    cfg_select! {
-        unix      => udp.as_raw_fd(),
-        not(unix) => ()
-    }
+#[cfg(unix)]
+pub fn maybe_raw_fd(udp: &impl AsRawFd) -> MaybeRawFd {
+    udp.as_raw_fd()
+}
+#[cfg(not(unix))]
+pub fn maybe_raw_fd<T>(_udp: &T) -> MaybeRawFd {
+    ()
 }
 
 pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
@@ -71,7 +112,7 @@ pub struct Listener {
 }
 impl Listener {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
-        let udp = UdpSocket::bind(addr).await?;
+        let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
         let listener = UtpListener::new_identity_dispatch(
@@ -542,8 +583,8 @@ async fn connect_configured(
         fec_tuning,
         frame_delivery,
     } = config;
-    let udp = UdpSocket::bind(bind).await?;
-    udp.connect(addr).await?;
+    let udp = bind_udp(bind).await?;
+    connect_udp(&udp, addr).await?;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
     let log_config = match log_config {
@@ -788,12 +829,12 @@ impl UnreliableRead for IdentityConnRead {
         Ok(min_len)
     }
 }
-/// `ConnWrite<UdpSocket>` wrapper that carries the socket's raw fd for
+/// `ConnWrite<VectoredUdpSocket>` wrapper that carries the socket's raw fd for
 /// interface-backpressure fallback on Unix.  On non-Unix, behaves
-/// identically to the stock `ConnWrite<UdpSocket>` path.
+/// identically to the stock `ConnWrite<VectoredUdpSocket>` path.
 #[derive(Debug)]
 pub(crate) struct RawFdConnWrite {
-    inner: ConnWrite<UdpSocket>,
+    inner: ConnWrite<VectoredUdpSocket>,
     raw_fd: MaybeRawFd,
     peer: Option<core::net::SocketAddr>,
 }
@@ -813,6 +854,16 @@ impl UnreliableWrite for RawFdConnWrite {
             }
             Err(e) => Err(normalize_send_err(e).kind()),
         }
+    }
+
+    async fn send_vectored(
+        &mut self,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Result<usize, std::io::ErrorKind> {
+        self.inner
+            .send_vectored(bufs)
+            .await
+            .map_err(|error| normalize_send_err(error).kind())
     }
 }
 
@@ -872,11 +923,9 @@ impl UnreliableWrite for std::sync::Arc<tokio_udp::UdpSocket> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
         match tokio_udp::UdpSocket::try_send(self, buf) {
             Ok(n) => Ok(n),
-            Err(e) if should_wait_after_try_send(&e) => {
-                tokio_udp::UdpSocket::send(self, buf)
-                    .await
-                    .map_err(|e| normalize_send_err(e).kind())
-            }
+            Err(e) if should_wait_after_try_send(&e) => tokio_udp::UdpSocket::send(self, buf)
+                .await
+                .map_err(|e| normalize_send_err(e).kind()),
             Err(e) => Err(normalize_send_err(e).kind()),
         }
     }
@@ -1240,6 +1289,15 @@ mod tests {
         let mut buf = [0; 1024];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(msg_1, &buf[..n]);
+    }
+
+    #[tokio::test]
+    async fn identity_listener_uses_tokio_udp_transport() {
+        fn require_tokio_udp(_listener: &UtpListener<VectoredUdpSocket, SocketAddr, Packet>) {}
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        require_tokio_udp(&listener.listener);
+        #[cfg(unix)]
+        assert!(tokio_udp::is_vectored_supported());
     }
 
     #[test]
