@@ -81,7 +81,7 @@ async fn connect_udp(
 ) -> std::io::Result<()> {
     let mut last_error = None;
     for addr in resolve_socket_addrs(addr).await? {
-        match socket.connect(addr) {
+        match socket.connect(addr).await {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
