@@ -265,6 +265,12 @@ impl FecState {
     /// draw for the whole message), so the deeper parity buys tail latency
     /// for negligible bytes on a large-MSS path.
     ///
+    /// Note: "interactive" here is defined purely by symbol count at the
+    /// FEC Layer. It is intentionally independent of any upper-layer
+    /// byte-size traffic classification - a message an upper mux classifies
+    /// as interactive (e.g. 2048 bytes) may still be a multi-symbol group
+    /// here at default MSS. The two notions are not supposed to align.
+    ///
     /// Reed-Solomon needs the complete parity set to reconstruct, so the full
     /// `parity_count` tokens are reserved atomically before encoding any
     /// (the stock path only; the single-symbol bypass skips the budget
