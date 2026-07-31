@@ -370,7 +370,10 @@ impl UnreliableWrite for KeyedConnWrite {
             .map_err(|e| crate::udp::normalize_send_err(e).kind())
     }
 
-    async fn send_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize, std::io::ErrorKind> {
+    async fn send_vectored(
+        &mut self,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Result<usize, std::io::ErrorKind> {
         if bufs.is_empty() {
             return Ok(0);
         }

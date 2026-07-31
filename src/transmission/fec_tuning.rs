@@ -25,8 +25,6 @@
 //! 8 KiB UDP datagram, and one lost fragment kills the whole symbol — which
 //! inverts the benefit.  Use the default MSS for WAN paths.
 
-
-
 /// Per-connection FEC tuning.
 ///
 /// - `instream_flush`: when `true`, the transmission layer force-flushes the
@@ -72,8 +70,6 @@ impl FecTuning {
     }
 }
 
-
-
 /// Read `RTP_MINDIV` once at process startup to feed the *default* FEC
 /// tuning for A/B comparison.  `1`/`true` selects `FecTuning::mindiv()`;
 /// anything else (including unset) selects `FecTuning::default()`.  This is
@@ -105,6 +101,4 @@ mod tests {
         assert!(t.instream_flush);
         assert_eq!(t.interactive_parity_depth, 3);
     }
-
-
 }

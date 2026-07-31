@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use fec::proto::{data_mss, symbol_size};
 use tokio::net::UdpSocket;
 use tokio_udp::UdpSocket as VectoredUdpSocket;
-use udp_listener::{Conn, ConnRead, ConnWrite, Packet, UtpListener};
 
 use crate::{
     delivery::frame::{FrameDelivery, frame_delivery_from_env},
@@ -115,9 +114,18 @@ impl Listener {
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
-        let listener = UtpListener::new_identity_dispatch(
+        let responder = crate::probe::ProbeResponder::new(probe_echo_socket(&udp));
+        let dispatch: Dispatch<SocketAddr, SocketAddr, Packet> =
+            Arc::new(move |addr: &SocketAddr, packet: Packet| {
+                if responder.observe(addr, packet.as_ref()) {
+                    return None;
+                }
+                Some((*addr, packet))
+            });
+        let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
+            dispatch,
         );
         Ok(Self {
             listener,
@@ -179,7 +187,7 @@ impl Listener {
                 supervisor,
                 peer_addr,
             } = accepted;
-            make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr)
+            make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr, None)
         }))
     }
 
@@ -323,6 +331,7 @@ pub struct FrameDeliveryIo {
     pub supervisor: SessionSupervisor,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
+    pub probe_tap: Option<crate::probe::ProbeTap>,
 }
 pub type FrameDeliveryAccept = tokio::task::JoinHandle<std::io::Result<FrameDeliveryIo>>;
 pub struct FrameDeliveryAcceptConfig {
@@ -395,6 +404,7 @@ fn make_frame_delivery_io(
     supervisor: SessionSupervisor,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
+    probe_tap: Option<crate::probe::ProbeTap>,
 ) -> std::io::Result<FrameDeliveryIo> {
     let (read, write) = into_frame_io_parts(read, write)?.into_parts();
     Ok(FrameDeliveryIo {
@@ -403,6 +413,7 @@ fn make_frame_delivery_io(
         supervisor,
         local_addr,
         peer_addr,
+        probe_tap,
     })
 }
 
@@ -575,48 +586,9 @@ async fn connect_configured(
     config: ConnectConfig<'_>,
     watchdog: Option<WatchdogTuning>,
 ) -> std::io::Result<Connected> {
-    let ConnectConfig {
-        log_config,
-        handshake,
-        fec,
-        mss,
-        fec_tuning,
-        frame_delivery,
-    } = config;
     let udp = bind_udp(bind).await?;
     connect_udp(&udp, addr).await?;
-    let local_addr = udp.local_addr()?;
-    let peer_addr = udp.peer_addr()?;
-    let log_config = match log_config {
-        Some(c) => Some(
-            c.transmission_layer_log_config(local_addr, peer_addr)
-                .await?,
-        ),
-        None => None,
-    };
-    let udp = Arc::new(udp);
-    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Arc::clone(&udp),
-        udp,
-        fec,
-        mss,
-        fec_tuning,
-        frame_delivery,
-    );
-    if handshake {
-        client_opening_handshake(&mut unreliable_layer).await?;
-    }
-    let (read, write, supervisor) = match watchdog {
-        Some(tuning) => socket_with_watchdog_tuning(unreliable_layer, log_config, tuning),
-        None => socket(unreliable_layer, log_config),
-    };
-    Ok(Connected {
-        read,
-        write,
-        supervisor,
-        local_addr,
-        peer_addr,
-    })
+    connect_bound(udp, config, watchdog).await
 }
 
 /// Connect to `addr` with a custom MSS, [`FecTuning`], [`FrameDelivery`],
@@ -641,6 +613,7 @@ pub struct Connected {
     pub supervisor: SessionSupervisor,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
+    pub probe_tap: Option<crate::probe::ProbeTap>,
 }
 
 impl FrameDeliveryIo {
@@ -676,8 +649,44 @@ impl FrameDeliveryIo {
             supervisor,
             local_addr,
             peer_addr,
+            probe_tap,
         } = connected;
-        make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr)
+        make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr, probe_tap)
+    }
+    pub async fn connect_with_socket(
+        socket: VectoredUdpSocket,
+        addr: SocketAddr,
+        config: FrameDeliveryConnectConfig<'_>,
+    ) -> std::io::Result<Self> {
+        let FrameDeliveryConnectConfig {
+            log_config,
+            handshake,
+            fec,
+            mss,
+            fec_tuning,
+        } = config;
+        let connected = connect_with_socket(
+            socket,
+            addr,
+            ConnectConfig {
+                log_config,
+                handshake,
+                fec,
+                mss: mss.resolve(),
+                fec_tuning,
+                frame_delivery: FrameDelivery::enabled(),
+            },
+        )
+        .await?;
+        let Connected {
+            read,
+            write,
+            supervisor,
+            local_addr,
+            peer_addr,
+            probe_tap,
+        } = connected;
+        make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr, probe_tap)
     }
 }
 
@@ -1542,4 +1551,232 @@ mod tests {
         assert_eq!(MssConfig::Default.resolve(), NO_FEC_MSS);
         assert_eq!(MssConfig::Custom(9_000).resolve(), 9_000);
     }
+
+    fn spawn_accept_loop(listener: Listener) -> SocketAddr {
+        let addr = listener.local_addr();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept_without_handshake(false).await.is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_echoes_probe_with_direction_flipped() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = spawn_accept_loop(listener);
+        let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        prober.connect(addr).await.unwrap();
+        let probe = crate::probe::encode_probe(0xDEAD_BEEF, 12345);
+        prober.send(&probe).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
+            .await
+            .expect("probe echo timed out")
+            .unwrap();
+        let (nonce, timestamp) = crate::probe::decode_echo(&buf[..n]).expect("not a probe echo");
+        assert_eq!((nonce, timestamp), (0xDEAD_BEEF, 12345));
+        assert_eq!(buf[..8], probe[..8]);
+        assert_eq!(buf[9..n], probe[9..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probes_never_create_connection_state() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+        let accept = tokio::spawn(async move {
+            listener
+                .accept_without_handshake(false)
+                .await
+                .unwrap()
+                .peer_addr
+        });
+        let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        prober
+            .send_to(&crate::probe::encode_probe(1, 2), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        prober.recv(&mut buf).await.unwrap();
+        assert!(!accept.is_finished(), "a probe created connection state");
+        let real = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        real.send_to(b"payload", addr).await.unwrap();
+        let accepted_peer = tokio::time::timeout(std::time::Duration::from_secs(2), accept)
+            .await
+            .expect("accept timed out")
+            .unwrap();
+        assert_eq!(accepted_peer, real.local_addr().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_floods_are_rate_limited_per_source() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = spawn_accept_loop(listener);
+        let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        prober.connect(addr).await.unwrap();
+        for nonce in 0..200u64 {
+            let _ = prober.send(&crate::probe::encode_probe(nonce, 0)).await;
+        }
+        let mut echoes = 0usize;
+        let mut buf = [0u8; 64];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), prober.recv(&mut buf)).await
+        {
+            if crate::probe::decode_echo(&buf[..n]).is_some() {
+                echoes += 1;
+            }
+        }
+        assert!(echoes >= 1, "no probe was answered at all");
+        assert!(
+            echoes <= 48,
+            "flood was not rate limited: {echoes} echoes for 200 probes"
+        );
+    }
+
+    fn spawn_greeting_server(listener: Listener, reply: &'static [u8]) -> SocketAddr {
+        let addr = listener.local_addr();
+        let listener = Arc::new(listener);
+        tokio::spawn(async move {
+            let mut accepted = listener.accept_without_handshake(false).await.unwrap();
+            tokio::spawn({
+                let listener = Arc::clone(&listener);
+                async move {
+                    loop {
+                        if listener.accept_without_handshake(false).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            let mut buf = [0u8; 64];
+            let _ = accepted.read.recv(&mut buf).await;
+            accepted.write.send(reply).await.unwrap();
+            let _ = accepted.read.recv(&mut buf).await;
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_tap_probes_the_sessions_own_tuple() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = spawn_greeting_server(listener, b"data");
+        let mut connected = connect_without_handshake("127.0.0.1:0", addr, None, false)
+            .await
+            .unwrap();
+        let mut tap = connected
+            .probe_tap
+            .take()
+            .expect("client connects carry a tap");
+        connected.write.send(b"hi").await.unwrap();
+        let mut buf = [0; 16];
+        let n = connected.read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"data");
+        tap.send_probe(99, 7).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(nonce) = tap.try_recv_echo() {
+                assert_eq!(nonce, 99);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe echo never reached the tap"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_with_socket_preserves_the_bound_local_addr() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = spawn_greeting_server(listener, b"hello");
+        let socket = VectoredUdpSocket::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let bound = socket.local_addr().unwrap();
+        let mut connected = connect_with_socket(
+            socket,
+            addr,
+            ConnectConfig {
+                log_config: None,
+                handshake: false,
+                fec: false,
+                mss: NO_FEC_MSS,
+                fec_tuning: FecTuning::default(),
+                frame_delivery: frame_delivery_from_env(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(connected.local_addr, bound);
+        connected.write.send(b"hi").await.unwrap();
+        let mut buf = [0; 16];
+        let n = connected.read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+}
+use udp_listener::{Conn, ConnRead, ConnWrite, Dispatch, Packet, UtpListener};
+fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
+    let echo = udp.try_clone_std().ok()?;
+    echo.set_nonblocking(true).ok()?;
+    Some(echo)
+}
+async fn connect_bound(
+    udp: VectoredUdpSocket,
+    config: ConnectConfig<'_>,
+    watchdog: Option<WatchdogTuning>,
+) -> std::io::Result<Connected> {
+    let ConnectConfig {
+        log_config,
+        handshake,
+        fec,
+        mss,
+        fec_tuning,
+        frame_delivery,
+    } = config;
+    let local_addr = udp.local_addr()?;
+    let peer_addr = udp.peer_addr()?;
+    let log_config = match log_config {
+        Some(c) => Some(
+            c.transmission_layer_log_config(local_addr, peer_addr)
+                .await?,
+        ),
+        None => None,
+    };
+    let udp = Arc::new(udp);
+    let (probe_tap, filtered_read) = crate::probe::client_probe_tap(Arc::clone(&udp));
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        filtered_read,
+        udp,
+        fec,
+        mss,
+        fec_tuning,
+        frame_delivery,
+    );
+    if handshake {
+        client_opening_handshake(&mut unreliable_layer).await?;
+    }
+    let (read, write, supervisor) = match watchdog {
+        Some(tuning) => socket_with_watchdog_tuning(unreliable_layer, log_config, tuning),
+        None => socket(unreliable_layer, log_config),
+    };
+    Ok(Connected {
+        read,
+        write,
+        supervisor,
+        local_addr,
+        peer_addr,
+        probe_tap: Some(probe_tap),
+    })
+}
+pub async fn connect_with_socket(
+    socket: VectoredUdpSocket,
+    addr: SocketAddr,
+    config: ConnectConfig<'_>,
+) -> std::io::Result<Connected> {
+    socket.connect(addr).await?;
+    connect_bound(socket, config, None).await
 }

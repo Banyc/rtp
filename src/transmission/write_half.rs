@@ -178,7 +178,10 @@ impl WriteHalf {
                     15
                 };
                 let payload = &bufs.data[..data_written];
-                let iov = [std::io::IoSlice::new(&hdr[..hdr_len]), std::io::IoSlice::new(payload)];
+                let iov = [
+                    std::io::IoSlice::new(&hdr[..hdr_len]),
+                    std::io::IoSlice::new(payload),
+                ];
                 let res = self.utp_write.send_vectored(&iov).await;
                 // For the rtx_dup path the caller needs the raw wire bytes.
                 // Concatenate into bufs.utp on demand (rare).
