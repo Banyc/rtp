@@ -74,13 +74,24 @@ async fn bind_udp(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Vecto
     Err(last_error.expect("resolve_socket_addrs returned at least one address"))
 }
 
+fn dialable_addr(addr: SocketAddr) -> SocketAddr {
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    let loopback = match addr.ip() {
+        core::net::IpAddr::V4(_) => core::net::IpAddr::V4(core::net::Ipv4Addr::LOCALHOST),
+        core::net::IpAddr::V6(_) => core::net::IpAddr::V6(core::net::Ipv6Addr::LOCALHOST),
+    };
+    SocketAddr::new(loopback, addr.port())
+}
+
 async fn connect_udp(
     socket: &VectoredUdpSocket,
     addr: impl tokio::net::ToSocketAddrs,
 ) -> std::io::Result<()> {
     let mut last_error = None;
     for addr in resolve_socket_addrs(addr).await? {
-        match socket.connect(addr).await {
+        match socket.connect(dialable_addr(addr)).await {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -1718,6 +1729,37 @@ mod tests {
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
+
+    #[test]
+    fn dialable_addr_rewrites_only_an_unspecified_ip() {
+        for (input, want) in [
+            ("0.0.0.0:5", "127.0.0.1:5"),
+            ("[::]:5", "[::1]:5"),
+            ("[::1]:5", "[::1]:5"),
+            ("127.0.0.1:5", "127.0.0.1:5"),
+            ("192.168.1.2:5", "192.168.1.2:5"),
+            ("[::2]:5", "[::2]:5"),
+        ] {
+            let got = dialable_addr(input.parse::<SocketAddr>().unwrap());
+            assert_eq!(got, want.parse::<SocketAddr>().unwrap(), "input: {input}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dialing_a_wildcard_listener_addr_stays_connected() {
+        let listener = Listener::bind("0.0.0.0:0").await.unwrap();
+        assert!(listener.local_addr().ip().is_unspecified());
+        let addr = spawn_greeting_server(listener, b"hello");
+        let mut connected = connect_without_handshake("0.0.0.0:0", addr, None, false)
+            .await
+            .unwrap();
+        assert!(!connected.local_addr.ip().is_unspecified());
+        assert!(!connected.peer_addr.ip().is_unspecified());
+        connected.write.send(b"hi").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = connected.read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
 }
 use udp_listener::{Conn, ConnRead, ConnWrite, Dispatch, Packet, UtpListener};
 fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
@@ -1778,6 +1820,6 @@ pub async fn connect_with_socket(
     addr: SocketAddr,
     config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
-    socket.connect(addr).await?;
+    socket.connect(dialable_addr(addr)).await?;
     connect_bound(socket, config, None).await
 }

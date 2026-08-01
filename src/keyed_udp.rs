@@ -336,7 +336,7 @@ impl KeyedConnWrite {
                     self.write.send(&self.buf).await
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => Err(udp::normalize_send_err(e)),
         }?;
         Ok(sent.saturating_sub(self.data_offset))
     }
