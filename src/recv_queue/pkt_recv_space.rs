@@ -82,29 +82,28 @@ impl PktRecvSpace {
         data: Vec<u8>,
         frame_len: Option<u32>,
     ) -> RecvDisposition {
+        if let Some(frame_len) = frame_len
+            && !crate::delivery::frame::send::is_valid_frame_len(frame_len)
+        {
+            self.reused_buf.put(data);
+            return RecvDisposition::Rejected;
+        }
         let Some(next) = self.next else {
             self.reused_buf.put(data);
             return RecvDisposition::Rejected;
         };
-
-        // Stale: seq is already behind the in-order cursor.
         if seq < next {
             self.reused_buf.put(data);
             return RecvDisposition::Duplicate;
         }
-
-        // Window check.
         if seq - next >= MAX_NUM_RECVING_PKTS as u64 {
             self.reused_buf.put(data);
             return RecvDisposition::Rejected;
         }
-
-        // In-window duplicate: already have this slot.
         if self.slots.contains_key(&seq) {
             self.reused_buf.put(data);
             return RecvDisposition::Duplicate;
         }
-
         self.slots
             .insert(seq, RecvSlot::Data(RecvPkt { data, frame_len }));
         self.ack_history.insert(seq);
@@ -452,6 +451,55 @@ mod tests {
         assert!(
             space.fin_at_head(),
             "FIN at in-order head must be detected after all data delivered"
+        );
+    }
+
+    #[test]
+    fn a_frame_is_delivered_at_its_declared_length() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        assert!(space.recv(0, b"ABCDEFGH".to_vec(), Some(4)));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"ABCD");
+    }
+
+    #[test]
+    fn a_multi_packet_frame_stops_at_its_declared_length() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        assert!(space.recv(0, b"AB".to_vec(), Some(5)));
+        assert!(space.recv(1, b"CDEFGH".to_vec(), None));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"ABCDE");
+    }
+
+    #[test]
+    fn oversize_frame_len_cannot_pin_the_in_order_cursor() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        assert_eq!(
+            space.recv_disposition(0, b"poison".to_vec(), Some(u32::MAX)),
+            RecvDisposition::Rejected
+        );
+        assert!(space.recv(0, b"real".to_vec(), Some(4)));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"real");
+        assert_eq!(space.next, Some(1));
+        assert!(space.slots.is_empty());
+    }
+
+    #[test]
+    fn zero_frame_len_is_rejected() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        assert_eq!(
+            space.recv_disposition(0, vec![], Some(0)),
+            RecvDisposition::Rejected
+        );
+        assert!(space.slots.is_empty());
+        assert!(space.pop_complete_frame().is_none());
+    }
+
+    #[test]
+    fn max_frame_len_is_still_accepted() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let max = crate::delivery::frame::send::MAX_FRAME_LEN;
+        assert_eq!(
+            space.recv_disposition(0, vec![0u8; 1], Some(max as u32)),
+            RecvDisposition::Inserted
         );
     }
 

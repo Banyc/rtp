@@ -17,63 +17,38 @@ pub(crate) struct RecvPkt {
     pub(crate) frame_len: Option<u32>,
 }
 
-fn find_complete_frame(slots: &BTreeMap<u64, RecvSlot>) -> Option<Vec<u64>> {
+fn find_complete_frame(slots: &BTreeMap<u64, RecvSlot>) -> Option<(Vec<u64>, u32)> {
     let mut collected_seqs: Vec<u64> = Vec::new();
-    let mut target_len: Option<u32> = None;
+    let mut target_len: u32 = 0;
     let mut collected: usize = 0;
-
     for (&seq, slot) in slots.iter() {
         match slot {
             RecvSlot::Data(pkt) => {
-                if collected_seqs.is_empty() {
+                if collected_seqs.is_empty() || pkt.frame_len.is_some() {
                     let Some(fl) = pkt.frame_len else {
                         continue;
                     };
-                    if fl == 0 {
-                        return Some(vec![seq]);
-                    }
-                    target_len = Some(fl);
+                    collected_seqs.clear();
                     collected_seqs.push(seq);
-                    collected += pkt.data.len();
-                    if collected >= fl as usize {
-                        return Some(collected_seqs);
-                    }
+                    target_len = fl;
+                    collected = pkt.data.len();
                 } else {
-                    if let Some(fl) = pkt.frame_len {
-                        collected_seqs.clear();
-                        if fl == 0 {
-                            return Some(vec![seq]);
-                        }
-                        target_len = Some(fl);
-                        collected_seqs.push(seq);
-                        collected = pkt.data.len();
-                        if collected >= fl as usize {
-                            return Some(collected_seqs);
-                        }
-                        continue;
-                    }
                     let expected = *collected_seqs.last().unwrap() + 1;
                     if seq != expected {
                         collected_seqs.clear();
-                        target_len = None;
                         collected = 0;
                         continue;
                     }
                     collected_seqs.push(seq);
                     collected += pkt.data.len();
-                    if let Some(tl) = target_len
-                        && collected >= tl as usize
-                    {
-                        return Some(collected_seqs);
-                    }
+                }
+                if collected >= target_len as usize {
+                    return Some((collected_seqs, target_len));
                 }
             }
             RecvSlot::Tombstone => {
-                if !collected_seqs.is_empty() {
-                    collected_seqs.clear();
-                    target_len = None;
-                    collected = 0;
-                }
+                collected_seqs.clear();
+                collected = 0;
             }
         }
     }
@@ -84,26 +59,15 @@ pub(crate) fn pop_complete_frame(
     slots: &mut BTreeMap<u64, RecvSlot>,
     reused_buf: &mut ObjPool<Vec<u8>>,
 ) -> Option<Vec<u8>> {
-    let seqs = find_complete_frame(slots)?;
+    let (seqs, frame_len) = find_complete_frame(slots)?;
     let mut frame_bytes = Vec::new();
-
     for &seq in &seqs {
-        let slot = slots.remove(&seq).unwrap();
-        match slot {
-            RecvSlot::Data(pkt) => {
-                frame_bytes.extend_from_slice(&pkt.data);
-                reused_buf.put(pkt.data);
-            }
-            RecvSlot::Tombstone => {
-                slots.insert(seq, RecvSlot::Tombstone);
-            }
+        if let Some(RecvSlot::Data(pkt)) = slots.insert(seq, RecvSlot::Tombstone) {
+            frame_bytes.extend_from_slice(&pkt.data);
+            reused_buf.put(pkt.data);
         }
     }
-
-    for seq in seqs.iter() {
-        slots.insert(*seq, RecvSlot::Tombstone);
-    }
-
+    frame_bytes.truncate(frame_len as usize);
     Some(frame_bytes)
 }
 

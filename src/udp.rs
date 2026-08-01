@@ -690,6 +690,7 @@ impl FrameDeliveryIo {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn wrap_fec(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,

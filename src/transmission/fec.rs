@@ -5,6 +5,11 @@ use primitive::io::token_bucket::TokenBucket;
 
 const FEC_DEBUG: bool = false;
 
+fn fec_hdr_size() -> usize {
+    let probe = crate::udp::MAX_MSS;
+    probe - fec::proto::symbol_size(probe).unwrap()
+}
+
 const WINDOW_SIZE: NonZeroU64 = NonZeroU64::new(32).unwrap();
 const MAX_GROUP_SIZE: usize = MAX_DATA_PER_GROUP + MAX_PARITY_PER_GROUP;
 /// Maximum data symbols accumulated before a group is forcibly flushed.
@@ -14,6 +19,7 @@ const PARITY_RATIO_NUM: usize = 1;
 const PARITY_RATIO_DEN: usize = 4;
 const MAX_PARITY_PER_GROUP: usize =
     (MAX_DATA_PER_GROUP * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
+const MAX_INTERACTIVE_PARITY_DEPTH: u8 = (MAX_GROUP_SIZE - 1) as u8;
 /// Groups with at most this many data symbols get parity protection.
 /// Larger groups skip parity to avoid impacting throughput of big traffic.
 const PARITY_DATA_THRESHOLD: usize = 4;
@@ -59,20 +65,9 @@ pub struct FecConfig {
 pub struct FecState {
     encoder: FecEncoder,
     decoder: FecDecoder,
-    /// Codec payloads recovered by parity, waiting to be fed to the reliable
-    /// layer's `recv_pkts` path.
     recovered: VecDeque<Vec<u8>>,
     enc_buf: Vec<u8>,
-    /// Set by the transmission layer when the reliable layer reports that a
-    /// tail FEC flush is permitted (send buffer empty, cwnd has room, no RTO
-    /// pending). Cleared otherwise. When blocked, `close_fec_burst` skips the
-    /// open group instead of flushing it.
-    tail_flush_allowed: bool,
-    /// Per-connection interactive parity depth for single-symbol groups (from
-    /// `FecTuning`).  `1` is stock; a deeper value makes
-    /// `maybe_flush_parities` emit up to that many parity copies for a group
-    /// with exactly one data symbol, bypassing the spare-token budget gate.
-    /// Multi-symbol groups always keep the stock gate and ratio.
+    symbol_size: usize,
     interactive_parity_depth: u8,
     stats: Stats,
 }
@@ -163,23 +158,12 @@ impl FecState {
             decoder,
             recovered: VecDeque::new(),
             enc_buf: vec![0; config.symbol_size * 2],
-            tail_flush_allowed: false,
-            interactive_parity_depth: config.interactive_parity_depth.max(1),
+            symbol_size: config.symbol_size,
+            interactive_parity_depth: config
+                .interactive_parity_depth
+                .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
             stats: Stats::default(),
         }
-    }
-
-    /// Mark the open group as eligible for a tail FEC flush at the next
-    /// `close_fec_burst`. Called by the transmission layer when the reliable
-    /// layer reports `can_send_tail_fec`.
-    pub fn note_tail_flush_allowed(&mut self) {
-        self.tail_flush_allowed = true;
-    }
-
-    /// Mark the open group as not eligible for a tail FEC flush. The next
-    /// `close_fec_burst` will skip the group instead of flushing it.
-    pub fn note_tail_flush_blocked(&mut self) {
-        self.tail_flush_allowed = false;
     }
 
     /// Skip the currently-open FEC group, recording it in the burst-end skip
@@ -381,6 +365,10 @@ impl FecState {
         pkts
     }
 
+    pub fn max_wire_pkt_size(&self) -> usize {
+        self.symbol_size + fec_hdr_size()
+    }
+
     /// Number of data symbols in the currently-open FEC group.  Exposed so the
     /// transmission layer's data-path burst close can decide whether a partial
     /// group needs force-flushing.
@@ -418,12 +406,6 @@ impl FecState {
     /// Pop a codec payload recovered by parity.
     pub fn pop_recovered(&mut self) -> Option<Vec<u8>> {
         self.recovered.pop_front()
-    }
-
-    /// Whether a tail flush is currently allowed. Consumed by
-    /// `close_fec_burst` to decide between flushing and skipping.
-    pub fn tail_flush_allowed(&self) -> bool {
-        self.tail_flush_allowed
     }
 
     /// Number of codec payloads recovered by parity so far. Returns `None`
@@ -635,6 +617,46 @@ mod tests {
     fn depth_zero_is_clamped_to_one() {
         let fec = fec_state(8192 - 11, 0);
         assert_eq!(fec.interactive_parity_depth(), 1);
+    }
+
+    #[test]
+    fn depth_above_the_decoder_group_size_is_clamped_so_recovery_still_works() {
+        use fec::de::FecDecoder;
+        let symbol_size = 8192 - 11;
+        let mut fec = fec_state(symbol_size, 40);
+        assert_eq!(
+            fec.interactive_parity_depth(),
+            MAX_INTERACTIVE_PARITY_DEPTH,
+            "an over-deep request must be clamped to what the decoder accepts"
+        );
+        let (mut tb, now) = unlimited_bucket(Instant::now());
+        let payload = vec![7u8; 32];
+        let mut sym_buf = vec![0u8; 8192];
+        fec.encode_data(&payload, &mut sym_buf, false);
+        assert_eq!(fec.encoder.group_data_count(), 1);
+        let parity_pkts = fec.maybe_flush_parities(&mut tb, now, false);
+        assert_eq!(
+            parity_pkts.len(),
+            usize::from(MAX_INTERACTIVE_PARITY_DEPTH),
+            "the flush must emit only parity the decoder will accept"
+        );
+        let mut decoder = FecDecoder::builder()
+            .window_size(WINDOW_SIZE)
+            .symbol_size(symbol_size)
+            .max_group_size(MAX_GROUP_SIZE)
+            .build();
+        let mut recovered = vec![];
+        for pkt in &parity_pkts {
+            decoder.decode(pkt, |data| recovered.push(data.to_vec()));
+        }
+        assert!(
+            !recovered.is_empty(),
+            "an over-deep parity burst recovered nothing at all"
+        );
+        assert_eq!(
+            recovered[0], payload,
+            "the recovered symbol must be the dropped data symbol"
+        );
     }
 
     // ---- In-stream group FEC tests ----

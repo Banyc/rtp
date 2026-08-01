@@ -113,13 +113,16 @@ impl FrameSendStage {
     }
 }
 
+pub(crate) fn is_valid_frame_len(frame_len: u32) -> bool {
+    frame_len != 0 && frame_len as usize <= MAX_FRAME_LEN
+}
 /// Validate a frame for staging: rejects empty frames and frames larger than
 /// [`MAX_FRAME_LEN`] with `InvalidInput`.
 pub(crate) fn validate_frame(frame: &[u8]) -> Result<(), std::io::ErrorKind> {
-    if frame.is_empty() {
+    let Ok(frame_len) = u32::try_from(frame.len()) else {
         return Err(std::io::ErrorKind::InvalidInput);
-    }
-    if frame.len() > MAX_FRAME_LEN {
+    };
+    if !is_valid_frame_len(frame_len) {
         return Err(std::io::ErrorKind::InvalidInput);
     }
     Ok(())

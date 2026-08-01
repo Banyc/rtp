@@ -239,7 +239,6 @@ impl PktSendSpace {
         if delivered > 0 {
             self.tlp.reset();
         }
-
         if !self.fast_loss_disabled
             && let Some(min_rtt) = self.rtt_stats.min_rtt()
         {
@@ -255,7 +254,6 @@ impl PktSendSpace {
                 }
             }
         }
-
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
@@ -270,7 +268,6 @@ impl PktSendSpace {
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
-
         let cumulative_front_after = self.send_wnd.start().or(self.send_wnd.next()).copied();
         if cumulative_front_before
             .zip(cumulative_front_after)
@@ -278,17 +275,22 @@ impl PktSendSpace {
         {
             self.liveness.record_progress();
         }
-
-        for ball in recved.balls() {
-            let ball_end = ball.start + ball.size.get();
-            for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
-                if s < ball.start {
-                    p.sack_passes = p.sack_passes.saturating_add(ball.size.get() as u32);
+        let balls = recved.balls();
+        for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
+            let mut passes: u32 = 0;
+            for ball in balls {
+                let ball_end = ball.start + ball.size.get();
+                let newer = if s < ball.start {
+                    ball.size.get()
                 } else if s < ball_end {
-                }
+                    ball_end - s - 1
+                } else {
+                    0
+                };
+                passes = passes.saturating_add(u32::try_from(newer).unwrap_or(u32::MAX));
             }
+            p.sack_passes = p.sack_passes.max(passes);
         }
-
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
         if peer_waiting_for_acked_pkts && delivered == 0 {
@@ -925,16 +927,12 @@ impl LossEventWindow {
         if elapsed < bucket_len {
             return;
         }
-
-        // Gap of 2 or more empty buckets: reset both buckets (loss event has aged out).
-        let gap_buckets = elapsed.as_millis() / bucket_len.as_millis();
+        let gap_buckets = elapsed.as_nanos() / bucket_len.as_nanos();
         if gap_buckets >= 2 {
             self.curr.reset(now);
             self.prev.reset(now);
             return;
         }
-
-        // Single-bucket rotation.
         self.prev = self.curr.clone();
         self.curr.reset(now);
     }
@@ -1020,15 +1018,28 @@ mod tests {
     /// the send window (it is delivered) and increments `sack_passes` on
     /// every older in-flight packet.
     fn sack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
+        let mut peer = crate::sack::AckQueue::new();
+        for s in 0..space.next_seq() {
+            if space.send_wnd.get(&s).and_then(|o| o.as_ref()).is_none() {
+                peer.insert(s);
+            }
+        }
+        peer.insert(seq);
+        let balls = peer.balls().collect::<Vec<_>>();
+        let recved = crate::sack::AckBallSequence::new(&balls);
+        let mut acked = Vec::new();
+        space.ack(recved, &mut acked, now);
+        acked.len()
+    }
+
+    fn resack(space: &mut PktSendSpace, seq: u64, now: Instant) {
         let ball = crate::sack::AckBall {
             start: seq,
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
-        let recved = crate::sack::AckBallSequence::new(&balls);
         let mut acked = Vec::new();
-        space.ack(recved, &mut acked, now);
-        acked.len()
+        space.ack(crate::sack::AckBallSequence::new(&balls), &mut acked, now);
     }
 
     fn sack_passes(space: &PktSendSpace, seq: u64) -> u32 {
@@ -1106,6 +1117,19 @@ mod tests {
             w.record_delivered(1, now, smooth);
         }
         assert!(w.rate(now, smooth).is_some());
+    }
+
+    #[test]
+    fn a_sub_two_bucket_gap_keeps_the_loss_in_prev_on_a_fractional_rtt() {
+        let t0 = Instant::now();
+        let smooth = Duration::from_micros(10_500);
+        let mut w = LossEventWindow::new();
+        w.record_lost(1, t0, smooth);
+        w.record_delivered(1, t0 + ms(20), smooth);
+        assert!(
+            w.raw_has_loss_event(),
+            "a 1.90-bucket gap aged the loss event out"
+        );
     }
 
     #[test]
@@ -1215,6 +1239,34 @@ mod tests {
         ack_up_to(&mut space, 0, t0 + ms(1));
         assert!(!space.has_tail_probe(t0 + ms(900)));
         assert!(space.tail_probe(t0 + ms(900)).is_none());
+    }
+
+    #[test]
+    fn the_outage_cut_censors_late_rate_samples_after_the_epoch_closes() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let pre_outage = t0 + ms(5);
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        lose_packet(&mut space, 1, t0 + ms(50));
+        let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
+        assert!(space.detect_outage_recovery(detect_at), "epoch must open");
+        assert!(
+            space.should_censor_rate_sample(pre_outage),
+            "a blackout-spanning sample must be censored while the epoch is open"
+        );
+        space.sample_rtt(ms(200), detect_at + ms(300));
+        assert!(!space.in_outage_recovery(), "epoch must have closed");
+        assert!(
+            space.should_censor_rate_sample(pre_outage),
+            "a blackout-spanning sample must stay censored after the epoch closes"
+        );
+        assert!(
+            !space.should_censor_rate_sample(detect_at + ms(1)),
+            "a post-cut sample must not be censored"
+        );
     }
 
     #[test]
@@ -1600,6 +1652,39 @@ mod tests {
             .rtx(early)
             .expect("fast loss should retransmit seq 0 before the reorder window");
         assert_eq!(rtx.seq, 0, "fast loss should target the starved seq 0");
+    }
+
+    #[test]
+    fn duplicate_acks_carrying_no_new_information_do_not_earn_sack_passes() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        assert!(space.fast_loss_armed(), "gate should be armed");
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+        sack_one(&mut space, 1, t0 + ms(10));
+        resack(&mut space, 1, t0 + ms(11));
+        resack(&mut space, 1, t0 + ms(12));
+        assert_eq!(
+            sack_passes(&space, 0),
+            1,
+            "one newer packet delivered is one sack pass, however often it is re-acked"
+        );
+        let early = t0 + ms(30);
+        assert!(
+            early.duration_since(t0) < space.smooth_rtt(),
+            "test must run before the reorder window expires"
+        );
+        assert!(
+            !space.has_rtx(early),
+            "duplicate acks must not declare a fast loss"
+        );
+        assert!(
+            space.rtx(early).is_none(),
+            "duplicate acks must not retransmit a merely reordered packet"
+        );
     }
 
     #[test]

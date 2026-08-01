@@ -465,6 +465,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_non_fec_fast_path_copies_only_when_a_duplicate_needs_it() {
+        let (mut tl, recorder) = harness(false, false);
+        tl.set_instream_group_fec_for_test(false);
+        stage_small_message(&tl);
+        let mut bufs = SendBufs::new();
+        assert!(
+            tl.send_pkts(&mut bufs).await.unwrap(),
+            "a data packet must go out"
+        );
+        assert_eq!(recorder.lock().unwrap().count(), 1);
+        assert!(
+            bufs.utp.iter().all(|&byte| byte == 0),
+            "the fast path re-encoded the packet into bufs.utp for a send with no duplicate"
+        );
+    }
+
+    #[tokio::test]
     async fn fatal_regular_fec_parity_send_terminates_session() {
         let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::ConnectionReset);
         stage_small_message(&tl);
@@ -917,6 +934,102 @@ mod tests {
             .expect("released receive must finish")
             .expect("released receive must succeed");
         assert!(!state.third_cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn ack_flush_never_sends_an_empty_page() {
+        use crate::transmission::transmission_layer::MAX_NUM_ACK;
+        let (mut transmission, recorder) = harness(false, false);
+        {
+            let mut reliable = transmission.shared.reliable_layer.lock().unwrap();
+            for seq in (0..128).step_by(2) {
+                reliable.recv_data_pkt(seq, None, b"x");
+            }
+            assert_eq!(
+                reliable.pkt_recv_space().ack_history().balls().count(),
+                MAX_NUM_ACK,
+                "the history must hold exactly one page of balls"
+            );
+        }
+        transmission.shared.ack_flush.lock().unwrap().pending_acks = 1;
+        let mut send_bufs = SendBufs::new();
+        transmission
+            .flush_acks(&mut send_bufs)
+            .await
+            .expect("flush must succeed");
+        let sent = recorder.lock().unwrap().datagrams();
+        assert!(!sent.is_empty(), "the flush must send the one real page");
+        assert!(
+            sent.iter().all(|datagram| !datagram.is_empty()),
+            "an ACK flush sent {} datagrams, one of them empty",
+            sent.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_flush_does_not_claim_a_fin_that_arrived_mid_flush() {
+        #[derive(Debug)]
+        struct SilentRead;
+        #[async_trait]
+        impl UnreliableRead for SilentRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                Err(std::io::ErrorKind::WouldBlock)
+            }
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+                std::future::pending().await
+            }
+        }
+        #[derive(Debug)]
+        struct BlockingWrite {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl UnreliableWrite for BlockingWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+                self.started.notify_one();
+                self.release.notified().await;
+                Ok(buf.len())
+            }
+        }
+        let send_started = Arc::new(tokio::sync::Notify::new());
+        let release_send = Arc::new(tokio::sync::Notify::new());
+        let layer = crate::udp::wrap_fec(
+            SilentRead,
+            BlockingWrite {
+                started: Arc::clone(&send_started),
+                release: Arc::clone(&release_send),
+            },
+            false,
+        );
+        let mut transmission = TransmissionLayer::new(layer, None);
+        let shared = Arc::clone(&transmission.shared);
+        shared.ack_flush.lock().unwrap().pending_acks = 1;
+        let mut send_bufs = SendBufs::new();
+        let mut flush = Box::pin(transmission.flush_acks(&mut send_bufs));
+        tokio::select! {
+            result = &mut flush => panic!("ACK send completed before release: {result:?}"),
+            () = send_started.notified() => (),
+        }
+        {
+            let mut s = shared.ack_flush.lock().unwrap();
+            s.pending_acks += 1;
+            s.fin_pending = true;
+        }
+        release_send.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), flush)
+            .await
+            .expect("released ACK send did not finish")
+            .expect("ACK send failed");
+        let s = shared.ack_flush.lock().unwrap();
+        assert!(
+            s.fin_pending,
+            "a FIN that arrived mid-flush was not acked by it and must stay pending"
+        );
+        assert_eq!(
+            s.pending_acks, 1,
+            "only the acks claimed before the send may be subtracted"
+        );
     }
 
     #[tokio::test]

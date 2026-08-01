@@ -20,10 +20,10 @@ impl TsEcho {
         self.pending = Some(send_ts);
     }
 
-    /// Restore a claimed echo timestamp (used when an ACK flush is retried
-    /// after a WouldBlock — the echo must survive the failed flush).
     pub(crate) fn restore(&mut self, send_ts: u32) {
-        self.pending = Some(send_ts);
+        if self.pending.is_none() {
+            self.pending = Some(send_ts);
+        }
     }
 
     /// Take the pending echo timestamp, consuming it so each RTT sample is
@@ -112,6 +112,33 @@ impl Default for RecentEchoes {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn restore_does_not_clobber_a_newer_pending_echo() {
+        let mut echo = TsEcho::new();
+        echo.set(1000);
+        let claimed = echo.take().expect("the flush claims the pending echo");
+        echo.set(2000);
+        echo.restore(claimed);
+        assert_eq!(
+            echo.take(),
+            Some(2000),
+            "the newer echo must survive the restore"
+        );
+    }
+
+    #[test]
+    fn restore_returns_the_claimed_echo_when_none_arrived() {
+        let mut echo = TsEcho::new();
+        echo.set(1000);
+        let claimed = echo.take().expect("the flush claims the pending echo");
+        echo.restore(claimed);
+        assert_eq!(
+            echo.take(),
+            Some(1000),
+            "the claim must survive the failure"
+        );
+    }
 
     #[test]
     fn dedup_blocks_duplicate_echo() {

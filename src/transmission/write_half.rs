@@ -152,15 +152,12 @@ impl WriteHalf {
             }
             let instream = self.instream_group_fec_enabled();
             let has_fec = self.fec.is_some() || instream;
-
-            let (primary_res, send_buf): (_, &[u8]) = if !has_fec {
-                // Fast path: non-FEC, data-only packet — avoid copying the
-                // payload by encoding just the protocol header on the stack
-                // and issuing a single vectored send.
+            let wants_dup = self.rtx_dup() && was_repair && !queue_building;
+            let (primary_res, send_buf): (_, Option<&[u8]>) = if !has_fec {
                 let ts = data.send_ts.unwrap_or(0);
                 let cmd: u8 = match data.frame_len {
                     Some(_) => crate::delivery::frame::wire::FRAME_DATA_TS_CMD,
-                    None => 3, // DATA_TS_CMD
+                    None => 3,
                 };
                 let mut hdr = [0u8; 19];
                 let hdr_len = if let Some(frame_len) = data.frame_len {
@@ -183,11 +180,11 @@ impl WriteHalf {
                     std::io::IoSlice::new(payload),
                 ];
                 let res = self.utp_write.send_vectored(&iov).await;
-                // For the rtx_dup path the caller needs the raw wire bytes.
-                // Concatenate into bufs.utp on demand (rare).
-                let dup_buf = {
+                let dup_buf = if wants_dup {
                     let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
-                    &bufs.utp[..n]
+                    Some(&bufs.utp[..n])
+                } else {
+                    None
                 };
                 (res, dup_buf)
             } else {
@@ -201,14 +198,14 @@ impl WriteHalf {
                     }
                     None => utp_pkt,
                 };
-                (self.utp_write.send(send_buf).await, send_buf)
+                (self.utp_write.send(send_buf).await, Some(send_buf))
             };
             match primary_res {
                 Ok(_) => {
                     if self.fec.is_some() && instream {
                         self.maybe_flush_full_fec_group(Instant::now()).await?;
                     }
-                    if self.rtx_dup() && was_repair && !queue_building {
+                    if wants_dup && let Some(send_buf) = send_buf {
                         let now = Instant::now();
                         let token_taken = self
                             .send_rate_limiter
@@ -288,15 +285,9 @@ impl WriteHalf {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
-        {
-            let mut fec = fec.lock().unwrap();
-            if can_send_tail_fec {
-                fec.note_tail_flush_allowed();
-            } else {
-                fec.note_tail_flush_blocked();
-                fec.skip_open_group();
-                return Ok(());
-            }
+        if !can_send_tail_fec {
+            fec.lock().unwrap().skip_open_group();
+            return Ok(());
         }
         self.flush_fec_parities(now).await
     }
@@ -437,7 +428,10 @@ impl WriteHalf {
         };
         let mut echo_ts = self.ack_flush.lock().unwrap().ts_echo.take();
         let echo_backup = echo_ts;
-        let claimed_acks = self.ack_flush.lock().unwrap().pending_acks;
+        let (claimed_acks, claimed_fin) = {
+            let s = self.ack_flush.lock().unwrap();
+            (s.pending_acks, s.fin_pending)
+        };
         let mut page_0 = true;
         let mut skip = 0;
         let fec_enabled = self.fec.is_some();
@@ -490,17 +484,17 @@ impl WriteHalf {
                 if history_count < MAX_NUM_ACK {
                     let mut s = self.ack_flush.lock().unwrap();
                     s.ack_page_cursor = MAX_NUM_ACK;
-                    s.complete_claim(claimed_acks, true);
+                    s.complete_claim(claimed_acks, claimed_fin);
                     s.last_ack_flush = Some(now);
                     drop(s);
                     self.coord.session_outbound_progress.notify_one();
                     break;
                 }
                 skip = cursor;
-                if skip > history_count {
+                if skip >= history_count {
                     let mut s = self.ack_flush.lock().unwrap();
                     s.ack_page_cursor = MAX_NUM_ACK;
-                    s.complete_claim(claimed_acks, true);
+                    s.complete_claim(claimed_acks, claimed_fin);
                     s.last_ack_flush = Some(now);
                     drop(s);
                     self.coord.session_outbound_progress.notify_one();
@@ -513,7 +507,7 @@ impl WriteHalf {
                 } else {
                     s.ack_page_cursor = MAX_NUM_ACK;
                 }
-                s.complete_claim(claimed_acks, true);
+                s.complete_claim(claimed_acks, claimed_fin);
                 s.last_ack_flush = Some(now);
                 drop(s);
                 self.coord.session_outbound_progress.notify_one();

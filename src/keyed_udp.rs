@@ -12,54 +12,36 @@ use crate::{
     transmission::{
         fec_tuning::{FecTuning, fec_tuning_from_env},
         frame_delivery::{FrameDelivery, frame_delivery_from_env},
-        transmission_layer::{UnreliableLayer, UnreliableWrite},
+        transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     },
     udp::{
-        self, MaybeRawFd, maybe_raw_fd, should_wait_after_try_send, wrap_fec,
+        self, MaybeRawFd, maybe_raw_fd, should_wait_after_try_send,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
 
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
-fn checked_keyed_mss<K: DispatchKey>(
-    mss_after_fec: NonZeroUsize,
+fn wrap_keyed<K: DispatchKey>(
+    read: impl UnreliableRead,
+    write: impl UnreliableWrite,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
     frame_delivery: FrameDelivery,
-) -> NonZeroUsize {
+) -> UnreliableLayer {
     let key_size = K::max_size();
-    let remaining = mss_after_fec
-        .get()
+    let mss = mss
         .checked_sub(key_size)
-        .unwrap_or_else(|| {
-            panic!("mss {mss_after_fec} leaves no room for the {key_size}-byte dispatch key")
-        });
-    let overhead = if frame_delivery.enabled {
-        crate::delivery::frame::wire::frame_data_overhead()
-    } else {
-        crate::codec::data_overhead()
-    };
-    assert!(
-        overhead < remaining,
-        "mss {mss_after_fec} leaves no payload room after {key_size}-byte dispatch key and {overhead}-byte codec overhead"
-    );
-    NonZeroUsize::new(remaining).unwrap()
-}
-
-/// Apply the keyed-dispatch MSS reduction to an already-wrapped
-/// [`UnreliableLayer`].  The dispatch key is prepended to every datagram, so
-/// the effective MSS the reliable layer sees is `mss - key_size`.  The FEC
-/// tuning is preserved unchanged.
-fn apply_keyed_mss<K: DispatchKey>(layer: UnreliableLayer) -> UnreliableLayer {
-    let frame_delivery = layer.frame_delivery;
-    UnreliableLayer {
-        utp_read: layer.utp_read,
-        utp_write: layer.utp_write,
-        post_open_handshake: layer.post_open_handshake,
-        mss: checked_keyed_mss::<K>(layer.mss, frame_delivery),
-        fec: layer.fec,
-        fec_tuning: layer.fec_tuning,
+        .unwrap_or_else(|| panic!("mss {mss} leaves no room for the {key_size}-byte dispatch key"));
+    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        read,
+        write,
+        fec,
+        mss,
+        tuning,
         frame_delivery,
-    }
+    )
 }
 
 #[derive(Debug)]
@@ -143,15 +125,7 @@ impl<K: DispatchKey> Server<K> {
             let peer = write.peer_addr();
             KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
         };
-        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            read,
-            write,
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        );
-        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
+        let unreliable_layer = wrap_keyed::<K>(read, write, fec, mss, tuning, frame_delivery);
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -170,8 +144,14 @@ impl<K: DispatchKey> Server<K> {
             let peer = write.peer_addr();
             KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
         };
-        let unreliable_layer = wrap_fec(read, write, fec);
-        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
+        let unreliable_layer = wrap_keyed::<K>(
+            read,
+            write,
+            fec,
+            crate::udp::NO_FEC_MSS,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -270,15 +250,7 @@ impl<K: DispatchKey> Client<K> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
-        let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            read,
-            write,
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        );
-        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
+        let unreliable_layer = wrap_keyed::<K>(read, write, fec, mss, tuning, frame_delivery);
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
             read,
@@ -291,8 +263,14 @@ impl<K: DispatchKey> Client<K> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
-        let unreliable_layer = wrap_fec(read, write, fec);
-        let unreliable_layer = apply_keyed_mss::<K>(unreliable_layer);
+        let unreliable_layer = wrap_keyed::<K>(
+            read,
+            write,
+            fec,
+            crate::udp::NO_FEC_MSS,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
             read,
@@ -344,7 +322,7 @@ impl KeyedConnWrite {
     }
 
     async fn send_buf(&mut self) -> std::io::Result<usize> {
-        match self.write.try_send(&self.buf) {
+        let sent = match self.write.try_send(&self.buf) {
             Ok(n) => Ok(n),
             Err(e) if should_wait_after_try_send(&e) => {
                 #[cfg(target_os = "macos")]
@@ -359,7 +337,8 @@ impl KeyedConnWrite {
                 }
             }
             Err(e) => Err(e),
-        }
+        }?;
+        Ok(sent.saturating_sub(self.data_offset))
     }
 }
 #[async_trait]
@@ -498,6 +477,31 @@ fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<(K, P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::delivery::frame::FrameDelivery;
+    use crate::transmission::fec_tuning::FecTuning;
+    use crate::transmission::transmission_layer::UnreliableRead;
+
+    #[derive(Debug)]
+    struct DummyRead;
+    #[async_trait]
+    impl UnreliableRead for DummyRead {
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            Err(std::io::ErrorKind::WouldBlock)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DummyWrite;
+    #[async_trait]
+    impl UnreliableWrite for DummyWrite {
+        async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            Ok(0)
+        }
+    }
 
     #[derive(Debug, Clone, Hash, PartialEq, Eq)]
     struct HugeKey;
@@ -676,6 +680,38 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyed_send_reports_only_the_callers_bytes() {
+        use crate::transmission::transmission_layer::UnreliableWrite;
+        const KEY: u64 = 0x0102_0304_0506_0708;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let client = Client::<u64>::connect_without_handshake("127.0.0.1:0", peer_addr)
+            .await
+            .unwrap();
+        let accepted = client.listener.open(KEY).unwrap();
+        let (_read, write) = accepted.split();
+        let mut write = KeyedConnWrite::new(write, &KEY, client.raw_fd, None);
+        let payload = b"handshake bytes";
+        assert_eq!(
+            UnreliableWrite::send(&mut write, payload).await.unwrap(),
+            payload.len()
+        );
+        let mut buf = [0u8; 64];
+        let (n, _from) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!(n, payload.len() + u64::max_size());
+        let iov = [
+            std::io::IoSlice::new(&payload[..4]),
+            std::io::IoSlice::new(&payload[4..]),
+        ];
+        assert_eq!(
+            UnreliableWrite::send_vectored(&mut write, &iov)
+                .await
+                .unwrap(),
+            payload.len()
+        );
+    }
+
     /// Fix #4: `keyed_send_cancellation_safe` — cancel a keyed send
     /// mid-flight (drop the future), then a second send on the same
     /// `KeyedConnWrite` must succeed (no panic at `unwrap()` on a
@@ -713,64 +749,36 @@ mod tests {
         }
     }
 
-    /// `frame_mode_rejects_undersized_mss` — a frame-delivery + FEC +
-    /// dispatch-key (u16) connection whose post-FEC MSS leaves less than
-    /// `frame_data_overhead()` after the key must panic at construction
-    /// (the `assert!` in `checked_keyed_mss` fires) rather than silently
-    /// transmitting oversized packets.  Before the fix,
-    /// `checked_keyed_mss` validated against `data_overhead()` (15B) even
-    /// in frame-delivery mode, which needs `frame_data_overhead()` (19B),
-    /// so the first-packet cap would underflow and `.unwrap_or(1)` would
-    /// silently emit a 1-byte payload producing an oversized codec packet.
     #[test]
-    #[should_panic(expected = "leaves no payload room")]
-    fn frame_mode_rejects_undersized_mss() {
-        use crate::delivery::frame::FrameDelivery;
-        use crate::transmission::fec_tuning::FecTuning;
-        use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
-        use crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
-
-        #[derive(Debug)]
-        struct DummyRead;
-        #[async_trait]
-        impl UnreliableRead for DummyRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
-            }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
-            }
-        }
-        #[derive(Debug)]
-        struct DummyWrite;
-        #[async_trait]
-        impl UnreliableWrite for DummyWrite {
-            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-                Ok(0)
-            }
-        }
-
-        // Pick an MSS that passes `checked_mss_and_fec` (post-FEC mss >
-        // frame_data_overhead(19)) but fails `checked_keyed_mss` (post-FEC
-        // mss - u16 key(2) < frame_data_overhead(19)).
-        //
-        // FEC reduces mss by: HDR_SIZE(11) + DATA_SYMBOL_HDR_SIZE(2) = 13.
-        // Post-FEC mss = raw_mss - 13.
-        // We want: post-FEC mss > 19 AND post-FEC mss - 2 < 19
-        //   => 19 < post-FEC mss < 21 => post-FEC mss = 20 => raw_mss = 33.
-        // remaining = 20 - 2 = 18 < frame_data_overhead(19) => assert fires.
-        let mss = 33;
-
-        let layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+    fn a_keyed_fec_datagram_fits_the_requested_mss() {
+        let mss = crate::udp::NO_FEC_MSS;
+        let layer = super::wrap_keyed::<u16>(
             DummyRead,
             DummyWrite,
-            true, // FEC on
+            true,
+            mss,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
+        let datagram =
+            layer.fec.as_ref().unwrap().max_wire_pkt_size() + <u16 as DispatchKey>::max_size();
+        assert!(
+            datagram <= mss,
+            "a parity datagram is {datagram} bytes on a {mss}-byte MSS"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "leaves no room for the first-frame header")]
+    fn frame_mode_rejects_undersized_mss() {
+        let mss = 33;
+        super::wrap_keyed::<u16>(
+            DummyRead,
+            DummyWrite,
+            true,
             mss,
             FecTuning::default(),
             FrameDelivery::enabled(),
         );
-        // apply_keyed_mss calls checked_keyed_mss::<u16>(layer.mss, frame_delivery)
-        // which must panic because remaining (15) < frame_data_overhead (19).
-        super::apply_keyed_mss::<u16>(layer);
     }
 }
