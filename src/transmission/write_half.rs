@@ -4,10 +4,9 @@ use std::time::Instant;
 use super::shared::Shared;
 use super::termination::{PeerReset, TerminationWriter};
 use super::transmission_layer::{
-    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, FEC_DEBUG, MAX_NUM_ACK, PRINT_DEBUG_MSGS,
-    ProactiveTerminationContext, SendBufs, UnreliableWrite,
+    FEC_DEBUG, PRINT_DEBUG_MSGS, ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
-use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
+use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::pacer::SendWake;
 
@@ -269,7 +268,7 @@ impl WriteHalf {
         self.flush_fec_parities(now).await
     }
 
-    async fn close_fec_burst(
+    pub(crate) async fn close_fec_burst(
         &mut self,
         now: Instant,
         can_send_tail_fec: bool,
@@ -291,7 +290,7 @@ impl WriteHalf {
         fec.lock().unwrap().skip_open_group();
     }
 
-    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), IoErr> {
+    pub(crate) async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), IoErr> {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
@@ -381,133 +380,25 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub fn has_pending_acks(&self) -> bool {
-        let s = self.ack_flush.lock().unwrap();
-        0 < s.pending_acks || s.fin_pending
+        self.ack_flush.lock().unwrap().has_pending()
     }
 
     pub fn ack_flush_is_due(&self) -> bool {
-        let s = self.ack_flush.lock().unwrap();
-        if s.pending_acks == 0 && !s.fin_pending {
-            return false;
-        }
         let now = Instant::now();
-        s.fin_pending
-            || ACK_FLUSH_COUNT <= s.pending_acks
-            || s.last_ack_flush
-                .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
+        self.ack_flush.lock().unwrap().is_due(now)
     }
 
     pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         {
             let s = self.ack_flush.lock().unwrap();
-            if s.pending_acks == 0 && !s.fin_pending {
+            if !s.has_pending() {
                 return Ok(());
             }
         }
-        self.flush_acks_inner(bufs).await
+        super::ack_flush::flush(self, bufs).await
     }
 
-    async fn flush_acks_inner(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        let now = Instant::now();
-        let (cursor, history_count) = {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
-            let queue = reliable_layer.pkt_recv_space().ack_history();
-            let count = queue.len();
-            let s = self.ack_flush.lock().unwrap();
-            (s.ack_page_cursor.max(MAX_NUM_ACK).min(count), count)
-        };
-        let mut echo_ts = self.ack_flush.lock().unwrap().ts_echo.take();
-        let echo_backup = echo_ts;
-        let (claimed_acks, claimed_fin) = {
-            let s = self.ack_flush.lock().unwrap();
-            (s.pending_acks, s.fin_pending)
-        };
-        let mut page_0 = true;
-        let mut skip = 0;
-        let fec_enabled = self.fec.is_some();
-        let mut pages_sent: usize = 0;
-        'ack_pages: loop {
-            let written_bytes = {
-                let reliable_layer = self.reliable_layer.lock().unwrap();
-                let queue = reliable_layer.pkt_recv_space().ack_history();
-                let ack = EncodeAck {
-                    queue,
-                    skip,
-                    max_take: MAX_NUM_ACK,
-                };
-                let this_echo = echo_ts.take();
-                encode_ack_data(Some(ack), this_echo, None, &mut bufs.utp).unwrap()
-            };
-            let res = self
-                .send_with_fec(&bufs.utp[..written_bytes], &mut bufs.fec)
-                .await;
-            match res {
-                Ok(_) => {
-                    pages_sent += 1;
-                    if fec_enabled {
-                        let now = Instant::now();
-                        let can_send_tail_fec =
-                            { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
-                        self.close_fec_burst(now, can_send_tail_fec).await?;
-                    }
-                }
-                Err(error) if error == std::io::ErrorKind::WouldBlock => {
-                    if let Some(ts) = echo_ts.take().or(echo_backup) {
-                        self.ack_flush.lock().unwrap().ts_echo.restore(ts);
-                    }
-                    let mut s = self.ack_flush.lock().unwrap();
-                    s.complete_claim(pages_sent * MAX_NUM_ACK, false);
-                    drop(s);
-                    self.coord.session_outbound_progress.notify_one();
-                    break 'ack_pages;
-                }
-                Err(e) => {
-                    self.termination.press_error(e);
-                    if let Some(ts) = echo_ts.take().or(echo_backup) {
-                        self.ack_flush.lock().unwrap().ts_echo.restore(ts);
-                    }
-                    return Err(e);
-                }
-            }
-            if page_0 {
-                page_0 = false;
-                if history_count < MAX_NUM_ACK {
-                    let mut s = self.ack_flush.lock().unwrap();
-                    s.ack_page_cursor = MAX_NUM_ACK;
-                    s.complete_claim(claimed_acks, claimed_fin);
-                    s.last_ack_flush = Some(now);
-                    drop(s);
-                    self.coord.session_outbound_progress.notify_one();
-                    break;
-                }
-                skip = cursor;
-                if skip >= history_count {
-                    let mut s = self.ack_flush.lock().unwrap();
-                    s.ack_page_cursor = MAX_NUM_ACK;
-                    s.complete_claim(claimed_acks, claimed_fin);
-                    s.last_ack_flush = Some(now);
-                    drop(s);
-                    self.coord.session_outbound_progress.notify_one();
-                    break;
-                }
-            } else {
-                let mut s = self.ack_flush.lock().unwrap();
-                if cursor + MAX_NUM_ACK < history_count {
-                    s.ack_page_cursor = cursor + MAX_NUM_ACK;
-                } else {
-                    s.ack_page_cursor = MAX_NUM_ACK;
-                }
-                s.complete_claim(claimed_acks, claimed_fin);
-                s.last_ack_flush = Some(now);
-                drop(s);
-                self.coord.session_outbound_progress.notify_one();
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    async fn send_with_fec(
+    pub(crate) async fn send_with_fec(
         &mut self,
         codec_pkt: &[u8],
         fec_buf: &mut [u8],

@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use super::ack_flush::AckFlushState;
 use super::coordination::Coordination;
 use super::fec::FecState;
 use super::read_half::ReadHalf;
@@ -11,8 +12,8 @@ use super::termination::{
     PeerReset, TerminationPresser, TerminationReaper, channel as termination_channel,
 };
 use super::transmission_layer::{
-    ACK_FLUSH_AGE, ACK_FLUSH_COUNT, AckFlushState, Log, LogConfig, PRINT_DEBUG_MSGS,
-    ReliableLayerLogger, UnreliableLayer, instream_group_fec_from_env, rtx_dup_from_env,
+    Log, LogConfig, PRINT_DEBUG_MSGS, ReliableLayerLogger, UnreliableLayer,
+    instream_group_fec_from_env, rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
 use super::watchdog_tuning::WatchdogTuning;
@@ -328,14 +329,7 @@ impl Shared {
         };
         let ack_deadline = {
             let ack = self.ack_flush.lock().unwrap();
-            if ack.pending_acks >= ACK_FLUSH_COUNT || ack.fin_pending {
-                Some(now)
-            } else if ack.pending_acks > 0 {
-                ack.last_ack_flush
-                    .map_or(Some(now), |last| Some(last + ACK_FLUSH_AGE))
-            } else {
-                None
-            }
+            ack.next_deadline(now)
         };
         if let Some(ack_deadline) = ack_deadline {
             protocol_deadline =
@@ -384,7 +378,7 @@ impl Shared {
             let reliable_drained = self.reliable_layer.lock().unwrap().is_no_data_to_send();
             let ack_drained = {
                 let ack_flush = self.ack_flush.lock().unwrap();
-                ack_flush.pending_acks == 0 && !ack_flush.fin_pending
+                !ack_flush.has_pending()
             };
             if reliable_drained && ack_drained {
                 return Ok(());
@@ -415,11 +409,7 @@ impl Shared {
         let ack_work_added = batch.pending_acks > 0 || batch.fin_ack;
         if ack_work_added {
             let mut ack_flush = self.ack_flush.lock().unwrap();
-            ack_flush.pending_acks += batch.pending_acks;
-            ack_flush.fin_pending |= batch.fin_ack;
-            if let Some(echo_ts) = batch.echo_ts {
-                ack_flush.ts_echo.set(echo_ts);
-            }
+            ack_flush.record(batch.pending_acks, batch.fin_ack, batch.echo_ts);
         }
         if ack_work_added {
             self.coord.resume_send.notify_one();
@@ -555,8 +545,9 @@ mod tests {
     use crate::io_err::IoErr;
     use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
+    use crate::transmission::test_doubles::BlockingWrite;
     use crate::transmission::transmission_layer::{
-        UnreliableLayer, UnreliableRead, UnreliableWrite,
+        UnreliableLayer, UnreliableRead,
     };
 
     use super::build_parts;
@@ -564,13 +555,10 @@ mod tests {
     #[derive(Debug)]
     struct PendingRead;
 
-    #[derive(Debug)]
-    struct PendingWrite;
-
     fn pending_layer(frame_delivery: FrameDelivery) -> UnreliableLayer {
         UnreliableLayer {
             utp_read: Box::new(PendingRead),
-            utp_write: Box::new(PendingWrite),
+            utp_write: Box::new(BlockingWrite::new()),
             post_open_handshake: None,
             mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
@@ -586,13 +574,6 @@ mod tests {
         }
 
         async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-            std::future::pending().await
-        }
-    }
-
-    #[async_trait]
-    impl UnreliableWrite for PendingWrite {
-        async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
             std::future::pending().await
         }
     }

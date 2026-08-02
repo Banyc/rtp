@@ -1,3 +1,4 @@
+pub(crate) mod ack_flush;
 pub(crate) mod coordination;
 pub(crate) mod fec;
 pub mod fec_tuning;
@@ -12,6 +13,8 @@ pub(crate) mod termination;
 pub mod transmission_layer;
 #[cfg(test)]
 mod transmission_layer_test_facade;
+#[cfg(test)]
+pub(crate) mod test_doubles;
 mod ts_echo;
 pub mod watchdog_tuning;
 pub(crate) mod write_half;

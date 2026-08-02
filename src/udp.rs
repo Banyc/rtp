@@ -2,10 +2,9 @@ use core::{net::SocketAddr, num::NonZeroUsize};
 use std::{path::Path, sync::Arc};
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 
 use async_trait::async_trait;
-use fec::proto::{data_mss, symbol_size};
 use tokio::net::UdpSocket;
 use tokio_udp::UdpSocket as VectoredUdpSocket;
 
@@ -18,12 +17,35 @@ use crate::{
         socket, socket_with_watchdog_tuning,
     },
     transmission::{
-        fec::{FecConfig, FecState},
         fec_tuning::{FecTuning, fec_tuning_from_env},
-        transmission_layer::{self, UnreliableLayer, UnreliableRead, UnreliableWrite},
+        transmission_layer::{self, UnreliableRead, UnreliableWrite},
         watchdog_tuning::WatchdogTuning,
     },
 };
+#[cfg(test)]
+use crate::transmission::transmission_layer::UnreliableLayer;
+
+pub use raw_send::{MaybeRawFd, maybe_raw_fd};
+pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
+
+mod layer;
+#[cfg(test)]
+pub(crate) use layer::wrap_fec;
+#[cfg(test)]
+pub(crate) use layer::{checked_mss_and_fec, wrap_fec_with_mss, wrap_fec_with_mss_and_fec_tuning};
+pub(crate) use layer::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
+
+mod raw_send;
+/// Test-only utilities for simulating packet loss without OS-level network
+/// shaping. Compiled only under `test` builds so production code is completely
+/// unaffected — there is no global drop flag on the production
+/// `UnreliableRead`/`UnreliableWrite` impls.
+///
+/// Loss is per-instance, not global: each test creates a [`LossRate`] and
+/// injects it into the wrappers it wants to be lossy, so tests never interfere
+/// with each other.
+#[cfg(test)]
+pub mod testing;
 
 pub const NO_FEC_MSS: usize = 1424;
 /// Maximum user-configured MSS. Datagrams larger than this are rejected before
@@ -98,19 +120,6 @@ async fn connect_udp(
         }
     }
     Err(last_error.expect("resolve_socket_addrs returned at least one address"))
-}
-
-#[cfg(unix)]
-pub type MaybeRawFd = RawFd;
-#[cfg(not(unix))]
-pub type MaybeRawFd = ();
-#[cfg(unix)]
-pub fn maybe_raw_fd(udp: &impl AsRawFd) -> MaybeRawFd {
-    udp.as_raw_fd()
-}
-#[cfg(not(unix))]
-pub fn maybe_raw_fd<T>(_udp: &T) -> MaybeRawFd {
-    ()
 }
 
 pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
@@ -702,130 +711,6 @@ impl FrameDeliveryIo {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn wrap_fec(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
-    fec: bool,
-) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
-        fec,
-        NO_FEC_MSS,
-        FecTuning::default(),
-        FrameDelivery::default(),
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn wrap_fec_with_mss(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
-    fec: bool,
-    mss: usize,
-) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
-        fec,
-        mss,
-        fec_tuning_from_env(),
-        FrameDelivery::default(),
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
-        fec,
-        mss,
-        tuning,
-        FrameDelivery::default(),
-    )
-}
-
-pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-    frame_delivery: FrameDelivery,
-) -> UnreliableLayer {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning, frame_delivery);
-    UnreliableLayer {
-        utp_read: Box::new(read),
-        utp_write: Box::new(write),
-        post_open_handshake: None,
-        mss,
-        fec: fec_state,
-        fec_tuning: tuning,
-        frame_delivery,
-    }
-}
-
-fn checked_mss_and_fec(
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-    frame_delivery: FrameDelivery,
-) -> (NonZeroUsize, Option<FecState>, FecTuning) {
-    assert!(
-        mss <= MAX_MSS,
-        "mss {mss} exceeds the {MAX_MSS}-byte datagram ceiling"
-    );
-    let fec_state = if fec {
-        let symbol_size = symbol_size(mss).expect("mss too small for the FEC header");
-        Some(FecState::new(FecConfig {
-            symbol_size,
-            interactive_parity_depth: tuning.interactive_parity_depth,
-        }))
-    } else {
-        None
-    };
-    let mss = if fec {
-        data_mss(mss).expect("mss too small for the FEC header")
-    } else {
-        mss
-    };
-    assert!(
-        crate::codec::data_overhead() < mss,
-        "mss {mss} leaves no room for the codec payload"
-    );
-    // In frame-delivery mode, the first packet of each frame carries a
-    // 4-byte frame-length header (FRAME_DATA_TS), so the MSS must leave
-    // room for `frame_data_overhead()` (data_overhead + 4), not just
-    // `data_overhead()`.  A too-small MSS would yield 0-byte-payload first
-    // packets.
-    if frame_delivery.enabled {
-        assert!(
-            crate::delivery::frame::wire::frame_data_overhead() < mss,
-            "mss {mss} leaves no room for the first-frame header"
-        );
-    }
-    // FEC off → depth is irrelevant; normalise to the default so the field is
-    // inert. When FEC is on, clamp to 1 so a misconfigured 0 cannot disable
-    // parity entirely (the stock path always emits at least 1).
-    let tuning = if fec_state.is_none() {
-        FecTuning::default()
-    } else {
-        FecTuning {
-            interactive_parity_depth: tuning.interactive_parity_depth.max(1),
-            ..tuning
-        }
-    };
-    (NonZeroUsize::new(mss).unwrap(), fec_state, tuning)
-}
-
 // Accepted socket
 #[async_trait]
 impl UnreliableRead for IdentityConnRead {
@@ -950,401 +835,6 @@ impl UnreliableWrite for std::sync::Arc<tokio_udp::UdpSocket> {
     }
 }
 
-/// Returns `true` if `code` is the raw OS errno for `ENOBUFS` on the current
-/// platform (macOS `55`, Linux `105`).
-fn is_enobufs_raw_os_error(code: i32) -> bool {
-    cfg_select! {
-        target_os = "macos" => code == 55,
-        target_os = "linux" => code == 105,
-        _ => false,
-    }
-}
-
-/// Normalize transient UDP send-buffer exhaustion (ENOBUFS / ENOBUFS-equivalent
-/// OS errors) to [`std::io::ErrorKind::WouldBlock`].
-///
-/// UDP has no flow control: when the kernel send buffer is full the OS
-/// reports a transient error (macOS errno 55 `ENOBUFS`, Linux errno 105
-/// `ENOBUFS`). These are not fatal — the packet is simply dropped and the
-/// caller should treat it as transient backpressure (equivalent to a loss
-/// event). Reliability is provided above this layer by the reliable layer's
-/// retransmit logic, so dropping an outgoing packet here is recoverable.
-///
-/// All other errors are passed through unchanged.
-pub(crate) fn normalize_send_err(e: std::io::Error) -> IoErr {
-    let err = IoErr::from(e);
-    match err.raw_os_error().is_some_and(is_enobufs_raw_os_error) {
-        true => err.with_kind(std::io::ErrorKind::WouldBlock),
-        false => err,
-    }
-}
-
-/// Decide whether a failed [`UnreliableWrite::try_send`] should fall back to
-/// the async `send` path (waiting for the socket to become writable), or to
-/// the raw-fd fallback ([`raw_sendto_fallback`]).
-///
-/// We only want to wait when the error is a genuine "would block" from a
-/// non-blocking socket that is not currently writable. If the kernel
-/// reported `ENOBUFS` (transient send-buffer exhaustion) we must *not*
-/// wait — the socket is writable, the packet was simply dropped, and
-/// blocking here would spin on a ready-but-lossy path. In that case the
-/// error is normalized to [`std::io::ErrorKind::WouldBlock`] by
-/// [`normalize_send_err`] and surfaced to the caller as a loss event.
-pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
-    if e.kind() != std::io::ErrorKind::WouldBlock {
-        return false;
-    }
-    match e.raw_os_error() {
-        Some(code) => !is_enobufs_raw_os_error(code),
-        None => true,
-    }
-}
-
-/// On macOS, kqueue EVFILT_WRITE tracks only socket sndbuf, not mbuf/
-/// interface-queue pressure — so tokio UDP writability readiness is
-/// *poisoned* under interface backpressure: it reports writable, the send
-/// returns EAGAIN, and a readiness-await parks forever.  Fall back to
-/// bounded raw `send` / `sendto` retries on the socket's raw fd instead
-/// of ever awaiting writability.  Interrupted/EINTR is retried (without
-/// consuming a retry) and each retry backs off with increasing delay so
-/// the send buffer has time to drain.
-///
-/// When `peer` is `Some`, the socket is unconnected and `send_to` is used
-/// to address the peer directly.  When `None`, the socket is connected
-#[cfg(unix)]
-unsafe fn borrowed_udp_socket(raw_fd: MaybeRawFd) -> std::mem::ManuallyDrop<std::net::UdpSocket> {
-    use std::os::fd::FromRawFd;
-    std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) })
-}
-
-/// and a plain `send` suffices.
-///
-/// The raw fd is borrowed via `std::net::UdpSocket::from_raw_fd` so the
-/// OS handles the sockaddr encoding — this avoids both the byte-order bug
-/// of hand-rolled `sockaddr_in` (`from_be_bytes` stores 127.0.0.1 as
-/// memory [1,0,0,127] on little-endian) and the Linux build break from
-/// the BSD-only `sin_len`/`sin6_len` fields.  The borrowed socket is
-/// `mem::forget`ten so the fd is never closed.
-///
-/// Returns `Err(WouldBlock)` when retry budget is exhausted — the caller
-/// must retry later, not treat the packet as sent.
-pub(crate) async fn raw_sendto_fallback(
-    raw_fd: MaybeRawFd,
-    buf: &[u8],
-    peer: Option<core::net::SocketAddr>,
-) -> Result<usize, IoErr> {
-    const BACKOFFS_US: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
-    #[cfg(not(unix))]
-    {
-        let _ = (raw_fd, buf, peer);
-        return Err(std::io::ErrorKind::Unsupported.into());
-    }
-    #[cfg(unix)]
-    {
-        let socket = unsafe { borrowed_udp_socket(raw_fd) };
-        let mut attempt = 0;
-        loop {
-            let res = match &peer {
-                Some(peer) => socket.send_to(buf, peer),
-                None => socket.send(buf),
-            };
-            match res {
-                Ok(n) => {
-                    return Ok(n);
-                }
-                Err(err) => {
-                    let kind = err.kind();
-                    match kind {
-                        std::io::ErrorKind::Interrupted => continue,
-                        std::io::ErrorKind::WouldBlock => {
-                            if attempt >= BACKOFFS_US.len() {
-                                return Err(std::io::ErrorKind::WouldBlock.into());
-                            }
-                            tokio::time::sleep(std::time::Duration::from_micros(
-                                BACKOFFS_US[attempt],
-                            ))
-                            .await;
-                            attempt += 1;
-                        }
-                        _ => {
-                            return Err(normalize_send_err(err));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Test-only utilities for simulating packet loss without OS-level network
-/// shaping. Compiled only under `test` builds so production code is completely
-/// unaffected — there is no global drop flag on the production
-/// `UnreliableRead`/`UnreliableWrite` impls.
-///
-/// Loss is per-instance, not global: each test creates a [`LossRate`] and
-/// injects it into the wrappers it wants to be lossy, so tests never interfere
-/// with each other.
-#[cfg(test)]
-pub mod testing {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use super::*;
-
-    /// A toggable loss rate in basis points (0–10_000), owned by a single test
-    /// and shared (via `Arc`) between the read and write wrappers of one
-    /// connection. 0 means no loss; 10_000 means drop every packet.
-    ///
-    /// Create one per test with [`LossRate::new`] and pass clones to
-    /// [`LossyRead::new`] / [`LossyWrite::new`].
-    #[derive(Debug, Clone)]
-    pub struct LossRate(Arc<AtomicUsize>);
-
-    impl LossRate {
-        /// New loss rate of `bps` basis points (500 = 5%). Clamped to
-        /// `[0, 10_000]`.
-        pub fn new(bps: usize) -> Self {
-            Self(Arc::new(AtomicUsize::new(bps.min(10_000))))
-        }
-
-        /// Set the loss rate to `bps` basis points. Clamped to
-        /// `[0, 10_000]`.
-        pub fn set(&self, bps: usize) {
-            self.0.store(bps.min(10_000), Ordering::Relaxed);
-        }
-
-        /// Current loss rate in basis points.
-        pub fn get(&self) -> usize {
-            self.0.load(Ordering::Relaxed)
-        }
-
-        /// Returns `true` with probability `bps / 10_000`.
-        fn roll(&self) -> bool {
-            let bps = self.0.load(Ordering::Relaxed);
-            bps > 0 && rand::random::<u32>() % 10_000 < bps as u32
-        }
-    }
-
-    /// Wrapper around any `UnreliableRead` that drops a fraction of received
-    /// packets per the injected [`LossRate`]. Dropped packets are skipped (recv
-    /// keeps waiting for the next one); `try_recv` reports `WouldBlock`.
-    #[derive(Debug)]
-    pub struct LossyRead<R: UnreliableRead> {
-        inner: R,
-        rate: LossRate,
-    }
-
-    impl<R: UnreliableRead> LossyRead<R> {
-        pub fn new(read: R, rate: LossRate) -> Self {
-            Self { inner: read, rate }
-        }
-    }
-
-    #[async_trait]
-    impl<R: UnreliableRead + Send + Sync + 'static> UnreliableRead for LossyRead<R> {
-        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-            let n = self.inner.try_recv(buf)?;
-            if self.rate.roll() {
-                return Err(std::io::ErrorKind::WouldBlock.into());
-            }
-            Ok(n)
-        }
-
-        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-            loop {
-                let n = self.inner.recv(buf).await?;
-                if !self.rate.roll() {
-                    return Ok(n);
-                }
-            }
-        }
-    }
-
-    /// Wrapper around any `UnreliableWrite` that drops a fraction of sent
-    /// packets per the injected [`LossRate`]. A dropped send reports success
-    /// (the data is "written" then silently discarded), simulating a packet
-    /// lost in flight after the sender's kernel has accepted it.
-    #[derive(Debug)]
-    pub struct LossyWrite<W: UnreliableWrite> {
-        inner: W,
-        rate: LossRate,
-    }
-
-    impl<W: UnreliableWrite> LossyWrite<W> {
-        pub fn new(write: W, rate: LossRate) -> Self {
-            Self { inner: write, rate }
-        }
-    }
-
-    #[async_trait]
-    impl<W: UnreliableWrite> UnreliableWrite for LossyWrite<W> {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
-            if self.rate.roll() {
-                return Ok(buf.len());
-            }
-            self.inner.send(buf).await
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct ImpairRate {
-        pub loss: LossRate,
-        pub reorder: LossRate,
-        pub duplicate: LossRate,
-        applied: Arc<[AtomicUsize; 3]>,
-    }
-
-    impl ImpairRate {
-        pub fn new(loss_bps: usize, reorder_bps: usize, duplicate_bps: usize) -> Self {
-            Self {
-                loss: LossRate::new(loss_bps),
-                reorder: LossRate::new(reorder_bps),
-                duplicate: LossRate::new(duplicate_bps),
-                applied: Arc::new([const { AtomicUsize::new(0) }; 3]),
-            }
-        }
-
-        pub fn applied(&self) -> (usize, usize, usize) {
-            let n = |i: usize| self.applied[i].load(Ordering::Relaxed);
-            (n(0), n(1), n(2))
-        }
-
-        fn record(&self, i: usize) {
-            self.applied[i].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct ImpairedWrite<W: UnreliableWrite> {
-        inner: W,
-        rate: ImpairRate,
-        held: Option<Vec<u8>>,
-    }
-
-    impl<W: UnreliableWrite> ImpairedWrite<W> {
-        pub fn new(write: W, rate: ImpairRate) -> Self {
-            Self {
-                inner: write,
-                rate,
-                held: None,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl<W: UnreliableWrite> UnreliableWrite for ImpairedWrite<W> {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
-            if self.rate.loss.roll() {
-                self.rate.record(0);
-                return Ok(buf.len());
-            }
-            if let Some(held) = self.held.take() {
-                self.inner.send(buf).await?;
-                self.inner.send(&held).await?;
-                return Ok(buf.len());
-            }
-            if self.rate.reorder.roll() {
-                self.rate.record(1);
-                self.held = Some(buf.to_vec());
-                return Ok(buf.len());
-            }
-            let n = self.inner.send(buf).await?;
-            if self.rate.duplicate.roll() {
-                self.rate.record(2);
-                self.inner.send(buf).await?;
-                self.inner.send(buf).await?;
-                return Ok(buf.len());
-            }
-            Ok(n)
-        }
-    }
-
-    pub fn wrap_fec_impaired<R, W>(
-        read: R,
-        write: W,
-        fec: bool,
-        rate: ImpairRate,
-    ) -> UnreliableLayer
-    where
-        R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite,
-    {
-        let (mss, fec_state, tuning) = checked_mss_and_fec(
-            fec,
-            NO_FEC_MSS,
-            fec_tuning_from_env(),
-            FrameDelivery::default(),
-        );
-        UnreliableLayer {
-            utp_read: Box::new(read),
-            utp_write: Box::new(ImpairedWrite::new(write, rate)),
-            post_open_handshake: None,
-            mss,
-            fec: fec_state,
-            fec_tuning: tuning,
-            frame_delivery: FrameDelivery::default(),
-        }
-    }
-
-    /// Like `wrap_fec` but wraps the read/write pair in lossy injectors driven
-    /// by `rate`. Each connection should get its own `LossRate` (or a shared
-    /// one if you want both directions of a single link to share loss state).
-    pub fn wrap_fec_lossy<R, W>(read: R, write: W, fec: bool, rate: LossRate) -> UnreliableLayer
-    where
-        R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite,
-    {
-        wrap_fec_lossy_with_mss(read, write, fec, NO_FEC_MSS, rate)
-    }
-
-    pub fn wrap_fec_lossy_with_mss<R, W>(
-        read: R,
-        write: W,
-        fec: bool,
-        mss: usize,
-        rate: LossRate,
-    ) -> UnreliableLayer
-    where
-        R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite,
-    {
-        wrap_fec_lossy_with_mss_and_fec_tuning(read, write, fec, mss, fec_tuning_from_env(), rate)
-    }
-
-    /// Like `wrap_fec_lossy_with_mss` but takes an explicit `FecTuning` and
-    /// threads it through the same `checked_mss_and_fec` /
-    /// `wrap_fec_with_mss_and_fec_tuning` construction path production uses.
-    /// Only the lossy read/write injection differs from production; the FEC
-    /// state, MSS normalisation, and tuning clamping are identical, so a
-    /// regression that silently disables FEC at a non-default MSS is caught.
-    pub fn wrap_fec_lossy_with_mss_and_fec_tuning<R, W>(
-        read: R,
-        write: W,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-        rate: LossRate,
-    ) -> UnreliableLayer
-    where
-        R: UnreliableRead + Send + Sync + 'static,
-        W: UnreliableWrite,
-    {
-        let (mss, fec_state, tuning) =
-            checked_mss_and_fec(fec, mss, tuning, FrameDelivery::default());
-        UnreliableLayer {
-            utp_read: Box::new(LossyRead::new(read, rate.clone())),
-            utp_write: Box::new(LossyWrite::new(write, rate)),
-            post_open_handshake: None,
-            mss,
-            fec: fec_state,
-            fec_tuning: tuning,
-            frame_delivery: FrameDelivery::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct LogConfig<'a> {
     pub log_dir_path: &'a Path,
@@ -1413,37 +903,6 @@ mod tests {
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
         require_send(connect("0.0.0.0:0", "0.0.0.0:0", None, false));
-    }
-
-    #[test]
-    fn should_wait_after_plain_wouldblock() {
-        // A WouldBlock with no underlying raw OS error (e.g. synthesized by a
-        // non-blocking mpsc channel) should fall back to the async wait path.
-        let e = std::io::Error::from(std::io::ErrorKind::WouldBlock);
-        assert!(should_wait_after_try_send(&e));
-    }
-
-    #[test]
-    fn should_not_wait_after_enobufs() {
-        #[cfg(target_os = "macos")]
-        let code = 55;
-        #[cfg(target_os = "linux")]
-        let code = 105;
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let e = std::io::Error::from(std::io::ErrorKind::WouldBlock);
-            assert!(should_wait_after_try_send(&e));
-            return;
-        }
-        let e = std::io::Error::from_raw_os_error(code);
-        assert!(!should_wait_after_try_send(&e));
-        let normalized = normalize_send_err(e);
-        assert_eq!(normalized.kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(normalized.raw_os_error(), Some(code));
-        assert!(
-            normalized.to_string().contains(&format!("os error {code}")),
-            "a normalized ENOBUFS must still name itself, got {normalized}"
-        );
     }
 
     #[derive(Debug)]
@@ -1559,49 +1018,6 @@ mod tests {
         }
     }
 
-    /// Fix #1: `raw_fallback_sends_to_peer_on_unconnected_socket` — bind an
-    /// unconnected `UdpSocket`, send via the raw fallback with
-    /// `Some(127.0.0.1:port)`, and assert the datagram arrives at that peer.
-    /// Before the fix, `u32::from_be_bytes(octets)` stored 127.0.0.1 as memory
-    /// `[1,0,0,127]` on little-endian (macOS), so the datagram went to the
-    /// wrong address and never arrived.
-    #[cfg(target_os = "macos")]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn raw_fallback_sends_to_peer_on_unconnected_socket() {
-        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer.local_addr().unwrap();
-
-        // Bind an unconnected socket so `peer` is `Some`.
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        sender.set_nonblocking(true).unwrap();
-        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&sender);
-
-        let payload = b"raw-fallback-test";
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            raw_sendto_fallback(raw_fd, payload, Some(peer_addr)),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(n)) => assert_eq!(n, payload.len()),
-            Ok(Err(e)) => panic!("raw_sendto_fallback failed: {e:?}"),
-            Err(_) => panic!("raw_sendto_fallback hung"),
-        }
-
-        let mut buf = [0u8; 32];
-        let (n, from) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv_from(&mut buf))
-                .await
-                .expect("peer recv timed out")
-                .expect("peer recv failed");
-        assert_eq!(&buf[..n], payload);
-        assert_eq!(
-            from.ip(),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
-        );
-    }
-
     /// Fix #10: `frame_delivery_mss_to_small_for_first_frame_header_errors`
     /// — constructing a frame-delivery connection with an MSS too small for
     /// the first-frame header errors instead of silently producing 0-byte-
@@ -1621,19 +1037,6 @@ mod tests {
             crate::transmission::fec_tuning::FecTuning::default(),
             FrameDelivery::enabled(),
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn dropping_borrowed_socket_never_closes_original_fd() {
-        let original = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&original);
-        {
-            let _socket = unsafe { borrowed_udp_socket(raw_fd) };
-        }
-        original
-            .send_to(b"alive", original.local_addr().unwrap())
-            .unwrap();
     }
 
     #[test]

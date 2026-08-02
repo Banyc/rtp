@@ -97,19 +97,7 @@ pub struct EncodeAck<'a> {
     pub skip: usize,
     pub max_take: usize,
 }
-impl EncodeAck<'_> {
-    pub fn next_page(&self) -> Option<Self> {
-        let skip = self.skip + self.max_take;
-        if self.queue.len() <= skip {
-            return None;
-        }
-        Some(Self {
-            queue: self.queue,
-            skip,
-            max_take: self.max_take,
-        })
-    }
-}
+
 #[derive(Debug, Clone)]
 pub struct EncodeData<'a> {
     pub seq: u64,

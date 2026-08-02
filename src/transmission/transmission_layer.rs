@@ -1,10 +1,10 @@
-use core::{num::NonZeroUsize, time::Duration};
-use std::{io::IoSlice, path::PathBuf, sync::Mutex, time::Instant};
+use core::num::NonZeroUsize;
+use std::{io::IoSlice, path::PathBuf, sync::Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{fec::FecState, fec_tuning::FecTuning, ts_echo::TsEcho};
+use super::{fec::FecState, fec_tuning::FecTuning};
 use crate::delivery::frame::FrameDelivery;
 use crate::io_err::IoErr;
 use crate::sack::AckBall;
@@ -13,10 +13,9 @@ pub use crate::send_queue::liveness::PeerStall;
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
-pub(crate) const MAX_NUM_ACK: usize = 64;
-pub(crate) const ACK_FLUSH_COUNT: usize = 8;
-pub(crate) const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 pub(crate) const BUF_SIZE: usize = 1024 * 64;
+
+pub(crate) use super::ack_flush::MAX_NUM_ACK;
 
 /// Whether retransmission armor (`RTP_RTX_DUP`) is enabled at process
 /// startup.  Reads `RTP_RTX_DUP` once; `1`/`true` enables it, anything
@@ -112,44 +111,6 @@ impl RecvBufs {
 impl Default for RecvBufs {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Shared ACK-flush state, accessed from both the recv path (records ACK
-/// work) and the send path (flushes ACKs to the wire).  Protected by a
-/// `Mutex` so the recv and send tasks can safely concurrent access it.
-#[derive(Debug)]
-pub(crate) struct AckFlushState {
-    pub(crate) ts_echo: TsEcho,
-    pub(crate) pending_acks: usize,
-    pub(crate) fin_pending: bool,
-    pub(crate) last_ack_flush: Option<Instant>,
-    /// Resume offset for deep ack-history pages. Each flush sends cumulative
-    /// page 0 plus one deep page starting here. Wrapped back to MAX_NUM_ACK on
-    /// reset and when the cursor reaches the end of the history.
-    pub(crate) ack_page_cursor: usize,
-}
-
-impl AckFlushState {
-    pub(crate) fn new() -> Self {
-        Self {
-            ts_echo: TsEcho::new(),
-            pending_acks: 0,
-            fin_pending: false,
-            last_ack_flush: None,
-            ack_page_cursor: MAX_NUM_ACK,
-        }
-    }
-
-    /// Subtract-claimed: decrement `pending_acks` by the number actually
-    /// sent (clamped), and clear `fin_pending` only if the FIN was claimed
-    /// and sent.  Never wholesale-clear so a WouldBlock/cancel leaves the
-    /// remaining work intact for the next flush.
-    pub(crate) fn complete_claim(&mut self, claimed_acks: usize, claimed_fin: bool) {
-        self.pending_acks -= claimed_acks.min(self.pending_acks);
-        if claimed_fin {
-            self.fin_pending = false;
-        }
     }
 }
 #[derive(Debug)]

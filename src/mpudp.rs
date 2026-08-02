@@ -9,9 +9,9 @@ use crate::{
     transmission::{
         fec_tuning::FecTuning,
         frame_delivery::{FrameDelivery, frame_delivery_from_env},
-        transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
+        transmission_layer::{UnreliableRead, UnreliableWrite},
     },
-    udp::LogConfig,
+    udp::{LogConfig, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery},
 };
 
 pub const MSS: usize = 1400;
@@ -109,15 +109,14 @@ async fn convert_conn(
         None => None,
     };
     let (r, w) = conn.into_split();
-    let unreliable_layer = UnreliableLayer {
-        utp_read: Box::new(r),
-        utp_write: Box::new(w),
-        post_open_handshake: None,
-        mss: NonZeroUsize::new(MSS).unwrap(),
-        fec: None,
-        fec_tuning: tuning,
+    let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        r,
+        w,
+        false,
+        MSS,
+        tuning,
         frame_delivery,
-    };
+    );
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,

@@ -169,8 +169,8 @@ impl GentleMode {
 
         let open_since = self.gentle_gate_open_since.get_or_insert(now);
         let open_for = now.saturating_duration_since(*open_since);
-        let open_threshold = crate::reliable::reliable_layer::RTT_MIN_BUCKET.max(
-            smooth_rtt.saturating_mul(crate::reliable::reliable_layer::RTT_MIN_BUCKET_RTT_SCALE),
+        let open_threshold = crate::reliable::rate_window::RTT_MIN_BUCKET.max(
+            smooth_rtt.saturating_mul(crate::reliable::rate_window::RTT_MIN_BUCKET_RTT_SCALE),
         );
         if open_for >= open_threshold {
             // The gate has been open long enough on a clean link: leave gentle

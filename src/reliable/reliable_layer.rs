@@ -64,7 +64,6 @@ const QUEUE_RTT_FACTOR: f64 = 2.0;
 // controlled by QUEUE_RTT_FACTOR, not this fraction.
 pub(crate) const QUEUE_TOL_RTT_FRACTION: f64 = 0.25;
 pub(crate) const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(5);
-pub(crate) const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
 pub(crate) const DRAIN_RATE_FRACTION: f64 = 0.85;
 
 /// Fraction of the recent peak delivery rate used as a drain-floor target.
@@ -81,15 +80,13 @@ const DRAIN_FLOOR_PEAK_FRACTION: f64 = 0.25;
 /// stale windowed peak.
 const DRAIN_FLOOR_GRACE_RTTS: f64 = 3.0;
 
-/// Window over which the delivery-rate peak is tracked.
-///
-/// Twice RTT_MIN_BUCKET so the peak reflects the recent steady state but ages
-/// out after idle gaps, mirroring WindowedRttMin.
-const DELIVERY_PEAK_BUCKET: Duration = Duration::from_secs(10);
-
 // Gentle-mode parameters are defined in super::gentle and re-exported here
 // so the test imports via `super::` continue to work.
 pub(crate) use super::gentle::*;
+
+#[cfg(test)]
+use super::rate_window::{RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE};
+use super::rate_window::{WindowedDeliveryMax, WindowedRttMin};
 
 #[derive(Debug, Clone)]
 enum SendFinBuf {
@@ -1017,97 +1014,6 @@ impl ReliableLayer {
             delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),
             app_limited: self.prev_sample_rate.as_ref().map(|sr| sr.is_app_limited()),
         }
-    }
-}
-
-/// Maximum of a sliding window of delivery-rate samples.
-///
-/// Mirrors WindowedRttMin but keeps the peak instead of the minimum. The peak
-/// is used to compute a per-flow drain floor: a flow is allowed to drain down
-/// to a fraction of its own recent peak so a small incumbent is not pinned at
-/// the global MIN_SEND_RATE by a competitor's standing queue.
-#[derive(Debug, Clone)]
-pub(crate) struct WindowedDeliveryMax {
-    bucket_start: Instant,
-    cur: Option<f64>,
-    prev: Option<f64>,
-}
-
-impl WindowedDeliveryMax {
-    fn new(now: Instant) -> Self {
-        Self {
-            bucket_start: now,
-            cur: None,
-            prev: None,
-        }
-    }
-
-    fn update(&mut self, now: Instant, rate: f64) -> f64 {
-        let elapsed = now.duration_since(self.bucket_start);
-        if elapsed > DELIVERY_PEAK_BUCKET * 2 {
-            // Idle staleness: both buckets have aged out.
-            self.cur = None;
-            self.prev = None;
-            self.bucket_start = now;
-        } else if elapsed > DELIVERY_PEAK_BUCKET {
-            self.prev = self.cur.take();
-            self.bucket_start = now;
-        }
-
-        self.cur = Some(match self.cur {
-            Some(cur) => cur.max(rate),
-            None => rate,
-        });
-
-        let candidates = [self.cur, self.prev].into_iter().flatten();
-        candidates.fold(rate, f64::max)
-    }
-}
-
-/// Minimum of a sliding window of RTT samples.
-///
-/// RTT rises when a queue builds, but a lifetime `min_rtt` collapses to ~0 on
-/// jittery links and never recovers. Instead, keep a short windowed minimum:
-/// the floor tracks recent baseline RTT and recovers quickly enough to let the
-/// delay-based gate close when the queue inflates and reopen when it drains.
-#[derive(Debug, Clone)]
-pub(crate) struct WindowedRttMin {
-    bucket_start: Instant,
-    cur: Option<Duration>,
-    prev: Option<Duration>,
-}
-
-pub(crate) const RTT_MIN_BUCKET_RTT_SCALE: u32 = 10;
-
-impl WindowedRttMin {
-    fn new(now: Instant) -> Self {
-        Self {
-            bucket_start: now,
-            cur: None,
-            prev: None,
-        }
-    }
-
-    fn update(&mut self, now: Instant, rtt: Duration) -> Duration {
-        let bucket = RTT_MIN_BUCKET.max(rtt.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
-        let elapsed = now.duration_since(self.bucket_start);
-        if elapsed > bucket * 2 {
-            // Idle staleness: both buckets have aged out, mirror LossEventWindow::rotate.
-            self.cur = None;
-            self.prev = None;
-            self.bucket_start = now;
-        } else if elapsed > bucket {
-            self.prev = self.cur.take();
-            self.bucket_start = now;
-        }
-
-        self.cur = Some(match self.cur {
-            Some(cur) => cur.min(rtt),
-            None => rtt,
-        });
-
-        let candidates = [self.cur, self.prev].into_iter().flatten();
-        candidates.min().unwrap_or(rtt)
     }
 }
 

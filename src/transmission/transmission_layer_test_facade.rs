@@ -117,6 +117,7 @@ impl TransmissionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transmission::test_doubles::BlockingWrite;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -300,19 +301,6 @@ mod tests {
                 };
                 buf[..datagram.len()].copy_from_slice(&datagram);
                 Ok(datagram.len())
-            }
-        }
-        #[derive(Debug)]
-        struct BlockingWrite {
-            started: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-        }
-        #[async_trait]
-        impl UnreliableWrite for BlockingWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
-                self.started.notify_one();
-                self.release.notified().await;
-                Ok(buf.len())
             }
         }
         let mut fin = vec![0; 64];
@@ -980,19 +968,6 @@ mod tests {
             }
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 std::future::pending().await
-            }
-        }
-        #[derive(Debug)]
-        struct BlockingWrite {
-            started: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-        }
-        #[async_trait]
-        impl UnreliableWrite for BlockingWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
-                self.started.notify_one();
-                self.release.notified().await;
-                Ok(buf.len())
             }
         }
         let send_started = Arc::new(tokio::sync::Notify::new());
