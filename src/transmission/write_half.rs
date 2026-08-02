@@ -8,6 +8,7 @@ use super::transmission_layer::{
     ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
 use crate::codec::{EncodeAck, EncodeData, encode_ack_data, encode_kill};
+use crate::io_err::IoErr;
 use crate::pacer::SendWake;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,20 +36,14 @@ impl WriteHalf {
         self.termination_writer.kill_requested()
     }
 
-    async fn try_send_requested_kill(
-        &mut self,
-        bufs: &mut SendBufs,
-    ) -> Option<Result<(), std::io::ErrorKind>> {
+    async fn try_send_requested_kill(&mut self, bufs: &mut SendBufs) -> Option<Result<(), IoErr>> {
         let attempt = self.termination_writer.take_kill_attempt()?;
         let result = self.send_kill_pkt(bufs).await;
         drop(attempt);
         Some(result)
     }
 
-    async fn throw_error_after_requested_kill(
-        &mut self,
-        bufs: &mut SendBufs,
-    ) -> Result<(), std::io::ErrorKind> {
+    async fn throw_error_after_requested_kill(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         match self.termination.throw_error() {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -88,14 +83,11 @@ impl WriteHalf {
     }
 
     #[cfg(test)]
-    pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
+    pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
         self.send_pkts_inner(bufs).await
     }
 
-    pub(crate) async fn send_pass(
-        &mut self,
-        bufs: &mut SendBufs,
-    ) -> Result<SendPass, std::io::ErrorKind> {
+    pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendPass, IoErr> {
         let made_progress = self.send_pkts_inner(bufs).await?;
         Ok(SendPass {
             made_progress,
@@ -103,9 +95,9 @@ impl WriteHalf {
         })
     }
 
-    async fn send_pkts_inner(&mut self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
+    async fn send_pkts_inner(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
         if self.try_send_requested_kill(bufs).await.is_some() {
-            return Err(std::io::ErrorKind::BrokenPipe);
+            return Err(std::io::ErrorKind::BrokenPipe.into());
         }
         self.proactively_terminate_stalled_session();
         self.throw_error_after_requested_kill(bufs).await?;
@@ -114,7 +106,7 @@ impl WriteHalf {
         let mut written_fin = false;
         loop {
             if self.try_send_requested_kill(bufs).await.is_some() {
-                return Err(std::io::ErrorKind::BrokenPipe);
+                return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             self.throw_error_after_requested_kill(bufs).await?;
             let now = Instant::now();
@@ -215,7 +207,7 @@ impl WriteHalf {
                         if token_taken {
                             match self.utp_write.send(send_buf).await {
                                 Ok(_) => {}
-                                Err(std::io::ErrorKind::WouldBlock) => {
+                                Err(error) if error == std::io::ErrorKind::WouldBlock => {
                                     if FEC_DEBUG {
                                         eprintln!("send_pkts: dup WouldBlock (transient)");
                                     }
@@ -229,7 +221,7 @@ impl WriteHalf {
                     }
                     continue;
                 }
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     if FEC_DEBUG {
                         eprintln!("send_pkts: WouldBlock on data send (transient)");
                     }
@@ -263,7 +255,7 @@ impl WriteHalf {
         Ok(0 < written_bytes || written_fin)
     }
 
-    async fn maybe_flush_full_fec_group(&mut self, now: Instant) -> Result<(), std::io::ErrorKind> {
+    async fn maybe_flush_full_fec_group(&mut self, now: Instant) -> Result<(), IoErr> {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
@@ -281,7 +273,7 @@ impl WriteHalf {
         &mut self,
         now: Instant,
         can_send_tail_fec: bool,
-    ) -> Result<(), std::io::ErrorKind> {
+    ) -> Result<(), IoErr> {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
@@ -299,7 +291,7 @@ impl WriteHalf {
         fec.lock().unwrap().skip_open_group();
     }
 
-    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), std::io::ErrorKind> {
+    async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), IoErr> {
         let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
@@ -315,7 +307,7 @@ impl WriteHalf {
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     if FEC_DEBUG {
                         eprintln!("flush_fec_parities: WouldBlock (transient)");
                     }
@@ -330,13 +322,17 @@ impl WriteHalf {
         Ok(())
     }
 
-    async fn send_due_post_open_response(&mut self) -> Result<(), std::io::ErrorKind> {
+    async fn send_due_post_open_response(&mut self) -> Result<(), IoErr> {
         let Some(response) = self.claim_post_open_response(Instant::now()) else {
             return Ok(());
         };
         match self.utp_write.send(&response.bytes).await {
             Ok(len) if len == response.bytes.len() => Ok(()),
-            Ok(_) | Err(std::io::ErrorKind::WouldBlock) => {
+            Ok(_) => {
+                self.retry_post_open_response(Instant::now());
+                Ok(())
+            }
+            Err(error) if error == std::io::ErrorKind::WouldBlock => {
                 self.retry_post_open_response(Instant::now());
                 Ok(())
             }
@@ -347,7 +343,7 @@ impl WriteHalf {
         }
     }
 
-    pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         let fec_enabled = self.send_kill_data_pkt(bufs).await?;
         if fec_enabled {
             self.flush_kill_fec_tail().await;
@@ -355,10 +351,7 @@ impl WriteHalf {
         Ok(())
     }
 
-    async fn send_kill_data_pkt(
-        &mut self,
-        bufs: &mut SendBufs,
-    ) -> Result<bool, std::io::ErrorKind> {
+    async fn send_kill_data_pkt(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
         let fec_enabled = self.fec.is_some();
@@ -377,10 +370,7 @@ impl WriteHalf {
     }
 
     #[cfg(test)]
-    pub async fn send_kill_and_abort(
-        &mut self,
-        bufs: &mut SendBufs,
-    ) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_kill_and_abort(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         self.termination
             .press_broken_pipe(PeerReset::SendKill, None);
         match self.try_send_requested_kill(bufs).await {
@@ -407,7 +397,7 @@ impl WriteHalf {
                 .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
     }
 
-    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         {
             let s = self.ack_flush.lock().unwrap();
             if s.pending_acks == 0 && !s.fin_pending {
@@ -417,12 +407,12 @@ impl WriteHalf {
         self.flush_acks_inner(bufs).await
     }
 
-    async fn flush_acks_inner(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    async fn flush_acks_inner(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         let now = Instant::now();
         let (cursor, history_count) = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let queue = reliable_layer.pkt_recv_space().ack_history();
-            let count = queue.balls().count();
+            let count = queue.len();
             let s = self.ack_flush.lock().unwrap();
             (s.ack_page_cursor.max(MAX_NUM_ACK).min(count), count)
         };
@@ -461,7 +451,7 @@ impl WriteHalf {
                         self.close_fec_burst(now, can_send_tail_fec).await?;
                     }
                 }
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     if let Some(ts) = echo_ts.take().or(echo_backup) {
                         self.ack_flush.lock().unwrap().ts_echo.restore(ts);
                     }
@@ -521,7 +511,7 @@ impl WriteHalf {
         &mut self,
         codec_pkt: &[u8],
         fec_buf: &mut [u8],
-    ) -> Result<usize, std::io::ErrorKind> {
+    ) -> Result<usize, IoErr> {
         let send_buf: &[u8] = {
             match self.fec.as_ref() {
                 Some(fec) => {

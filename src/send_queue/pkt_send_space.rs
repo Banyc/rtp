@@ -227,7 +227,10 @@ impl PktSendSpace {
         let cumulative_front_before = self.send_wnd.start().or(self.send_wnd.next()).copied();
         let peer_waiting_for_acked_pkts =
             cumulative_front_before.is_some_and(|front| recved.first_unacked() < front);
-        if let Some(seq) = recved.out_of_order_seq_end() {
+        let sent_end = self.send_wnd.next().copied().unwrap_or(u64::MAX);
+        if let Some(seq) = recved.out_of_order_seq_end()
+            && seq < sent_end
+        {
             self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
         }
         self.unacked_buf.clear();
@@ -279,9 +282,9 @@ impl PktSendSpace {
         for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
             let mut passes: u32 = 0;
             for ball in balls {
-                let ball_end = ball.start + ball.size.get();
+                let ball_end = ball.end().min(sent_end);
                 let newer = if s < ball.start {
-                    ball.size.get()
+                    ball_end.saturating_sub(ball.start)
                 } else if s < ball_end {
                     ball_end - s - 1
                 } else {
@@ -1890,6 +1893,63 @@ mod tests {
         // seq 0 is below out_of_order_seq_end (= 3), so the reorder-window
         // path applies to it.
         assert!(space.out_of_order_seq_end > 0);
+    }
+
+    #[test]
+    fn a_peer_cannot_report_a_gap_past_what_was_sent() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        for _ in 0..3 {
+            send_packet(&mut space, t0);
+        }
+        let balls = [crate::sack::AckBall {
+            start: u64::MAX,
+            size: std::num::NonZeroU64::new(1).unwrap(),
+        }];
+        let mut acked = Vec::new();
+        space.ack(
+            crate::sack::AckBallSequence::new(&balls),
+            &mut acked,
+            t0 + ms(1),
+        );
+        assert!(
+            space.out_of_order_seq_end <= space.next_seq(),
+            "the peer moved the gap bound to {} with only {} sequences sent",
+            space.out_of_order_seq_end,
+            space.next_seq(),
+        );
+        assert!(
+            !space.has_rtx(t0 + ms(300)),
+            "the whole send window went into fast retransmit on one bogus ack"
+        );
+    }
+
+    #[test]
+    fn a_ball_spanning_the_whole_space_is_no_evidence_of_loss() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        for _ in 0..3 {
+            send_packet(&mut space, t0);
+        }
+        let balls = [crate::sack::AckBall {
+            start: 3,
+            size: std::num::NonZeroU64::new(u64::MAX).unwrap(),
+        }];
+        let mut acked = Vec::new();
+        space.ack(
+            crate::sack::AckBallSequence::new(&balls),
+            &mut acked,
+            t0 + ms(1),
+        );
+        for s in 0..3 {
+            assert_eq!(
+                sack_passes(&space, s),
+                0,
+                "seq {s} was credited with newer deliveries the peer never received"
+            );
+        }
     }
 
     #[test]

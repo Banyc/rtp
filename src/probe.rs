@@ -1,3 +1,4 @@
+use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::UnreliableRead;
 use async_trait::async_trait;
 use std::{
@@ -159,7 +160,7 @@ impl<R> EchoInterceptRead<R> {
 }
 #[async_trait]
 impl<R: UnreliableRead> UnreliableRead for EchoInterceptRead<R> {
-    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         loop {
             let n = self.inner.try_recv(buf)?;
             if self.filter(&buf[..n]).is_some() {
@@ -167,7 +168,7 @@ impl<R: UnreliableRead> UnreliableRead for EchoInterceptRead<R> {
             }
         }
     }
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         loop {
             let n = self.inner.recv(buf).await?;
             if self.filter(&buf[..n]).is_some() {

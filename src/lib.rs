@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod delivery;
 pub mod handshake;
+pub mod io_err;
 pub mod keyed_udp;
 pub mod mpudp;
 mod pacer;

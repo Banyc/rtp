@@ -10,6 +10,7 @@ use super::transmission_layer::{
     UnreliableWrite,
 };
 use super::write_half::WriteHalf;
+use crate::io_err::IoErr;
 use async_trait::async_trait;
 
 #[cfg(test)]
@@ -85,11 +86,11 @@ impl TransmissionLayer {
             .take_at_most_tokens(n, now)
     }
 
-    pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, std::io::ErrorKind> {
+    pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
         self.write_half.send_pkts(bufs).await
     }
 
-    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         self.write_half.flush_acks(bufs).await
     }
 
@@ -97,21 +98,18 @@ impl TransmissionLayer {
         self.write_half.has_pending_acks()
     }
 
-    pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         self.write_half.send_kill_pkt(bufs).await
     }
 
-    pub async fn send_kill_and_abort(
-        &mut self,
-        bufs: &mut SendBufs,
-    ) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_kill_and_abort(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         self.write_half.send_kill_and_abort(bufs).await
     }
 
     pub async fn recv_pkts(
         &mut self,
         bufs: &mut RecvBufs,
-    ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
+    ) -> Result<RecvPkts, (IoErr, SendKillPkt)> {
         self.read_half.recv_pkts(bufs).await
     }
 }
@@ -144,11 +142,11 @@ mod tests {
     struct BlackholeRead;
     #[async_trait]
     impl UnreliableRead for BlackholeRead {
-        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
-        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
     }
 
@@ -186,9 +184,9 @@ mod tests {
         #[derive(Debug)]
         struct OneDatagramRead(Option<Vec<u8>>);
         impl OneDatagramRead {
-            fn take(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            fn take(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let Some(datagram) = self.0.take() else {
-                    return Err(std::io::ErrorKind::WouldBlock);
+                    return Err(std::io::ErrorKind::WouldBlock.into());
                 };
                 buf[..datagram.len()].copy_from_slice(&datagram);
                 Ok(datagram.len())
@@ -196,10 +194,10 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableRead for OneDatagramRead {
-            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 self.take(buf)
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 self.take(buf)
             }
         }
@@ -207,7 +205,7 @@ mod tests {
         struct ImmediateWrite;
         #[async_trait]
         impl UnreliableWrite for ImmediateWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 Ok(buf.len())
             }
         }
@@ -239,9 +237,9 @@ mod tests {
         #[derive(Debug)]
         struct DatagramQueue(std::collections::VecDeque<Vec<u8>>);
         impl DatagramQueue {
-            fn take(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            fn take(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let Some(datagram) = self.0.pop_front() else {
-                    return Err(std::io::ErrorKind::WouldBlock);
+                    return Err(std::io::ErrorKind::WouldBlock.into());
                 };
                 buf[..datagram.len()].copy_from_slice(&datagram);
                 Ok(datagram.len())
@@ -249,10 +247,10 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableRead for DatagramQueue {
-            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 self.take(buf)
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 self.take(buf)
             }
         }
@@ -260,7 +258,7 @@ mod tests {
         struct ImmediateWrite;
         #[async_trait]
         impl UnreliableWrite for ImmediateWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 Ok(buf.len())
             }
         }
@@ -293,12 +291,12 @@ mod tests {
         struct OneFinRead(Option<Vec<u8>>);
         #[async_trait]
         impl UnreliableRead for OneFinRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let Some(datagram) = self.0.take() else {
-                    return Err(std::io::ErrorKind::WouldBlock);
+                    return Err(std::io::ErrorKind::WouldBlock.into());
                 };
                 buf[..datagram.len()].copy_from_slice(&datagram);
                 Ok(datagram.len())
@@ -311,7 +309,7 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for BlockingWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.started.notify_one();
                 self.release.notified().await;
                 Ok(buf.len())
@@ -395,7 +393,7 @@ mod tests {
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
         #[async_trait]
         impl UnreliableWrite for SharedWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.0.lock().unwrap().push(buf.to_vec());
                 Ok(buf.len())
             }
@@ -416,6 +414,7 @@ mod tests {
         );
         let mut tl = TransmissionLayer::new(ul, None);
         tl.set_rtx_dup_for_test(enabled);
+        tl.set_instream_group_fec_for_test(false);
         (tl, recorder)
     }
 
@@ -426,11 +425,11 @@ mod tests {
     }
     #[async_trait]
     impl UnreliableWrite for FailAfterFirstWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(buf.len())
             } else {
-                Err(self.error)
+                Err(self.error.into())
             }
         }
     }
@@ -488,14 +487,17 @@ mod tests {
         let mut bufs = SendBufs::new();
         assert_eq!(
             tl.send_pkts(&mut bufs).await,
-            Err(std::io::ErrorKind::ConnectionReset)
+            Err(std::io::ErrorKind::ConnectionReset.into())
         );
-        assert_eq!(tl.throw_error(), Err(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(
+            tl.throw_error(),
+            Err(std::io::ErrorKind::ConnectionReset.into())
+        );
         assert!(tl.termination.terminal().is_cancelled());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             tl.send_pkts(&mut bufs).await,
-            Err(std::io::ErrorKind::ConnectionReset)
+            Err(std::io::ErrorKind::ConnectionReset.into())
         );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -525,7 +527,7 @@ mod tests {
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_kill_and_abort(&mut bufs).await, Ok(()));
-        assert_eq!(tl.throw_error(), Err(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(tl.throw_error(), Err(std::io::ErrorKind::BrokenPipe.into()));
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             2,
@@ -639,7 +641,7 @@ mod tests {
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
         #[async_trait]
         impl UnreliableWrite for SharedWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.0.lock().unwrap().push(buf.to_vec());
                 Ok(buf.len())
             }
@@ -660,6 +662,7 @@ mod tests {
         );
         let mut tl = TransmissionLayer::new(ul, None);
         tl.set_rtx_dup_for_test(enabled);
+        tl.set_instream_group_fec_for_test(false);
         (tl, recorder)
     }
 
@@ -777,13 +780,13 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableRead for OnePktRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let mut sent = self.sent.lock().unwrap();
                 if *sent {
-                    return Err(std::io::ErrorKind::UnexpectedEof);
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
                 }
                 *sent = true;
                 let payload = b"hi";
@@ -802,8 +805,8 @@ mod tests {
         struct BlockedWrite;
         #[async_trait]
         impl UnreliableWrite for BlockedWrite {
-            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
         }
         let read = OnePktRead {
@@ -852,10 +855,10 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableRead for CancellationSensitiveRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let call = self.state.calls.fetch_add(1, Ordering::SeqCst);
                 let mut probe = (call == 2).then(|| CancelProbe {
                     state: Arc::clone(&self.state),
@@ -883,7 +886,7 @@ mod tests {
         struct ImmediateWrite;
         #[async_trait]
         impl UnreliableWrite for ImmediateWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 Ok(buf.len())
             }
         }
@@ -972,10 +975,10 @@ mod tests {
         struct SilentRead;
         #[async_trait]
         impl UnreliableRead for SilentRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 std::future::pending().await
             }
         }
@@ -986,7 +989,7 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for BlockingWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.started.notify_one();
                 self.release.notified().await;
                 Ok(buf.len())
@@ -1042,10 +1045,10 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for WouldBlockWrite {
-            async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
                 let mut c = self.call_count.lock().unwrap();
                 *c += 1;
-                Err(std::io::ErrorKind::WouldBlock)
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
         }
         #[derive(Debug)]
@@ -1054,13 +1057,13 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableRead for OnePktRead2 {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let mut sent = self.sent.lock().unwrap();
                 if *sent {
-                    return Err(std::io::ErrorKind::UnexpectedEof);
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
                 }
                 *sent = true;
                 let payload = b"x";
@@ -1114,7 +1117,7 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for PendingKillWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.recorder.lock().unwrap().push(buf.to_vec());
                 if buf == [2] {
                     self.kill_started.notify_one();
@@ -1158,7 +1161,7 @@ mod tests {
         kill_started.notified().await;
         assert_eq!(
             shared.throw_error(),
-            Err(std::io::ErrorKind::BrokenPipe),
+            Err(std::io::ErrorKind::BrokenPipe.into()),
             "local fatal state must be visible while KILL delivery is blocked"
         );
         assert!(
@@ -1166,7 +1169,9 @@ mod tests {
             "session cancellation must be published before KILL delivery completes"
         );
         assert!(!send.is_finished(), "KILL delivery must still be pending");
-        let err = shared.termination.io_error(std::io::ErrorKind::BrokenPipe);
+        let err = shared
+            .termination
+            .io_error(std::io::ErrorKind::BrokenPipe.into());
         let msg = err.to_string();
         assert!(
             msg.contains("trigger=proactive_stall"),
@@ -1195,7 +1200,7 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for KillThenStuckTail {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 if self.sends.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(buf.len())
                 } else {
@@ -1222,7 +1227,10 @@ mod tests {
         });
         tail_started.notified().await;
         assert_eq!(sends.load(Ordering::SeqCst), 2);
-        assert_eq!(shared.throw_error(), Err(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(
+            shared.throw_error(),
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        );
         assert!(shared.termination.terminal().is_cancelled());
         assert!(!send.is_finished());
         send.abort();
@@ -1239,13 +1247,13 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableRead for DupEchoRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
                 let mut sent = self.sent.lock().unwrap();
                 if *sent >= 2 {
-                    return Err(std::io::ErrorKind::UnexpectedEof);
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
                 }
                 *sent += 1;
                 let mut pkt = [0u8; 1 + 4];
@@ -1260,7 +1268,7 @@ mod tests {
         struct OkWrite;
         #[async_trait]
         impl UnreliableWrite for OkWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 Ok(buf.len())
             }
         }

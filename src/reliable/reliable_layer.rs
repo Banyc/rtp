@@ -14,6 +14,7 @@ use primitive::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::io_err::IoErr;
 use crate::{
     codec::data_overhead,
     delivery::{
@@ -318,11 +319,11 @@ impl ReliableLayer {
         self.send_fin_buf = SendFinBuf::Some;
     }
 
-    pub(crate) fn ensure_write_open(&self) -> Result<(), std::io::ErrorKind> {
+    pub(crate) fn ensure_write_open(&self) -> Result<(), IoErr> {
         if matches!(self.send_fin_buf, SendFinBuf::Empty) {
             Ok(())
         } else {
-            Err(std::io::ErrorKind::BrokenPipe)
+            Err(std::io::ErrorKind::BrokenPipe.into())
         }
     }
 
@@ -348,7 +349,7 @@ impl ReliableLayer {
         }
     }
 
-    pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> Result<usize, std::io::ErrorKind> {
+    pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> Result<usize, IoErr> {
         self.ensure_write_open()?;
         self.detect_application_limited_phases(now);
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
@@ -357,14 +358,9 @@ impl ReliableLayer {
         Ok(self.send_data_buf.stage(buf, cap))
     }
 
-    /// Stage a whole application frame in frame-delivery mode.  The frame is
-    /// queued in the frame send stage and packetized frame-aligned by
-    /// subsequent `send_data_pkt` calls (a packet never carries bytes of two
-    /// frames).  Returns `Ok(())` on success, or `Err(InvalidInput)` when the
-    /// mode is off, the frame is empty, or the frame exceeds `MAX_FRAME_LEN`.
-    pub fn send_frame_buf(&mut self, frame: &[u8], now: Instant) -> Result<(), std::io::ErrorKind> {
+    pub fn send_frame_buf(&mut self, frame: &[u8], now: Instant) -> Result<(), IoErr> {
         if !self.frame_delivery.enabled {
-            return Err(std::io::ErrorKind::InvalidInput);
+            return Err(std::io::ErrorKind::InvalidInput.into());
         }
         self.ensure_write_open()?;
         crate::delivery::frame::send::validate_frame(frame)?;
@@ -922,35 +918,21 @@ impl ReliableLayer {
         disposition
     }
 
-    /// Pop one complete frame from the receive queue in frame-delivery mode.
-    /// Returns `Ok(Some(frame))` when a complete frame is available (possibly
-    /// out of order past sequence holes), `Ok(None)` on EOF (FIN received and
-    /// no more frames), or `Err(InvalidInput)` when frame-delivery mode is
-    /// off.
-    pub fn recv_frame_buf(&mut self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+    pub fn recv_frame_buf(&mut self) -> Result<Option<Vec<u8>>, IoErr> {
         if !self.frame_delivery.enabled {
-            return Err(std::io::ErrorKind::InvalidInput);
+            return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        // Try to pop a complete frame from the receive queue.
         if let Some(frame) = self.pkt_recv_space.pop_complete_frame() {
             return Ok(Some(frame));
         }
-        // FIN handling: in frame mode the FIN is an empty-payload packet
-        // with no `frame_len`.  `move_recv_data` (which sets `recv_fin_buf`)
-        // is bypassed in frame mode, so we gate EOF on the recv-space cursor
-        // directly: a FIN at the in-order head means all earlier data has
-        // been delivered, so surface EOF.  A FIN behind an out-of-order gap
-        // does NOT surface EOF until the gap fills.
         if self.pkt_recv_space.fin_at_head() {
             self.recv_fin_buf = true;
             return Ok(None);
         }
-        // Fallback: if `recv_fin_buf` was set by some other path, honor it.
         if self.recv_fin_buf {
             return Ok(None);
         }
-        // No complete frame and no FIN yet: pending.
-        Err(std::io::ErrorKind::WouldBlock)
+        Err(std::io::ErrorKind::WouldBlock.into())
     }
 
     /// Move data from pkt space to data buffer
@@ -1410,7 +1392,7 @@ mod tests {
         stock.send_fin_buf();
         assert_eq!(
             stock.send_data_buf(b"after FIN", now),
-            Err(std::io::ErrorKind::BrokenPipe)
+            Err(std::io::ErrorKind::BrokenPipe.into())
         );
         let (mut frame, _) = super::ReliableLayer::new(
             NonZeroUsize::new(TEST_MSS).unwrap(),
@@ -1420,7 +1402,7 @@ mod tests {
         frame.send_fin_buf();
         assert_eq!(
             frame.send_frame_buf(b"after FIN", now),
-            Err(std::io::ErrorKind::BrokenPipe)
+            Err(std::io::ErrorKind::BrokenPipe.into())
         );
     }
 

@@ -100,7 +100,7 @@ pub struct EncodeAck<'a> {
 impl EncodeAck<'_> {
     pub fn next_page(&self) -> Option<Self> {
         let skip = self.skip + self.max_take;
-        if self.queue.balls().count() <= skip {
+        if self.queue.len() <= skip {
             return None;
         }
         Some(Self {

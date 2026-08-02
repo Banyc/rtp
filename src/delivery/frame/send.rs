@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 
 use primitive::{ops::len::Len, queue::cap_queue::CapVecQueue};
 
+use crate::io_err::IoErr;
+
 /// Maximum application bytes in a single frame in frame-delivery mode.
 /// Set equal to the stock `MAX_SEND_DATA_BUF_LEN` so a frame can occupy
 /// the whole staging buffer.
@@ -51,15 +53,11 @@ impl FrameSendStage {
         self.data.len()
     }
 
-    pub(crate) fn stage_frame(
-        &mut self,
-        frame: &[u8],
-        soft_cap: usize,
-    ) -> Result<(), std::io::ErrorKind> {
+    pub(crate) fn stage_frame(&mut self, frame: &[u8], soft_cap: usize) -> Result<(), IoErr> {
         validate_frame(frame)?;
         let pending_bytes = self.pending_bytes();
         if self.pending_frames.len() == MAX_PENDING_FRAMES {
-            return Err(std::io::ErrorKind::WouldBlock);
+            return Err(std::io::ErrorKind::WouldBlock.into());
         }
         let free_bytes = if pending_bytes == 0 {
             MAX_FRAME_LEN
@@ -69,7 +67,7 @@ impl FrameSendStage {
                 .min(MAX_FRAME_LEN - pending_bytes)
         };
         if free_bytes < frame.len() {
-            return Err(std::io::ErrorKind::WouldBlock);
+            return Err(std::io::ErrorKind::WouldBlock.into());
         }
         self.data.batch_enqueue(frame);
         self.pending_frames.push_back(PendingFrame {
@@ -118,12 +116,12 @@ pub(crate) fn is_valid_frame_len(frame_len: u32) -> bool {
 }
 /// Validate a frame for staging: rejects empty frames and frames larger than
 /// [`MAX_FRAME_LEN`] with `InvalidInput`.
-pub(crate) fn validate_frame(frame: &[u8]) -> Result<(), std::io::ErrorKind> {
+pub(crate) fn validate_frame(frame: &[u8]) -> Result<(), IoErr> {
     let Ok(frame_len) = u32::try_from(frame.len()) else {
-        return Err(std::io::ErrorKind::InvalidInput);
+        return Err(std::io::ErrorKind::InvalidInput.into());
     };
     if !is_valid_frame_len(frame_len) {
-        return Err(std::io::ErrorKind::InvalidInput);
+        return Err(std::io::ErrorKind::InvalidInput.into());
     }
     Ok(())
 }

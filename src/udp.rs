@@ -9,6 +9,7 @@ use fec::proto::{data_mss, symbol_size};
 use tokio::net::UdpSocket;
 use tokio_udp::UdpSocket as VectoredUdpSocket;
 
+use crate::io_err::IoErr;
 use crate::{
     delivery::frame::{FrameDelivery, frame_delivery_from_env},
     handshake::{client_opening_handshake, server_opening_handshake},
@@ -828,7 +829,7 @@ fn checked_mss_and_fec(
 // Accepted socket
 #[async_trait]
 impl UnreliableRead for IdentityConnRead {
-    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         let pkt = Self::recv(self).try_recv().map_err(|e| match e {
             tokio::sync::mpsc::error::TryRecvError::Empty => std::io::ErrorKind::WouldBlock,
             tokio::sync::mpsc::error::TryRecvError::Disconnected => {
@@ -840,7 +841,7 @@ impl UnreliableRead for IdentityConnRead {
         Ok(min_len)
     }
 
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         let pkt = Self::recv(self)
             .recv()
             .await
@@ -862,48 +863,41 @@ pub(crate) struct RawFdConnWrite {
 
 #[async_trait]
 impl UnreliableWrite for RawFdConnWrite {
-    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
         match self.inner.try_send(buf) {
             Ok(n) => Ok(n),
             Err(e) if should_wait_after_try_send(&e) => {
                 cfg_select! {
                     target_os = "macos" => raw_sendto_fallback(self.raw_fd, buf, self.peer).await,
-                    not(target_os = "macos") => self.inner.send(buf)
-                            .await
-                            .map_err(|e| normalize_send_err(e).kind()),
+                    not(target_os = "macos") => self.inner.send(buf).await.map_err(normalize_send_err),
                 }
             }
-            Err(e) => Err(normalize_send_err(e).kind()),
+            Err(e) => Err(normalize_send_err(e)),
         }
     }
 
-    async fn send_vectored(
-        &mut self,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Result<usize, std::io::ErrorKind> {
+    async fn send_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize, IoErr> {
         self.inner
             .send_vectored(bufs)
             .await
-            .map_err(|error| normalize_send_err(error).kind())
+            .map_err(normalize_send_err)
     }
 }
 
 // Connected socket
 #[async_trait]
 impl UnreliableRead for Arc<UdpSocket> {
-    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::try_recv(self, buf).map_err(|e| normalize_send_err(e).kind())
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+        UdpSocket::try_recv(self, buf).map_err(normalize_send_err)
     }
 
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        UdpSocket::recv(self, buf)
-            .await
-            .map_err(|e| normalize_send_err(e).kind())
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+        UdpSocket::recv(self, buf).await.map_err(normalize_send_err)
     }
 }
 #[async_trait]
 impl UnreliableWrite for Arc<UdpSocket> {
-    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
         match UdpSocket::try_send(self, buf) {
             Ok(n) => Ok(n),
             Err(e) if should_wait_after_try_send(&e) => {
@@ -913,12 +907,10 @@ impl UnreliableWrite for Arc<UdpSocket> {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    UdpSocket::send(self, buf)
-                        .await
-                        .map_err(|e| normalize_send_err(e).kind())
+                    UdpSocket::send(self, buf).await.map_err(normalize_send_err)
                 }
             }
-            Err(e) => Err(normalize_send_err(e).kind()),
+            Err(e) => Err(normalize_send_err(e)),
         }
     }
 }
@@ -928,36 +920,33 @@ impl UnreliableWrite for Arc<UdpSocket> {
 
 #[async_trait]
 impl UnreliableRead for std::sync::Arc<tokio_udp::UdpSocket> {
-    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-        tokio_udp::UdpSocket::try_recv(self, buf).map_err(|e| normalize_send_err(e).kind())
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+        tokio_udp::UdpSocket::try_recv(self, buf).map_err(normalize_send_err)
     }
 
-    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         tokio_udp::UdpSocket::recv(self, buf)
             .await
-            .map_err(|e| normalize_send_err(e).kind())
+            .map_err(normalize_send_err)
     }
 }
 
 #[async_trait]
 impl UnreliableWrite for std::sync::Arc<tokio_udp::UdpSocket> {
-    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
         match tokio_udp::UdpSocket::try_send(self, buf) {
             Ok(n) => Ok(n),
             Err(e) if should_wait_after_try_send(&e) => tokio_udp::UdpSocket::send(self, buf)
                 .await
-                .map_err(|e| normalize_send_err(e).kind()),
-            Err(e) => Err(normalize_send_err(e).kind()),
+                .map_err(normalize_send_err),
+            Err(e) => Err(normalize_send_err(e)),
         }
     }
 
-    async fn send_vectored(
-        &mut self,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Result<usize, std::io::ErrorKind> {
+    async fn send_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize, IoErr> {
         tokio_udp::UdpSocket::send_vectored(self, bufs)
             .await
-            .map_err(|e| normalize_send_err(e).kind())
+            .map_err(normalize_send_err)
     }
 }
 
@@ -982,13 +971,12 @@ fn is_enobufs_raw_os_error(code: i32) -> bool {
 /// retransmit logic, so dropping an outgoing packet here is recoverable.
 ///
 /// All other errors are passed through unchanged.
-pub(crate) fn normalize_send_err(e: std::io::Error) -> std::io::Error {
-    if let Some(code) = e.raw_os_error()
-        && is_enobufs_raw_os_error(code)
-    {
-        return std::io::ErrorKind::WouldBlock.into();
+pub(crate) fn normalize_send_err(e: std::io::Error) -> IoErr {
+    let err = IoErr::from(e);
+    match err.raw_os_error().is_some_and(is_enobufs_raw_os_error) {
+        true => err.with_kind(std::io::ErrorKind::WouldBlock),
+        false => err,
     }
-    e
 }
 
 /// Decide whether a failed [`UnreliableWrite::try_send`] should fall back to
@@ -1044,12 +1032,12 @@ pub(crate) async fn raw_sendto_fallback(
     raw_fd: MaybeRawFd,
     buf: &[u8],
     peer: Option<core::net::SocketAddr>,
-) -> Result<usize, std::io::ErrorKind> {
+) -> Result<usize, IoErr> {
     const BACKOFFS_US: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
     #[cfg(not(unix))]
     {
         let _ = (raw_fd, buf, peer);
-        return Err(std::io::ErrorKind::Unsupported);
+        return Err(std::io::ErrorKind::Unsupported.into());
     }
     #[cfg(unix)]
     {
@@ -1070,7 +1058,7 @@ pub(crate) async fn raw_sendto_fallback(
                         std::io::ErrorKind::Interrupted => continue,
                         std::io::ErrorKind::WouldBlock => {
                             if attempt >= BACKOFFS_US.len() {
-                                return Err(std::io::ErrorKind::WouldBlock);
+                                return Err(std::io::ErrorKind::WouldBlock.into());
                             }
                             tokio::time::sleep(std::time::Duration::from_micros(
                                 BACKOFFS_US[attempt],
@@ -1079,7 +1067,7 @@ pub(crate) async fn raw_sendto_fallback(
                             attempt += 1;
                         }
                         _ => {
-                            return Err(normalize_send_err(err).kind());
+                            return Err(normalize_send_err(err));
                         }
                     }
                 }
@@ -1156,15 +1144,15 @@ pub mod testing {
 
     #[async_trait]
     impl<R: UnreliableRead + Send + Sync + 'static> UnreliableRead for LossyRead<R> {
-        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
             let n = self.inner.try_recv(buf)?;
             if self.rate.roll() {
-                return Err(std::io::ErrorKind::WouldBlock);
+                return Err(std::io::ErrorKind::WouldBlock.into());
             }
             Ok(n)
         }
 
-        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
             loop {
                 let n = self.inner.recv(buf).await?;
                 if !self.rate.roll() {
@@ -1192,11 +1180,111 @@ pub mod testing {
 
     #[async_trait]
     impl<W: UnreliableWrite> UnreliableWrite for LossyWrite<W> {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             if self.rate.roll() {
                 return Ok(buf.len());
             }
             self.inner.send(buf).await
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ImpairRate {
+        pub loss: LossRate,
+        pub reorder: LossRate,
+        pub duplicate: LossRate,
+        applied: Arc<[AtomicUsize; 3]>,
+    }
+
+    impl ImpairRate {
+        pub fn new(loss_bps: usize, reorder_bps: usize, duplicate_bps: usize) -> Self {
+            Self {
+                loss: LossRate::new(loss_bps),
+                reorder: LossRate::new(reorder_bps),
+                duplicate: LossRate::new(duplicate_bps),
+                applied: Arc::new([const { AtomicUsize::new(0) }; 3]),
+            }
+        }
+
+        pub fn applied(&self) -> (usize, usize, usize) {
+            let n = |i: usize| self.applied[i].load(Ordering::Relaxed);
+            (n(0), n(1), n(2))
+        }
+
+        fn record(&self, i: usize) {
+            self.applied[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ImpairedWrite<W: UnreliableWrite> {
+        inner: W,
+        rate: ImpairRate,
+        held: Option<Vec<u8>>,
+    }
+
+    impl<W: UnreliableWrite> ImpairedWrite<W> {
+        pub fn new(write: W, rate: ImpairRate) -> Self {
+            Self {
+                inner: write,
+                rate,
+                held: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<W: UnreliableWrite> UnreliableWrite for ImpairedWrite<W> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+            if self.rate.loss.roll() {
+                self.rate.record(0);
+                return Ok(buf.len());
+            }
+            if let Some(held) = self.held.take() {
+                self.inner.send(buf).await?;
+                self.inner.send(&held).await?;
+                return Ok(buf.len());
+            }
+            if self.rate.reorder.roll() {
+                self.rate.record(1);
+                self.held = Some(buf.to_vec());
+                return Ok(buf.len());
+            }
+            let n = self.inner.send(buf).await?;
+            if self.rate.duplicate.roll() {
+                self.rate.record(2);
+                self.inner.send(buf).await?;
+                self.inner.send(buf).await?;
+                return Ok(buf.len());
+            }
+            Ok(n)
+        }
+    }
+
+    pub fn wrap_fec_impaired<R, W>(
+        read: R,
+        write: W,
+        fec: bool,
+        rate: ImpairRate,
+    ) -> UnreliableLayer
+    where
+        R: UnreliableRead + Send + Sync + 'static,
+        W: UnreliableWrite,
+    {
+        let (mss, fec_state, tuning) = checked_mss_and_fec(
+            fec,
+            NO_FEC_MSS,
+            fec_tuning_from_env(),
+            FrameDelivery::default(),
+        );
+        UnreliableLayer {
+            utp_read: Box::new(read),
+            utp_write: Box::new(ImpairedWrite::new(write, rate)),
+            post_open_handshake: None,
+            mss,
+            fec: fec_state,
+            fec_tuning: tuning,
+            frame_delivery: FrameDelivery::default(),
         }
     }
 
@@ -1337,51 +1425,41 @@ mod tests {
 
     #[test]
     fn should_not_wait_after_enobufs() {
-        // ENOBUFS is normalized to WouldBlock, but the raw OS error is
-        // preserved on the error, so `should_wait_after_try_send` must
-        // return false — waiting would spin on a writable-but-lossy socket.
         #[cfg(target_os = "macos")]
         let code = 55;
         #[cfg(target_os = "linux")]
         let code = 105;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            // On other platforms we have no ENOBUFS mapping; skip the raw-code
-            // assertion but still verify that a plain WouldBlock waits.
             let e = std::io::Error::from(std::io::ErrorKind::WouldBlock);
             assert!(should_wait_after_try_send(&e));
             return;
         }
-
         let e = std::io::Error::from_raw_os_error(code);
-        // Note: `Error::from_raw_os_error` does *not* map ENOBUFS to
-        // `WouldBlock` — that mapping is performed by `normalize_send_err`.
-        // Here we only check that `should_wait_after_try_send` returns false
-        // for an error carrying the ENOBUFS raw code regardless of its
-        // `kind()`.
         assert!(!should_wait_after_try_send(&e));
-
-        // After normalization the raw OS error is stripped and the kind
-        // becomes WouldBlock, so the wait path is taken again.
         let normalized = normalize_send_err(e);
-        assert!(normalized.raw_os_error().is_none());
-        assert!(should_wait_after_try_send(&normalized));
+        assert_eq!(normalized.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(normalized.raw_os_error(), Some(code));
+        assert!(
+            normalized.to_string().contains(&format!("os error {code}")),
+            "a normalized ENOBUFS must still name itself, got {normalized}"
+        );
     }
 
     #[derive(Debug)]
     struct Dummy;
     #[async_trait]
     impl UnreliableRead for Dummy {
-        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
-        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
     }
     #[async_trait]
     impl UnreliableWrite for Dummy {
-        async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
             Ok(0)
         }
     }
@@ -1735,12 +1813,11 @@ mod tests {
         for (input, want) in [
             ("0.0.0.0:5", "127.0.0.1:5"),
             ("[::]:5", "[::1]:5"),
-            ("[::1]:5", "[::1]:5"),
             ("127.0.0.1:5", "127.0.0.1:5"),
             ("192.168.1.2:5", "192.168.1.2:5"),
-            ("[::2]:5", "[::2]:5"),
+            ("[::1]:5", "[::1]:5"),
         ] {
-            let got = dialable_addr(input.parse::<SocketAddr>().unwrap());
+            let got = dialable_addr(input.parse().unwrap());
             assert_eq!(got, want.parse::<SocketAddr>().unwrap(), "input: {input}");
         }
     }
@@ -1756,7 +1833,7 @@ mod tests {
         assert!(!connected.local_addr.ip().is_unspecified());
         assert!(!connected.peer_addr.ip().is_unspecified());
         connected.write.send(b"hi").await.unwrap();
-        let mut buf = [0u8; 16];
+        let mut buf = [0; 16];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
     }

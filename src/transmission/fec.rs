@@ -79,6 +79,7 @@ struct FecStats {
     pub groups_skipped_no_surplus_tokens: usize,
     pub groups_skipped_burst_end: usize,
     pub recovered_symbols: usize,
+    pub dropped_hostile_pkts: usize,
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
@@ -90,6 +91,7 @@ struct Stats {
     pub groups_skipped_no_surplus_tokens: usize,
     pub parity_groups_skipped_burst_end: usize,
     pub recovered_symbols: usize,
+    pub dropped_hostile_pkts: usize,
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
@@ -102,6 +104,7 @@ impl Stats {
             groups_skipped_no_surplus_tokens: self.groups_skipped_no_surplus_tokens,
             groups_skipped_burst_end: self.parity_groups_skipped_burst_end,
             recovered_symbols: self.recovered_symbols,
+            dropped_hostile_pkts: self.dropped_hostile_pkts,
             group_size_skipped_burst_end: self.group_size_skipped_burst_end,
             group_size_skipped_no_surplus_tokens: self.group_size_skipped_no_surplus_tokens,
         }
@@ -119,6 +122,7 @@ impl fmt::Display for FecStats {
             )
             .field("groups_skipped_burst_end", &self.groups_skipped_burst_end)
             .field("recovered_symbols", &self.recovered_symbols)
+            .field("dropped_hostile_pkts", &self.dropped_hostile_pkts)
             .field(
                 "group_size_skipped_burst_end",
                 &fmt_hist(&self.group_size_skipped_burst_end),
@@ -141,6 +145,22 @@ fn fmt_hist(hist: &[u64]) -> String {
     } else {
         format!("[{}]", entries.join(", "))
     }
+}
+
+fn encodable_wire_pkt(pkt: &[u8], symbol_size: usize) -> bool {
+    if pkt.len() > symbol_size + fec_hdr_size() {
+        return false;
+    }
+    let Some(&data_count) = pkt.get(9) else {
+        return false;
+    };
+    if data_count == 0 {
+        return true;
+    }
+    let Some(&parity_count) = pkt.get(10) else {
+        return false;
+    };
+    parity_count != 0 && usize::from(data_count) + usize::from(parity_count) <= MAX_GROUP_SIZE
 }
 
 impl FecState {
@@ -383,10 +403,25 @@ impl FecState {
     ///   data symbols are queued in `self.recovered` and should be drained via
     ///   `pop_recovered` before reading the next raw packet.
     pub fn decode(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
+        if !encodable_wire_pkt(pkt, self.symbol_size) {
+            self.stats.dropped_hostile_pkts += 1;
+            return None;
+        }
         let recovered_before = self.recovered.len();
-        let hdr_len = self.decoder.decode(pkt, |data| {
-            self.recovered.push_back(data.to_vec());
-        });
+        let decoder = &mut self.decoder;
+        let recovered = &mut self.recovered;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder.decode(pkt, |data| {
+                recovered.push_back(data.to_vec());
+            })
+        }));
+        let hdr_len = match unwound {
+            Ok(hdr_len) => hdr_len,
+            Err(_) => {
+                self.stats.dropped_hostile_pkts += 1;
+                None
+            }
+        };
         self.stats.recovered_symbols += self.recovered.len() - recovered_before;
         if FEC_DEBUG {
             let kind = if hdr_len.is_some() {
@@ -426,6 +461,11 @@ impl FecState {
     #[cfg(test)]
     pub(crate) fn parity_sent(&self) -> usize {
         self.stats.parity_sent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped_hostile_pkts(&self) -> usize {
+        self.stats.dropped_hostile_pkts
     }
 
     /// Print the basic FEC counters to stderr. Only active when `FEC_DEBUG` is
@@ -867,6 +907,133 @@ mod tests {
             recovered[0].iter().all(|&b| b == 3),
             "recovered symbol must be the dropped one (all bytes == 3), got {:?}",
             recovered[0]
+        );
+    }
+
+    fn wire_pkt(
+        group_id: u64,
+        symbol_id: u8,
+        data_count: u8,
+        parity_count: u8,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&group_id.to_be_bytes());
+        pkt.push(symbol_id);
+        pkt.push(data_count);
+        if data_count != 0 {
+            pkt.push(parity_count);
+        }
+        pkt.extend_from_slice(body);
+        pkt
+    }
+
+    #[test]
+    fn a_parity_header_no_encoder_could_emit_is_dropped() {
+        let symbol_size = 1424 - 11;
+        let body = vec![0u8; symbol_size];
+        for (data_count, parity_count) in [(1u8, 0u8), (200, 200), (255, 255), (20, 6)] {
+            let mut fec = fec_state(symbol_size, 1);
+            let pkt = wire_pkt(0, 0, data_count, parity_count, &body);
+            assert!(
+                fec.decode(&pkt).is_none(),
+                "parity header {data_count}+{parity_count} must be dropped"
+            );
+            assert_eq!(
+                fec.dropped_hostile_pkts(),
+                1,
+                "parity header {data_count}+{parity_count} must be refused before the decoder"
+            );
+        }
+        let mut fec = fec_state(symbol_size, 1);
+        assert!(fec.decode(&wire_pkt(0, 20, 20, 5, &body)).is_none());
+        assert_eq!(fec.dropped_hostile_pkts(), 0);
+    }
+
+    #[test]
+    fn a_recovered_symbol_claiming_more_than_it_holds_is_dropped() {
+        let symbol_size = 1424 - 11;
+        let mut fec = fec_state(symbol_size, 1);
+        let data0 = vec![0u8; symbol_size - fec::proto::DATA_SYMBOL_HDR_SIZE];
+        let parity = vec![0xFFu8; symbol_size];
+        assert!(fec.decode(&wire_pkt(0, 0, 0, 0, &data0)).is_some());
+        assert!(fec.decode(&wire_pkt(0, 2, 2, 1, &parity)).is_none());
+        assert_eq!(fec.dropped_hostile_pkts(), 1);
+        while fec.pop_recovered().is_some() {}
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn byte(&mut self) -> u8 {
+            self.next() as u8
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn a_hostile_datagram_never_escapes_the_fec_decoder() {
+        const ROUNDS: usize = 50_000;
+        let symbol_size = 1424 - fec_hdr_size();
+        let mut rng = Rng(0x5eed_0fec);
+        let mut fec = fec_state(symbol_size, 1);
+        let mut decoded = 0_usize;
+        for round in 0..ROUNDS {
+            let group_id = rng.below(4) as u64;
+            let symbol_id = rng.below(MAX_GROUP_SIZE + 2) as u8;
+            let (data_count, parity_count) = match rng.below(4) {
+                0 => (0, 0),
+                1 => (
+                    1,
+                    rng.below(MAX_INTERACTIVE_PARITY_DEPTH as usize) as u8 + 1,
+                ),
+                2 => (
+                    INSTREAM_DATA_PER_GROUP as u8,
+                    INSTREAM_PARITY_PER_GROUP as u8,
+                ),
+                _ => (rng.byte(), rng.byte()),
+            };
+            let body_len = match rng.below(4) {
+                0 => symbol_size,
+                _ => rng.below(symbol_size + 1),
+            };
+            let body: Vec<u8> = (0..body_len).map(|_| rng.byte()).collect();
+            let mut pkt = wire_pkt(group_id, symbol_id, data_count, parity_count, &body);
+            if rng.below(8) == 0 && !pkt.is_empty() {
+                let n = rng.below(pkt.len());
+                pkt.truncate(n);
+            }
+            if let Some(payload) = fec.decode(&pkt) {
+                decoded += 1;
+                assert!(
+                    payload.len() <= pkt.len(),
+                    "round {round}: a {}-byte packet yielded {} payload bytes",
+                    pkt.len(),
+                    payload.len()
+                );
+            }
+            while let Some(recovered) = fec.pop_recovered() {
+                assert!(
+                    recovered.len() <= symbol_size,
+                    "round {round}: recovered {} bytes from a {symbol_size}-byte symbol",
+                    recovered.len()
+                );
+            }
+        }
+        assert!(
+            decoded > 0,
+            "no packet decoded in {ROUNDS} rounds; the generator went stale"
         );
     }
 }

@@ -20,6 +20,8 @@ use crate::{
     },
 };
 
+use crate::io_err::IoErr;
+
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
 fn wrap_keyed<K: DispatchKey>(
@@ -336,23 +338,20 @@ impl KeyedConnWrite {
                     self.write.send(&self.buf).await
                 }
             }
-            Err(e) => Err(udp::normalize_send_err(e)),
+            Err(e) => Err(udp::normalize_send_err(e).into()),
         }?;
         Ok(sent.saturating_sub(self.data_offset))
     }
 }
 #[async_trait]
 impl UnreliableWrite for KeyedConnWrite {
-    async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
         Self::send(self, buf)
             .await
-            .map_err(|e| crate::udp::normalize_send_err(e).kind())
+            .map_err(crate::udp::normalize_send_err)
     }
 
-    async fn send_vectored(
-        &mut self,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Result<usize, std::io::ErrorKind> {
+    async fn send_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> Result<usize, IoErr> {
         if bufs.is_empty() {
             return Ok(0);
         }
@@ -364,7 +363,7 @@ impl UnreliableWrite for KeyedConnWrite {
         }
         self.send_buf()
             .await
-            .map_err(|e| crate::udp::normalize_send_err(e).kind())
+            .map_err(crate::udp::normalize_send_err)
     }
 }
 
@@ -486,11 +485,11 @@ mod tests {
     struct DummyRead;
     #[async_trait]
     impl UnreliableRead for DummyRead {
-        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
-        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
     }
 
@@ -498,7 +497,7 @@ mod tests {
     struct DummyWrite;
     #[async_trait]
     impl UnreliableWrite for DummyWrite {
-        async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
             Ok(0)
         }
     }

@@ -7,6 +7,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use super::transmission_layer::ProactiveTerminationContext;
+use crate::io_err::IoErr;
 
 const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(675);
 
@@ -18,7 +19,7 @@ pub(crate) enum PeerReset {
 
 #[derive(Debug, Clone)]
 struct FirstErrorValue {
-    kind: std::io::ErrorKind,
+    error: IoErr,
     context: Option<ProactiveTerminationContext>,
 }
 
@@ -88,19 +89,19 @@ pub(crate) fn channel() -> (TerminationPresser, TerminationWriter, TerminationRe
 }
 
 impl TerminationPresser {
-    pub(crate) fn press_error(&self, kind: std::io::ErrorKind) -> bool {
-        self.press(kind, None, PeerReset::NoKill)
+    pub(crate) fn press_error(&self, error: IoErr) -> bool {
+        self.press(error, None, PeerReset::NoKill)
     }
     pub(crate) fn press_broken_pipe(
         &self,
         peer_reset: PeerReset,
         context: Option<ProactiveTerminationContext>,
     ) -> bool {
-        self.press(std::io::ErrorKind::BrokenPipe, context, peer_reset)
+        self.press(std::io::ErrorKind::BrokenPipe.into(), context, peer_reset)
     }
     fn press(
         &self,
-        kind: std::io::ErrorKind,
+        error: IoErr,
         context: Option<ProactiveTerminationContext>,
         peer_reset: PeerReset,
     ) -> bool {
@@ -111,7 +112,7 @@ impl TerminationPresser {
             if state.first_error.is_some() {
                 false
             } else {
-                state.first_error = Some(FirstErrorValue { kind, context });
+                state.first_error = Some(FirstErrorValue { error, context });
                 if peer_reset == PeerReset::SendKill {
                     if state.writer_alive {
                         state.kill = KillState::Requested;
@@ -133,16 +134,16 @@ impl TerminationPresser {
         self.inner.terminal.cancel();
         inserted
     }
-    pub(crate) fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
+    pub(crate) fn throw_error(&self) -> Result<(), IoErr> {
         match &self.inner.state.lock().unwrap().first_error {
-            Some(error) => Err(error.kind),
+            Some(first) => Err(first.error),
             None => Ok(()),
         }
     }
     pub(crate) fn has_error(&self) -> bool {
         self.inner.state.lock().unwrap().first_error.is_some()
     }
-    pub(crate) fn io_error(&self, kind: std::io::ErrorKind) -> std::io::Error {
+    pub(crate) fn io_error(&self, error: IoErr) -> std::io::Error {
         let context = self
             .inner
             .state
@@ -150,11 +151,11 @@ impl TerminationPresser {
             .unwrap()
             .first_error
             .as_ref()
-            .filter(|error| error.kind == kind)
-            .and_then(|error| error.context.clone());
+            .filter(|first| first.error == error)
+            .and_then(|first| first.context.clone());
         match context {
-            Some(context) => std::io::Error::new(kind, context),
-            None => std::io::Error::from(kind),
+            Some(context) => std::io::Error::new(error.kind(), format!("{context}: {error}")),
+            None => std::io::Error::from(error),
         }
     }
     pub(crate) fn terminal(&self) -> &CancellationToken {
@@ -229,7 +230,7 @@ impl TerminationReaper {
         peer_fin: &CancellationToken,
         outbound_drained: F,
     ) where
-        F: Future<Output = Result<(), std::io::ErrorKind>>,
+        F: Future<Output = Result<(), IoErr>>,
     {
         self.ready_or_graceful_close_with_timeout(
             peer_fin,
@@ -244,7 +245,7 @@ impl TerminationReaper {
         outbound_drained: F,
         timeout: Duration,
     ) where
-        F: Future<Output = Result<(), std::io::ErrorKind>>,
+        F: Future<Output = Result<(), IoErr>>,
     {
         tokio::pin!(outbound_drained);
         let timeout = tokio::time::sleep(timeout);
@@ -371,10 +372,9 @@ mod tests {
         peer_fin.cancel();
         presser.press_broken_pipe(PeerReset::SendKill, None);
         let attempt = writer.take_kill_attempt().expect("KILL request");
-        let mut ready = Box::pin(
-            reaper
-                .ready_or_graceful_close(&peer_fin, async { Err(std::io::ErrorKind::BrokenPipe) }),
-        );
+        let mut ready = Box::pin(reaper.ready_or_graceful_close(&peer_fin, async {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), &mut ready)
                 .await
@@ -413,7 +413,7 @@ mod tests {
             std::time::Duration::from_millis(100),
             reaper.ready_or_graceful_close_with_timeout(
                 &peer_fin,
-                async { Err(std::io::ErrorKind::BrokenPipe) },
+                async { Err(std::io::ErrorKind::BrokenPipe.into()) },
                 std::time::Duration::from_millis(10),
             ),
         )

@@ -19,6 +19,7 @@ use super::watchdog_tuning::WatchdogTuning;
 use super::write_half::WriteHalf;
 
 use crate::handshake::{ClaimedResponse, Observation, PostOpenHandshake};
+use crate::io_err::IoErr;
 use crate::pacer::{SendPacer, SendWake};
 use crate::reliable::reliable_layer::ReliableLayer;
 
@@ -189,7 +190,7 @@ impl Shared {
             .map(|fec| fec.lock().unwrap().recovered_symbols())
     }
 
-    pub fn throw_error(&self) -> Result<(), std::io::ErrorKind> {
+    pub fn throw_error(&self) -> Result<(), IoErr> {
         self.termination.throw_error()
     }
 
@@ -198,7 +199,7 @@ impl Shared {
             .press_broken_pipe(PeerReset::SendKill, None);
     }
 
-    pub async fn send(&self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    pub async fn send(&self, data: &[u8]) -> Result<usize, IoErr> {
         self.termination.throw_error()?;
         if data.is_empty() {
             self.reliable_layer.lock().unwrap().ensure_write_open()?;
@@ -213,7 +214,7 @@ impl Shared {
         result
     }
 
-    async fn send_stock(&self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    async fn send_stock(&self, data: &[u8]) -> Result<usize, IoErr> {
         let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
@@ -236,7 +237,7 @@ impl Shared {
         }
     }
 
-    pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, IoErr> {
         let frame_len = frame.len();
         let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
         loop {
@@ -251,7 +252,7 @@ impl Shared {
                     self.coord.resume_send.notify_one();
                     return Ok(frame_len);
                 }
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     self.termination.throw_error()?;
                     tokio::select! {
                         _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
@@ -361,7 +362,7 @@ impl Shared {
         us as u32
     }
 
-    pub async fn no_data_to_send(&self) -> Result<(), std::io::ErrorKind> {
+    pub async fn no_data_to_send(&self) -> Result<(), IoErr> {
         let mut sent_pkt_acked = self.coord.sent_pkt_acked.notified();
         loop {
             self.termination.throw_error()?;
@@ -376,7 +377,7 @@ impl Shared {
         }
     }
 
-    pub(crate) async fn session_outbound_drained(&self) -> Result<(), std::io::ErrorKind> {
+    pub(crate) async fn session_outbound_drained(&self) -> Result<(), IoErr> {
         loop {
             let progress = self.coord.session_outbound_progress.notified();
             self.termination.throw_error()?;
@@ -395,7 +396,7 @@ impl Shared {
         }
     }
 
-    pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
         let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
@@ -439,12 +440,12 @@ impl Shared {
         }
     }
 
-    pub async fn recv(&self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    pub async fn recv(&self, data: &mut [u8]) -> Result<usize, IoErr> {
         if data.is_empty() {
             return Ok(0);
         }
         if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
-            return Err(std::io::ErrorKind::InvalidInput);
+            return Err(std::io::ErrorKind::InvalidInput.into());
         }
         let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
         let read_bytes = loop {
@@ -477,7 +478,7 @@ impl Shared {
         Ok(read_bytes)
     }
 
-    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+    pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, IoErr> {
         let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
@@ -495,7 +496,7 @@ impl Shared {
                 Ok(None) => {
                     return Ok(None);
                 }
-                Err(std::io::ErrorKind::WouldBlock) => {
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     tokio::select! {
                         () = recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
@@ -551,6 +552,7 @@ mod tests {
 
     use crate::delivery::frame::FrameDelivery;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
+    use crate::io_err::IoErr;
     use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::transmission_layer::{
@@ -579,18 +581,18 @@ mod tests {
 
     #[async_trait]
     impl UnreliableRead for PendingRead {
-        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-            Err(std::io::ErrorKind::WouldBlock)
+        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+            Err(std::io::ErrorKind::WouldBlock.into())
         }
 
-        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
             std::future::pending().await
         }
     }
 
     #[async_trait]
     impl UnreliableWrite for PendingWrite {
-        async fn send(&mut self, _buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+        async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
             std::future::pending().await
         }
     }
@@ -614,11 +616,11 @@ mod tests {
         }
         shared
             .termination
-            .press_error(std::io::ErrorKind::BrokenPipe);
+            .press_error(std::io::ErrorKind::BrokenPipe.into());
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), blocked_send)
             .await
             .expect("BrokenPipe must wake a sender waiting for frame-queue capacity");
-        assert_eq!(result, Err(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(result, Err(std::io::ErrorKind::BrokenPipe.into()));
     }
 
     #[test]

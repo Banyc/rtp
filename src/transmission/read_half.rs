@@ -6,6 +6,7 @@ use super::transmission_layer::{
     FEC_DEBUG, MAX_NUM_ACK, RecvBufs, RecvPkts, SendKillPkt, UnreliableRead,
 };
 use super::ts_echo::{RecentEchoes, TsEcho};
+use crate::io_err::IoErr;
 use crate::{
     codec::decode,
     handshake::{Observation, is_post_open_candidate},
@@ -30,7 +31,7 @@ impl ReadHalf {
     pub async fn recv_pkts(
         &mut self,
         bufs: &mut RecvBufs,
-    ) -> Result<RecvPkts, (std::io::ErrorKind, SendKillPkt)> {
+    ) -> Result<RecvPkts, (IoErr, SendKillPkt)> {
         let Self {
             utp_read,
             recent_echoes,
@@ -38,7 +39,7 @@ impl ReadHalf {
         } = self;
         let shared: &Shared = shared.as_ref();
         let termination = &shared.termination;
-        let throw_error = |e: std::io::ErrorKind| {
+        let throw_error = |e: IoErr| {
             termination.press_error(e);
             e
         };
@@ -123,7 +124,7 @@ impl ReadHalf {
                     }
                 }
                 if data.killed {
-                    let e = std::io::ErrorKind::BrokenPipe;
+                    let e = IoErr::from(std::io::ErrorKind::BrokenPipe);
                     throw_error(e);
                     return Err((e, SendKillPkt::No));
                 }

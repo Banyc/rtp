@@ -12,22 +12,19 @@ impl AckQueue {
         }
     }
 
+    fn neighbours(&self, seq: u64) -> (Option<AckBall>, Option<AckBall>) {
+        let ball = |(&start, &size): (&u64, &NonZeroU64)| AckBall { start, size };
+        let prev = self.start_to_size.range(..seq).next_back().map(ball);
+        let next = self.start_to_size.range(seq..).next().map(ball);
+        (prev, next)
+    }
+
     pub fn insert(&mut self, seq: u64) {
-        let mut prev = None;
-        let mut next = None;
-        for ball in self.balls() {
-            if ball.start < seq {
-                prev = Some(ball);
-                continue;
-            }
-            next = Some(ball);
-            break;
-        }
+        let (prev, next) = self.neighbours(seq);
         let this = AckBall {
             start: seq,
             size: NonZeroU64::new(1).unwrap(),
         };
-
         let mut merge_pair = |this: AckBall, other: Option<AckBall>| -> AckBall {
             let Some(other) = other else {
                 return this;
@@ -40,7 +37,6 @@ impl AckQueue {
         };
         let this = merge_pair(this, prev);
         let this = merge_pair(this, next);
-
         self.start_to_size.insert(this.start, this.size);
     }
 
@@ -49,6 +45,14 @@ impl AckQueue {
             start: *s,
             size: *n,
         })
+    }
+
+    pub fn len(&self) -> usize {
+        self.start_to_size.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start_to_size.is_empty()
     }
 }
 impl Default for AckQueue {
@@ -117,11 +121,15 @@ pub struct AckBall {
     pub size: NonZeroU64,
 }
 impl AckBall {
+    pub fn end(&self) -> u64 {
+        self.start.saturating_add(self.size.get())
+    }
+
     pub fn contains(&self, seq: u64) -> bool {
         if seq < self.start {
             return false;
         }
-        seq < self.start + self.size.get()
+        seq < self.end()
     }
 
     pub fn merge(&self, other: &Self) -> Option<Self> {
@@ -134,10 +142,10 @@ impl AckBall {
         if other.start < self.start {
             return other.merge(self);
         }
-        if self.start + self.size.get() < other.start {
+        if self.end() < other.start {
             return None;
         }
-        let size = other.start - self.start + other.size.get();
+        let size = other.end() - self.start;
         Some(Self {
             start: self.start,
             size: NonZeroU64::new(size).unwrap().max(self.size),
@@ -188,5 +196,77 @@ mod tests {
         a.insert(3);
         a.insert(2);
         assert_eq!(a.start_to_size.len(), 1);
+    }
+
+    #[test]
+    fn a_ball_reaching_past_the_end_of_the_space_still_acknowledges() {
+        let ball = AckBall {
+            start: 1,
+            size: NonZeroU64::new(u64::MAX).unwrap(),
+        };
+        assert_eq!(ball.end(), u64::MAX, "the end wrapped below the start");
+        let recved = AckBallSequence::new(std::slice::from_ref(&ball));
+        let mut acked = Vec::new();
+        recved.ack(&[5, 9], &mut acked);
+        assert_eq!(
+            acked,
+            vec![5, 9],
+            "a ball covering the whole space acknowledged nothing"
+        );
+    }
+
+    fn insert_cost(holes: u64) -> f64 {
+        const N: u64 = 20_000;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut q = AckQueue::new();
+            for i in 0..holes {
+                q.insert(i * 2);
+            }
+            let base = holes * 2 + 1_000;
+            let start = std::time::Instant::now();
+            for i in 0..N {
+                q.insert(base + i);
+            }
+            best = best.min(start.elapsed().as_secs_f64() / N as f64 * 1e9);
+        }
+        best
+    }
+
+    #[test]
+    fn a_queue_full_of_holes_costs_no_more_per_packet() {
+        let few = insert_cost(16);
+        let many = insert_cost(4096);
+        assert!(
+            many < few * 8.0,
+            "{many:.1} ns/insert at 4096 balls against {few:.1} ns at 16: the per-packet cost grows with the number of holes"
+        );
+    }
+
+    fn len_cost(holes: u64) -> f64 {
+        const N: u64 = 200_000;
+        let mut q = AckQueue::new();
+        for i in 0..holes {
+            q.insert(i * 2);
+        }
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(std::hint::black_box(&q).len());
+            }
+            best = best.min(start.elapsed().as_secs_f64() / N as f64 * 1e9);
+        }
+        best
+    }
+
+    #[test]
+    fn asking_the_queue_how_big_it_is_does_not_walk_it() {
+        let few = len_cost(16);
+        let many = len_cost(4096);
+        assert!(
+            many < few * 8.0,
+            "{many:.1} ns/len at 4096 balls against {few:.1} ns at 16: the size of the ack history is being counted rather than read"
+        );
     }
 }

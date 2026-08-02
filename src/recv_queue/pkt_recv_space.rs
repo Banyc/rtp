@@ -31,12 +31,9 @@ impl RecvDisposition {
 
 #[derive(Debug)]
 pub struct PktRecvSpace {
-    /// In-order cursor: the next sequence number the byte-stream delivery
-    /// path expects.  Frame-delivery delivery may pop frames past this
-    /// cursor; the cursor advances when contiguous tombstones (and data
-    /// slots delivered via `pop`) are collapsed.
     next: Option<u64>,
     slots: BTreeMap<u64, RecvSlot>,
+    scan_start: u64,
     reused_buf: ObjPool<Vec<u8>>,
     ack_history: AckQueue,
 }
@@ -46,6 +43,7 @@ impl PktRecvSpace {
         Self {
             next: Some(0),
             slots: BTreeMap::new(),
+            scan_start: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             ack_history: AckQueue::new(),
         }
@@ -72,10 +70,6 @@ impl PktRecvSpace {
         self.recv_disposition(seq, data, frame_len).should_ack()
     }
 
-    /// Return the disposition of the received packet:
-    /// `Rejected` for closed/out-of-window,
-    /// `Duplicate` for stale/already-present,
-    /// `Inserted` only after slot insertion and ack-history insertion.
     pub(crate) fn recv_disposition(
         &mut self,
         seq: u64,
@@ -106,28 +100,18 @@ impl PktRecvSpace {
         }
         self.slots
             .insert(seq, RecvSlot::Data(RecvPkt { data, frame_len }));
+        self.scan_start = self.scan_start.min(seq);
         self.ack_history.insert(seq);
         RecvDisposition::Inserted
     }
 
-    /// Pop one complete frame (possibly out of order past sequence holes).
-    /// The consumed slots are replaced with `Tombstone`s, and a contiguous
-    /// tombstone prefix at the in-order cursor is collapsed.  The scan and
-    /// extraction logic lives in [`crate::delivery::frame::recv`].
     pub fn pop_complete_frame(&mut self) -> Option<Vec<u8>> {
         let frame_bytes = crate::delivery::frame::recv::pop_complete_frame(
             &mut self.slots,
             &mut self.reused_buf,
+            &mut self.scan_start,
         )?;
-
         self.collapse_tombstone_prefix();
-
-        // After collapsing, check if a FIN has been received: an empty-payload
-        // packet with no frame_len that is now at the in-order head after
-        // all earlier slots are consumed or tombstoned.  We don't set a flag
-        // here — that's done by the caller (reliable_layer) when it sees an
-        // empty-payload non-frame packet at pop/peek.
-
         Some(frame_bytes)
     }
 
@@ -528,6 +512,57 @@ mod tests {
         assert!(
             space.fin_at_head(),
             "FIN must surface EOF after the gap fills"
+        );
+    }
+
+    #[test]
+    fn a_late_packet_below_the_scan_cursor_still_completes_its_frame() {
+        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        for seq in 2..64 {
+            assert!(space.recv(seq, b"x".to_vec(), Some(1)));
+        }
+        assert!(space.recv(1, b"lo".to_vec(), None));
+        for _ in 2..64 {
+            assert!(space.pop_complete_frame().is_some());
+        }
+        assert!(space.pop_complete_frame().is_none());
+        assert!(space.recv(0, b"hel".to_vec(), Some(5)));
+        assert_eq!(
+            space.pop_complete_frame().as_deref(),
+            Some(&b"hello"[..]),
+            "the frame waiting on the late packet was never handed up"
+        );
+        space.collapse_tombstone_prefix();
+        assert_eq!(
+            space.next_seq(),
+            Some(64),
+            "the in-order cursor did not advance past the filled hole"
+        );
+    }
+
+    fn ooo_pop_cost(outstanding: u64) -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+            for seq in 1..=outstanding {
+                assert!(space.recv(seq, b"x".to_vec(), Some(1)));
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..outstanding {
+                assert!(space.pop_complete_frame().is_some());
+            }
+            best = best.min(start.elapsed().as_secs_f64() / outstanding as f64 * 1e9);
+        }
+        best
+    }
+
+    #[test]
+    fn delivering_past_a_hole_costs_no_more_per_frame() {
+        let few = ooo_pop_cost(64);
+        let many = ooo_pop_cost(4096);
+        assert!(
+            many < few * 8.0,
+            "{many:.1} ns/frame at 4096 outstanding against {few:.1} ns at 64: the per-frame cost grows with the number of frames delivered past the hole"
         );
     }
 }

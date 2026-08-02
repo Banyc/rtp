@@ -9,6 +9,7 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 
 pub use crate::handshake::{client_opening_handshake, server_opening_handshake};
 
+use crate::io_err::IoErr;
 use crate::transmission::{
     read_half::ReadHalf,
     shared::{Shared, build_parts, build_parts_with_watchdog_tuning},
@@ -442,7 +443,7 @@ pub struct ReadSocket {
 }
 
 impl ReadSocket {
-    pub async fn recv(&mut self, data: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+    pub async fn recv(&mut self, data: &mut [u8]) -> Result<usize, IoErr> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -475,7 +476,7 @@ impl ReadSocket {
         }
     }
 
-    pub async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, std::io::ErrorKind> {
+    pub async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, IoErr> {
         self.frame_buf.clear();
         self.transmission_layer.recv_frame().await
     }
@@ -496,11 +497,11 @@ pub struct WriteSocket {
 }
 
 impl WriteSocket {
-    pub async fn send(&mut self, data: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    pub async fn send(&mut self, data: &[u8]) -> Result<usize, IoErr> {
         self.transmission_layer.send(data).await
     }
 
-    pub async fn send_frame(&mut self, frame: &[u8]) -> Result<usize, std::io::ErrorKind> {
+    pub async fn send_frame(&mut self, frame: &[u8]) -> Result<usize, IoErr> {
         self.transmission_layer.send_frame(frame).await
     }
 
@@ -512,7 +513,7 @@ impl WriteSocket {
             .is_send_buf_empty()
     }
 
-    pub async fn send_buf_empty(&self) -> Result<(), std::io::ErrorKind> {
+    pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
         self.transmission_layer.send_buf_empty().await
     }
 
@@ -620,41 +621,34 @@ mod tests {
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-
         #[derive(Debug)]
         struct FailedRead;
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for FailedRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::ConnectionReset)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
             }
-
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::ConnectionReset)
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
             }
         }
-
         #[derive(Debug)]
         struct DropProbeWrite {
             sends: Arc<AtomicUsize>,
             dropped: Arc<tokio::sync::Notify>,
         }
-
         impl Drop for DropProbeWrite {
             fn drop(&mut self) {
                 self.dropped.notify_one();
             }
         }
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.sends.fetch_add(1, Ordering::SeqCst);
                 Ok(buf.len())
             }
         }
-
         let sends = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(tokio::sync::Notify::new());
         let layer = wrap_fec(
@@ -678,10 +672,10 @@ mod tests {
         struct PanickingRead;
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PanickingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 panic!("injected RTP read panic")
             }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 panic!("injected RTP read panic")
             }
         }
@@ -696,7 +690,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 Ok(buf.len())
             }
         }
@@ -724,12 +718,12 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for GatedFailedRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 self.fail.notified().await;
-                Err(std::io::ErrorKind::ConnectionReset)
+                Err(std::io::ErrorKind::ConnectionReset.into())
             }
         }
         #[derive(Debug)]
@@ -745,7 +739,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for GatedWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 self.started.notify_one();
                 self.release.notified().await;
                 Ok(buf.len())
@@ -797,10 +791,10 @@ mod tests {
         struct PendingRead;
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 std::future::pending().await
             }
         }
@@ -819,7 +813,7 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for KillGateWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 assert_eq!(buf, [2], "the gated send must be the RTP KILL command");
                 self.kill_started.notify_one();
                 self.release_kill.notified().await;
@@ -966,7 +960,7 @@ mod tests {
         assert_eq!(a_write.send(&[]).await.unwrap(), 0);
         assert_eq!(
             a_write.send_frame(&[]).await,
-            Err(std::io::ErrorKind::InvalidInput)
+            Err(std::io::ErrorKind::InvalidInput.into())
         );
         let mut empty = [];
         assert_eq!(a_read.recv(&mut empty).await.unwrap(), 0);
@@ -1441,10 +1435,10 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for DropProbeUdpWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 UdpSocket::send(&self.socket, buf)
                     .await
-                    .map_err(|error| error.kind())
+                    .map_err(IoErr::from)
             }
         }
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1545,10 +1539,10 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for ProbeUdpWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 let written = UdpSocket::send(&self.socket, buf)
                     .await
-                    .map_err(|error| error.kind())?;
+                    .map_err(IoErr::from)?;
                 self.sent.lock().unwrap().push(buf.to_vec());
                 self.sent_notify.notify_waiters();
                 Ok(written)
@@ -1631,20 +1625,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_public_send_does_not_cancel_driver_io() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
         #[derive(Debug)]
         struct PendingRead;
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 std::future::pending().await
             }
         }
-
         #[derive(Debug)]
         struct WriteState {
             calls: AtomicUsize,
@@ -1653,12 +1644,10 @@ mod tests {
             first_completed: tokio::sync::Notify,
             first_cancelled: AtomicBool,
         }
-
         struct CancelProbe {
             state: Arc<WriteState>,
             completed: bool,
         }
-
         impl Drop for CancelProbe {
             fn drop(&mut self) {
                 if !self.completed {
@@ -1666,15 +1655,13 @@ mod tests {
                 }
             }
         }
-
         #[derive(Debug)]
         struct DriverWrite {
             state: Arc<WriteState>,
         }
-
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for DriverWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 if self.state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     let mut probe = CancelProbe {
                         state: Arc::clone(&self.state),
@@ -1688,7 +1675,6 @@ mod tests {
                 Ok(buf.len())
             }
         }
-
         let state = Arc::new(WriteState {
             calls: AtomicUsize::new(0),
             first_started: tokio::sync::Notify::new(),
@@ -1696,7 +1682,6 @@ mod tests {
             first_completed: tokio::sync::Notify::new(),
             first_cancelled: AtomicBool::new(false),
         });
-
         let layer = wrap_fec(
             PendingRead,
             DriverWrite {
@@ -1739,10 +1724,10 @@ mod tests {
         struct PendingRead;
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
-                Err(std::io::ErrorKind::WouldBlock)
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
             }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 std::future::pending().await
             }
         }
@@ -1757,7 +1742,7 @@ mod tests {
         struct BlockingFirstWrite(Arc<WriteState>);
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableWrite for BlockingFirstWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, std::io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 let call = self.0.calls.fetch_add(1, Ordering::SeqCst);
                 if call == 0 {
                     self.0.first_started.notify_one();
@@ -1802,5 +1787,101 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), state.kill_started.notified())
             .await
             .expect("driver did not observe the out-of-band abort request");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bulk_transfer_survives_loss_reorder_and_duplication() {
+        use crate::udp::testing::{ImpairRate, wrap_fec_impaired};
+        for fec in [false, true] {
+            let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+            let rate_a = ImpairRate::new(1500, 3000, 1000);
+            let rate_b = ImpairRate::new(1500, 3000, 1000);
+            let a = wrap_fec_impaired(a.clone(), a, fec, rate_a.clone());
+            let b = wrap_fec_impaired(b.clone(), b, fec, rate_b.clone());
+            let (a_r, a_w, _a_supervisor) = socket(a, None);
+            let (b_r, b_w, _b_supervisor) = socket(b, None);
+            let mut send_buf = vec![0u8; 1 << 20];
+            for byte in &mut send_buf {
+                *byte = rand::random();
+            }
+            let mut recv_buf = vec![0u8; send_buf.len()];
+            let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
+            let mut b_r = b_r.into_async_read();
+            let b_w = b_w.into_async_write();
+            let expected = send_buf.clone();
+            let recv_done = Arc::new(tokio::sync::Notify::new());
+            let sender = tokio::spawn({
+                let recv_done = recv_done.clone();
+                async move {
+                    let _b_w = b_w;
+                    a.write_all(&send_buf).await.unwrap();
+                    recv_done.notified().await;
+                    a
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(120), b_r.read_exact(&mut recv_buf))
+                .await
+                .unwrap_or_else(|_| panic!("fec={fec}: the transfer stalled"))
+                .unwrap();
+            assert_eq!(expected, recv_buf, "fec={fec}: the stream arrived corrupt");
+            recv_done.notify_waiters();
+            sender.await.unwrap();
+            let (dropped, reordered, duplicated) = rate_a.applied();
+            assert!(
+                dropped > 0 && reordered > 0 && duplicated > 0,
+                "fec={fec}: the data path was not actually impaired (dropped {dropped}, reordered {reordered}, duplicated {duplicated})"
+            );
+            let (dropped, reordered, duplicated) = rate_b.applied();
+            assert!(
+                dropped + reordered + duplicated > 0,
+                "fec={fec}: the acknowledgement path was not impaired at all"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_packet_arriving_twice_does_not_duplicate_a_byte() {
+        use crate::udp::testing::{ImpairRate, wrap_fec_impaired};
+        let fec = false;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let rate_a = ImpairRate::new(0, 0, 10_000);
+        let a = wrap_fec_impaired(a.clone(), a, fec, rate_a.clone());
+        let b = wrap_fec_impaired(b.clone(), b, fec, ImpairRate::new(0, 0, 10_000));
+        let (a_r, a_w, _a_supervisor) = socket(a, None);
+        let (b_r, b_w, _b_supervisor) = socket(b, None);
+        let mut send_buf = vec![0u8; 1 << 18];
+        for byte in &mut send_buf {
+            *byte = rand::random();
+        }
+        let mut recv_buf = vec![0u8; send_buf.len()];
+        let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
+        let mut b_r = b_r.into_async_read();
+        let b_w = b_w.into_async_write();
+        let expected = send_buf.clone();
+        let recv_done = Arc::new(tokio::sync::Notify::new());
+        let sender = tokio::spawn({
+            let recv_done = recv_done.clone();
+            async move {
+                let _b_w = b_w;
+                a.write_all(&send_buf).await.unwrap();
+                recv_done.notified().await;
+                a
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(120), b_r.read_exact(&mut recv_buf))
+            .await
+            .expect("the transfer stalled with every packet duplicated")
+            .unwrap();
+        assert_eq!(expected, recv_buf);
+        recv_done.notify_waiters();
+        sender.await.unwrap();
+        let (_, _, duplicated) = rate_a.applied();
+        assert!(duplicated > 0, "no packet was actually duplicated");
     }
 }

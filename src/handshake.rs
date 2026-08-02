@@ -8,6 +8,9 @@ use rand::TryRng;
 
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
+#[cfg(test)]
+use crate::io_err::IoErr;
+
 const OPENING_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const POST_OPEN_RETRY_DELAYS: [Duration; 5] = [
@@ -377,7 +380,8 @@ async fn send(
         }
         match write.send(bytes).await {
             Ok(len) if len == bytes.len() => return Ok(()),
-            Ok(_) | Err(io::ErrorKind::WouldBlock) => {}
+            Ok(_) => {}
+            Err(error) if error == io::ErrorKind::WouldBlock => {}
             Err(kind) => return Err(io::Error::from(kind)),
         }
         if Instant::now() >= send_deadline {
@@ -396,9 +400,9 @@ fn timeout() -> io::Error {
 }
 
 #[cfg(test)]
-fn copy_datagram(datagram: &[u8], buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
+fn copy_datagram(datagram: &[u8], buf: &mut [u8]) -> Result<usize, IoErr> {
     if datagram.len() > buf.len() {
-        return Err(io::ErrorKind::InvalidInput);
+        return Err(io::ErrorKind::InvalidInput.into());
     }
     buf[..datagram.len()].copy_from_slice(datagram);
     Ok(datagram.len())
@@ -887,15 +891,17 @@ mod tests {
 
     #[async_trait]
     impl UnreliableRead for ChannelRead {
-        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
             match self.0.try_recv() {
                 Ok(datagram) => copy_datagram(&datagram, buf),
-                Err(mpsc::error::TryRecvError::Empty) => Err(io::ErrorKind::WouldBlock),
-                Err(mpsc::error::TryRecvError::Disconnected) => Err(io::ErrorKind::BrokenPipe),
+                Err(mpsc::error::TryRecvError::Empty) => Err(io::ErrorKind::WouldBlock.into()),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                }
             }
         }
 
-        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, io::ErrorKind> {
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
             let datagram = self.0.recv().await.ok_or(io::ErrorKind::BrokenPipe)?;
             copy_datagram(&datagram, buf)
         }
@@ -924,7 +930,7 @@ mod tests {
     }
     #[async_trait]
     impl UnreliableWrite for DropFirstReadyWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             if Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Ready) {
                 self.ready_attempts.fetch_add(1, Ordering::SeqCst);
                 if !self.dropped {
@@ -941,7 +947,7 @@ mod tests {
     }
     #[async_trait]
     impl UnreliableWrite for CountingChannelWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             if Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::ConfirmAck) {
                 self.confirmation_attempts.fetch_add(1, Ordering::SeqCst);
             }
@@ -961,7 +967,7 @@ mod tests {
 
     #[async_trait]
     impl UnreliableWrite for DropFirstConfirmationsWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             if self.remaining > 0
                 && Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::ConfirmAck)
             {
@@ -990,7 +996,7 @@ mod tests {
 
     #[async_trait]
     impl UnreliableWrite for DeliverFirstConfirmOnlyWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             if Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::Confirm) {
                 if self.confirm_delivered {
                     return Ok(buf.len());
@@ -1013,7 +1019,7 @@ mod tests {
 
     #[async_trait]
     impl UnreliableWrite for InjectStaleRtpAfterHelloWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             self.tx
                 .send(buf.to_vec())
                 .await
@@ -1033,7 +1039,7 @@ mod tests {
 
     #[async_trait]
     impl UnreliableWrite for InjectStaleRtpAfterFirstConfirmWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             self.tx
                 .send(buf.to_vec())
                 .await
@@ -1053,7 +1059,7 @@ mod tests {
 
     #[async_trait]
     impl UnreliableWrite for ChannelWrite {
-        async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             let kind = Packet::decode(buf).map(|packet| packet.kind);
             if kind.is_some() && self.drop_once == kind {
                 self.drop_once = None;
@@ -1079,9 +1085,9 @@ mod tests {
         struct AlwaysWouldBlock(Arc<std::sync::atomic::AtomicUsize>);
         #[async_trait]
         impl UnreliableWrite for AlwaysWouldBlock {
-            async fn send(&mut self, _buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Err(io::ErrorKind::WouldBlock)
+                Err(io::ErrorKind::WouldBlock.into())
             }
         }
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1104,11 +1110,11 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for LateWritable {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 if Instant::now() >= self.ready_at {
                     Ok(buf.len())
                 } else {
-                    Err(io::ErrorKind::WouldBlock)
+                    Err(io::ErrorKind::WouldBlock.into())
                 }
             }
         }
@@ -1143,7 +1149,7 @@ mod tests {
         }
         #[async_trait]
         impl UnreliableWrite for PendingWrite {
-            async fn send(&mut self, buf: &[u8]) -> Result<usize, io::ErrorKind> {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
                 let mut probe = CancelProbe {
                     cancelled: Arc::clone(&self.cancelled),
                     completed: false,
