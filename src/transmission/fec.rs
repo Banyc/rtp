@@ -962,31 +962,13 @@ mod tests {
         while fec.pop_recovered().is_some() {}
     }
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-
-        fn byte(&mut self) -> u8 {
-            self.next() as u8
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-    }
+    use crate::testing::SplitMix64;
 
     #[test]
     fn a_hostile_datagram_never_escapes_the_fec_decoder() {
         const ROUNDS: usize = 50_000;
         let symbol_size = 1424 - fec_hdr_size();
-        let mut rng = Rng(0x5eed_0fec);
+        let mut rng = SplitMix64::new(0x5eed_0fec);
         let mut fec = fec_state(symbol_size, 1);
         let mut decoded = 0_usize;
         for round in 0..ROUNDS {

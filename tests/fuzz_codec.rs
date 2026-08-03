@@ -1,28 +1,9 @@
 use rtp::codec::{DecodedDataPkt, decode};
+use rtp::testing::SplitMix64;
 
 const ROUNDS: usize = 400_000;
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn byte(&mut self) -> u8 {
-        self.next() as u8
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
-fn packet(rng: &mut Rng) -> Vec<u8> {
+fn packet(rng: &mut SplitMix64) -> Vec<u8> {
     let mut out = vec![];
     for _ in 0..1 + rng.below(6) {
         match rng.below(6) {
@@ -77,7 +58,7 @@ fn packet(rng: &mut Rng) -> Vec<u8> {
 
 #[test]
 fn a_hostile_datagram_never_yields_a_range_outside_it() {
-    let mut rng = Rng(0x5eed);
+    let mut rng = SplitMix64::new(0x5eed);
     let mut acks = Vec::new();
     let mut decoded_count = 0_usize;
     let mut decode_attempts = 0_usize;
