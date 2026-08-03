@@ -80,9 +80,11 @@ fn a_hostile_datagram_never_yields_a_range_outside_it() {
     let mut rng = Rng(0x5eed);
     let mut acks = Vec::new();
     let mut decoded_count = 0_usize;
+    let mut decode_attempts = 0_usize;
     for _ in 0..ROUNDS {
         let pkt = packet(&mut rng);
         acks.clear();
+        decode_attempts += 1;
         let Ok(decoded) = decode(&pkt, &mut acks) else {
             continue;
         };
@@ -99,6 +101,10 @@ fn a_hostile_datagram_never_yields_a_range_outside_it() {
             assert!(ack.end() >= ack.start, "{ack:?} wrapped");
         }
     }
+    assert!(
+        decode_attempts >= ROUNDS,
+        "only {decode_attempts}/{ROUNDS} mutation cases executed; the fuzz budget was truncated"
+    );
     assert!(
         decoded_count * 4 > ROUNDS,
         "only {decoded_count}/{ROUNDS} packets decoded; the generator went stale"
