@@ -13,7 +13,6 @@ use super::termination::{
 };
 use super::transmission_layer::{
     Log, LogConfig, PRINT_DEBUG_MSGS, ReliableLayerLogger, UnreliableLayer,
-    instream_group_fec_from_env, rtx_dup_from_env,
 };
 use super::ts_echo::RecentEchoes;
 use super::watchdog_tuning::WatchdogTuning;
@@ -96,10 +95,10 @@ pub fn build_parts(
         send_rate_limiter,
         termination,
         coord: Coordination::new(),
-        rtx_dup: std::sync::atomic::AtomicBool::new(rtx_dup_from_env()),
+        rtx_dup: std::sync::atomic::AtomicBool::new(unreliable_layer.rtx_dup),
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
-            instream_group_fec_from_env(),
+            unreliable_layer.instream_group_fec,
         ),
         clock_epoch: now,
         reliable_layer_logger,
@@ -146,10 +145,10 @@ pub fn build_parts_with_watchdog_tuning(
         send_rate_limiter,
         termination,
         coord: Coordination::new(),
-        rtx_dup: std::sync::atomic::AtomicBool::new(rtx_dup_from_env()),
+        rtx_dup: std::sync::atomic::AtomicBool::new(unreliable_layer.rtx_dup),
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
-            instream_group_fec_from_env(),
+            unreliable_layer.instream_group_fec,
         ),
         clock_epoch: now,
         reliable_layer_logger,
@@ -566,6 +565,8 @@ mod tests {
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery,
+            rtx_dup: false,
+            instream_group_fec: false,
         }
     }
 

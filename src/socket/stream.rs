@@ -439,19 +439,15 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            false,
-            crate::udp::NO_FEC_MSS,
+            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery,
-        );
+            frame_delivery).unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            false,
-            crate::udp::NO_FEC_MSS,
+            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery,
-        );
+            frame_delivery).unwrap();
         let (mut a_read, mut a_write, _a_supervisor) = socket(a_layer, None);
         let (_b_read, mut b_write, _b_supervisor) = socket(b_layer, None);
         assert_eq!(a_write.send(&[]).await.unwrap(), 0);
@@ -653,11 +649,9 @@ mod tests {
         let a = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            false,
-            mss,
+            false,crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default(),
-        );
+            crate::delivery::frame::FrameDelivery::default()).unwrap();
         let (_a_r, a_w, _a_supervisor) = socket(a, None);
         let write_stream = a_w.into_async_write();
         let max_stage = write_stream.max_stage();
@@ -727,19 +721,15 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            fec,
-            mss,
+            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd,
-        );
+            fd).unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            fec,
-            mss,
+            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd,
-        );
+            fd).unwrap();
         let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
         let (mut b_r, _b_w, _b_supervisor) = socket(b_layer, None);
         let frame_size = 16 * 1024;
@@ -801,19 +791,15 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            fec,
-            mss,
+            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd,
-        );
+            fd).unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            fec,
-            mss,
+            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd,
-        );
+            fd).unwrap();
         let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
         let (b_r, b_w, _b_supervisor) = socket(b_layer, None);
         let mut a_io = into_frame_io_parts(a_r, a_w)
@@ -891,19 +877,15 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            false,
-            crate::udp::NO_FEC_MSS,
+            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery,
-        );
+            frame_delivery).unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            false,
-            crate::udp::NO_FEC_MSS,
+            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery,
-        );
+            frame_delivery).unwrap();
         let (mut a_read, _a_write, _a_supervisor) = socket(a_layer, None);
         let (_b_read, mut b_write, _b_supervisor) = socket(b_layer, None);
         assert_eq!(b_write.send_frame(b"abcdef").await.unwrap(), 6);

@@ -123,6 +123,14 @@ pub struct UnreliableLayer {
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
     pub(crate) frame_delivery: FrameDelivery,
+    /// Retransmission-armor duplicate-copy toggle.  Set once at construction
+    /// from the connect/accept config (which reads `RTP_RTX_DUP` in
+    /// `Default`); the shared session state is seeded from here.
+    pub(crate) rtx_dup: bool,
+    /// In-stream group FEC toggle.  Set once at construction from the
+    /// connect/accept config (which reads `RTP_INSTREAM_GROUP_FEC` in
+    /// `Default`); the shared session state is seeded from here.
+    pub(crate) instream_group_fec: bool,
 }
 
 #[derive(Debug, Clone)]

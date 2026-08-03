@@ -38,10 +38,23 @@ async fn main() {
             let listener = rtp::udp::Listener::bind(internet_addresses[0])
                 .await
                 .unwrap();
-            let accepted = listener.accept(fec).await.unwrap();
+            let accepted = listener
+                .accept_with(rtp::udp::AcceptConfig {
+                    fec,
+                    ..rtp::udp::AcceptConfig::default()
+                })
+                .await
+                .unwrap();
             tokio::spawn(async move {
                 loop {
-                    if listener.accept(fec).await.is_err() {
+                    if listener
+                        .accept_with(rtp::udp::AcceptConfig {
+                            fec,
+                            ..rtp::udp::AcceptConfig::default()
+                        })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -63,10 +76,17 @@ async fn main() {
                 rtp::mpudp::Listener::bind(all_socket_addrs.into_iter(), max_session_conns)
                     .await
                     .unwrap();
-            let accepted = listener.accept_without_handshake().await.unwrap();
+            let accepted = listener
+                .accept_with(rtp::udp::AcceptConfig::default())
+                .await
+                .unwrap();
             tokio::spawn(async move {
                 loop {
-                    if listener.accept_without_handshake().await.is_err() {
+                    if listener
+                        .accept_with(rtp::udp::AcceptConfig::default())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

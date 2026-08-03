@@ -18,7 +18,9 @@ use crate::{
     },
     transmission::{
         fec_tuning::{FecTuning, fec_tuning_from_env},
-        transmission_layer::{self, UnreliableRead, UnreliableWrite},
+        transmission_layer::{
+            self, UnreliableRead, UnreliableWrite, instream_group_fec_from_env, rtx_dup_from_env,
+        },
         watchdog_tuning::WatchdogTuning,
     },
 };
@@ -30,10 +32,10 @@ pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_a
 
 mod layer;
 #[cfg(test)]
-pub(crate) use layer::wrap_fec;
-#[cfg(test)]
-pub(crate) use layer::checked_mss_and_fec;
-pub(crate) use layer::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
+pub(crate) use layer::{checked_mss_and_fec, wrap_fec};
+pub(crate) use layer::{
+    MssError, ValidMss, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+};
 
 mod raw_send;
 /// Test-only utilities for simulating packet loss without OS-level network
@@ -61,10 +63,10 @@ pub enum MssConfig {
     Custom(usize),
 }
 impl MssConfig {
-    const fn resolve(self) -> usize {
+    pub fn resolve(self) -> Result<ValidMss, MssError> {
         match self {
-            Self::Default => NO_FEC_MSS,
-            Self::Custom(mss) => mss,
+            Self::Default => ValidMss::try_new(NO_FEC_MSS),
+            Self::Custom(mss) => ValidMss::try_new(mss),
         }
     }
 }
@@ -159,34 +161,67 @@ impl Listener {
         self.local_addr
     }
 
-    /// [`Self::accept()`] but without handshake
-    pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted> {
-        let mss = NO_FEC_MSS;
-        let tuning = FecTuning::default();
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
+    /// [`Self::accept_without_handshake_with()`] with the default
+    /// [`AcceptConfig`] (env-tuned).
+    pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted> {
+        self.accept_without_handshake_with(AcceptConfig::default())
+            .await
+    }
+
+    /// Accept a connection and run the server opening handshake inside the
+    /// returned task.  All tuning (FEC, MSS, frame delivery, retransmission
+    /// armor, in-stream group FEC) comes from `config`; see [`AcceptConfig`]
+    /// for the env-vs-default rules.
+    ///
+    /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
+    ///
+    /// You should keep this method in a loop.
+    pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<Handshake> {
+        let accepted = self.listener.accept().await?;
+        let raw_fd = self.raw_fd;
+        Ok(tokio::spawn(async move {
+            accept(
+                accepted,
+                true,
+                config.fec,
+                config.mss.resolve()?,
+                config.fec_tuning,
+                config.frame_delivery,
+                config.rtx_dup,
+                config.instream_group_fec,
+                raw_fd,
+            )
+            .await
+        }))
+    }
+
+    /// [`Self::accept_with()`] but without the server opening handshake;
+    /// returns the accepted session directly.
+    pub async fn accept_without_handshake_with(
+        &self,
+        config: AcceptConfig,
+    ) -> std::io::Result<Accepted> {
+        let accepted = self.listener.accept().await?;
+        accept(
+            accepted,
+            false,
+            config.fec,
+            config.mss.resolve()?,
+            config.fec_tuning,
+            config.frame_delivery,
+            config.rtx_dup,
+            config.instream_group_fec,
+            self.raw_fd,
         )
         .await
     }
 
-    /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
-    ///
-    /// You should keep this method in a loop.
-    pub async fn accept(&self, fec: bool) -> std::io::Result<Handshake> {
-        let mss = NO_FEC_MSS;
-        let tuning = fec_tuning_from_env();
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
-    }
-
+    /// [`Self::accept_without_handshake_with()`] wrapped into
+    /// [`FrameDeliveryIo`] halves; the accepted session skips the server
+    /// opening handshake.
     pub async fn accept_frame_delivery(
         &self,
-        config: FrameDeliveryAcceptConfig,
+        config: AcceptConfig,
     ) -> std::io::Result<FrameDeliveryAccept> {
         let accepted = self.listener.accept().await?;
         let raw_fd = self.raw_fd;
@@ -194,11 +229,13 @@ impl Listener {
         Ok(tokio::spawn(async move {
             let accepted = accept(
                 accepted,
-                config.handshake,
+                false,
                 config.fec,
-                config.mss.resolve(),
+                config.mss.resolve()?,
                 config.fec_tuning,
                 FrameDelivery::enabled(),
+                config.rtx_dup,
+                config.instream_group_fec,
                 raw_fd,
             )
             .await?;
@@ -210,131 +247,6 @@ impl Listener {
             } = accepted;
             make_frame_delivery_io(read, write, supervisor, local_addr, peer_addr, None)
         }))
-    }
-
-    /// [`Self::accept()`] but without handshake and with a custom MSS.
-    pub async fn accept_without_handshake_with_mss(
-        &self,
-        fec: bool,
-        mss: usize,
-    ) -> std::io::Result<Accepted> {
-        let tuning = fec_tuning_from_env();
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        )
-        .await
-    }
-
-    /// [`Self::accept()`] with a custom MSS.
-    ///
-    /// # Panics
-    /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-    /// overhead. Both peers must use the same `mss`; there is no in-band
-    /// negotiation.
-    pub async fn accept_with_mss(&self, fec: bool, mss: usize) -> std::io::Result<Handshake> {
-        let tuning = fec_tuning_from_env();
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
-    }
-
-    /// [`Self::accept()`] but without handshake, with a custom MSS and a
-    /// per-connection [`FecTuning`].  Both peers must agree on the MSS and
-    /// the FEC flag; the FEC tuning is likewise out-of-band (no in-band
-    /// negotiation).  See [`FecTuning`] for the large-MSS recipe and the
-    /// platform-fragmentation caveat.
-    pub async fn accept_without_handshake_with_mss_and_fec_tuning(
-        &self,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-    ) -> std::io::Result<Accepted> {
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        )
-        .await
-    }
-
-    /// [`Self::accept()`] with a custom MSS and a per-connection
-    /// [`FecTuning`].
-    ///
-    /// # Panics
-    /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-    /// overhead. Both peers must use the same `mss`; there is no in-band
-    /// negotiation.  The FEC tuning is likewise out-of-band — both peers
-    /// must pass the same [`FecTuning`] for the parity depth to match.
-    pub async fn accept_with_mss_and_fec_tuning(
-        &self,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-    ) -> std::io::Result<Handshake> {
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_with_mss_fec_tuning_and_frame_delivery(fec, mss, tuning, frame_delivery)
-            .await
-    }
-
-    /// [`Self::accept()`] but without handshake, with a custom MSS, a
-    /// per-connection [`FecTuning`], and an explicit [`FrameDelivery`].
-    /// Both peers must enable frame delivery together; there is no in-band
-    /// negotiation — same coupling as the FEC flag.
-    pub async fn accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-        &self,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-        frame_delivery: FrameDelivery,
-    ) -> std::io::Result<Accepted> {
-        let accepted = self.listener.accept().await?;
-        let handshake = false;
-        accept(
-            accepted,
-            handshake,
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-            self.raw_fd,
-        )
-        .await
-    }
-
-    /// [`Self::accept()`] with a custom MSS, a per-connection
-    /// [`FecTuning`], and an explicit [`FrameDelivery`].  Both peers must
-    /// enable frame delivery together; there is no in-band negotiation —
-    /// same coupling as the FEC flag.
-    ///
-    /// # Panics
-    /// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-    /// overhead. Both peers must use the same `mss`; there is no in-band
-    /// negotiation.  The FEC tuning is likewise out-of-band — both peers
-    /// must pass the same [`FecTuning`] for the parity depth to match.
-    pub async fn accept_with_mss_fec_tuning_and_frame_delivery(
-        &self,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-        frame_delivery: FrameDelivery,
-    ) -> std::io::Result<Handshake> {
-        let accepted = self.listener.accept().await?;
-        let handshake = true;
-        Ok(tokio::spawn(accept(
-            accepted,
-            handshake,
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-            self.raw_fd,
-        )))
     }
 }
 #[derive(Debug)]
@@ -355,41 +267,78 @@ pub struct FrameDeliveryIo {
     pub probe_tap: Option<crate::probe::ProbeTap>,
 }
 pub type FrameDeliveryAccept = tokio::task::JoinHandle<std::io::Result<FrameDeliveryIo>>;
-pub struct FrameDeliveryAcceptConfig {
-    pub handshake: bool,
+
+/// Tuning for [`Listener::accept_with`] / [`Listener::accept_without_handshake_with`].
+///
+/// `Default` reads the process environment once: `fec_tuning` and
+/// `frame_delivery` come from `RTP_FEC_TUNING` / `RTP_FRAME_DELIVERY`,
+/// `rtx_dup` from `RTP_RTX_DUP`, and `instream_group_fec` from
+/// `RTP_INSTREAM_GROUP_FEC`.  Override the fields explicitly to opt out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptConfig {
     pub fec: bool,
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
+    pub frame_delivery: FrameDelivery,
+    pub rtx_dup: bool,
+    pub instream_group_fec: bool,
 }
 
+impl Default for AcceptConfig {
+    fn default() -> Self {
+        Self {
+            fec: false,
+            mss: MssConfig::Default,
+            fec_tuning: fec_tuning_from_env(),
+            frame_delivery: frame_delivery_from_env(),
+            rtx_dup: rtx_dup_from_env(),
+            instream_group_fec: instream_group_fec_from_env(),
+        }
+    }
+}
+
+/// Tuning for [`connect_with`] / [`FrameDeliveryIo::connect`].
+///
+/// `Default` reads the process environment once; see [`AcceptConfig`] for the
+/// env-vs-default rules.
+#[derive(Debug, Clone)]
 pub struct ConnectConfig<'a> {
     pub log_config: Option<LogConfig<'a>>,
     pub handshake: bool,
     pub fec: bool,
-    pub mss: usize,
-    pub fec_tuning: FecTuning,
-    pub frame_delivery: FrameDelivery,
-}
-
-pub struct FrameDeliveryConnectConfig<'a> {
-    pub log_config: Option<LogConfig<'a>>,
-    pub handshake: bool,
-    pub fec: bool,
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
+    pub frame_delivery: FrameDelivery,
+    pub rtx_dup: bool,
+    pub instream_group_fec: bool,
+    pub watchdog: Option<WatchdogTuning>,
 }
 
-pub struct WatchdogConnectConfig<'a> {
-    pub connection: ConnectConfig<'a>,
-    pub watchdog: WatchdogTuning,
+impl<'a> Default for ConnectConfig<'a> {
+    fn default() -> Self {
+        Self {
+            log_config: None,
+            handshake: true,
+            fec: false,
+            mss: MssConfig::Default,
+            fec_tuning: fec_tuning_from_env(),
+            frame_delivery: frame_delivery_from_env(),
+            rtx_dup: rtx_dup_from_env(),
+            instream_group_fec: instream_group_fec_from_env(),
+            watchdog: None,
+        }
+    }
 }
+
 async fn accept(
     accepted: IdentityConn,
     handshake: bool,
     fec: bool,
-    mss: usize,
+    mss: ValidMss,
     tuning: FecTuning,
     frame_delivery: FrameDelivery,
+    rtx_dup: bool,
+    instream_group_fec: bool,
     raw_fd: MaybeRawFd,
 ) -> std::io::Result<Accepted> {
     let peer_addr = *accepted.conn_key();
@@ -406,7 +355,9 @@ async fn accept(
         mss,
         tuning,
         frame_delivery,
-    );
+    )?;
+    unreliable_layer.rtx_dup = rtx_dup;
+    unreliable_layer.instream_group_fec = instream_group_fec;
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -438,119 +389,10 @@ fn make_frame_delivery_io(
     })
 }
 
-pub async fn connect_without_handshake(
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    fec: bool,
-) -> std::io::Result<Connected> {
-    let handshake = false;
-    let mss = NO_FEC_MSS;
-    let tuning = FecTuning::default();
-    let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(
-        bind,
-        addr,
-        ConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning: tuning,
-            frame_delivery,
-        },
-    )
-    .await
-}
-pub async fn connect(
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    fec: bool,
-) -> std::io::Result<Connected> {
-    let handshake = true;
-    let mss = NO_FEC_MSS;
-    let tuning = fec_tuning_from_env();
-    let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(
-        bind,
-        addr,
-        ConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning: tuning,
-            frame_delivery,
-        },
-    )
-    .await
-}
-pub async fn connect_without_handshake_with_mss(
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    fec: bool,
-    mss: usize,
-) -> std::io::Result<Connected> {
-    let handshake = false;
-    let tuning = fec_tuning_from_env();
-    let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(
-        bind,
-        addr,
-        ConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning: tuning,
-            frame_delivery,
-        },
-    )
-    .await
-}
-/// Connect to `addr` with a custom MSS.
-///
-/// # Panics
-/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-/// overhead.
-///
-/// # Platform notes
-/// On macOS, datagrams larger than the kernel `net.inet.udp.maxdgram`
-/// (default 9216 bytes) fail with `EMSGSIZE`. Because the symbol size derives
-/// from the configured `mss`, both peers must use the same value; there is no
-/// in-band negotiation.
-pub async fn connect_with_mss(
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    handshake: bool,
-    fec: bool,
-    mss: usize,
-) -> std::io::Result<Connected> {
-    let tuning = fec_tuning_from_env();
-    let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(
-        bind,
-        addr,
-        ConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning: tuning,
-            frame_delivery,
-        },
-    )
-    .await
-}
-
-/// Connect to `addr` with a custom MSS and a per-connection [`FecTuning`].
-///
-/// # Panics
-/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-/// overhead.
+/// Connect to `addr` with the given [`ConnectConfig`].  `bind` is the local
+/// address to bind.  Both peers must agree on the FEC flag, the MSS, and
+/// frame delivery — there is no in-band negotiation; see [`ConnectConfig`]
+/// for the env-vs-default tuning rules.
 ///
 /// # Platform notes
 /// On macOS, datagrams larger than the kernel `net.inet.udp.maxdgram`
@@ -561,70 +403,22 @@ pub async fn connect_with_mss(
 /// large-MSS recipe targets loopback / jumbo / fragmentation-tolerant paths;
 /// real WANs IP-fragment 8 KiB UDP and one lost fragment kills the whole
 /// symbol, inverting the benefit.
-pub async fn connect_with_mss_and_fec_tuning(
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    log_config: Option<LogConfig<'_>>,
-    handshake: bool,
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-) -> std::io::Result<Connected> {
-    let frame_delivery = frame_delivery_from_env();
-    connect_with_mss_fec_tuning_and_frame_delivery(
-        bind,
-        addr,
-        ConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning: tuning,
-            frame_delivery,
-        },
-    )
-    .await
-}
-
-/// Connect to `addr` with a custom MSS, a per-connection [`FecTuning`],
-/// and an explicit [`FrameDelivery`].  Both peers must enable frame delivery
-/// together; there is no in-band negotiation — same coupling as the FEC flag.
-///
-/// # Panics
-/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-/// overhead.
-pub async fn connect_with_mss_fec_tuning_and_frame_delivery(
+pub async fn connect_with(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
-    connect_configured(bind, addr, config, None).await
+    connect_configured(bind, addr, config).await
 }
 
 async fn connect_configured(
     bind: impl tokio::net::ToSocketAddrs,
     addr: impl tokio::net::ToSocketAddrs,
     config: ConnectConfig<'_>,
-    watchdog: Option<WatchdogTuning>,
 ) -> std::io::Result<Connected> {
     let udp = bind_udp(bind).await?;
     connect_udp(&udp, addr).await?;
-    connect_bound(udp, config, watchdog).await
-}
-
-/// Connect to `addr` with a custom MSS, [`FecTuning`], [`FrameDelivery`],
-/// and [`WatchdogTuning`].  This is the fully-explicit connect entrypoint
-/// used by tests that exercise watchdog behaviour under impairment.
-///
-/// # Panics
-/// Panics if `mss` exceeds [`MAX_MSS`] or is too small for the codec/FEC
-/// overhead.
-pub async fn connect_with_mss_fec_tuning_frame_delivery_and_watchdog(
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    config: WatchdogConnectConfig<'_>,
-) -> std::io::Result<Connected> {
-    connect_configured(bind, addr, config.connection, Some(config.watchdog)).await
+    connect_bound(udp, config).await
 }
 
 #[derive(Debug)]
@@ -641,27 +435,15 @@ impl FrameDeliveryIo {
     pub async fn connect(
         bind: impl tokio::net::ToSocketAddrs,
         addr: impl tokio::net::ToSocketAddrs,
-        config: FrameDeliveryConnectConfig<'_>,
+        config: ConnectConfig<'_>,
     ) -> std::io::Result<Self> {
-        let FrameDeliveryConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning,
-        } = config;
         let connected = connect_configured(
             bind,
             addr,
             ConnectConfig {
-                log_config,
-                handshake,
-                fec,
-                mss: mss.resolve(),
-                fec_tuning,
                 frame_delivery: FrameDelivery::enabled(),
+                ..config
             },
-            None,
         )
         .await?;
         let Connected {
@@ -677,25 +459,14 @@ impl FrameDeliveryIo {
     pub async fn connect_with_socket(
         socket: VectoredUdpSocket,
         addr: SocketAddr,
-        config: FrameDeliveryConnectConfig<'_>,
+        config: ConnectConfig<'_>,
     ) -> std::io::Result<Self> {
-        let FrameDeliveryConnectConfig {
-            log_config,
-            handshake,
-            fec,
-            mss,
-            fec_tuning,
-        } = config;
         let connected = connect_with_socket(
             socket,
             addr,
             ConnectConfig {
-                log_config,
-                handshake,
-                fec,
-                mss: mss.resolve(),
-                fec_tuning,
                 frame_delivery: FrameDelivery::enabled(),
+                ..config
             },
         )
         .await?;
@@ -865,7 +636,13 @@ mod tests {
         let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                let accepted = listener.accept(fec).await.unwrap();
+                let accepted = listener
+                    .accept_with(AcceptConfig {
+                        fec,
+                        ..AcceptConfig::default()
+                    })
+                    .await
+                    .unwrap();
                 tokio::spawn(async move {
                     let mut accepted = accepted.await.unwrap().unwrap();
                     accepted.write.send(msg_1).await.unwrap();
@@ -874,13 +651,16 @@ mod tests {
                 });
             }
         });
-        let mut connected = connect(
+        let mut connected = connect_with(
             "0.0.0.0:0",
             addr,
-            Some(LogConfig {
-                log_dir_path: Path::new("target/tests"),
-            }),
-            fec,
+            ConnectConfig {
+                log_config: Some(LogConfig {
+                    log_dir_path: Path::new("target/tests"),
+                }),
+                fec,
+                ..ConnectConfig::default()
+            },
         )
         .await
         .unwrap();
@@ -902,7 +682,7 @@ mod tests {
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
-        require_send(connect("0.0.0.0:0", "0.0.0.0:0", None, false));
+        require_send(connect_with("0.0.0.0:0", "0.0.0.0:0", ConnectConfig::default()));
     }
 
     #[derive(Debug)]
@@ -929,38 +709,29 @@ mod tests {
             Box::new(Dummy),
             Box::new(Dummy),
             false,
-            NO_FEC_MSS,
+            ValidMss::try_new(NO_FEC_MSS).unwrap(),
             FecTuning::default(),
             FrameDelivery::default(),
-        );
+        )
+        .unwrap();
         assert_eq!(layer.mss.get(), NO_FEC_MSS);
         assert!(layer.fec.is_none());
     }
 
     #[test]
-    #[should_panic(expected = "datagram ceiling")]
     fn checked_mss_rejects_oversized() {
-        let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            Box::new(Dummy),
-            Box::new(Dummy),
-            false,
-            MAX_MSS + 1,
-            FecTuning::default(),
-            FrameDelivery::default(),
-        );
+        assert!(matches!(
+            ValidMss::try_new(MAX_MSS + 1),
+            Err(MssError::ExceedsDatagramCeiling { .. })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "leaves no room for the codec payload")]
     fn checked_mss_rejects_undersized() {
-        let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            Box::new(Dummy),
-            Box::new(Dummy),
-            false,
-            1,
-            FecTuning::default(),
-            FrameDelivery::default(),
-        );
+        assert!(matches!(
+            ValidMss::try_new(1),
+            Err(MssError::NoRoomForCodecPayload { .. })
+        ));
     }
 
     #[test]
@@ -969,10 +740,11 @@ mod tests {
             Box::new(Dummy),
             Box::new(Dummy),
             true,
-            NO_FEC_MSS,
+            ValidMss::try_new(NO_FEC_MSS).unwrap(),
             FecTuning::default(),
             FrameDelivery::default(),
-        );
+        )
+        .unwrap();
         assert!(layer.fec.is_some());
         // The final MSS after reserving the FEC header is smaller than the raw
         // user-provided NO_FEC_MSS, but it must still leave room for the codec
@@ -999,7 +771,11 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 let accepted = listener
-                    .accept_without_handshake_with_mss(fec, mss)
+                    .accept_without_handshake_with(AcceptConfig {
+                        fec,
+                        mss: MssConfig::Custom(mss),
+                        ..AcceptConfig::default()
+                    })
                     .await
                     .unwrap();
                 let msg = msg_for_server.clone();
@@ -1013,9 +789,18 @@ mod tests {
             }
         });
 
-        let mut connected = connect_without_handshake_with_mss("0.0.0.0:0", addr, None, fec, mss)
-            .await
-            .unwrap();
+        let mut connected = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                handshake: false,
+                fec,
+                mss: MssConfig::Custom(mss),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
         let mut buf = [0; 1];
         connected.write.send(&msg).await.unwrap();
         connected.read.recv(&mut buf).await.unwrap();
@@ -1051,33 +836,39 @@ mod tests {
     /// the first-frame header errors instead of silently producing 0-byte-
     /// payload first packets.
     #[test]
-    #[should_panic(expected = "first-frame header")]
     fn frame_delivery_mss_to_small_for_first_frame_header_errors() {
         use crate::delivery::frame::FrameDelivery;
         // An MSS that is large enough for `data_overhead` but too small for
         // `frame_data_overhead` (data_overhead + 4).
         let mss = crate::codec::data_overhead() + 1;
-        let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        let res = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(Dummy),
             Box::new(Dummy),
             false,
-            mss,
+            ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
             FrameDelivery::enabled(),
         );
+        assert!(matches!(
+            res,
+            Err(MssError::NoRoomForFirstFrameHeader { .. })
+        ));
     }
 
     #[test]
     fn mss_config_resolves_default_and_custom_values() {
-        assert_eq!(MssConfig::Default.resolve(), NO_FEC_MSS);
-        assert_eq!(MssConfig::Custom(9_000).resolve(), 9_000);
+        assert_eq!(MssConfig::Default.resolve().unwrap().get(), NO_FEC_MSS);
+        assert_eq!(
+            MssConfig::Custom(9_000).resolve().unwrap().get(),
+            9_000
+        );
     }
 
     fn spawn_accept_loop(listener: Listener) -> SocketAddr {
         let addr = listener.local_addr();
         tokio::spawn(async move {
             loop {
-                if listener.accept_without_handshake(false).await.is_err() {
+                if listener.accept_without_handshake().await.is_err() {
                     break;
                 }
             }
@@ -1110,7 +901,7 @@ mod tests {
         let addr = listener.local_addr();
         let accept = tokio::spawn(async move {
             listener
-                .accept_without_handshake(false)
+                .accept_without_handshake()
                 .await
                 .unwrap()
                 .peer_addr
@@ -1161,12 +952,12 @@ mod tests {
         let addr = listener.local_addr();
         let listener = Arc::new(listener);
         tokio::spawn(async move {
-            let mut accepted = listener.accept_without_handshake(false).await.unwrap();
+            let mut accepted = listener.accept_without_handshake().await.unwrap();
             tokio::spawn({
                 let listener = Arc::clone(&listener);
                 async move {
                     loop {
-                        if listener.accept_without_handshake(false).await.is_err() {
+                        if listener.accept_without_handshake().await.is_err() {
                             break;
                         }
                     }
@@ -1184,7 +975,7 @@ mod tests {
     async fn probe_tap_probes_the_sessions_own_tuple() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = spawn_greeting_server(listener, b"data");
-        let mut connected = connect_without_handshake("127.0.0.1:0", addr, None, false)
+        let mut connected = connect_with("127.0.0.1:0", addr, ConnectConfig { handshake: false, ..ConnectConfig::default() })
             .await
             .unwrap();
         let mut tap = connected
@@ -1222,12 +1013,9 @@ mod tests {
             socket,
             addr,
             ConnectConfig {
-                log_config: None,
                 handshake: false,
-                fec: false,
-                mss: NO_FEC_MSS,
-                fec_tuning: FecTuning::default(),
-                frame_delivery: frame_delivery_from_env(),
+                mss: MssConfig::Custom(NO_FEC_MSS),
+                ..ConnectConfig::default()
             },
         )
         .await
@@ -1258,9 +1046,16 @@ mod tests {
         let listener = Listener::bind("0.0.0.0:0").await.unwrap();
         assert!(listener.local_addr().ip().is_unspecified());
         let addr = spawn_greeting_server(listener, b"hello");
-        let mut connected = connect_without_handshake("0.0.0.0:0", addr, None, false)
-            .await
-            .unwrap();
+        let mut connected = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                handshake: false,
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(!connected.local_addr.ip().is_unspecified());
         assert!(!connected.peer_addr.ip().is_unspecified());
         connected.write.send(b"hi").await.unwrap();
@@ -1278,7 +1073,6 @@ fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
 async fn connect_bound(
     udp: VectoredUdpSocket,
     config: ConnectConfig<'_>,
-    watchdog: Option<WatchdogTuning>,
 ) -> std::io::Result<Connected> {
     let ConnectConfig {
         log_config,
@@ -1287,6 +1081,9 @@ async fn connect_bound(
         mss,
         fec_tuning,
         frame_delivery,
+        rtx_dup,
+        instream_group_fec,
+        watchdog,
     } = config;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
@@ -1303,10 +1100,12 @@ async fn connect_bound(
         Box::new(filtered_read),
         Box::new(udp),
         fec,
-        mss,
+        mss.resolve()?,
         fec_tuning,
         frame_delivery,
-    );
+    )?;
+    unreliable_layer.rtx_dup = rtx_dup;
+    unreliable_layer.instream_group_fec = instream_group_fec;
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -1329,5 +1128,5 @@ pub async fn connect_with_socket(
     config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
     socket.connect(dialable_addr(addr)).await?;
-    connect_bound(socket, config, None).await
+    connect_bound(socket, config).await
 }

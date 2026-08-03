@@ -40,9 +40,17 @@ async fn main() {
                 .log_dir
                 .as_ref()
                 .map(|c| rtp::udp::LogConfig { log_dir_path: c });
-            let connected = rtp::udp::connect("0.0.0.0:0", internet_addresses[0], log_config, fec)
-                .await
-                .unwrap();
+            let connected = rtp::udp::connect_with(
+                "0.0.0.0:0",
+                internet_addresses[0],
+                rtp::udp::ConnectConfig {
+                    log_config,
+                    fec,
+                    ..rtp::udp::ConnectConfig::default()
+                },
+            )
+            .await
+            .unwrap();
             (
                 Box::new(connected.read.into_async_read()),
                 Box::new(connected.write.into_async_write()),
@@ -58,9 +66,12 @@ async fn main() {
                 let socket_addrs = lookup_host(internet_address).await.unwrap();
                 all_socket_addrs.extend(socket_addrs);
             }
-            let connected = rtp::mpudp::Conn::connect_without_handshake(
+            let connected = rtp::mpudp::Conn::connect_with(
                 all_socket_addrs.into_iter(),
-                log_config,
+                rtp::udp::ConnectConfig {
+                    log_config,
+                    ..rtp::udp::ConnectConfig::default()
+                },
             )
             .await
             .unwrap();

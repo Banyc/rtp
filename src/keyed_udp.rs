@@ -10,12 +10,12 @@ use udp_listener::{ConnWrite, Packet, UtpListener};
 use crate::{
     socket::{ReadSocket, SessionSupervisor, WriteSocket, socket},
     transmission::{
-        fec_tuning::{FecTuning, fec_tuning_from_env},
-        frame_delivery::{FrameDelivery, frame_delivery_from_env},
+        fec_tuning::FecTuning,
+        frame_delivery::FrameDelivery,
         transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     },
     udp::{
-        self, MaybeRawFd, maybe_raw_fd, should_wait_after_try_send,
+        self, AcceptConfig, MaybeRawFd, ValidMss, maybe_raw_fd, should_wait_after_try_send,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
@@ -28,11 +28,12 @@ fn wrap_keyed<K: DispatchKey>(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,
     fec: bool,
-    mss: usize,
+    mss: ValidMss,
     tuning: FecTuning,
     frame_delivery: FrameDelivery,
 ) -> UnreliableLayer {
     let key_size = K::max_size();
+    let mss = mss.get();
     let mss = mss
         .checked_sub(key_size)
         .unwrap_or_else(|| panic!("mss {mss} leaves no room for the {key_size}-byte dispatch key"));
@@ -40,10 +41,11 @@ fn wrap_keyed<K: DispatchKey>(
         Box::new(read),
         Box::new(write),
         fec,
-        mss,
+        ValidMss::try_new(mss).unwrap(),
         tuning,
         frame_delivery,
     )
+    .unwrap()
 }
 
 #[derive(Debug)]
@@ -73,72 +75,9 @@ impl<K: DispatchKey> Server<K> {
         self.local_addr
     }
 
-    /// [`Self::accept_without_handshake()`] with a custom MSS.
-    pub async fn accept_without_handshake_with_mss(
-        &self,
-        fec: bool,
-        mss: usize,
-    ) -> std::io::Result<Accepted<K>> {
-        let tuning = fec_tuning_from_env();
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        )
-        .await
-    }
-
-    /// [`Self::accept_without_handshake()`] with a custom MSS and a
-    /// per-connection [`FecTuning`].  Both peers must agree on the MSS and the
-    /// FEC flag; the FEC tuning is likewise out-of-band.
-    pub async fn accept_without_handshake_with_mss_and_fec_tuning(
-        &self,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-    ) -> std::io::Result<Accepted<K>> {
-        let frame_delivery = frame_delivery_from_env();
-        self.accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        )
-        .await
-    }
-
-    /// [`Self::accept_without_handshake()`] with a custom MSS, a
-    /// per-connection [`FecTuning`], and an explicit [`FrameDelivery`].
-    /// Both peers must enable frame delivery together; there is no in-band
-    /// negotiation — same coupling as the FEC flag.
-    pub async fn accept_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-        &self,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-        frame_delivery: FrameDelivery,
-    ) -> std::io::Result<Accepted<K>> {
-        let accepted = self.listener.accept().await?;
-        let conn_key = accepted.conn_key().clone();
-        let (read, write) = accepted.split();
-        let write = {
-            let peer = write.peer_addr();
-            KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
-        };
-        let unreliable_layer = wrap_keyed::<K>(read, write, fec, mss, tuning, frame_delivery);
-        let (read, write, supervisor) = socket(unreliable_layer, None);
-        Ok(Accepted {
-            read,
-            write,
-            supervisor,
-            dispatch_key: conn_key,
-        })
-    }
-
-    /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
-    pub async fn accept_without_handshake(&self, fec: bool) -> std::io::Result<Accepted<K>> {
+    /// [`udp::Listener::accept_without_handshake_with`] equivalent that also
+    /// records the dispatch key of the accepted connection.
+    pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<Accepted<K>> {
         let accepted = self.listener.accept().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
@@ -149,10 +88,10 @@ impl<K: DispatchKey> Server<K> {
         let unreliable_layer = wrap_keyed::<K>(
             read,
             write,
-            fec,
-            crate::udp::NO_FEC_MSS,
-            FecTuning::default(),
-            FrameDelivery::default(),
+            config.fec,
+            config.mss.resolve()?,
+            config.fec_tuning,
+            config.frame_delivery,
         );
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -199,79 +138,23 @@ impl<K: DispatchKey> Client<K> {
         }
     }
 
-    /// [`Self::open_without_handshake()`] with a custom MSS.
-    pub fn open_without_handshake_with_mss(
+    /// Open a connection to an existing keyed session without the opening
+    /// handshake.
+    pub fn open_without_handshake_with(
         &self,
         dispatch_key: K,
-        fec: bool,
-        mss: usize,
+        config: AcceptConfig,
     ) -> Option<Connected> {
-        let tuning = fec_tuning_from_env();
-        let frame_delivery = frame_delivery_from_env();
-        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            dispatch_key,
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        )
-    }
-
-    /// [`Self::open_without_handshake()`] with a custom MSS and a
-    /// per-connection [`FecTuning`].  Both peers must agree on the MSS and
-    /// the FEC flag; the FEC tuning is likewise out-of-band.
-    pub fn open_without_handshake_with_mss_and_fec_tuning(
-        &self,
-        dispatch_key: K,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-    ) -> Option<Connected> {
-        let frame_delivery = frame_delivery_from_env();
-        self.open_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-            dispatch_key,
-            fec,
-            mss,
-            tuning,
-            frame_delivery,
-        )
-    }
-
-    /// [`Self::open_without_handshake()`] with a custom MSS, a
-    /// per-connection [`FecTuning`], and an explicit [`FrameDelivery`].
-    /// Both peers must enable frame delivery together; there is no in-band
-    /// negotiation — same coupling as the FEC flag.
-    pub fn open_without_handshake_with_mss_fec_tuning_and_frame_delivery(
-        &self,
-        dispatch_key: K,
-        fec: bool,
-        mss: usize,
-        tuning: FecTuning,
-        frame_delivery: FrameDelivery,
-    ) -> Option<Connected> {
-        let accepted = self.listener.open(dispatch_key.clone())?;
-        let (read, write) = accepted.split();
-        let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
-        let unreliable_layer = wrap_keyed::<K>(read, write, fec, mss, tuning, frame_delivery);
-        let (read, write, supervisor) = socket(unreliable_layer, None);
-        Some(Connected {
-            read,
-            write,
-            supervisor,
-        })
-    }
-
-    pub fn open_without_handshake(&self, dispatch_key: K, fec: bool) -> Option<Connected> {
         let accepted = self.listener.open(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
         let unreliable_layer = wrap_keyed::<K>(
             read,
             write,
-            fec,
-            crate::udp::NO_FEC_MSS,
-            FecTuning::default(),
-            FrameDelivery::default(),
+            config.fec,
+            config.mss.resolve().ok()?,
+            config.fec_tuning,
+            config.frame_delivery,
         );
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
@@ -526,7 +409,7 @@ mod tests {
             Client::<HugeKey>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
-        let _ = client.open_without_handshake(HugeKey, false).unwrap();
+        let _ = client.open_without_handshake_with(HugeKey, AcceptConfig::default()).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -539,13 +422,13 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             let server = Arc::new(server);
-            let mut accepted = server.accept_without_handshake(fec).await.unwrap();
+            let mut accepted = server.accept_with(AcceptConfig { fec, ..AcceptConfig::default() }).await.unwrap();
             assert_eq!(accepted.dispatch_key, key);
             tokio::spawn({
                 let server = server.clone();
                 async move {
                     loop {
-                        let _ = server.accept_without_handshake(fec).await;
+                        let _ = server.accept_with(AcceptConfig { fec, ..AcceptConfig::default() }).await;
                     }
                 }
             });
@@ -569,7 +452,7 @@ mod tests {
                     }
                 }
             });
-            let mut accepted = client.open_without_handshake(key, fec).unwrap();
+            let mut accepted = client.open_without_handshake_with(key, AcceptConfig { fec, ..AcceptConfig::default() }).unwrap();
             accepted.write.send(msg_1).await.unwrap();
             let mut buf = vec![0; 1024];
             let n = accepted.read.recv(&mut buf).await.unwrap();
@@ -596,7 +479,7 @@ mod tests {
         let pong = b"pong";
 
         let server_task = tokio::spawn(async move {
-            let mut accepted = server.accept_without_handshake(fec).await.unwrap();
+            let mut accepted = server.accept_with(AcceptConfig { fec, ..AcceptConfig::default() }).await.unwrap();
             assert_eq!(accepted.dispatch_key, key);
             let mut buf = [0u8; 16];
             let n = accepted.read.recv(&mut buf).await.unwrap();
@@ -609,7 +492,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut opened = client.open_without_handshake(key, fec).unwrap();
+        let mut opened = client.open_without_handshake_with(key, AcceptConfig { fec, ..AcceptConfig::default() }).unwrap();
 
         // Send the ping before any dispatch loop is spawned. The server will
         // reply, but that reply will sit undelivered in the client socket until
@@ -665,7 +548,7 @@ mod tests {
             Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
-        let mut conn = client.open_without_handshake(42, false).unwrap();
+        let mut conn = client.open_without_handshake_with(42, AcceptConfig::default()).unwrap();
 
         // Send a small payload.  On macOS the raw fallback path is used on
         // WouldBlock.  The send must complete within a bounded time (not
@@ -723,7 +606,7 @@ mod tests {
             Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
-        let mut conn = client.open_without_handshake(42, false).unwrap();
+        let mut conn = client.open_without_handshake_with(42, AcceptConfig::default()).unwrap();
 
         // Spawn a send future and cancel it by aborting the task before
         // it completes.  We use tokio::select! with a timeout to force
@@ -755,7 +638,7 @@ mod tests {
             DummyRead,
             DummyWrite,
             true,
-            mss,
+            ValidMss::try_new(mss).unwrap(),
             FecTuning::default(),
             FrameDelivery::default(),
         );
@@ -768,16 +651,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "leaves no room for the first-frame header")]
     fn frame_mode_rejects_undersized_mss() {
         let mss = 33;
-        super::wrap_keyed::<u16>(
-            DummyRead,
-            DummyWrite,
-            true,
-            mss,
-            FecTuning::default(),
-            FrameDelivery::enabled(),
-        );
+        let res = std::panic::catch_unwind(|| {
+            super::wrap_keyed::<u16>(
+                DummyRead,
+                DummyWrite,
+                true,
+                ValidMss::try_new(mss).unwrap(),
+                FecTuning::default(),
+                FrameDelivery::enabled(),
+            )
+        });
+        assert!(res.is_err(), "undersized mss must panic in keyed wrap");
     }
 }

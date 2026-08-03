@@ -8,10 +8,13 @@ use crate::{
     socket::{ReadSocket, SessionSupervisor, WriteSocket, socket},
     transmission::{
         fec_tuning::FecTuning,
-        frame_delivery::{FrameDelivery, frame_delivery_from_env},
+        frame_delivery::FrameDelivery,
         transmission_layer::{UnreliableRead, UnreliableWrite},
     },
-    udp::{LogConfig, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery},
+    udp::{
+        AcceptConfig, ConnectConfig, LogConfig, ValidMss,
+        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+    },
 };
 
 pub const MSS: usize = 1400;
@@ -32,28 +35,9 @@ impl Listener {
     pub fn local_addrs(&self) -> impl Iterator<Item = SocketAddr> + '_ {
         self.listener.local_addrs()
     }
-    pub async fn accept_without_handshake(&mut self) -> io::Result<Conn> {
+    pub async fn accept_with(&mut self, config: AcceptConfig) -> io::Result<Conn> {
         let conn = self.listener.accept().await?;
-        let frame_delivery = frame_delivery_from_env();
-        convert_conn(conn, None, FecTuning::default(), frame_delivery).await
-    }
-
-    pub async fn accept_without_handshake_with_fec_tuning(
-        &mut self,
-        tuning: FecTuning,
-    ) -> io::Result<Conn> {
-        let conn = self.listener.accept().await?;
-        let frame_delivery = frame_delivery_from_env();
-        convert_conn(conn, None, tuning, frame_delivery).await
-    }
-
-    pub async fn accept_without_handshake_with_fec_tuning_and_frame_delivery(
-        &mut self,
-        tuning: FecTuning,
-        frame_delivery: FrameDelivery,
-    ) -> io::Result<Conn> {
-        let conn = self.listener.accept().await?;
-        convert_conn(conn, None, tuning, frame_delivery).await
+        convert_conn(conn, None, config.fec_tuning, config.frame_delivery).await
     }
 }
 #[derive(Debug)]
@@ -63,33 +47,18 @@ pub struct Conn {
     pub supervisor: SessionSupervisor,
 }
 impl Conn {
-    pub async fn connect_without_handshake(
+    pub async fn connect_with(
         addrs: impl Iterator<Item = SocketAddr>,
-        log_config: Option<LogConfig<'_>>,
+        config: ConnectConfig<'_>,
     ) -> io::Result<Self> {
         let conn = MpUdpConn::connect(addrs).await?;
-        let frame_delivery = frame_delivery_from_env();
-        convert_conn(conn, log_config, FecTuning::default(), frame_delivery).await
-    }
-
-    pub async fn connect_without_handshake_with_fec_tuning(
-        addrs: impl Iterator<Item = SocketAddr>,
-        log_config: Option<LogConfig<'_>>,
-        tuning: FecTuning,
-    ) -> io::Result<Self> {
-        let conn = MpUdpConn::connect(addrs).await?;
-        let frame_delivery = frame_delivery_from_env();
-        convert_conn(conn, log_config, tuning, frame_delivery).await
-    }
-
-    pub async fn connect_without_handshake_with_fec_tuning_and_frame_delivery(
-        addrs: impl Iterator<Item = SocketAddr>,
-        log_config: Option<LogConfig<'_>>,
-        tuning: FecTuning,
-        frame_delivery: FrameDelivery,
-    ) -> io::Result<Self> {
-        let conn = MpUdpConn::connect(addrs).await?;
-        convert_conn(conn, log_config, tuning, frame_delivery).await
+        convert_conn(
+            conn,
+            config.log_config,
+            config.fec_tuning,
+            config.frame_delivery,
+        )
+        .await
     }
 }
 async fn convert_conn(
@@ -113,10 +82,10 @@ async fn convert_conn(
         Box::new(r),
         Box::new(w),
         false,
-        MSS,
+        ValidMss::try_new(MSS).unwrap(),
         tuning,
         frame_delivery,
-    );
+    )?;
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,
@@ -182,7 +151,10 @@ mod tests {
         let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                let mut accepted = listener.accept_without_handshake().await.unwrap();
+                let mut accepted = listener
+                    .accept_with(AcceptConfig::default())
+                    .await
+                    .unwrap();
                 println!("accepted");
                 tokio::spawn(async move {
                     accepted.write.send(msg_1).await.unwrap();
@@ -191,11 +163,14 @@ mod tests {
                 });
             }
         });
-        let mut connected = Conn::connect_without_handshake(
+        let mut connected = Conn::connect_with(
             addrs.into_iter(),
-            Some(LogConfig {
-                log_dir_path: Path::new("target/tests"),
-            }),
+            ConnectConfig {
+                log_config: Some(LogConfig {
+                    log_dir_path: Path::new("target/tests"),
+                }),
+                ..ConnectConfig::default()
+            },
         )
         .await
         .unwrap();
@@ -264,9 +239,9 @@ mod tests {
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
-        require_send(Conn::connect_without_handshake(
+        require_send(Conn::connect_with(
             ["0.0.0.0:0".parse().unwrap()].into_iter(),
-            None,
+            ConnectConfig::default(),
         ));
     }
 }

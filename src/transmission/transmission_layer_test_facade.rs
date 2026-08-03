@@ -57,24 +57,6 @@ impl TransmissionLayer {
         }
     }
 
-    /// Test-only: force the `RTP_RTX_DUP` toggle to a fixed value regardless
-    /// of the process environment, so parallel tests in the same binary do not
-    /// race on the env var.
-    pub(crate) fn set_rtx_dup_for_test(&mut self, enabled: bool) {
-        self.shared
-            .rtx_dup
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Test-only: force the `RTP_INSTREAM_GROUP_FEC` toggle to a fixed value
-    /// regardless of the process environment, so parallel tests in the same
-    /// binary do not race on the env var.
-    pub(crate) fn set_instream_group_fec_for_test(&mut self, enabled: bool) {
-        self.shared
-            .instream_group_fec_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Test-only: take up to `n` tokens from the shared send-rate limiter so
     /// the retransmission-armor duplicate-copy token gate can be exercised
     /// (the primary rtx bypasses the bucket; the dup needs a token).
@@ -397,17 +379,15 @@ mod tests {
         }
         let write = SharedWrite(recorder.clone());
         let read = BlackholeRead;
-        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        let mut ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(read),
             Box::new(write),
-            fec,
-            crate::udp::NO_FEC_MSS,
+            fec,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             tuning,
-            crate::delivery::frame::FrameDelivery::default(),
-        );
-        let mut tl = TransmissionLayer::new(ul, None);
-        tl.set_rtx_dup_for_test(enabled);
-        tl.set_instream_group_fec_for_test(false);
+            crate::delivery::frame::FrameDelivery::default()).unwrap();
+        ul.rtx_dup = enabled;
+        ul.instream_group_fec = false;
+        let tl = TransmissionLayer::new(ul, None);
         (tl, recorder)
     }
 
@@ -435,11 +415,9 @@ mod tests {
                 attempts: Arc::clone(&attempts),
                 error,
             }),
-            true,
-            crate::udp::NO_FEC_MSS,
+            true,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::mindiv(),
-            crate::delivery::frame::FrameDelivery::default(),
-        );
+            crate::delivery::frame::FrameDelivery::default()).unwrap();
         (TransmissionLayer::new(unreliable, None), attempts)
     }
 
@@ -460,7 +438,6 @@ mod tests {
     #[tokio::test]
     async fn the_non_fec_fast_path_copies_only_when_a_duplicate_needs_it() {
         let (mut tl, recorder) = harness(false, false);
-        tl.set_instream_group_fec_for_test(false);
         stage_small_message(&tl);
         let mut bufs = SendBufs::new();
         assert!(
@@ -647,24 +624,23 @@ mod tests {
         }
         let write = SharedWrite(recorder.clone());
         let read = BlackholeRead;
-        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        let mut ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(read),
             Box::new(write),
-            fec,
-            mss,
+            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default(),
-        );
-        let mut tl = TransmissionLayer::new(ul, None);
-        tl.set_rtx_dup_for_test(enabled);
-        tl.set_instream_group_fec_for_test(false);
+            crate::delivery::frame::FrameDelivery::default()).unwrap();
+        ul.rtx_dup = enabled;
+        ul.instream_group_fec = false;
+        let tl = TransmissionLayer::new(ul, None);
         (tl, recorder)
     }
 
     #[tokio::test]
     async fn full_group_flushes_four_parities_inline_mid_burst() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.set_instream_group_fec_for_test(true);
+        tl.instream_group_fec_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         stage_n_packets(&tl, 8);
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
@@ -678,7 +654,8 @@ mod tests {
     #[tokio::test]
     async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.set_instream_group_fec_for_test(true);
+        tl.instream_group_fec_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -725,7 +702,8 @@ mod tests {
     #[tokio::test]
     async fn ack_burst_keeps_stock_tail_gate_when_blocked() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.set_instream_group_fec_for_test(true);
+        tl.instream_group_fec_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -1121,11 +1099,9 @@ mod tests {
                 recorder: Arc::clone(&recorder),
                 kill_started: Arc::clone(&kill_started),
             }),
-            false,
-            crate::udp::NO_FEC_MSS,
+            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default(),
-        );
+            crate::delivery::frame::FrameDelivery::default()).unwrap();
         let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, tuning);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         {

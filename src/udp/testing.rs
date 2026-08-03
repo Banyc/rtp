@@ -194,10 +194,11 @@ where
 {
     let (mss, fec_state, tuning) = checked_mss_and_fec(
         fec,
-        NO_FEC_MSS,
+        ValidMss::try_new(NO_FEC_MSS).unwrap(),
         fec_tuning_from_env(),
         FrameDelivery::default(),
-    );
+    )
+    .unwrap();
     UnreliableLayer {
         utp_read: Box::new(read),
         utp_write: Box::new(ImpairedWrite::new(write, rate)),
@@ -206,6 +207,8 @@ where
         fec: fec_state,
         fec_tuning: tuning,
         frame_delivery: FrameDelivery::default(),
+        rtx_dup: false,
+        instream_group_fec: false,
     }
 }
 
@@ -253,7 +256,8 @@ where
     W: UnreliableWrite,
 {
     let (mss, fec_state, tuning) =
-        checked_mss_and_fec(fec, mss, tuning, FrameDelivery::default());
+        checked_mss_and_fec(fec, ValidMss::try_new(mss).unwrap(), tuning, FrameDelivery::default())
+            .unwrap();
     UnreliableLayer {
         utp_read: Box::new(LossyRead::new(read, rate.clone())),
         utp_write: Box::new(LossyWrite::new(write, rate)),
@@ -262,5 +266,7 @@ where
         fec: fec_state,
         fec_tuning: tuning,
         frame_delivery: FrameDelivery::default(),
+        rtx_dup: false,
+        instream_group_fec: false,
     }
 }
