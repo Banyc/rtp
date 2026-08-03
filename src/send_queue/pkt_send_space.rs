@@ -622,6 +622,9 @@ impl PktSendSpace {
         self.outage.in_outage_recovery()
     }
 
+    // Only the outage-recovery tests read the cut; keep `allow` because
+    // `expect` would go unfulfilled in `--all-targets`/test builds where the
+    // method is used.
     #[allow(dead_code)]
     pub(crate) fn outage_cut(&self) -> Option<Instant> {
         self.outage.outage_cut()

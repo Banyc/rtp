@@ -45,7 +45,6 @@ impl OutageEpoch {
         self.recovery_start.is_some()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn outage_cut(&self) -> Option<Instant> {
         self.outage_loss_cut
     }

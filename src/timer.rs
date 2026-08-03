@@ -3,14 +3,14 @@ use std::time::Instant;
 
 use primitive::{ops::clear::Clear, time::timer::Timer};
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ContActTimerOn {
     Unchanged,
     Hot,
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 /// Only return the value if there is only the same kind of actions performed during a specific duration
 #[derive(Debug, Clone)]
 pub struct ContActTimer<T> {
@@ -18,7 +18,7 @@ pub struct ContActTimer<T> {
     value: T,
     on: ContActTimerOn,
 }
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl<T> ContActTimer<T> {
     pub fn new(value: T, now: Instant, on: ContActTimerOn) -> Self {
         let mut timer = Timer::new();

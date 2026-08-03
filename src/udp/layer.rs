@@ -28,6 +28,8 @@ pub(crate) fn wrap_fec(
     )
 }
 
+// Test-only construction paths; keep `allow` because `expect` would go
+// unfulfilled in `--all-targets`/test builds where these are used.
 #[allow(dead_code)]
 pub(crate) fn wrap_fec_with_mss(
     read: impl UnreliableRead,
@@ -45,6 +47,8 @@ pub(crate) fn wrap_fec_with_mss(
     )
 }
 
+// Test-only construction path; keep `allow` because `expect` would go
+// unfulfilled in `--all-targets`/test builds where this is used.
 #[allow(dead_code)]
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
     read: impl UnreliableRead,
@@ -62,7 +66,6 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
         FrameDelivery::default(),
     )
 }
-
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     read: impl UnreliableRead,
     write: impl UnreliableWrite,
