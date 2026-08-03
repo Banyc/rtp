@@ -30,9 +30,7 @@ impl Future for SessionSupervisor {
             Poll::Ready(Err(error)) if error.is_panic() => {
                 std::panic::resume_unwind(error.into_panic())
             }
-            Poll::Ready(Err(error)) => {
-                panic!("RTP session supervisor was unexpectedly cancelled: {error}")
-            }
+            Poll::Ready(Err(_)) => Poll::Ready(()),
         }
     }
 }
@@ -181,10 +179,7 @@ fn build_socket(
 }
 
 async fn next_event_exit(events: &mut JoinSet<()>) -> Result<(), JoinError> {
-    events
-        .join_next()
-        .await
-        .expect("RTP event set became empty while the session was alive")
+    events.join_next().await.unwrap_or(Ok(()))
 }
 
 async fn join_drivers(
@@ -195,7 +190,6 @@ async fn join_drivers(
     let unexpected_clean_exit =
         first_exit.as_ref().is_some_and(Result::is_ok) && !shared.termination.has_error();
     let mut panic_payload = None;
-    let mut cancelled = None;
     let mut result = first_exit;
     loop {
         if let Some(result) = result.take() {
@@ -206,9 +200,7 @@ async fn join_drivers(
                         panic_payload = Some(error.into_panic());
                     }
                 }
-                Err(error) => {
-                    cancelled.get_or_insert_with(|| error.to_string());
-                }
+                Err(_error) => {}
             }
         }
         result = events.join_next().await;
@@ -218,9 +210,6 @@ async fn join_drivers(
     }
     if let Some(payload) = panic_payload {
         std::panic::resume_unwind(payload);
-    }
-    if let Some(error) = cancelled {
-        panic!("RTP driver task was unexpectedly cancelled: {error}");
     }
     assert!(
         !unexpected_clean_exit,
