@@ -234,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "perf lane: wall-clock ns/insert ratio; run with cargo test --release -- --ignored"]
     fn a_queue_full_of_holes_costs_no_more_per_packet() {
         let few = insert_cost(16);
         let many = insert_cost(4096);
@@ -261,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "perf lane: wall-clock ns/len ratio; run with cargo test --release -- --ignored"]
     fn asking_the_queue_how_big_it_is_does_not_walk_it() {
         let few = len_cost(16);
         let many = len_cost(4096);

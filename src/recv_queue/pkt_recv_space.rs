@@ -557,6 +557,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "perf lane: wall-clock ns/frame ratio; run with cargo test --release -- --ignored"]
     fn delivering_past_a_hole_costs_no_more_per_frame() {
         let few = ooo_pop_cost(64);
         let many = ooo_pop_cost(4096);
