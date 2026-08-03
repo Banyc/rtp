@@ -55,3 +55,68 @@ impl Packet {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_packet() -> Packet {
+        Packet {
+            kind: Kind::Ready,
+            nonce: 0x0123_4567_89ab_cdef,
+        }
+    }
+
+    #[test]
+    fn a_single_byte_mutation_of_every_fixed_field_is_rejected() {
+        let valid = valid_packet().encode();
+        // Every MAGIC byte: changing any single byte must fail to decode.
+        for index in 0..MAGIC.len() {
+            let mut mutated = valid;
+            mutated[index] ^= 0x01;
+            assert_eq!(
+                Packet::decode(&mutated),
+                None,
+                "a change to MAGIC byte {index} was accepted"
+            );
+        }
+        // The FEC_GUARD byte.
+        let mut mutated = valid;
+        mutated[MAGIC.len()] ^= 0x01;
+        assert_eq!(
+            Packet::decode(&mutated),
+            None,
+            "a changed FEC_GUARD byte was accepted"
+        );
+        // The kind byte: value 0 and every value outside the valid 1..=5
+        // range must be rejected.
+        for kind in [0u8].into_iter().chain(6..=255) {
+            let mut mutated = valid;
+            mutated[MAGIC.len() + 1] = kind;
+            assert_eq!(
+                Packet::decode(&mutated),
+                None,
+                "kind byte {kind} was accepted as a valid handshake kind"
+            );
+        }
+    }
+
+    #[test]
+    fn a_packet_one_byte_short_or_long_is_rejected() {
+        let valid = valid_packet().encode();
+        assert_eq!(
+            Packet::decode(&valid[..PACKET_LEN - 1]),
+            None,
+            "a {}-byte packet must not decode as an {PACKET_LEN}-byte packet",
+            PACKET_LEN - 1
+        );
+        let mut padded = valid.to_vec();
+        padded.push(0);
+        assert_eq!(
+            Packet::decode(&padded),
+            None,
+            "a {}-byte packet must not decode as an {PACKET_LEN}-byte packet",
+            PACKET_LEN + 1
+        );
+    }
+}
