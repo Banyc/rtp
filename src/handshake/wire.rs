@@ -1,3 +1,4 @@
+// Policy: Latest-only protocol, stale peer = attacker, lockstep deploy.
 pub(crate) const MAGIC: [u8; 8] = [0xf7, b'R', b'T', b'P', b'O', b'P', 1, 0];
 pub(crate) const FEC_GUARD: u8 = 0xff;
 pub(crate) const PACKET_LEN: usize = 18;
