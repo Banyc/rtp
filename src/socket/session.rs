@@ -39,7 +39,7 @@ pub fn socket(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (ReadSocket, WriteSocket, SessionSupervisor) {
-    build_socket(build_parts(unreliable_layer, log_config))
+    build_socket(TransmissionLayer::new(unreliable_layer, log_config))
 }
 
 pub fn socket_with_watchdog_tuning(
@@ -47,7 +47,7 @@ pub fn socket_with_watchdog_tuning(
     log_config: Option<LogConfig>,
     tuning: WatchdogTuning,
 ) -> (ReadSocket, WriteSocket, SessionSupervisor) {
-    build_socket(build_parts_with_watchdog_tuning(
+    build_socket(TransmissionLayer::new_with_watchdog_tuning(
         unreliable_layer,
         log_config,
         tuning,
@@ -56,9 +56,67 @@ pub fn socket_with_watchdog_tuning(
 
 type SocketParts = (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper);
 
+/// The composed session before the driver tasks are spawned.  Production
+/// [`socket`] / [`socket_with_watchdog_tuning`] hand one to [`build_socket`],
+/// which spawns the write/read driver tasks; the test facade holds the same
+/// composition to poke the write/read halves directly without spawning them.
+pub(crate) struct TransmissionLayer {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) write_half: WriteHalf,
+    pub(crate) read_half: ReadHalf,
+    pub(crate) termination_reaper: TerminationReaper,
+}
+
+impl std::ops::Deref for TransmissionLayer {
+    type Target = Shared;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+impl TransmissionLayer {
+    pub(crate) fn from_parts(parts: SocketParts) -> Self {
+        let (shared, write_half, read_half, termination_reaper) = parts;
+        Self {
+            shared,
+            write_half,
+            read_half,
+            termination_reaper,
+        }
+    }
+
+    pub(crate) fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
+        Self::from_parts(build_parts(unreliable_layer, log_config))
+    }
+
+    pub(crate) fn new_with_watchdog_tuning(
+        unreliable_layer: UnreliableLayer,
+        log_config: Option<LogConfig>,
+        tuning: WatchdogTuning,
+    ) -> Self {
+        Self::from_parts(build_parts_with_watchdog_tuning(
+            unreliable_layer,
+            log_config,
+            tuning,
+        ))
+    }
+
+    pub(crate) fn into_parts(self) -> SocketParts {
+        let Self {
+            shared,
+            write_half,
+            read_half,
+            termination_reaper,
+        } = self;
+        (shared, write_half, read_half, termination_reaper)
+    }
+}
+
 fn build_socket(
-    (shared, write_half, read_half, termination_reaper): SocketParts,
+    parts: TransmissionLayer,
 ) -> (ReadSocket, WriteSocket, SessionSupervisor) {
+    let (shared, write_half, read_half, termination_reaper) = parts.into_parts();
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
     let stop_drivers = tokio_util::sync::CancellationToken::new();

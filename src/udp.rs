@@ -882,15 +882,15 @@ mod tests {
         let addr = spawn_accept_loop(listener);
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
-        let probe = crate::probe::encode_probe(0xDEAD_BEEF, 12345);
+        let probe = crate::probe::encode_probe(crate::probe::ProbeEcho { nonce: 0xDEAD_BEEF, timestamp_micros: 12345 });
         prober.send(&probe).await.unwrap();
         let mut buf = [0u8; 64];
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
             .await
             .expect("probe echo timed out")
             .unwrap();
-        let (nonce, timestamp) = crate::probe::decode_echo(&buf[..n]).expect("not a probe echo");
-        assert_eq!((nonce, timestamp), (0xDEAD_BEEF, 12345));
+        let echo = crate::probe::decode_echo(&buf[..n]).expect("not a probe echo");
+        assert_eq!(echo, crate::probe::ProbeEcho { nonce: 0xDEAD_BEEF, timestamp_micros: 12345 });
         assert_eq!(buf[..8], probe[..8]);
         assert_eq!(buf[9..n], probe[9..]);
     }
@@ -908,7 +908,7 @@ mod tests {
         });
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober
-            .send_to(&crate::probe::encode_probe(1, 2), addr)
+            .send_to(&crate::probe::encode_probe(crate::probe::ProbeEcho { nonce: 1, timestamp_micros: 2 }), addr)
             .await
             .unwrap();
         let mut buf = [0u8; 64];
@@ -930,7 +930,7 @@ mod tests {
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
         for nonce in 0..200u64 {
-            let _ = prober.send(&crate::probe::encode_probe(nonce, 0)).await;
+            let _ = prober.send(&crate::probe::encode_probe(crate::probe::ProbeEcho { nonce, timestamp_micros: 0 })).await;
         }
         let mut echoes = 0usize;
         let mut buf = [0u8; 64];
@@ -986,11 +986,11 @@ mod tests {
         let mut buf = [0; 16];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"data");
-        tap.send_probe(99, 7).unwrap();
+        tap.send_probe(crate::probe::ProbeEcho { nonce: 99, timestamp_micros: 7 }).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            if let Some(nonce) = tap.try_recv_echo() {
-                assert_eq!(nonce, 99);
+            if let Some(echo) = tap.try_recv_echo() {
+                assert_eq!(echo.nonce, 99);
                 break;
             }
             assert!(

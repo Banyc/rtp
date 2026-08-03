@@ -2,61 +2,14 @@ use core::time::Duration;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::read_half::ReadHalf;
-use super::shared::Shared;
-use super::shared::{build_parts, build_parts_with_watchdog_tuning};
 use super::transmission_layer::{
-    LogConfig, RecvBufs, RecvPkts, SendBufs, SendKillPkt, UnreliableLayer, UnreliableRead,
-    UnreliableWrite,
+    RecvBufs, RecvPkts, SendBufs, SendKillPkt, UnreliableRead, UnreliableWrite,
 };
-use super::write_half::WriteHalf;
 use crate::io_err::IoErr;
+use crate::socket::session::TransmissionLayer;
 use async_trait::async_trait;
 
-#[cfg(test)]
-pub struct TransmissionLayer {
-    pub(crate) shared: Arc<Shared>,
-    pub(crate) write_half: WriteHalf,
-    pub(crate) read_half: ReadHalf,
-    pub(crate) _termination_reaper: super::termination::TerminationReaper,
-}
-
-#[cfg(test)]
-impl std::ops::Deref for TransmissionLayer {
-    type Target = Shared;
-
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
-}
-
-#[cfg(test)]
 impl TransmissionLayer {
-    pub fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
-        let (shared, write_half, read_half, termination_reaper) =
-            build_parts(unreliable_layer, log_config);
-        Self {
-            shared,
-            write_half,
-            read_half,
-            _termination_reaper: termination_reaper,
-        }
-    }
-
-    pub fn new_with_watchdog_tuning(
-        unreliable_layer: UnreliableLayer,
-        tuning: crate::transmission::watchdog_tuning::WatchdogTuning,
-    ) -> Self {
-        let (shared, write_half, read_half, termination_reaper) =
-            build_parts_with_watchdog_tuning(unreliable_layer, None, tuning);
-        Self {
-            shared,
-            write_half,
-            read_half,
-            _termination_reaper: termination_reaper,
-        }
-    }
-
     /// Test-only: take up to `n` tokens from the shared send-rate limiter so
     /// the retransmission-armor duplicate-copy token gate can be exercised
     /// (the primary rtx bypasses the bucket; the dup needs a token).
@@ -314,7 +267,7 @@ mod tests {
         assert!(transmission.recv_fin().is_cancelled());
         assert!(transmission.has_pending_acks());
         let shared = Arc::clone(&transmission.shared);
-        let reaper = transmission._termination_reaper.clone();
+        let reaper = transmission.termination_reaper.clone();
         let mut reap = Box::pin(async move {
             reaper
                 .ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained())
@@ -1102,7 +1055,7 @@ mod tests {
             false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             FecTuning::default(),
             crate::delivery::frame::FrameDelivery::default()).unwrap();
-        let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, tuning);
+        let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         {
             let rl = tl.reliable_layer();
