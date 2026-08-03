@@ -32,7 +32,7 @@ mod layer;
 #[cfg(test)]
 pub(crate) use layer::wrap_fec;
 #[cfg(test)]
-pub(crate) use layer::{checked_mss_and_fec, wrap_fec_with_mss, wrap_fec_with_mss_and_fec_tuning};
+pub(crate) use layer::checked_mss_and_fec;
 pub(crate) use layer::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
 
 mod raw_send;
@@ -400,8 +400,8 @@ async fn accept(
         peer: Some(peer_addr),
     };
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
+        Box::new(read),
+        Box::new(write),
         fec,
         mss,
         tuning,
@@ -925,7 +925,14 @@ mod tests {
 
     #[test]
     fn checked_mss_default_matches_legacy_derivation() {
-        let layer = wrap_fec_with_mss(Dummy, Dummy, false, NO_FEC_MSS);
+        let layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(Dummy),
+            Box::new(Dummy),
+            false,
+            NO_FEC_MSS,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
         assert_eq!(layer.mss.get(), NO_FEC_MSS);
         assert!(layer.fec.is_none());
     }
@@ -933,18 +940,39 @@ mod tests {
     #[test]
     #[should_panic(expected = "datagram ceiling")]
     fn checked_mss_rejects_oversized() {
-        let _ = wrap_fec_with_mss(Dummy, Dummy, false, MAX_MSS + 1);
+        let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(Dummy),
+            Box::new(Dummy),
+            false,
+            MAX_MSS + 1,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
     }
 
     #[test]
     #[should_panic(expected = "leaves no room for the codec payload")]
     fn checked_mss_rejects_undersized() {
-        let _ = wrap_fec_with_mss(Dummy, Dummy, false, 1);
+        let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(Dummy),
+            Box::new(Dummy),
+            false,
+            1,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
     }
 
     #[test]
     fn checked_mss_fec_default_matches_legacy_derivation() {
-        let layer = wrap_fec_with_mss(Dummy, Dummy, true, NO_FEC_MSS);
+        let layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(Dummy),
+            Box::new(Dummy),
+            true,
+            NO_FEC_MSS,
+            FecTuning::default(),
+            FrameDelivery::default(),
+        );
         assert!(layer.fec.is_some());
         // The final MSS after reserving the FEC header is smaller than the raw
         // user-provided NO_FEC_MSS, but it must still leave room for the codec
@@ -1030,8 +1058,8 @@ mod tests {
         // `frame_data_overhead` (data_overhead + 4).
         let mss = crate::codec::data_overhead() + 1;
         let _ = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            Dummy,
-            Dummy,
+            Box::new(Dummy),
+            Box::new(Dummy),
             false,
             mss,
             crate::transmission::fec_tuning::FecTuning::default(),
@@ -1272,8 +1300,8 @@ async fn connect_bound(
     let udp = Arc::new(udp);
     let (probe_tap, filtered_read) = crate::probe::client_probe_tap(Arc::clone(&udp));
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        filtered_read,
-        udp,
+        Box::new(filtered_read),
+        Box::new(udp),
         fec,
         mss,
         fec_tuning,

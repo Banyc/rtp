@@ -66,9 +66,9 @@ pub(crate) type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 /// to avoid per-call allocation.
 #[derive(Debug)]
 pub struct SendBufs {
-    pub data: Vec<u8>,
-    pub utp: Vec<u8>,
-    pub fec: Vec<u8>,
+    pub(crate) data: Vec<u8>,
+    pub(crate) utp: Vec<u8>,
+    pub(crate) fec: Vec<u8>,
 }
 
 impl SendBufs {
@@ -115,14 +115,14 @@ impl Default for RecvBufs {
 }
 #[derive(Debug)]
 pub struct UnreliableLayer {
-    pub utp_read: Box<dyn UnreliableRead>,
-    pub utp_write: Box<dyn UnreliableWrite>,
+    pub(crate) utp_read: Box<dyn UnreliableRead>,
+    pub(crate) utp_write: Box<dyn UnreliableWrite>,
     #[doc(hidden)]
-    pub post_open_handshake: Option<crate::handshake::PostOpenHandshake>,
-    pub mss: NonZeroUsize,
-    pub fec: Option<FecState>,
-    pub fec_tuning: FecTuning,
-    pub frame_delivery: FrameDelivery,
+    pub(crate) post_open_handshake: Option<crate::handshake::PostOpenHandshake>,
+    pub(crate) mss: NonZeroUsize,
+    pub(crate) fec: Option<FecState>,
+    pub(crate) fec_tuning: FecTuning,
+    pub(crate) frame_delivery: FrameDelivery,
 }
 
 #[derive(Debug, Clone)]

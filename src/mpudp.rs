@@ -110,8 +110,8 @@ async fn convert_conn(
     };
     let (r, w) = conn.into_split();
     let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        r,
-        w,
+        Box::new(r),
+        Box::new(w),
         false,
         MSS,
         tuning,

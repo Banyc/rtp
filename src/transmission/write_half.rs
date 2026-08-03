@@ -83,18 +83,19 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
-        self.send_pkts_inner(bufs).await
+        self.send_pkts_inner(bufs, Instant::now()).await
     }
 
     pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendPass, IoErr> {
-        let made_progress = self.send_pkts_inner(bufs).await?;
+        let now = Instant::now();
+        let made_progress = self.send_pkts_inner(bufs, now).await?;
         Ok(SendPass {
             made_progress,
-            wake: self.next_send_wake(Instant::now()),
+            wake: self.next_send_wake(now),
         })
     }
 
-    async fn send_pkts_inner(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
+    async fn send_pkts_inner(&mut self, bufs: &mut SendBufs, now: Instant) -> Result<bool, IoErr> {
         if self.try_send_requested_kill(bufs).await.is_some() {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
@@ -108,7 +109,6 @@ impl WriteHalf {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             self.throw_error_after_requested_kill(bufs).await?;
-            let now = Instant::now();
             let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_pkt(&mut bufs.data, now)
@@ -194,10 +194,9 @@ impl WriteHalf {
             match primary_res {
                 Ok(_) => {
                     if self.fec.is_some() && instream {
-                        self.maybe_flush_full_fec_group(Instant::now()).await?;
+                        self.maybe_flush_full_fec_group(now).await?;
                     }
                     if wants_dup && let Some(send_buf) = send_buf {
-                        let now = Instant::now();
                         let token_taken = self
                             .send_rate_limiter
                             .lock()
@@ -239,7 +238,6 @@ impl WriteHalf {
             self.coord.sent_data_pkt.notify_waiters();
         }
         if self.fec.is_some() {
-            let now = Instant::now();
             let stock_can_send_tail_fec =
                 { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
             let data_path = true;

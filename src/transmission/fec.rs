@@ -385,15 +385,9 @@ impl FecState {
         pkts
     }
 
+    #[cfg(test)]
     pub fn max_wire_pkt_size(&self) -> usize {
         self.symbol_size + fec_hdr_size()
-    }
-
-    /// Number of data symbols in the currently-open FEC group.  Exposed so the
-    /// transmission layer's data-path burst close can decide whether a partial
-    /// group needs force-flushing.
-    pub fn group_data_count(&self) -> usize {
-        self.encoder.group_data_count()
     }
 
     /// Feed an incoming raw UDP packet through the FEC decoder. Returns:

@@ -219,7 +219,11 @@ mod tests {
         };
         let len = crate::codec::encode_ack_data(None, None, Some(fin), &mut datagram).unwrap();
         datagram.truncate(len);
-        let layer = crate::udp::wrap_fec(OneDatagramRead(Some(datagram)), ImmediateWrite, false);
+        let layer = crate::udp::wrap_fec(
+            Box::new(OneDatagramRead(Some(datagram))),
+            Box::new(ImmediateWrite),
+            false,
+        );
         let mut transmission = TransmissionLayer::new(layer, None);
         let mut recv_bufs = RecvBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
@@ -276,7 +280,7 @@ mod tests {
             datagram
         };
         let datagrams = std::collections::VecDeque::from([encode(0, b"payload"), encode(0, b"")]);
-        let layer = crate::udp::wrap_fec(DatagramQueue(datagrams), ImmediateWrite, false);
+        let layer = crate::udp::wrap_fec(Box::new(DatagramQueue(datagrams)), Box::new(ImmediateWrite), false);
         let mut transmission = TransmissionLayer::new(layer, None);
         let mut recv_bufs = RecvBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
@@ -315,11 +319,11 @@ mod tests {
         let send_started = Arc::new(tokio::sync::Notify::new());
         let release_send = Arc::new(tokio::sync::Notify::new());
         let layer = crate::udp::wrap_fec(
-            OneFinRead(Some(fin)),
-            BlockingWrite {
+            Box::new(OneFinRead(Some(fin))),
+            Box::new(BlockingWrite {
                 started: Arc::clone(&send_started),
                 release: Arc::clone(&release_send),
-            },
+            }),
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
@@ -393,12 +397,13 @@ mod tests {
         }
         let write = SharedWrite(recorder.clone());
         let read = BlackholeRead;
-        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
-            read,
-            write,
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(read),
+            Box::new(write),
             fec,
             crate::udp::NO_FEC_MSS,
             tuning,
+            crate::delivery::frame::FrameDelivery::default(),
         );
         let mut tl = TransmissionLayer::new(ul, None);
         tl.set_rtx_dup_for_test(enabled);
@@ -424,15 +429,16 @@ mod tests {
 
     fn parity_error_harness(error: std::io::ErrorKind) -> (TransmissionLayer, Arc<AtomicUsize>) {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let unreliable = crate::udp::wrap_fec_with_mss_and_fec_tuning(
-            BlackholeRead,
-            FailAfterFirstWrite {
+        let unreliable = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(BlackholeRead),
+            Box::new(FailAfterFirstWrite {
                 attempts: Arc::clone(&attempts),
                 error,
-            },
+            }),
             true,
             crate::udp::NO_FEC_MSS,
             crate::transmission::fec_tuning::FecTuning::mindiv(),
+            crate::delivery::frame::FrameDelivery::default(),
         );
         (TransmissionLayer::new(unreliable, None), attempts)
     }
@@ -641,12 +647,13 @@ mod tests {
         }
         let write = SharedWrite(recorder.clone());
         let read = BlackholeRead;
-        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
-            read,
-            write,
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(read),
+            Box::new(write),
             fec,
             mss,
             crate::transmission::fec_tuning::FecTuning::default(),
+            crate::delivery::frame::FrameDelivery::default(),
         );
         let mut tl = TransmissionLayer::new(ul, None);
         tl.set_rtx_dup_for_test(enabled);
@@ -801,7 +808,7 @@ mod tests {
             sent: Mutex::new(false),
         };
         let write = BlockedWrite;
-        let ul = crate::udp::wrap_fec(read, write, false);
+        let ul = crate::udp::wrap_fec(Box::new(read), Box::new(write), false);
         let mut tl = TransmissionLayer::new(ul, None);
         let mut recv_bufs = RecvBufs::new();
         let result = tokio::time::timeout(
@@ -885,10 +892,10 @@ mod tests {
             third_cancelled: AtomicBool::new(false),
         });
         let layer = crate::udp::wrap_fec(
-            CancellationSensitiveRead {
+            Box::new(CancellationSensitiveRead {
                 state: Arc::clone(&state),
-            },
-            ImmediateWrite,
+            }),
+            Box::new(ImmediateWrite),
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
@@ -973,11 +980,11 @@ mod tests {
         let send_started = Arc::new(tokio::sync::Notify::new());
         let release_send = Arc::new(tokio::sync::Notify::new());
         let layer = crate::udp::wrap_fec(
-            SilentRead,
-            BlockingWrite {
+            Box::new(SilentRead),
+            Box::new(BlockingWrite {
                 started: Arc::clone(&send_started),
                 release: Arc::clone(&release_send),
-            },
+            }),
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
@@ -1059,7 +1066,7 @@ mod tests {
         let write = WouldBlockWrite {
             call_count: Mutex::new(0),
         };
-        let ul = crate::udp::wrap_fec(read, write, false);
+        let ul = crate::udp::wrap_fec(Box::new(read), Box::new(write), false);
         let mut tl = TransmissionLayer::new(ul, None);
         let mut recv_bufs = RecvBufs::new();
         let _ = tl.recv_pkts(&mut recv_bufs).await;
@@ -1108,15 +1115,16 @@ mod tests {
             Duration::from_millis(1),
             Duration::from_secs(2),
         );
-        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning(
-            BlackholeRead,
-            PendingKillWrite {
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(BlackholeRead),
+            Box::new(PendingKillWrite {
                 recorder: Arc::clone(&recorder),
                 kill_started: Arc::clone(&kill_started),
-            },
+            }),
             false,
             crate::udp::NO_FEC_MSS,
             FecTuning::default(),
+            crate::delivery::frame::FrameDelivery::default(),
         );
         let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, tuning);
         settle_rtt(&tl, Duration::from_millis(1), 5);
@@ -1187,11 +1195,11 @@ mod tests {
         let sends = Arc::new(AtomicUsize::new(0));
         let tail_started = Arc::new(tokio::sync::Notify::new());
         let unreliable = crate::udp::wrap_fec(
-            BlackholeRead,
-            KillThenStuckTail {
+            Box::new(BlackholeRead),
+            Box::new(KillThenStuckTail {
                 sends: Arc::clone(&sends),
                 tail_started: Arc::clone(&tail_started),
-            },
+            }),
             true,
         );
         let mut transmission = TransmissionLayer::new(unreliable, None);
@@ -1251,7 +1259,7 @@ mod tests {
             sent: Mutex::new(0),
         };
         let write = OkWrite;
-        let ul = crate::udp::wrap_fec(read, write, false);
+        let ul = crate::udp::wrap_fec(Box::new(read), Box::new(write), false);
         let mut tl = TransmissionLayer::new(ul, None);
         let mut recv_bufs = RecvBufs::new();
         let _ = tl.recv_pkts(&mut recv_bufs).await;

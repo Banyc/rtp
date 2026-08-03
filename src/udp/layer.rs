@@ -8,14 +8,14 @@ use super::MAX_MSS;
 use crate::delivery::frame::FrameDelivery;
 use crate::transmission::{
     fec::{FecConfig, FecState},
-    fec_tuning::{FecTuning, fec_tuning_from_env},
+    fec_tuning::FecTuning,
     transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
 
 #[cfg(test)]
 pub(crate) fn wrap_fec(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    read: Box<dyn UnreliableRead>,
+    write: Box<dyn UnreliableWrite>,
     fec: bool,
 ) -> UnreliableLayer {
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
@@ -28,47 +28,9 @@ pub(crate) fn wrap_fec(
     )
 }
 
-// Test-only construction paths; keep `allow` because `expect` would go
-// unfulfilled in `--all-targets`/test builds where these are used.
-#[allow(dead_code)]
-pub(crate) fn wrap_fec_with_mss(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
-    fec: bool,
-    mss: usize,
-) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
-        fec,
-        mss,
-        fec_tuning_from_env(),
-        FrameDelivery::default(),
-    )
-}
-
-// Test-only construction path; keep `allow` because `expect` would go
-// unfulfilled in `--all-targets`/test builds where this is used.
-#[allow(dead_code)]
-pub(crate) fn wrap_fec_with_mss_and_fec_tuning(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
-    fec: bool,
-    mss: usize,
-    tuning: FecTuning,
-) -> UnreliableLayer {
-    wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
-        fec,
-        mss,
-        tuning,
-        FrameDelivery::default(),
-    )
-}
 pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    read: Box<dyn UnreliableRead>,
+    write: Box<dyn UnreliableWrite>,
     fec: bool,
     mss: usize,
     tuning: FecTuning,
@@ -76,8 +38,8 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
 ) -> UnreliableLayer {
     let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning, frame_delivery);
     UnreliableLayer {
-        utp_read: Box::new(read),
-        utp_write: Box::new(write),
+        utp_read: read,
+        utp_write: write,
         post_open_handshake: None,
         mss,
         fec: fec_state,

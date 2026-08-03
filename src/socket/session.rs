@@ -261,14 +261,10 @@ mod tests {
         }
         let sends = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(tokio::sync::Notify::new());
-        let layer = wrap_fec(
-            FailedRead,
-            DropProbeWrite {
+        let layer = wrap_fec(Box::new(FailedRead), Box::new(DropProbeWrite {
                 sends: Arc::clone(&sends),
                 dropped: Arc::clone(&dropped),
-            },
-            false,
-        );
+            }), false);
         let (_read, _write, _supervisor) = socket(layer, None);
         tokio::time::timeout(Duration::from_secs(1), dropped.notified())
             .await
@@ -305,7 +301,11 @@ mod tests {
             }
         }
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let layer = wrap_fec(PanickingRead, DropProbeWrite(Some(dropped_tx)), false);
+        let layer = wrap_fec(
+            Box::new(PanickingRead),
+            Box::new(DropProbeWrite(Some(dropped_tx))),
+            false,
+        );
         let (_read, _write, supervisor) = socket(layer, None);
         let owner = tokio::spawn(supervisor);
         tokio::time::timeout(Duration::from_secs(1), dropped_rx)
@@ -359,17 +359,13 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(AtomicBool::new(false));
-        let layer = wrap_fec(
-            GatedFailedRead {
+        let layer = wrap_fec(Box::new(GatedFailedRead {
                 fail: Arc::clone(&fail),
-            },
-            GatedWrite {
+            }), Box::new(GatedWrite {
                 started: Arc::clone(&started),
                 release: Arc::clone(&release),
                 dropped: Arc::clone(&dropped),
-            },
-            false,
-        );
+            }), false);
         let (_read, mut write, supervisor) = socket(layer, None);
         let owner = tokio::spawn(supervisor);
         assert_eq!(write.send(b"payload").await.unwrap(), 7);
@@ -434,16 +430,12 @@ mod tests {
         let release_kill = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(tokio::sync::Notify::new());
         let was_dropped = Arc::new(AtomicBool::new(false));
-        let layer = wrap_fec(
-            PendingRead,
-            KillGateWrite {
+        let layer = wrap_fec(Box::new(PendingRead), Box::new(KillGateWrite {
                 kill_started: Arc::clone(&kill_started),
                 release_kill: Arc::clone(&release_kill),
                 dropped: Arc::clone(&dropped),
                 was_dropped: Arc::clone(&was_dropped),
-            },
-            false,
-        );
+            }), false);
         let (_read, mut write, _supervisor) = socket(layer, None);
         write.send_kill_and_abort().await;
         tokio::time::timeout(Duration::from_secs(1), kill_started.notified())
@@ -468,8 +460,8 @@ mod tests {
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
 
-        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
 
         let request = b"request";
         let response = b"response";
@@ -539,16 +531,16 @@ mod tests {
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
         let (a_read, a_write, _a_supervisor) = socket(
             wrap_fec(
-                Arc::clone(&a),
-                DropProbeUdpWrite {
+                Box::new(Arc::clone(&a)),
+                Box::new(DropProbeUdpWrite {
                     socket: a,
                     dropped: Some(dropped_tx),
-                },
+                }),
                 false,
             ),
             None,
         );
-        let (b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let (b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         assert_eq!(b_write.send(b"unread").await.unwrap(), 6);
         drop(b_write);
         tokio::time::timeout(
@@ -576,8 +568,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let (a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         drop(a_read);
         tokio::task::yield_now().await;
         assert_eq!(b_write.send(b"late payload").await.unwrap(), 12);
@@ -600,8 +592,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         let request = b"request";
         let response = b"response";
         assert_eq!(b_write.send(request).await.unwrap(), request.len());
@@ -666,24 +658,24 @@ mod tests {
         let b_sent_notify = Arc::new(tokio::sync::Notify::new());
         let (mut a_read, mut a_write, _a_supervisor) = socket(
             wrap_fec(
-                Arc::clone(&a),
-                ProbeUdpWrite {
+                Box::new(Arc::clone(&a)),
+                Box::new(ProbeUdpWrite {
                     socket: Arc::clone(&a),
                     sent: Arc::clone(&a_sent),
                     sent_notify: Arc::clone(&a_sent_notify),
-                },
+                }),
                 false,
             ),
             None,
         );
         let (mut b_read, mut b_write, _b_supervisor) = socket(
             wrap_fec(
-                Arc::clone(&b),
-                ProbeUdpWrite {
+                Box::new(Arc::clone(&b)),
+                Box::new(ProbeUdpWrite {
                     socket: Arc::clone(&b),
                     sent: Arc::clone(&b_sent),
                     sent_notify: Arc::clone(&b_sent_notify),
-                },
+                }),
                 false,
             ),
             None,

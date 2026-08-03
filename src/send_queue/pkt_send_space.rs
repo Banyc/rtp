@@ -180,9 +180,11 @@ impl PktSendSpace {
     /// stops after that many new packets, leaving the rest of staged data in
     /// the send buffer.  Used by in-stream group FEC tests that need the stock
     /// `can_send_tail_fec` gate closed (send buffer not empty) while still
-    /// having a partial FEC group open.
+    /// having a partial FEC group open.  This is the single state-mutating
+    /// seam behind [`crate::reliable::reliable_layer::ReliableLayer`]'s
+    /// `set_cwnd_for_test`; only that method is test-facing.
     #[cfg(test)]
-    pub(crate) fn set_cwnd_for_test(&mut self, cwnd: NonZeroUsize) {
+    pub(crate) fn set_cwnd(&mut self, cwnd: NonZeroUsize) {
         self.cwnd = cwnd;
     }
 
@@ -622,10 +624,9 @@ impl PktSendSpace {
         self.outage.in_outage_recovery()
     }
 
-    // Only the outage-recovery tests read the cut; keep `allow` because
-    // `expect` would go unfulfilled in `--all-targets`/test builds where the
-    // method is used.
-    #[allow(dead_code)]
+    // Only the outage-recovery tests read the cut; gate it to test builds
+    // instead of carrying an `#[allow(dead_code)]` on the production build.
+    #[cfg(test)]
     pub(crate) fn outage_cut(&self) -> Option<Instant> {
         self.outage.outage_cut()
     }

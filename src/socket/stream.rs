@@ -403,8 +403,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
-        let (_b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (_b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         assert_eq!(
             tokio::time::timeout(Duration::from_millis(100), a_write.send(&[]))
                 .await
@@ -437,16 +437,16 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let frame_delivery = crate::delivery::frame::FrameDelivery::enabled();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            a.clone(),
-            a,
+            Box::new(a.clone()),
+            Box::new(a),
             false,
             crate::udp::NO_FEC_MSS,
             crate::transmission::fec_tuning::FecTuning::default(),
             frame_delivery,
         );
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            b.clone(),
-            b,
+            Box::new(b.clone()),
+            Box::new(b),
             false,
             crate::udp::NO_FEC_MSS,
             crate::transmission::fec_tuning::FecTuning::default(),
@@ -479,8 +479,8 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let hello = b"hello";
         let world = b"world";
-        let a = wrap_fec(a.clone(), a, fec);
-        let b = wrap_fec(b.clone(), b, fec);
+        let a = wrap_fec(Box::new(a.clone()), Box::new(a), fec);
+        let b = wrap_fec(Box::new(b.clone()), Box::new(b), fec);
         let (mut a_r, mut a_w, _a_supervisor) = socket(a, None);
         let (mut b_r, mut b_w, _b_supervisor) = socket(b, None);
         a_w.send(hello).await.unwrap();
@@ -499,8 +499,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a = wrap_fec(a.clone(), a, fec);
-        let b = wrap_fec(b.clone(), b, fec);
+        let a = wrap_fec(Box::new(a.clone()), Box::new(a), fec);
+        let b = wrap_fec(Box::new(b.clone()), Box::new(b), fec);
         let (a_r, a_w, _a_supervisor) = socket(a, None);
         let (b_r, b_w, _b_supervisor) = socket(b, None);
         let mut send_buf = vec![0; 2 << 17];
@@ -637,12 +637,12 @@ mod tests {
 
 #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_max_stage_scales_with_mss() {
-        use crate::udp::{wrap_fec, wrap_fec_with_mss};
+        use crate::udp::wrap_fec;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let b_wrapped = wrap_fec(b.clone(), b, false);
+        let b_wrapped = wrap_fec(Box::new(b.clone()), Box::new(b), false);
         let (_b_r, b_w, _b_supervisor) = socket(b_wrapped, None);
         assert_eq!(
             b_w.into_async_write().max_stage(),
@@ -650,7 +650,14 @@ mod tests {
             "default-MSS staging buffer must be exactly 8 KiB"
         );
         let mss = 9_000;
-        let a = wrap_fec_with_mss(a.clone(), a, false, mss);
+        let a = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(a.clone()),
+            Box::new(a),
+            false,
+            mss,
+            crate::transmission::fec_tuning::FecTuning::default(),
+            crate::delivery::frame::FrameDelivery::default(),
+        );
         let (_a_r, a_w, _a_supervisor) = socket(a, None);
         let write_stream = a_w.into_async_write();
         let max_stage = write_stream.max_stage();
@@ -677,8 +684,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a = wrap_fec(a.clone(), a, fec);
-        let b = wrap_fec(b.clone(), b, fec);
+        let a = wrap_fec(Box::new(a.clone()), Box::new(a), fec);
+        let b = wrap_fec(Box::new(b.clone()), Box::new(b), fec);
         let (a_r, a_w, _a_supervisor) = socket(a, None);
         let (_b_r, b_w, _b_supervisor) = socket(b, None);
         let _a_r = a_r;
@@ -718,16 +725,16 @@ mod tests {
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            a.clone(),
-            a,
+            Box::new(a.clone()),
+            Box::new(a),
             fec,
             mss,
             crate::transmission::fec_tuning::FecTuning::default(),
             fd,
         );
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            b.clone(),
-            b,
+            Box::new(b.clone()),
+            Box::new(b),
             fec,
             mss,
             crate::transmission::fec_tuning::FecTuning::default(),
@@ -766,8 +773,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a = wrap_fec(a.clone(), a, fec);
-        let b = wrap_fec(b.clone(), b, fec);
+        let a = wrap_fec(Box::new(a.clone()), Box::new(a), fec);
+        let b = wrap_fec(Box::new(b.clone()), Box::new(b), fec);
         let (a_r, a_w, _a_supervisor) = socket(a, None);
         let (_b_r, _b_w, _b_supervisor) = socket(b, None);
         let result = into_frame_io_parts(a_r, a_w);
@@ -792,16 +799,16 @@ mod tests {
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            a.clone(),
-            a,
+            Box::new(a.clone()),
+            Box::new(a),
             fec,
             mss,
             crate::transmission::fec_tuning::FecTuning::default(),
             fd,
         );
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            b.clone(),
-            b,
+            Box::new(b.clone()),
+            Box::new(b),
             fec,
             mss,
             crate::transmission::fec_tuning::FecTuning::default(),
@@ -840,8 +847,8 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (mut a_read, a_write, _a_supervisor) = socket(wrap_fec(a.clone(), a, false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(b.clone(), b, false), None);
+        let (mut a_read, a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         let mut a_write = a_write.into_async_write();
         a_write.write_all(b"request").await.unwrap();
         a_write.shutdown().await.unwrap();
@@ -882,16 +889,16 @@ mod tests {
         b.connect(a.local_addr().unwrap()).await.unwrap();
         let frame_delivery = crate::delivery::frame::FrameDelivery::enabled();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            a.clone(),
-            a,
+            Box::new(a.clone()),
+            Box::new(a),
             false,
             crate::udp::NO_FEC_MSS,
             crate::transmission::fec_tuning::FecTuning::default(),
             frame_delivery,
         );
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-            b.clone(),
-            b,
+            Box::new(b.clone()),
+            Box::new(b),
             false,
             crate::udp::NO_FEC_MSS,
             crate::transmission::fec_tuning::FecTuning::default(),
@@ -977,10 +984,10 @@ mod tests {
             first_cancelled: AtomicBool::new(false),
         });
         let layer = wrap_fec(
-            PendingRead,
-            DriverWrite {
+            Box::new(PendingRead),
+            Box::new(DriverWrite {
                 state: Arc::clone(&state),
-            },
+            }),
             false,
         );
         let (_read, mut write, _supervisor) = socket(layer, None);
@@ -1053,7 +1060,11 @@ mod tests {
             release_first: tokio::sync::Notify::new(),
             kill_started: tokio::sync::Notify::new(),
         });
-        let layer = wrap_fec(PendingRead, BlockingFirstWrite(Arc::clone(&state)), false);
+        let layer = wrap_fec(
+            Box::new(PendingRead),
+            Box::new(BlockingFirstWrite(Arc::clone(&state))),
+            false,
+        );
         let (_read, write, _supervisor) = socket(layer, None);
         let mut write = write.into_async_write();
         let payload = vec![7; write.max_stage()];

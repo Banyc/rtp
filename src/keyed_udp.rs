@@ -37,8 +37,8 @@ fn wrap_keyed<K: DispatchKey>(
         .checked_sub(key_size)
         .unwrap_or_else(|| panic!("mss {mss} leaves no room for the {key_size}-byte dispatch key"));
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
-        write,
+        Box::new(read),
+        Box::new(write),
         fec,
         mss,
         tuning,

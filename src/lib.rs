@@ -12,6 +12,5 @@ mod sack;
 pub mod send_queue;
 pub mod socket;
 pub mod testing;
-mod timer;
 pub mod transmission;
 pub mod udp;
