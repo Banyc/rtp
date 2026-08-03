@@ -216,12 +216,13 @@ impl Shared {
     }
 
     async fn send_stock(&self, data: &[u8]) -> Result<usize, IoErr> {
+        let now = Instant::now();
         let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
             let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_buf(data, Instant::now())
+                reliable_layer.send_data_buf(data, now)
             }?;
             self.log("send_data_buf");
             if 0 < written_bytes {
@@ -239,13 +240,14 @@ impl Shared {
     }
 
     pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, IoErr> {
+        let now = Instant::now();
         let frame_len = frame.len();
         let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
         loop {
             self.termination.throw_error()?;
             let result = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_frame_buf(frame, Instant::now())
+                reliable_layer.send_frame_buf(frame, now)
             };
             match result {
                 Ok(()) => {
@@ -505,7 +507,7 @@ impl Shared {
         };
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("unix timestamp");
+            .unwrap_or_default();
         let log = self.reliable_layer.lock().unwrap().log();
         let log = Log {
             op,
