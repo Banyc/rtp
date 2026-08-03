@@ -553,6 +553,11 @@ mod tests {
         .expect("opening handshake hung")
         .expect("opening handshake failed");
 
+        // The server's post-open retransmission is scheduled with
+        // `std::time::Instant` (see `claim_post_open_response`), so only real
+        // wall-clock time can let the established+1s slot fire. `advance()`
+        // moves the tokio clock, not `std::time::Instant`, so a paused
+        // runtime cannot fast-forward this window.
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         assert_eq!(
             confirmation_attempts.load(Ordering::SeqCst),
@@ -602,6 +607,11 @@ mod tests {
         .expect("opening handshake hung")
         .expect("opening handshake failed");
 
+        // Same wall-clock constraint as the retired-ready test: the +1s and
+        // +3s post-open retransmission slots are `std::time::Instant`
+        // scheduled, so they can only fire with real time. Waiting 3.2s also
+        // proves the server stopped retransmitting after +1s (a non-retired
+        // recovery would send again at +3s, tripping `confirmation_attempts`).
         tokio::time::sleep(Duration::from_millis(3_200)).await;
         assert_eq!(ready_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
