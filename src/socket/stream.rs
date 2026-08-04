@@ -10,7 +10,6 @@ use super::session::SessionSupervisor;
 use crate::io_err::IoErr;
 use crate::transmission::shared::Shared;
 
-
 pub type ReadStream = PollRead<ReadSocket>;
 
 #[derive(Debug)]
@@ -397,14 +396,16 @@ mod tests {
     use super::*;
     use core::time::Duration;
 
-#[tokio::test]
+    #[tokio::test]
     async fn empty_stock_io_is_an_immediate_noop() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
-        let (_b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
+        let (mut a_read, mut a_write, _a_supervisor) =
+            socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (_b_read, mut b_write, _b_supervisor) =
+            socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         assert_eq!(
             tokio::time::timeout(Duration::from_millis(100), a_write.send(&[]))
                 .await
@@ -429,7 +430,7 @@ mod tests {
         assert_eq!(&buf[..n], b"payload");
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn empty_generic_frame_io_is_a_noop_but_empty_frame_is_invalid() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -439,15 +440,21 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            false,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery).unwrap();
+            frame_delivery,
+        )
+        .unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            false,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery).unwrap();
+            frame_delivery,
+        )
+        .unwrap();
         let (mut a_read, mut a_write, _a_supervisor) = socket(a_layer, None);
         let (_b_read, mut b_write, _b_supervisor) = socket(b_layer, None);
         assert_eq!(a_write.send(&[]).await.unwrap(), 0);
@@ -466,7 +473,7 @@ mod tests {
         assert_eq!(frame, b"frame");
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_async_io() {
         let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -488,7 +495,7 @@ mod tests {
         assert_eq!(&recv_buf[..hello.len()], hello);
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_async_async_io() {
         let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -528,7 +535,7 @@ mod tests {
         }
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_fec_recovers_under_loss() {
         use crate::udp::testing::{LossRate, wrap_fec_lossy};
         let rate_a = LossRate::new(300);
@@ -571,7 +578,7 @@ mod tests {
         );
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_fec_recovers_under_loss_with_mss_8192() {
         use crate::socket::socket;
         use crate::transmission::fec_tuning::FecTuning;
@@ -631,7 +638,7 @@ mod tests {
         );
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_max_stage_scales_with_mss() {
         use crate::udp::wrap_fec;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -649,9 +656,12 @@ mod tests {
         let a = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            false,crate::udp::ValidMss::try_new(mss).unwrap(),
+            false,
+            crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default()).unwrap();
+            crate::delivery::frame::FrameDelivery::default(),
+        )
+        .unwrap();
         let (_a_r, a_w, _a_supervisor) = socket(a, None);
         let write_stream = a_w.into_async_write();
         let max_stage = write_stream.max_stage();
@@ -668,7 +678,7 @@ mod tests {
         drop(write_stream);
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_stages_at_most_the_send_buf_capacity() {
         use std::pin::Pin;
         use std::task::{Context, Poll};
@@ -707,7 +717,7 @@ mod tests {
         drop(b_w);
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn frame_mode_async_write_produces_one_frame() {
         use crate::delivery::frame::FrameDelivery;
         use tokio::io::AsyncWriteExt;
@@ -721,15 +731,21 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
+            fec,
+            crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd).unwrap();
+            fd,
+        )
+        .unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
+            fec,
+            crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd).unwrap();
+            fd,
+        )
+        .unwrap();
         let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
         let (mut b_r, _b_w, _b_supervisor) = socket(b_layer, None);
         let frame_size = 16 * 1024;
@@ -756,7 +772,7 @@ mod tests {
         let _ = send_task.await;
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn frame_delivery_io_conversion_rejects_stock_mode() {
         let fec = false;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -777,7 +793,7 @@ mod tests {
         );
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn frame_delivery_io_preserves_frames_across_async_io() {
         use crate::delivery::frame::FrameDelivery;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -791,15 +807,21 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
+            fec,
+            crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd).unwrap();
+            fd,
+        )
+        .unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
+            fec,
+            crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            fd).unwrap();
+            fd,
+        )
+        .unwrap();
         let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
         let (b_r, b_w, _b_supervisor) = socket(b_layer, None);
         let mut a_io = into_frame_io_parts(a_r, a_w)
@@ -827,14 +849,16 @@ mod tests {
         assert_eq!(&buf[..n2], second, "second frame must match");
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn shutdown_rejects_later_write_and_preserves_read_half() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (mut a_read, a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
+        let (mut a_read, a_write, _a_supervisor) =
+            socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) =
+            socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         let mut a_write = a_write.into_async_write();
         a_write.write_all(b"request").await.unwrap();
         a_write.shutdown().await.unwrap();
@@ -867,7 +891,7 @@ mod tests {
         assert_eq!(&buf[..response_len], b"response");
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn recv_frame_discards_a_partially_consumed_frame_tail() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -877,15 +901,21 @@ mod tests {
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
-            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            false,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery).unwrap();
+            frame_delivery,
+        )
+        .unwrap();
         let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(b.clone()),
             Box::new(b),
-            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            false,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            frame_delivery).unwrap();
+            frame_delivery,
+        )
+        .unwrap();
         let (mut a_read, _a_write, _a_supervisor) = socket(a_layer, None);
         let (_b_read, mut b_write, _b_supervisor) = socket(b_layer, None);
         assert_eq!(b_write.send_frame(b"abcdef").await.unwrap(), 6);
@@ -905,7 +935,7 @@ mod tests {
         assert_eq!(&next, b"next");
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_public_send_does_not_cancel_driver_io() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         #[derive(Debug)]
@@ -1000,7 +1030,7 @@ mod tests {
             .expect("send after cancellation must succeed");
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn abort_is_callable_while_poll_write_retains_the_write_socket() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         #[derive(Debug)]
@@ -1076,7 +1106,7 @@ mod tests {
             .expect("driver did not observe the out-of-band abort request");
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_bulk_transfer_survives_loss_reorder_and_duplication() {
         use crate::udp::testing::{ImpairRate, wrap_fec_impaired};
         for fec in [false, true] {
@@ -1129,7 +1159,7 @@ mod tests {
         }
     }
 
-#[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread")]
     async fn every_packet_arriving_twice_does_not_duplicate_a_byte() {
         use crate::udp::testing::{ImpairRate, wrap_fec_impaired};
         let fec = false;

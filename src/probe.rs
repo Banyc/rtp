@@ -162,7 +162,8 @@ impl ProbeTap {
 pub(crate) fn client_probe_tap(
     socket: Arc<tokio_udp::UdpSocket>,
 ) -> (ProbeTap, EchoInterceptRead<Arc<tokio_udp::UdpSocket>>) {
-    let (echo_tx, echoes) = tokio::sync::mpsc::channel(64);    let dropped_echoes = Arc::new(AtomicUsize::new(0));
+    let (echo_tx, echoes) = tokio::sync::mpsc::channel(64);
+    let dropped_echoes = Arc::new(AtomicUsize::new(0));
     let peer_ip = socket
         .peer_addr()
         .map(|addr| addr.ip())

@@ -547,9 +547,7 @@ mod tests {
     use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::test_doubles::BlockingWrite;
-    use crate::transmission::transmission_layer::{
-        UnreliableLayer, UnreliableRead,
-    };
+    use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead};
 
     use super::build_parts;
 

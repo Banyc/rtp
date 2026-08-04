@@ -3,9 +3,9 @@ use core::num::NonZeroUsize;
 use fec::proto::{data_mss, symbol_size};
 use thiserror::Error;
 
+use super::MAX_MSS;
 #[cfg(test)]
 use super::NO_FEC_MSS;
-use super::MAX_MSS;
 use crate::delivery::frame::FrameDelivery;
 use crate::transmission::{
     fec::{FecConfig, FecState},
@@ -122,9 +122,7 @@ pub(crate) fn checked_mss_and_fec(
     // room for `frame_data_overhead()` (data_overhead + 4), not just
     // `data_overhead()`.  A too-small MSS would yield 0-byte-payload first
     // packets.
-    if frame_delivery.enabled
-        && crate::delivery::frame::wire::frame_data_overhead() >= mss
-    {
+    if frame_delivery.enabled && crate::delivery::frame::wire::frame_data_overhead() >= mss {
         return Err(MssError::NoRoomForFirstFrameHeader { mss });
     }
     // FEC off → depth is irrelevant; normalise to the default so the field is
@@ -154,12 +152,9 @@ mod tests {
             fn $name() {
                 let mss = ValidMss::try_new($mss);
                 let res = match mss {
-                    Ok(mss) => checked_mss_and_fec(
-                        $fec,
-                        mss,
-                        FecTuning::default(),
-                        $frame_delivery,
-                    ),
+                    Ok(mss) => {
+                        checked_mss_and_fec($fec, mss, FecTuning::default(), $frame_delivery)
+                    }
                     Err(error) => Err(error),
                 };
                 assert!(

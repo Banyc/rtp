@@ -9,6 +9,8 @@ use tokio::net::UdpSocket;
 use tokio_udp::UdpSocket as VectoredUdpSocket;
 
 use crate::io_err::IoErr;
+#[cfg(test)]
+use crate::transmission::transmission_layer::UnreliableLayer;
 use crate::{
     delivery::frame::{FrameDelivery, frame_delivery_from_env},
     handshake::{client_opening_handshake, server_opening_handshake},
@@ -24,18 +26,14 @@ use crate::{
         watchdog_tuning::WatchdogTuning,
     },
 };
-#[cfg(test)]
-use crate::transmission::transmission_layer::UnreliableLayer;
 
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
 mod layer;
+pub(crate) use layer::{MssError, ValidMss, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery};
 #[cfg(test)]
 pub(crate) use layer::{checked_mss_and_fec, wrap_fec};
-pub(crate) use layer::{
-    MssError, ValidMss, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
-};
 
 mod raw_send;
 /// Test-only utilities for simulating packet loss without OS-level network
@@ -682,7 +680,11 @@ mod tests {
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}
-        require_send(connect_with("0.0.0.0:0", "0.0.0.0:0", ConnectConfig::default()));
+        require_send(connect_with(
+            "0.0.0.0:0",
+            "0.0.0.0:0",
+            ConnectConfig::default(),
+        ));
     }
 
     #[derive(Debug)]
@@ -858,10 +860,7 @@ mod tests {
     #[test]
     fn mss_config_resolves_default_and_custom_values() {
         assert_eq!(MssConfig::Default.resolve().unwrap().get(), NO_FEC_MSS);
-        assert_eq!(
-            MssConfig::Custom(9_000).resolve().unwrap().get(),
-            9_000
-        );
+        assert_eq!(MssConfig::Custom(9_000).resolve().unwrap().get(), 9_000);
     }
 
     fn spawn_accept_loop(listener: Listener) -> SocketAddr {
@@ -882,7 +881,10 @@ mod tests {
         let addr = spawn_accept_loop(listener);
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
-        let probe = crate::probe::encode_probe(crate::probe::ProbeEcho { nonce: 0xDEAD_BEEF, timestamp_micros: 12345 });
+        let probe = crate::probe::encode_probe(crate::probe::ProbeEcho {
+            nonce: 0xDEAD_BEEF,
+            timestamp_micros: 12345,
+        });
         prober.send(&probe).await.unwrap();
         let mut buf = [0u8; 64];
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
@@ -890,7 +892,13 @@ mod tests {
             .expect("probe echo timed out")
             .unwrap();
         let echo = crate::probe::decode_echo(&buf[..n]).expect("not a probe echo");
-        assert_eq!(echo, crate::probe::ProbeEcho { nonce: 0xDEAD_BEEF, timestamp_micros: 12345 });
+        assert_eq!(
+            echo,
+            crate::probe::ProbeEcho {
+                nonce: 0xDEAD_BEEF,
+                timestamp_micros: 12345
+            }
+        );
         assert_eq!(buf[..8], probe[..8]);
         assert_eq!(buf[9..n], probe[9..]);
     }
@@ -899,16 +907,19 @@ mod tests {
     async fn probes_never_create_connection_state() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
-        let accept = tokio::spawn(async move {
-            listener
-                .accept_without_handshake()
-                .await
-                .unwrap()
-                .peer_addr
-        });
+        let accept =
+            tokio::spawn(
+                async move { listener.accept_without_handshake().await.unwrap().peer_addr },
+            );
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober
-            .send_to(&crate::probe::encode_probe(crate::probe::ProbeEcho { nonce: 1, timestamp_micros: 2 }), addr)
+            .send_to(
+                &crate::probe::encode_probe(crate::probe::ProbeEcho {
+                    nonce: 1,
+                    timestamp_micros: 2,
+                }),
+                addr,
+            )
             .await
             .unwrap();
         let mut buf = [0u8; 64];
@@ -930,7 +941,12 @@ mod tests {
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
         for nonce in 0..200u64 {
-            let _ = prober.send(&crate::probe::encode_probe(crate::probe::ProbeEcho { nonce, timestamp_micros: 0 })).await;
+            let _ = prober
+                .send(&crate::probe::encode_probe(crate::probe::ProbeEcho {
+                    nonce,
+                    timestamp_micros: 0,
+                }))
+                .await;
         }
         let mut echoes = 0usize;
         let mut buf = [0u8; 64];
@@ -975,9 +991,16 @@ mod tests {
     async fn probe_tap_probes_the_sessions_own_tuple() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = spawn_greeting_server(listener, b"data");
-        let mut connected = connect_with("127.0.0.1:0", addr, ConnectConfig { handshake: false, ..ConnectConfig::default() })
-            .await
-            .unwrap();
+        let mut connected = connect_with(
+            "127.0.0.1:0",
+            addr,
+            ConnectConfig {
+                handshake: false,
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
         let mut tap = connected
             .probe_tap
             .take()
@@ -986,7 +1009,11 @@ mod tests {
         let mut buf = [0; 16];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"data");
-        tap.send_probe(crate::probe::ProbeEcho { nonce: 99, timestamp_micros: 7 }).unwrap();
+        tap.send_probe(crate::probe::ProbeEcho {
+            nonce: 99,
+            timestamp_micros: 7,
+        })
+        .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(echo) = tap.try_recv_echo() {

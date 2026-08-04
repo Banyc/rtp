@@ -14,7 +14,6 @@ use crate::transmission::{
     write_half::WriteHalf,
 };
 
-
 #[derive(Debug)]
 #[must_use = "the RTP session supervisor must be retained and awaited"]
 pub struct SessionSupervisor {
@@ -113,9 +112,7 @@ impl TransmissionLayer {
     }
 }
 
-fn build_socket(
-    parts: TransmissionLayer,
-) -> (ReadSocket, WriteSocket, SessionSupervisor) {
+fn build_socket(parts: TransmissionLayer) -> (ReadSocket, WriteSocket, SessionSupervisor) {
     let (shared, write_half, read_half, termination_reaper) = parts.into_parts();
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
@@ -286,7 +283,7 @@ mod tests {
     use core::time::Duration;
     use std::sync::Mutex;
 
-#[tokio::test]
+    #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         #[derive(Debug)]
@@ -319,10 +316,14 @@ mod tests {
         }
         let sends = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(tokio::sync::Notify::new());
-        let layer = wrap_fec(Box::new(FailedRead), Box::new(DropProbeWrite {
+        let layer = wrap_fec(
+            Box::new(FailedRead),
+            Box::new(DropProbeWrite {
                 sends: Arc::clone(&sends),
                 dropped: Arc::clone(&dropped),
-            }), false);
+            }),
+            false,
+        );
         let (_read, _write, _supervisor) = socket(layer, None);
         tokio::time::timeout(Duration::from_secs(1), dropped.notified())
             .await
@@ -330,7 +331,7 @@ mod tests {
         assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn event_task_panic_reaps_the_rest_of_the_rtp_session() {
         #[derive(Debug)]
         struct PanickingRead;
@@ -377,7 +378,7 @@ mod tests {
         assert!(error.is_panic());
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn supervisor_signals_then_joins_without_cancelling_an_in_flight_send() {
         use std::sync::atomic::{AtomicBool, Ordering};
         #[derive(Debug)]
@@ -417,13 +418,17 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(AtomicBool::new(false));
-        let layer = wrap_fec(Box::new(GatedFailedRead {
+        let layer = wrap_fec(
+            Box::new(GatedFailedRead {
                 fail: Arc::clone(&fail),
-            }), Box::new(GatedWrite {
+            }),
+            Box::new(GatedWrite {
                 started: Arc::clone(&started),
                 release: Arc::clone(&release),
                 dropped: Arc::clone(&dropped),
-            }), false);
+            }),
+            false,
+        );
         let (_read, mut write, supervisor) = socket(layer, None);
         let owner = tokio::spawn(supervisor);
         assert_eq!(write.send(b"payload").await.unwrap(), 7);
@@ -448,7 +453,7 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn supervisor_waits_for_requested_kill_attempt_before_reaping() {
         use std::sync::atomic::{AtomicBool, Ordering};
         #[derive(Debug)]
@@ -488,12 +493,16 @@ mod tests {
         let release_kill = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(tokio::sync::Notify::new());
         let was_dropped = Arc::new(AtomicBool::new(false));
-        let layer = wrap_fec(Box::new(PendingRead), Box::new(KillGateWrite {
+        let layer = wrap_fec(
+            Box::new(PendingRead),
+            Box::new(KillGateWrite {
                 kill_started: Arc::clone(&kill_started),
                 release_kill: Arc::clone(&release_kill),
                 dropped: Arc::clone(&dropped),
                 was_dropped: Arc::clone(&was_dropped),
-            }), false);
+            }),
+            false,
+        );
         let (_read, mut write, _supervisor) = socket(layer, None);
         write.send_kill_and_abort().await;
         tokio::time::timeout(Duration::from_secs(1), kill_started.notified())
@@ -511,15 +520,17 @@ mod tests {
         assert!(was_dropped.load(Ordering::SeqCst));
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn graceful_drop_drains_response_after_peer_fin() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
 
-        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
+        let (mut a_read, mut a_write, _a_supervisor) =
+            socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) =
+            socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
 
         let request = b"request";
         let response = b"response";
@@ -560,7 +571,7 @@ mod tests {
         );
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn read_drop_with_unread_payload_reaps_after_peer_fin() {
         #[derive(Debug)]
         struct DropProbeUdpWrite {
@@ -598,7 +609,8 @@ mod tests {
             ),
             None,
         );
-        let (b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
+        let (b_read, mut b_write, _b_supervisor) =
+            socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         assert_eq!(b_write.send(b"unread").await.unwrap(), 6);
         drop(b_write);
         tokio::time::timeout(
@@ -620,14 +632,16 @@ mod tests {
         drop(b_read);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn first_payload_after_read_drop_resets_rtp_session() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
+        let (a_read, mut a_write, _a_supervisor) =
+            socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) =
+            socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         drop(a_read);
         tokio::task::yield_now().await;
         assert_eq!(b_write.send(b"late payload").await.unwrap(), 12);
@@ -644,14 +658,16 @@ mod tests {
         assert_eq!(local_error, std::io::ErrorKind::BrokenPipe);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn payload_consumed_before_read_drop_does_not_reset_write_half() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (mut a_read, mut a_write, _a_supervisor) = socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
-        let (mut b_read, mut b_write, _b_supervisor) = socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
+        let (mut a_read, mut a_write, _a_supervisor) =
+            socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        let (mut b_read, mut b_write, _b_supervisor) =
+            socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         let request = b"request";
         let response = b"response";
         assert_eq!(b_write.send(request).await.unwrap(), request.len());
@@ -670,7 +686,7 @@ mod tests {
         assert_eq!(&buf[..response_len], response);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn duplicate_payload_after_read_drop_is_acked_without_reset() {
         #[derive(Debug)]
         struct ProbeUdpWrite {

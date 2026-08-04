@@ -215,7 +215,11 @@ mod tests {
             datagram
         };
         let datagrams = std::collections::VecDeque::from([encode(0, b"payload"), encode(0, b"")]);
-        let layer = crate::udp::wrap_fec(Box::new(DatagramQueue(datagrams)), Box::new(ImmediateWrite), false);
+        let layer = crate::udp::wrap_fec(
+            Box::new(DatagramQueue(datagrams)),
+            Box::new(ImmediateWrite),
+            false,
+        );
         let mut transmission = TransmissionLayer::new(layer, None);
         let mut recv_bufs = RecvBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
@@ -335,9 +339,12 @@ mod tests {
         let mut ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(read),
             Box::new(write),
-            fec,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            fec,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             tuning,
-            crate::delivery::frame::FrameDelivery::default()).unwrap();
+            crate::delivery::frame::FrameDelivery::default(),
+        )
+        .unwrap();
         ul.rtx_dup = enabled;
         ul.instream_group_fec = false;
         let tl = TransmissionLayer::new(ul, None);
@@ -368,9 +375,12 @@ mod tests {
                 attempts: Arc::clone(&attempts),
                 error,
             }),
-            true,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            true,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::transmission::fec_tuning::FecTuning::mindiv(),
-            crate::delivery::frame::FrameDelivery::default()).unwrap();
+            crate::delivery::frame::FrameDelivery::default(),
+        )
+        .unwrap();
         (TransmissionLayer::new(unreliable, None), attempts)
     }
 
@@ -580,9 +590,12 @@ mod tests {
         let mut ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(read),
             Box::new(write),
-            fec,crate::udp::ValidMss::try_new(mss).unwrap(),
+            fec,
+            crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default()).unwrap();
+            crate::delivery::frame::FrameDelivery::default(),
+        )
+        .unwrap();
         ul.rtx_dup = enabled;
         ul.instream_group_fec = false;
         let tl = TransmissionLayer::new(ul, None);
@@ -1052,9 +1065,12 @@ mod tests {
                 recorder: Arc::clone(&recorder),
                 kill_started: Arc::clone(&kill_started),
             }),
-            false,crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            false,
+            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default()).unwrap();
+            crate::delivery::frame::FrameDelivery::default(),
+        )
+        .unwrap();
         let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         {

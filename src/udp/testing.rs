@@ -182,12 +182,7 @@ impl<W: UnreliableWrite> UnreliableWrite for ImpairedWrite<W> {
     }
 }
 
-pub fn wrap_fec_impaired<R, W>(
-    read: R,
-    write: W,
-    fec: bool,
-    rate: ImpairRate,
-) -> UnreliableLayer
+pub fn wrap_fec_impaired<R, W>(read: R, write: W, fec: bool, rate: ImpairRate) -> UnreliableLayer
 where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
@@ -255,9 +250,13 @@ where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
 {
-    let (mss, fec_state, tuning) =
-        checked_mss_and_fec(fec, ValidMss::try_new(mss).unwrap(), tuning, FrameDelivery::default())
-            .unwrap();
+    let (mss, fec_state, tuning) = checked_mss_and_fec(
+        fec,
+        ValidMss::try_new(mss).unwrap(),
+        tuning,
+        FrameDelivery::default(),
+    )
+    .unwrap();
     UnreliableLayer {
         utp_read: Box::new(LossyRead::new(read, rate.clone())),
         utp_write: Box::new(LossyWrite::new(write, rate)),

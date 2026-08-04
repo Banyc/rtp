@@ -10,11 +10,11 @@ pub mod frame_delivery {
 pub(crate) mod read_half;
 pub(crate) mod shared;
 pub(crate) mod termination;
+#[cfg(test)]
+pub(crate) mod test_doubles;
 pub mod transmission_layer;
 #[cfg(test)]
 mod transmission_layer_test_facade;
-#[cfg(test)]
-pub(crate) mod test_doubles;
 mod ts_echo;
 pub mod watchdog_tuning;
 pub(crate) mod write_half;

@@ -49,7 +49,8 @@ impl AckFlushState {
         }
         self.fin_pending
             || ACK_FLUSH_COUNT <= self.pending_acks
-            || self.last_ack_flush
+            || self
+                .last_ack_flush
                 .is_none_or(|last| ACK_FLUSH_AGE <= now.duration_since(last))
     }
 
@@ -129,8 +130,13 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
                 pages_sent += 1;
                 if fec_enabled {
                     let now = Instant::now();
-                    let can_send_tail_fec =
-                        { write_half.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+                    let can_send_tail_fec = {
+                        write_half
+                            .reliable_layer
+                            .lock()
+                            .unwrap()
+                            .can_send_tail_fec(now)
+                    };
                     write_half.close_fec_burst(now, can_send_tail_fec).await?;
                 }
             }

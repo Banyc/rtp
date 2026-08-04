@@ -62,7 +62,12 @@ impl LossEventWindow {
         self.curr.reset(now);
     }
 
-    pub(crate) fn record_delivered(&mut self, delivered: usize, now: Instant, smooth_rtt: Duration) {
+    pub(crate) fn record_delivered(
+        &mut self,
+        delivered: usize,
+        now: Instant,
+        smooth_rtt: Duration,
+    ) {
         self.rotate(now, smooth_rtt);
         if self.curr.start.is_none() {
             self.curr.reset(now);

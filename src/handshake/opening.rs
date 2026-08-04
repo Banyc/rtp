@@ -340,11 +340,19 @@ mod tests {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
         client_to_server_tx.send(Vec::new()).await.unwrap();
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(InjectStaleRtpAfterHelloWrite {
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(InjectStaleRtpAfterHelloWrite {
                 tx: client_to_server_tx,
                 injected: false,
-            }), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(ChannelWrite::new(server_to_client_tx, None, false)), false);
+            }),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(ChannelWrite::new(server_to_client_tx, None, false)),
+            false,
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             tokio::try_join!(
                 client_opening_handshake(&mut client),
@@ -360,8 +368,16 @@ mod tests {
     async fn server_first_handshake_does_not_wait_for_rtp_traffic() {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(ChannelWrite::new(client_to_server_tx, None, false)), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(ChannelWrite::new(server_to_client_tx, None, false)), false);
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(ChannelWrite::new(server_to_client_tx, None, false)),
+            false,
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             tokio::try_join!(
                 client_opening_handshake(&mut client),
@@ -378,8 +394,24 @@ mod tests {
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
         let drop_client = dropped.filter(|kind| matches!(kind, Kind::Hello | Kind::Confirm));
         let drop_server = dropped.filter(|kind| matches!(kind, Kind::HelloAck | Kind::ConfirmAck));
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(ChannelWrite::new(client_to_server_tx, drop_client, duplicate)), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(ChannelWrite::new(server_to_client_tx, drop_server, duplicate)), false);
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(ChannelWrite::new(
+                client_to_server_tx,
+                drop_client,
+                duplicate,
+            )),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(ChannelWrite::new(
+                server_to_client_tx,
+                drop_server,
+                duplicate,
+            )),
+            false,
+        );
         if dropped == Some(Kind::ConfirmAck) {
             let (_, server_socket) =
                 tokio::time::timeout(OPENING_TIMEOUT + Duration::from_secs(1), async {
@@ -431,11 +463,19 @@ mod tests {
     async fn post_open_guard_recovers_after_three_lost_confirmations() {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(ChannelWrite::new(client_to_server_tx, None, false)), true);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(DropFirstConfirmationsWrite {
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
+            true,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(DropFirstConfirmationsWrite {
                 tx: server_to_client_tx,
                 remaining: 3,
-            }), true);
+            }),
+            true,
+        );
         let (_, server_socket) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::try_join!(
                 async { client_opening_handshake(&mut client).await },
@@ -455,14 +495,22 @@ mod tests {
     async fn post_open_timer_recovers_without_another_client_confirmation() {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(DeliverFirstConfirmOnlyWrite {
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(DeliverFirstConfirmOnlyWrite {
                 tx: client_to_server_tx,
                 confirm_delivered: false,
-            }), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(DropFirstConfirmationsWrite {
+            }),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(DropFirstConfirmationsWrite {
                 tx: server_to_client_tx,
                 remaining: 1,
-            }), false);
+            }),
+            false,
+        );
         let (_, server_socket) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::try_join!(
                 async { client_opening_handshake(&mut client).await },
@@ -483,11 +531,19 @@ mod tests {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
         let confirmation_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(ChannelWrite::new(client_to_server_tx, None, false)), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(CountingChannelWrite {
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(CountingChannelWrite {
                 tx: server_to_client_tx,
                 confirmation_attempts: Arc::clone(&confirmation_attempts),
-            }), false);
+            }),
+            false,
+        );
 
         let (client_socket, server_socket) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::try_join!(
@@ -525,15 +581,23 @@ mod tests {
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
         let ready_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let confirmation_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(DropFirstReadyWrite {
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(DropFirstReadyWrite {
                 tx: client_to_server_tx,
                 ready_attempts: Arc::clone(&ready_attempts),
                 dropped: false,
-            }), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(CountingChannelWrite {
+            }),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(CountingChannelWrite {
                 tx: server_to_client_tx,
                 confirmation_attempts: Arc::clone(&confirmation_attempts),
-            }), false);
+            }),
+            false,
+        );
 
         let (client_socket, server_socket) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::try_join!(
@@ -570,14 +634,22 @@ mod tests {
     async fn stale_rtp_datagram_cannot_retire_nonce_bound_recovery() {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(InjectStaleRtpAfterFirstConfirmWrite {
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(InjectStaleRtpAfterFirstConfirmWrite {
                 tx: client_to_server_tx,
                 injected: false,
-            }), false);
-        let mut server = wrap_fec(Box::new(ChannelRead(client_to_server_rx)), Box::new(DropFirstConfirmationsWrite {
+            }),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(DropFirstConfirmationsWrite {
                 tx: server_to_client_tx,
                 remaining: 1,
-            }), false);
+            }),
+            false,
+        );
         let (_, server_socket) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::try_join!(
                 async { client_opening_handshake(&mut client).await },
@@ -597,7 +669,11 @@ mod tests {
     async fn client_cannot_succeed_without_a_delivered_confirmation() {
         let (client_to_server_tx, _client_to_server_rx) = mpsc::channel(1);
         let (_server_to_client_tx, server_to_client_rx) = mpsc::channel(1);
-        let mut client = wrap_fec(Box::new(ChannelRead(server_to_client_rx)), Box::new(ChannelWrite::new(client_to_server_tx, None, false)), false);
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
+            false,
+        );
         let result = client_phase(
             &mut client,
             0x1234,

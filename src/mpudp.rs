@@ -151,10 +151,7 @@ mod tests {
         let msg_1 = b"hello";
         tokio::spawn(async move {
             loop {
-                let mut accepted = listener
-                    .accept_with(AcceptConfig::default())
-                    .await
-                    .unwrap();
+                let mut accepted = listener.accept_with(AcceptConfig::default()).await.unwrap();
                 println!("accepted");
                 tokio::spawn(async move {
                     accepted.write.send(msg_1).await.unwrap();

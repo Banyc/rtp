@@ -409,7 +409,9 @@ mod tests {
             Client::<HugeKey>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
-        let _ = client.open_without_handshake_with(HugeKey, AcceptConfig::default()).unwrap();
+        let _ = client
+            .open_without_handshake_with(HugeKey, AcceptConfig::default())
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -422,13 +424,24 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             let server = Arc::new(server);
-            let mut accepted = server.accept_with(AcceptConfig { fec, ..AcceptConfig::default() }).await.unwrap();
+            let mut accepted = server
+                .accept_with(AcceptConfig {
+                    fec,
+                    ..AcceptConfig::default()
+                })
+                .await
+                .unwrap();
             assert_eq!(accepted.dispatch_key, key);
             tokio::spawn({
                 let server = server.clone();
                 async move {
                     loop {
-                        let _ = server.accept_with(AcceptConfig { fec, ..AcceptConfig::default() }).await;
+                        let _ = server
+                            .accept_with(AcceptConfig {
+                                fec,
+                                ..AcceptConfig::default()
+                            })
+                            .await;
                     }
                 }
             });
@@ -452,7 +465,15 @@ mod tests {
                     }
                 }
             });
-            let mut accepted = client.open_without_handshake_with(key, AcceptConfig { fec, ..AcceptConfig::default() }).unwrap();
+            let mut accepted = client
+                .open_without_handshake_with(
+                    key,
+                    AcceptConfig {
+                        fec,
+                        ..AcceptConfig::default()
+                    },
+                )
+                .unwrap();
             accepted.write.send(msg_1).await.unwrap();
             let mut buf = vec![0; 1024];
             let n = accepted.read.recv(&mut buf).await.unwrap();
@@ -479,7 +500,13 @@ mod tests {
         let pong = b"pong";
 
         let server_task = tokio::spawn(async move {
-            let mut accepted = server.accept_with(AcceptConfig { fec, ..AcceptConfig::default() }).await.unwrap();
+            let mut accepted = server
+                .accept_with(AcceptConfig {
+                    fec,
+                    ..AcceptConfig::default()
+                })
+                .await
+                .unwrap();
             assert_eq!(accepted.dispatch_key, key);
             let mut buf = [0u8; 16];
             let n = accepted.read.recv(&mut buf).await.unwrap();
@@ -492,7 +519,15 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut opened = client.open_without_handshake_with(key, AcceptConfig { fec, ..AcceptConfig::default() }).unwrap();
+        let mut opened = client
+            .open_without_handshake_with(
+                key,
+                AcceptConfig {
+                    fec,
+                    ..AcceptConfig::default()
+                },
+            )
+            .unwrap();
 
         // Send the ping before any dispatch loop is spawned. The server will
         // reply, but that reply will sit undelivered in the client socket until
@@ -548,7 +583,9 @@ mod tests {
             Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
-        let mut conn = client.open_without_handshake_with(42, AcceptConfig::default()).unwrap();
+        let mut conn = client
+            .open_without_handshake_with(42, AcceptConfig::default())
+            .unwrap();
 
         // Send a small payload.  On macOS the raw fallback path is used on
         // WouldBlock.  The send must complete within a bounded time (not
@@ -606,7 +643,9 @@ mod tests {
             Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
-        let mut conn = client.open_without_handshake_with(42, AcceptConfig::default()).unwrap();
+        let mut conn = client
+            .open_without_handshake_with(42, AcceptConfig::default())
+            .unwrap();
 
         // Spawn a send future and cancel it by aborting the task before
         // it completes.  We use tokio::select! with a timeout to force
