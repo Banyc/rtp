@@ -45,8 +45,8 @@ impl FrameSendStage {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.pending_frames.is_empty()
+    pub(crate) fn has_pending_frames(&self) -> bool {
+        !self.pending_frames.is_empty()
     }
 
     pub(crate) fn pending_bytes(&self) -> usize {
@@ -77,7 +77,7 @@ impl FrameSendStage {
         Ok(())
     }
 
-    pub(crate) fn next_chunk_len(
+    pub(crate) fn next_chunk(
         &self,
         first_pkt_max_payload: usize,
         normal_max_payload: usize,
@@ -194,25 +194,25 @@ mod tests {
         stage.stage_frame(&[1u8; 10], usize::MAX).unwrap();
         stage.stage_frame(&[2u8; 3], usize::MAX).unwrap();
 
-        let chunk = stage.next_chunk_len(4, 6).unwrap();
+        let chunk = stage.next_chunk(4, 6).unwrap();
         assert_eq!(chunk.take_bytes, 4);
         let mut out = Vec::new();
         assert_eq!(stage.pop_chunk(chunk, &mut out), Some(10));
         assert_eq!(out, [1u8; 4]);
 
-        let chunk = stage.next_chunk_len(4, 6).unwrap();
+        let chunk = stage.next_chunk(4, 6).unwrap();
         assert_eq!(chunk.take_bytes, 6);
         let mut out = Vec::new();
         assert_eq!(stage.pop_chunk(chunk, &mut out), None);
         assert_eq!(out, [1u8; 6]);
 
-        let chunk = stage.next_chunk_len(4, 6).unwrap();
+        let chunk = stage.next_chunk(4, 6).unwrap();
         assert_eq!(chunk.take_bytes, 3);
         let mut out = Vec::new();
         assert_eq!(stage.pop_chunk(chunk, &mut out), Some(3));
         assert_eq!(out, [2u8; 3]);
 
-        assert!(stage.is_empty());
-        assert!(stage.next_chunk_len(4, 6).is_none());
+        assert!(!stage.has_pending_frames());
+        assert!(stage.next_chunk(4, 6).is_none());
     }
 }

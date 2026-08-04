@@ -11,7 +11,6 @@
 pub struct SplitMix64 {
     state: u64,
 }
-
 impl SplitMix64 {
     /// New generator seeded with `seed`.
     pub fn new(seed: u64) -> Self {
@@ -37,3 +36,9 @@ impl SplitMix64 {
         (self.next_u64() % n as u64) as usize
     }
 }
+
+/// Hostile-input fuzz helpers: the packet decoder used by the hostile-input
+/// integration fuzzers.  `codec` is `pub(crate)` since the curated root API
+/// only exposes Listener/connector/config types, so these are re-exported for
+/// the fuzz tests.
+pub use crate::codec::{DecodedDataPkt, decode};

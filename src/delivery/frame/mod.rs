@@ -1,7 +1,7 @@
-//! Per-connection frame-delivery mode (`FrameDelivery`).
+//! Per-connection frame-delivery mode (`FrameMode`).
 //!
 //! Stock rtp exposes a strict in-order byte stream.  When
-//! `FrameDelivery { enabled: true }` is passed to both peers, the
+//! `FrameMode { enabled: true }` is passed to both peers, the
 //! connection switches to a *frame-aware* mode:
 //!
 //! - The sender marks application frame boundaries on the wire (first
@@ -14,7 +14,7 @@
 //! # Both peers must enable together
 //!
 //! There is no in-band negotiation — same coupling as the FEC flag.  Both
-//! peers must pass `FrameDelivery { enabled: true }` to the matching
+//! peers must pass `FrameMode { enabled: true }` to the matching
 //! `*_with_mss_fec_tuning_and_frame_delivery` constructor; a mismatch
 //! produces a framing desync.
 
@@ -25,27 +25,27 @@ pub(crate) mod wire;
 /// Per-connection frame-delivery configuration.
 ///
 /// `Default` is `enabled: false` — stock byte-stream behaviour.
-/// Pass `FrameDelivery { enabled: true }` to both peers via the
+/// Pass `FrameMode { enabled: true }` to both peers via the
 /// `*_with_mss_fec_tuning_and_frame_delivery` constructor family to
 /// switch the connection into frame-delivery mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FrameDelivery {
+pub struct FrameMode {
     pub enabled: bool,
 }
 
-impl FrameDelivery {
+impl FrameMode {
     pub const fn enabled() -> Self {
         Self { enabled: true }
     }
 }
 
 /// Read `RTP_FRAME_DELIVERY` once at process startup for the *default*
-/// frame-delivery mode.  `1`/`true` selects `FrameDelivery::enabled()`;
-/// anything else selects `FrameDelivery::default()`.
-pub fn frame_delivery_from_env() -> FrameDelivery {
+/// frame-delivery mode.  `1`/`true` selects `FrameMode::enabled()`;
+/// anything else selects `FrameMode::default()`.
+pub fn frame_delivery_from_env() -> FrameMode {
     match std::env::var("RTP_FRAME_DELIVERY") {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FrameDelivery::enabled(),
-        _ => FrameDelivery::default(),
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FrameMode::enabled(),
+        _ => FrameMode::default(),
     }
 }
 
@@ -55,13 +55,13 @@ mod tests {
 
     #[test]
     fn default_is_disabled() {
-        let f = FrameDelivery::default();
+        let f = FrameMode::default();
         assert!(!f.enabled);
     }
 
     #[test]
     fn enabled_preset() {
-        let f = FrameDelivery::enabled();
+        let f = FrameMode::enabled();
         assert!(f.enabled);
     }
 }

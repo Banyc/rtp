@@ -20,15 +20,15 @@ enum PostOpenRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Observation {
+pub(crate) enum PostOpenVerdict {
     NotHandshake,
-    Filtered,
+    Consumed,
     ReplyQueued,
     Complete,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ClaimedResponse {
+pub(crate) struct DueResponse {
     pub(crate) bytes: RecoveryResponse,
 }
 
@@ -77,26 +77,26 @@ impl PostOpenHandshake {
         }
     }
 
-    pub(crate) fn observe(&mut self, datagram: &[u8], now: Instant) -> Observation {
+    pub(crate) fn observe(&mut self, datagram: &[u8], now: Instant) -> PostOpenVerdict {
         let Some(packet) = Packet::decode(datagram) else {
-            return Observation::NotHandshake;
+            return PostOpenVerdict::NotHandshake;
         };
         if packet.nonce != self.nonce || self.expires_at <= now {
-            return Observation::Filtered;
+            return PostOpenVerdict::Consumed;
         }
         if self.role == PostOpenRole::Server && packet.kind == Kind::Ready {
             self.pending_at = None;
-            return Observation::Complete;
+            return PostOpenVerdict::Complete;
         }
         let should_reply = match self.role {
             PostOpenRole::Client => packet.kind == Kind::ConfirmAck,
             PostOpenRole::Server => packet.kind == Kind::Confirm,
         };
         if !should_reply {
-            return Observation::Filtered;
+            return PostOpenVerdict::Consumed;
         }
         self.pending_at = Some(self.pending_at.map_or(now, |pending| pending.min(now)));
-        Observation::ReplyQueued
+        PostOpenVerdict::ReplyQueued
     }
 
     pub(crate) fn next_send_time(&self, now: Instant) -> Option<Instant> {
@@ -118,7 +118,7 @@ impl PostOpenHandshake {
         }
     }
 
-    pub(crate) fn claim_response(&mut self, now: Instant) -> Option<ClaimedResponse> {
+    pub(crate) fn take_due_response(&mut self, now: Instant) -> Option<DueResponse> {
         if self.expires_at <= now {
             self.pending_at = None;
             return None;
@@ -140,7 +140,7 @@ impl PostOpenHandshake {
         if pending_due {
             self.pending_at = None;
         }
-        Some(ClaimedResponse {
+        Some(DueResponse {
             bytes: self.confirmation,
         })
     }

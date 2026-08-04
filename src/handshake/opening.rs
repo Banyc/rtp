@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::{
         codec,
-        handshake::{Observation, post_open::POST_OPEN_LIFETIME},
+        handshake::{PostOpenVerdict, post_open::POST_OPEN_LIFETIME},
         io_err::IoErr,
         socket::socket,
         transmission::{
@@ -235,7 +235,7 @@ mod tests {
 
             let mut fec = FecState::new(FecConfig {
                 symbol_size: 1_424,
-                interactive_parity_depth: 1,
+                small_group_parity_count: 1,
             });
             assert!(fec.decode(&encoded).is_none());
         }
@@ -257,13 +257,13 @@ mod tests {
         .encode();
         assert_eq!(
             recovery.observe(&confirm, established_at),
-            Observation::ReplyQueued
+            PostOpenVerdict::ReplyQueued
         );
         assert_eq!(
             recovery.next_send_time(established_at),
             Some(established_at)
         );
-        let response = recovery.claim_response(established_at).unwrap();
+        let response = recovery.take_due_response(established_at).unwrap();
         assert_eq!(
             Packet::decode(&response.bytes),
             Some(Packet {
@@ -272,16 +272,19 @@ mod tests {
             })
         );
         let late = established_at + Duration::from_secs(20);
-        assert!(recovery.claim_response(late).is_some());
+        assert!(recovery.take_due_response(late).is_some());
         assert_eq!(
             recovery.next_send_time(late),
             Some(established_at + Duration::from_secs(31))
         );
         let final_retry = established_at + Duration::from_secs(31);
-        assert!(recovery.claim_response(final_retry).is_some());
+        assert!(recovery.take_due_response(final_retry).is_some());
         let expired = established_at + POST_OPEN_LIFETIME;
         assert_eq!(recovery.next_send_time(final_retry), Some(expired));
-        assert_eq!(recovery.observe(&confirm, expired), Observation::Filtered);
+        assert_eq!(
+            recovery.observe(&confirm, expired),
+            PostOpenVerdict::Consumed
+        );
     }
 
     #[test]
@@ -293,7 +296,7 @@ mod tests {
             recovery.next_send_time(established_at),
             Some(established_at)
         );
-        let response = recovery.claim_response(established_at).unwrap();
+        let response = recovery.take_due_response(established_at).unwrap();
         assert_eq!(
             Packet::decode(&response.bytes),
             Some(Packet {
@@ -313,13 +316,13 @@ mod tests {
         .encode();
         assert_eq!(
             recovery.observe(&confirm_ack, established_at),
-            Observation::ReplyQueued
+            PostOpenVerdict::ReplyQueued
         );
-        assert!(recovery.claim_response(established_at).is_some());
+        assert!(recovery.take_due_response(established_at).is_some());
         let mut server = PostOpenHandshake::server(nonce, established_at);
         assert_eq!(
             server.observe(&response.bytes, established_at),
-            Observation::Complete
+            PostOpenVerdict::Complete
         );
     }
 

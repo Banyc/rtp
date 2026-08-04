@@ -1,5 +1,5 @@
 //! Per-connection FEC tuning ('FecTuning').
-//! `interactive_parity_depth_for_message` helper.
+//! `small_group_parity_count_for_message` helper.
 //!
 //! Stock rtp FEC uses a fixed 1:4 data-to-parity ratio and is gated by the
 //! spare-token budget so parity never competes with data bandwidth.  On a
@@ -13,9 +13,9 @@
 //!
 //! The real configuration is the per-connection `FecTuning` argument threaded
 //! through the `*_with_mss_and_fec_tuning` connect/accept APIs.  The env var
-//! `RTP_MINDIV=1` only feeds the default for A/B comparison — it is never
-//! read as the live setting, so it cannot silently apply to every connection
-//! in the process.
+//! `RTP_MAX_DIVERSITY=1` only feeds the default for A/B comparison — it is
+//! never read as the live setting, so it cannot silently apply to every
+//! connection in the process.
 //!
 //! # Both peers must agree
 //!
@@ -33,25 +33,25 @@
 ///   ACK/kill bursts keep the stock gate regardless — only data bursts are
 ///   force-flushed.  This is what lets a single-symbol interactive message
 ///   emit its parity promptly rather than being skipped at the burst end.
-/// - `interactive_parity_depth`: the parity depth requested for groups that
+/// - `small_group_parity_count`: the parity depth requested for groups that
 ///   encode as exactly one data symbol.  Multi-symbol groups always keep the
 ///   stock budget gate regardless of this value (ungated depth > 1 on bulk
 ///   would add ~75% overhead and defeat the point).
 ///
-/// `Default` is `(false, 1)` — stock behaviour, byte-for-byte.  The `mindiv`
-/// preset is `(true, 3)` — the recommended setting for interactive traffic on
-/// a large-MSS path.
+/// `Default` is `(false, 1)` — stock behaviour, byte-for-byte.  The
+/// `max_diversity` preset is `(true, 3)` — the recommended setting for
+/// interactive traffic on a large-MSS path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FecTuning {
     pub instream_flush: bool,
-    pub interactive_parity_depth: u8,
+    pub small_group_parity_count: u8,
 }
 
 impl Default for FecTuning {
     fn default() -> Self {
         Self {
             instream_flush: false,
-            interactive_parity_depth: 1,
+            small_group_parity_count: 1,
         }
     }
 }
@@ -62,24 +62,25 @@ impl FecTuning {
     /// single-symbol group.  Use this only when both peers agree on MSS and
     /// the path tolerates the datagram size (loopback / jumbo / no IP
     /// fragmentation).
-    pub const fn mindiv() -> Self {
+    pub const fn max_diversity() -> Self {
         Self {
             instream_flush: true,
-            interactive_parity_depth: 3,
+            small_group_parity_count: 3,
         }
     }
 }
 
-/// Read `RTP_MINDIV` once at process startup to feed the *default* FEC
-/// tuning for A/B comparison.  `1`/`true` selects `FecTuning::mindiv()`;
-/// anything else (including unset) selects `FecTuning::default()`.  This is
+/// Read `RTP_MAX_DIVERSITY` (falling back to the legacy `RTP_MINDIV` for one
+/// release) once at process startup to feed the *default* FEC tuning for A/B
+/// comparison.  `1`/`true` selects `FecTuning::max_diversity()`; anything
+/// else (including unset) selects `FecTuning::default()`.  This is
 /// **not** the live configuration — the real setting is the per-connection
 /// `FecTuning` argument threaded through the `*_with_mss_and_fec_tuning`
 /// APIs, so env-var state can never silently apply to every connection in
 /// the process.
 pub fn fec_tuning_from_env() -> FecTuning {
-    match std::env::var("RTP_MINDIV") {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FecTuning::mindiv(),
+    match std::env::var("RTP_MAX_DIVERSITY").or_else(|_| std::env::var("RTP_MINDIV")) {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FecTuning::max_diversity(),
         _ => FecTuning::default(),
     }
 }
@@ -92,13 +93,13 @@ mod tests {
     fn default_is_stock() {
         let t = FecTuning::default();
         assert!(!t.instream_flush);
-        assert_eq!(t.interactive_parity_depth, 1);
+        assert_eq!(t.small_group_parity_count, 1);
     }
 
     #[test]
-    fn mindiv_preset() {
-        let t = FecTuning::mindiv();
+    fn max_diversity_preset() {
+        let t = FecTuning::max_diversity();
         assert!(t.instream_flush);
-        assert_eq!(t.interactive_parity_depth, 3);
+        assert_eq!(t.small_group_parity_count, 3);
     }
 }

@@ -143,12 +143,12 @@ impl ProbeResponder {
     }
 }
 #[derive(Debug)]
-pub struct ProbeTap {
+pub struct EchoDemux {
     socket: Arc<tokio_udp::UdpSocket>,
     echoes: tokio::sync::mpsc::Receiver<ProbeEcho>,
     dropped_echoes: Arc<AtomicUsize>,
 }
-impl ProbeTap {
+impl EchoDemux {
     pub fn send_probe(&self, echo: ProbeEcho) -> std::io::Result<()> {
         self.socket.try_send(&encode_probe(echo)).map(drop)
     }
@@ -159,9 +159,9 @@ impl ProbeTap {
         self.dropped_echoes.load(Ordering::Relaxed)
     }
 }
-pub(crate) fn client_probe_tap(
+pub(crate) fn client_echo_demux(
     socket: Arc<tokio_udp::UdpSocket>,
-) -> (ProbeTap, EchoInterceptRead<Arc<tokio_udp::UdpSocket>>) {
+) -> (EchoDemux, EchoInterceptRead<Arc<tokio_udp::UdpSocket>>) {
     let (echo_tx, echoes) = tokio::sync::mpsc::channel(64);
     let dropped_echoes = Arc::new(AtomicUsize::new(0));
     let peer_ip = socket
@@ -176,7 +176,7 @@ pub(crate) fn client_probe_tap(
         peer_ip,
     };
     (
-        ProbeTap {
+        EchoDemux {
             socket,
             echoes,
             dropped_echoes,

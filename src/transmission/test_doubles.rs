@@ -6,7 +6,21 @@ use std::sync::{
 use async_trait::async_trait;
 
 use crate::io_err::IoErr;
-use crate::transmission::transmission_layer::UnreliableWrite;
+use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
+
+#[derive(Debug)]
+pub(crate) struct PendingRead;
+
+#[async_trait]
+impl UnreliableRead for PendingRead {
+    fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+        Err(std::io::ErrorKind::WouldBlock.into())
+    }
+
+    async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+        std::future::pending().await
+    }
+}
 
 /// A write that signals `started`, blocks until `release` is notified, then
 /// reports success.  A never-released instance blocks forever, so it doubles

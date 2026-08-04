@@ -5,30 +5,30 @@ use async_async_io::{
     write::{AsyncAsyncWrite, PollWrite},
 };
 
-use super::session::SessionSupervisor;
+use super::session::SessionHandle;
 
 use crate::io_err::IoErr;
-use crate::transmission::shared::Shared;
+use crate::transmission::connection::Connection;
 
-pub type ReadStream = PollRead<ReadSocket>;
+pub type AsyncReadAdapter = PollRead<ConnReader>;
 
 #[derive(Debug)]
-pub struct WriteStream {
-    inner: PollWrite<WriteSocket>,
-    max_stage: usize,
-    abort_session: Arc<Shared>,
+pub struct AsyncWriteAdapter {
+    inner: PollWrite<ConnWriter>,
+    max_write_bytes: usize,
+    abort_session: Arc<Connection>,
 }
 
-impl WriteStream {
-    pub fn into_inner(self) -> WriteSocket {
+impl AsyncWriteAdapter {
+    pub fn into_inner(self) -> ConnWriter {
         self.inner.into_inner()
     }
 
-    pub fn inner(&self) -> &WriteSocket {
+    pub fn inner(&self) -> &ConnWriter {
         self.inner.inner()
     }
 
-    pub fn inner_mut(&mut self) -> &mut WriteSocket {
+    pub fn inner_mut(&mut self) -> &mut ConnWriter {
         self.inner.inner_mut()
     }
 
@@ -37,27 +37,27 @@ impl WriteStream {
     }
 }
 
-impl std::convert::AsRef<WriteSocket> for WriteStream {
-    fn as_ref(&self) -> &WriteSocket {
+impl std::convert::AsRef<ConnWriter> for AsyncWriteAdapter {
+    fn as_ref(&self) -> &ConnWriter {
         self.inner()
     }
 }
 
-impl std::convert::AsMut<WriteSocket> for WriteStream {
-    fn as_mut(&mut self) -> &mut WriteSocket {
+impl std::convert::AsMut<ConnWriter> for AsyncWriteAdapter {
+    fn as_mut(&mut self) -> &mut ConnWriter {
         self.inner_mut()
     }
 }
 
-impl tokio::io::AsyncWrite for WriteStream {
+impl tokio::io::AsyncWrite for AsyncWriteAdapter {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        let max_stage = self.max_stage;
-        let buf = if buf.len() > max_stage {
-            &buf[..max_stage]
+        let max_write_bytes = self.max_write_bytes;
+        let buf = if buf.len() > max_write_bytes {
+            &buf[..max_write_bytes]
         } else {
             buf
         };
@@ -79,31 +79,31 @@ impl tokio::io::AsyncWrite for WriteStream {
     }
 }
 
-impl std::marker::Unpin for WriteStream {}
+impl std::marker::Unpin for AsyncWriteAdapter {}
 
 #[cfg(test)]
-impl WriteStream {
-    pub fn max_stage(&self) -> usize {
-        self.max_stage
+impl AsyncWriteAdapter {
+    pub fn max_write_bytes(&self) -> usize {
+        self.max_write_bytes
     }
 }
 
 #[derive(Debug)]
 pub struct IoStream {
-    read: ReadStream,
-    write: WriteStream,
+    read: AsyncReadAdapter,
+    write: AsyncWriteAdapter,
 }
 
 impl IoStream {
-    pub fn into_split(self) -> (ReadSocket, WriteSocket) {
+    pub fn into_split(self) -> (ConnReader, ConnWriter) {
         (self.read.into_inner(), self.write.into_inner())
     }
 
-    pub fn split(&self) -> (&ReadSocket, &WriteSocket) {
+    pub fn split(&self) -> (&ConnReader, &ConnWriter) {
         (self.read.inner(), self.write.inner())
     }
 
-    pub fn split_mut(&mut self) -> (&mut ReadSocket, &mut WriteSocket) {
+    pub fn split_mut(&mut self) -> (&mut ConnReader, &mut ConnWriter) {
         (self.read.inner_mut(), self.write.inner_mut())
     }
 }
@@ -143,10 +143,10 @@ impl tokio::io::AsyncWrite for IoStream {
 }
 
 #[derive(Debug)]
-pub struct FrameReader {
-    inner: ReadStream,
+pub struct FrameByteReader {
+    inner: AsyncReadAdapter,
 }
-impl tokio::io::AsyncRead for FrameReader {
+impl tokio::io::AsyncRead for FrameByteReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -157,15 +157,15 @@ impl tokio::io::AsyncRead for FrameReader {
 }
 
 #[derive(Debug)]
-pub struct FrameWriter {
-    inner: WriteStream,
+pub struct FrameByteWriter {
+    inner: AsyncWriteAdapter,
 }
-impl FrameWriter {
+impl FrameByteWriter {
     pub async fn send_kill_and_abort(&mut self) {
         self.inner.send_kill_and_abort().await;
     }
 }
-impl tokio::io::AsyncWrite for FrameWriter {
+impl tokio::io::AsyncWrite for FrameByteWriter {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -189,38 +189,38 @@ impl tokio::io::AsyncWrite for FrameWriter {
 
 #[derive(Debug)]
 pub(crate) struct FrameIoParts {
-    read: FrameReader,
-    write: FrameWriter,
+    read: FrameByteReader,
+    write: FrameByteWriter,
 }
 impl FrameIoParts {
-    pub(crate) fn into_parts(self) -> (FrameReader, FrameWriter) {
+    pub(crate) fn into_parts(self) -> (FrameByteReader, FrameByteWriter) {
         (self.read, self.write)
     }
 }
 
 const _: () = {
     fn assert_send<T: Send>() {}
-    let _ = assert_send::<WriteStream>;
-    let _ = assert_send::<ReadStream>;
+    let _ = assert_send::<AsyncWriteAdapter>;
+    let _ = assert_send::<AsyncReadAdapter>;
     let _ = assert_send::<IoStream>;
-    let _ = assert_send::<FrameReader>;
-    let _ = assert_send::<FrameWriter>;
+    let _ = assert_send::<FrameByteReader>;
+    let _ = assert_send::<FrameByteWriter>;
     let _ = assert_send::<FrameIoParts>;
-    let _ = assert_send::<SessionSupervisor>;
+    let _ = assert_send::<SessionHandle>;
 };
 
-pub fn unsplit(read: ReadStream, write: WriteStream) -> IoStream {
+pub fn unsplit(read: AsyncReadAdapter, write: AsyncWriteAdapter) -> IoStream {
     IoStream { read, write }
 }
 
 #[derive(Debug)]
-pub struct ReadSocket {
-    pub(crate) transmission_layer: Arc<Shared>,
+pub struct ConnReader {
+    pub(crate) transmission_layer: Arc<Connection>,
     pub(crate) frame_buf: Vec<u8>,
     pub(crate) _shutdown_guard: tokio_util::sync::DropGuard,
 }
 
-impl ReadSocket {
+impl ConnReader {
     pub async fn recv(&mut self, data: &mut [u8]) -> Result<usize, IoErr> {
         if data.is_empty() {
             return Ok(0);
@@ -259,7 +259,7 @@ impl ReadSocket {
         self.transmission_layer.recv_frame().await
     }
 
-    pub fn into_async_read(self) -> ReadStream {
+    pub fn into_async_read(self) -> AsyncReadAdapter {
         PollRead::new(self)
     }
 
@@ -269,12 +269,12 @@ impl ReadSocket {
 }
 
 #[derive(Debug)]
-pub struct WriteSocket {
-    pub(crate) transmission_layer: Arc<Shared>,
+pub struct ConnWriter {
+    pub(crate) transmission_layer: Arc<Connection>,
     pub(crate) _shutdown_guard: tokio_util::sync::DropGuard,
 }
 
-impl WriteSocket {
+impl ConnWriter {
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, IoErr> {
         self.transmission_layer.send(data).await
     }
@@ -299,25 +299,25 @@ impl WriteSocket {
         self.transmission_layer.request_kill_and_abort();
     }
 
-    pub fn into_async_write(self) -> WriteStream {
-        let max_stage = self
+    pub fn into_async_write(self) -> AsyncWriteAdapter {
+        let max_write_bytes = self
             .transmission_layer
             .reliable_layer()
             .lock()
             .unwrap()
             .write_unit_capacity();
         let abort_session = Arc::clone(&self.transmission_layer);
-        WriteStream {
+        AsyncWriteAdapter {
             inner: PollWrite::new(self),
-            max_stage,
+            max_write_bytes,
             abort_session,
         }
     }
 }
 
 pub(crate) fn into_frame_io_parts(
-    read: ReadSocket,
-    write: WriteSocket,
+    read: ConnReader,
+    write: ConnWriter,
 ) -> std::io::Result<FrameIoParts> {
     if !Arc::ptr_eq(&read.transmission_layer, &write.transmission_layer) {
         return Err(std::io::Error::new(
@@ -344,16 +344,16 @@ pub(crate) fn into_frame_io_parts(
         ));
     }
     Ok(FrameIoParts {
-        read: FrameReader {
+        read: FrameByteReader {
             inner: read.into_async_read(),
         },
-        write: FrameWriter {
+        write: FrameByteWriter {
             inner: write.into_async_write(),
         },
     })
 }
 
-impl AsyncAsyncRead for ReadSocket {
+impl AsyncAsyncRead for ConnReader {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.recv(buf)
             .await
@@ -361,7 +361,7 @@ impl AsyncAsyncRead for ReadSocket {
     }
 }
 
-impl AsyncAsyncWrite for WriteSocket {
+impl AsyncAsyncWrite for ConnWriter {
     async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.send(buf)
             .await
@@ -370,7 +370,7 @@ impl AsyncAsyncWrite for WriteSocket {
 
     async fn flush(&mut self) -> std::io::Result<()> {
         self.transmission_layer
-            .throw_error()
+            .check_error()
             .map_err(|kind| self.transmission_layer.termination.io_error(kind))?;
         Ok(())
     }
@@ -391,6 +391,7 @@ mod tests {
     };
 
     use super::super::session::socket;
+    use crate::transmission::test_doubles::PendingRead;
     use crate::udp::wrap_fec;
 
     use super::*;
@@ -436,7 +437,7 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let frame_delivery = crate::delivery::frame::FrameDelivery::enabled();
+        let frame_delivery = crate::delivery::frame::FrameMode::enabled();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
@@ -537,9 +538,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fec_recovers_under_loss() {
-        use crate::udp::testing::{LossRate, wrap_fec_lossy};
-        let rate_a = LossRate::new(300);
-        let rate_b = LossRate::new(300);
+        use crate::udp::testing::{BasisPoints, wrap_fec_lossy};
+        let rate_a = BasisPoints::new(300);
+        let rate_b = BasisPoints::new(300);
         let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -582,12 +583,12 @@ mod tests {
     async fn test_fec_recovers_under_loss_with_mss_8192() {
         use crate::socket::socket;
         use crate::transmission::fec_tuning::FecTuning;
-        use crate::udp::testing::{LossRate, wrap_fec_lossy_with_mss_and_fec_tuning};
-        let rate_a = LossRate::new(300);
-        let rate_b = LossRate::new(300);
+        use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
+        let rate_a = BasisPoints::new(300);
+        let rate_b = BasisPoints::new(300);
         let fec = true;
         let mss = 8192;
-        let tuning = FecTuning::mindiv();
+        let tuning = FecTuning::max_diversity();
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
@@ -639,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_stream_max_stage_scales_with_mss() {
+    async fn write_stream_max_write_bytes_scales_with_mss() {
         use crate::udp::wrap_fec;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -648,7 +649,7 @@ mod tests {
         let b_wrapped = wrap_fec(Box::new(b.clone()), Box::new(b), false);
         let (_b_r, b_w, _b_supervisor) = socket(b_wrapped, None);
         assert_eq!(
-            b_w.into_async_write().max_stage(),
+            b_w.into_async_write().max_write_bytes(),
             8 * 1024,
             "default-MSS staging buffer must be exactly 8 KiB"
         );
@@ -659,21 +660,21 @@ mod tests {
             false,
             crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default(),
+            crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
         let (_a_r, a_w, _a_supervisor) = socket(a, None);
         let write_stream = a_w.into_async_write();
-        let max_stage = write_stream.max_stage();
+        let max_write_bytes = write_stream.max_write_bytes();
         let per_packet_payload = mss - crate::codec::data_overhead();
         assert_eq!(
-            max_stage % per_packet_payload,
+            max_write_bytes % per_packet_payload,
             0,
-            "max_stage {max_stage} should be a multiple of per-packet payload {per_packet_payload}"
+            "max_write_bytes {max_write_bytes} should be a multiple of per-packet payload {per_packet_payload}"
         );
         assert!(
-            8 * 1024 < max_stage,
-            "max_stage {max_stage} should exceed the default staging buffer of 8 KiB"
+            8 * 1024 < max_write_bytes,
+            "max_write_bytes {max_write_bytes} should exceed the default staging buffer of 8 KiB"
         );
         drop(write_stream);
     }
@@ -719,11 +720,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_mode_async_write_produces_one_frame() {
-        use crate::delivery::frame::FrameDelivery;
+        use crate::delivery::frame::FrameMode;
         use tokio::io::AsyncWriteExt;
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
-        let fd = FrameDelivery::enabled();
+        let fd = FrameMode::enabled();
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
@@ -795,11 +796,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_delivery_io_preserves_frames_across_async_io() {
-        use crate::delivery::frame::FrameDelivery;
+        use crate::delivery::frame::FrameMode;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
-        let fd = FrameDelivery::enabled();
+        let fd = FrameMode::enabled();
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
@@ -897,7 +898,7 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let frame_delivery = crate::delivery::frame::FrameDelivery::enabled();
+        let frame_delivery = crate::delivery::frame::FrameMode::enabled();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
@@ -938,17 +939,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_public_send_does_not_cancel_driver_io() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        #[derive(Debug)]
-        struct PendingRead;
-        #[async_trait::async_trait]
-        impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::WouldBlock.into())
-            }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                std::future::pending().await
-            }
-        }
         #[derive(Debug)]
         struct WriteState {
             calls: AtomicUsize,
@@ -1034,17 +1024,6 @@ mod tests {
     async fn abort_is_callable_while_poll_write_retains_the_write_socket() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         #[derive(Debug)]
-        struct PendingRead;
-        #[async_trait::async_trait]
-        impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::WouldBlock.into())
-            }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                std::future::pending().await
-            }
-        }
-        #[derive(Debug)]
         struct WriteState {
             calls: AtomicUsize,
             first_started: tokio::sync::Notify,
@@ -1079,7 +1058,7 @@ mod tests {
         );
         let (_read, write, _supervisor) = socket(layer, None);
         let mut write = write.into_async_write();
-        let payload = vec![7; write.max_stage()];
+        let payload = vec![7; write.max_write_bytes()];
         assert!(write.write(&payload).await.unwrap() > 0);
         tokio::time::timeout(Duration::from_secs(1), state.first_started.notified())
             .await
@@ -1097,7 +1076,7 @@ mod tests {
         }
         assert!(
             retained_pending_write,
-            "test did not leave PollWrite owning a pending WriteSocket"
+            "test did not leave PollWrite owning a pending ConnWriter"
         );
         write.send_kill_and_abort().await;
         state.release_first.notify_one();

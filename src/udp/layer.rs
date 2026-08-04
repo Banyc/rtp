@@ -6,7 +6,7 @@ use thiserror::Error;
 use super::MAX_MSS;
 #[cfg(test)]
 use super::NO_FEC_MSS;
-use crate::delivery::frame::FrameDelivery;
+use crate::delivery::frame::FrameMode;
 use crate::transmission::{
     fec::{FecConfig, FecState},
     fec_tuning::FecTuning,
@@ -66,7 +66,7 @@ pub(crate) fn wrap_fec(
         fec,
         ValidMss::try_new(NO_FEC_MSS).unwrap(),
         FecTuning::default(),
-        FrameDelivery::default(),
+        FrameMode::default(),
     )
     .unwrap()
 }
@@ -77,7 +77,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     fec: bool,
     mss: ValidMss,
     tuning: FecTuning,
-    frame_delivery: FrameDelivery,
+    frame_delivery: FrameMode,
 ) -> Result<UnreliableLayer, MssError> {
     let (mss, fec_state, tuning) = checked_mss_and_fec(fec, mss, tuning, frame_delivery)?;
     Ok(UnreliableLayer {
@@ -97,14 +97,14 @@ pub(crate) fn checked_mss_and_fec(
     fec: bool,
     mss: ValidMss,
     tuning: FecTuning,
-    frame_delivery: FrameDelivery,
+    frame_delivery: FrameMode,
 ) -> Result<(NonZeroUsize, Option<FecState>, FecTuning), MssError> {
     let mss = mss.get();
     let fec_state = if fec {
         let symbol_size = symbol_size(mss).ok_or(MssError::TooSmallForFec { mss })?;
         Some(FecState::new(FecConfig {
             symbol_size,
-            interactive_parity_depth: tuning.interactive_parity_depth,
+            small_group_parity_count: tuning.small_group_parity_count,
         }))
     } else {
         None
@@ -132,7 +132,7 @@ pub(crate) fn checked_mss_and_fec(
         FecTuning::default()
     } else {
         FecTuning {
-            interactive_parity_depth: tuning.interactive_parity_depth.max(1),
+            small_group_parity_count: tuning.small_group_parity_count.max(1),
             ..tuning
         }
     };
@@ -171,28 +171,28 @@ mod tests {
         MssError::ExceedsDatagramCeiling { .. },
         false,
         MAX_MSS + 1,
-        FrameDelivery::default()
+        FrameMode::default()
     );
     checked_mss_and_fec_error_case!(
         mss_with_no_room_for_the_codec_payload_fails,
         MssError::NoRoomForCodecPayload { .. },
         false,
         crate::codec::data_overhead(),
-        FrameDelivery::default()
+        FrameMode::default()
     );
     checked_mss_and_fec_error_case!(
         fec_shrink_leaves_no_codec_room_fails,
         MssError::NoRoomForCodecPayload { .. },
         true,
         crate::codec::data_overhead() + 1,
-        FrameDelivery::default()
+        FrameMode::default()
     );
     checked_mss_and_fec_error_case!(
         frame_delivery_mss_with_no_room_for_the_first_frame_header_fails,
         MssError::NoRoomForFirstFrameHeader { .. },
         false,
         crate::codec::data_overhead() + 1,
-        FrameDelivery::enabled()
+        FrameMode::enabled()
     );
 
     #[test]
@@ -201,7 +201,7 @@ mod tests {
             false,
             ValidMss::try_new(1_400).unwrap(),
             FecTuning::default(),
-            FrameDelivery::default(),
+            FrameMode::default(),
         )
         .unwrap();
         assert_eq!(mss.get(), 1_400, "FEC off must keep the raw MSS");
@@ -216,7 +216,7 @@ mod tests {
             true,
             ValidMss::try_new(1_400).unwrap(),
             FecTuning::default(),
-            FrameDelivery::default(),
+            FrameMode::default(),
         )
         .unwrap();
         assert_eq!(
@@ -226,7 +226,7 @@ mod tests {
         );
         assert!(fec_state.is_some(), "FEC on must build FEC state");
         assert!(
-            tuning.interactive_parity_depth >= 1,
+            tuning.small_group_parity_count >= 1,
             "FEC on must clamp the parity depth to at least 1"
         );
     }

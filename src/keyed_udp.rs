@@ -7,11 +7,11 @@ use tokio::net::UdpSocket;
 use tokio_util::bytes::Buf;
 use udp_listener::{ConnWrite, Packet, UtpListener};
 
+use crate::delivery::frame::FrameMode;
 use crate::{
-    socket::{ReadSocket, SessionSupervisor, WriteSocket, socket},
+    socket::{ConnReader, ConnWriter, SessionHandle, socket},
     transmission::{
         fec_tuning::FecTuning,
-        frame_delivery::FrameDelivery,
         transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     },
     udp::{
@@ -30,7 +30,7 @@ fn wrap_keyed<K: DispatchKey>(
     fec: bool,
     mss: ValidMss,
     tuning: FecTuning,
-    frame_delivery: FrameDelivery,
+    frame_delivery: FrameMode,
 ) -> UnreliableLayer {
     let key_size = K::max_size();
     let mss = mss.get();
@@ -49,12 +49,12 @@ fn wrap_keyed<K: DispatchKey>(
 }
 
 #[derive(Debug)]
-pub struct Server<K> {
+pub struct Listener<K> {
     listener: UtpListener<UdpSocket, K, Packet>,
     local_addr: SocketAddr,
     raw_fd: MaybeRawFd,
 }
-impl<K: DispatchKey> Server<K> {
+impl<K: DispatchKey> Listener<K> {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let local_addr = udp.local_addr()?;
@@ -78,7 +78,7 @@ impl<K: DispatchKey> Server<K> {
     /// [`udp::Listener::accept_without_handshake_with`] equivalent that also
     /// records the dispatch key of the accepted connection.
     pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<Accepted<K>> {
-        let accepted = self.listener.accept().await?;
+        let accepted = self.listener.poll_next_conn().await?;
         let conn_key = accepted.conn_key().clone();
         let (read, write) = accepted.split();
         let write = {
@@ -104,18 +104,18 @@ impl<K: DispatchKey> Server<K> {
 }
 #[derive(Debug)]
 pub struct Accepted<K> {
-    pub read: ReadSocket,
-    pub write: WriteSocket,
-    pub supervisor: SessionSupervisor,
+    pub read: ConnReader,
+    pub write: ConnWriter,
+    pub supervisor: SessionHandle,
     pub dispatch_key: K,
 }
 
 #[derive(Debug)]
-pub struct Client<K> {
+pub struct Connector<K> {
     listener: UtpListener<UdpSocket, K, Packet>,
     raw_fd: MaybeRawFd,
 }
-impl<K: DispatchKey> Client<K> {
+impl<K: DispatchKey> Connector<K> {
     pub async fn connect_without_handshake(
         bind: impl tokio::net::ToSocketAddrs,
         server: impl tokio::net::ToSocketAddrs,
@@ -131,10 +131,10 @@ impl<K: DispatchKey> Client<K> {
         Ok(Self { listener, raw_fd })
     }
 
-    /// Side-effect: same as [`udp_listener::UtpListener::accept()`]
+    /// Side-effect: same as [`udp_listener::UtpListener::poll_next_conn()`]
     pub async fn dispatch(&self) -> std::io::Result<()> {
         loop {
-            let _ = self.listener.accept().await?;
+            let _ = self.listener.poll_next_conn().await?;
         }
     }
 
@@ -145,7 +145,7 @@ impl<K: DispatchKey> Client<K> {
         dispatch_key: K,
         config: AcceptConfig,
     ) -> Option<Connected> {
-        let accepted = self.listener.open(dispatch_key.clone())?;
+        let accepted = self.listener.register_conn(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
         let unreliable_layer = wrap_keyed::<K>(
@@ -166,9 +166,9 @@ impl<K: DispatchKey> Client<K> {
 }
 #[derive(Debug)]
 pub struct Connected {
-    pub read: ReadSocket,
-    pub write: WriteSocket,
-    pub supervisor: SessionSupervisor,
+    pub read: ConnReader,
+    pub write: ConnWriter,
+    pub supervisor: SessionHandle,
 }
 
 #[derive(Debug)]
@@ -360,7 +360,7 @@ fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<(K, P
 mod tests {
     use super::*;
 
-    use crate::delivery::frame::FrameDelivery;
+    use crate::delivery::frame::FrameMode;
     use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::transmission_layer::UnreliableRead;
 
@@ -405,10 +405,12 @@ mod tests {
     #[should_panic(expected = "dispatch key")]
     async fn test_key_too_large() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client =
-            Client::<HugeKey>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
-                .await
-                .unwrap();
+        let client = Connector::<HugeKey>::connect_without_handshake(
+            "0.0.0.0:0",
+            server.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
         let _ = client
             .open_without_handshake_with(HugeKey, AcceptConfig::default())
             .unwrap();
@@ -417,7 +419,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_key() {
         let fec = true;
-        let server = Server::<u8>::bind("127.0.0.1:0").await.unwrap();
+        let server = Listener::<u8>::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();
         let key = 42;
         let msg_1 = b"hello";
@@ -452,7 +454,7 @@ mod tests {
             accepted.write.send(msg_1).await.unwrap();
         });
         tasks.spawn(async move {
-            let client = Client::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+            let client = Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
                 .await
                 .unwrap();
             println!("connected");
@@ -493,7 +495,7 @@ mod tests {
         use std::time::Duration;
 
         let fec = false;
-        let server = Server::<u8>::bind("127.0.0.1:0").await.unwrap();
+        let server = Listener::<u8>::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();
         let key = 7;
         let ping = b"ping";
@@ -515,7 +517,7 @@ mod tests {
         });
 
         let client = Arc::new(
-            Client::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+            Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
                 .await
                 .unwrap(),
         );
@@ -580,7 +582,7 @@ mod tests {
         use std::time::Duration;
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client =
-            Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
+            Connector::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
         let mut conn = client
@@ -605,10 +607,10 @@ mod tests {
         const KEY: u64 = 0x0102_0304_0506_0708;
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer.local_addr().unwrap();
-        let client = Client::<u64>::connect_without_handshake("127.0.0.1:0", peer_addr)
+        let client = Connector::<u64>::connect_without_handshake("127.0.0.1:0", peer_addr)
             .await
             .unwrap();
-        let accepted = client.listener.open(KEY).unwrap();
+        let accepted = client.listener.register_conn(KEY).unwrap();
         let (_read, write) = accepted.split();
         let mut write = KeyedConnWrite::new(write, &KEY, client.raw_fd, None);
         let payload = b"handshake bytes";
@@ -640,7 +642,7 @@ mod tests {
         use std::time::Duration;
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client =
-            Client::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
+            Connector::<u8>::connect_without_handshake("0.0.0.0:0", server.local_addr().unwrap())
                 .await
                 .unwrap();
         let mut conn = client
@@ -679,7 +681,7 @@ mod tests {
             true,
             ValidMss::try_new(mss).unwrap(),
             FecTuning::default(),
-            FrameDelivery::default(),
+            FrameMode::default(),
         );
         let datagram =
             layer.fec.as_ref().unwrap().max_wire_pkt_size() + <u16 as DispatchKey>::max_size();
@@ -699,7 +701,7 @@ mod tests {
                 true,
                 ValidMss::try_new(mss).unwrap(),
                 FecTuning::default(),
-                FrameDelivery::enabled(),
+                FrameMode::enabled(),
             )
         });
         assert!(res.is_err(), "undersized mss must panic in keyed wrap");

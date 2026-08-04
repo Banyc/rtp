@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::shared::{ReceivedBatch, Shared};
+use super::connection::{Connection, ReceivedBatch};
 use super::transmission_layer::{
     FEC_DEBUG, MAX_NUM_ACK, RecvBufs, RecvPkts, SendKillPkt, UnreliableRead,
 };
@@ -9,18 +9,18 @@ use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
 use crate::{
     codec::decode,
-    handshake::{Observation, is_post_open_candidate},
-    sack::AckBallSequence,
+    handshake::{PostOpenVerdict, is_post_open_candidate},
+    sack::SackBlockSeq,
 };
 
 pub struct ReadHalf {
     pub(crate) utp_read: Box<dyn UnreliableRead>,
     pub(crate) recent_echoes: RecentEchoes,
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) shared: Arc<Connection>,
 }
 
 impl std::ops::Deref for ReadHalf {
-    type Target = Shared;
+    type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
         &self.shared
@@ -37,9 +37,9 @@ impl ReadHalf {
             recent_echoes,
             shared,
         } = self;
-        let shared: &Shared = shared.as_ref();
+        let shared: &Connection = shared.as_ref();
         let termination = &shared.termination;
-        let throw_error = |e: IoErr| {
+        let record_error = |e: IoErr| {
             termination.press_error(e);
             e
         };
@@ -53,13 +53,13 @@ impl ReadHalf {
         for _ in 0..MAX_NUM_ACK {
             shared
                 .termination
-                .throw_error()
+                .check_error()
                 .map_err(|e| (e, SendKillPkt::No))?;
             let res = {
                 match bufs.ack_to_peer.is_empty() {
-                    true => utp_read.recv(&mut bufs.utp).await,
+                    true => utp_read.recv(&mut bufs.codec_pkt).await,
                     false => {
-                        let res = utp_read.try_recv(&mut bufs.utp);
+                        let res = utp_read.try_recv(&mut bufs.codec_pkt);
                         if let Err(e) = &res
                             && *e == std::io::ErrorKind::WouldBlock
                         {
@@ -72,17 +72,17 @@ impl ReadHalf {
             let read_bytes = match res {
                 Ok(x) => x,
                 Err(e) => {
-                    return Err((throw_error(e), SendKillPkt::No));
+                    return Err((record_error(e), SendKillPkt::No));
                 }
             };
             let now = Instant::now();
-            let read_pkt = &bufs.utp[..read_bytes];
+            let read_pkt = &bufs.codec_pkt[..read_bytes];
             if is_post_open_candidate(read_pkt) {
                 match shared.observe_post_open_handshake(read_pkt, now) {
-                    Observation::NotHandshake => {}
-                    Observation::Filtered | Observation::Complete => continue,
-                    Observation::ReplyQueued => {
-                        shared.coord.resume_send.notify_one();
+                    PostOpenVerdict::NotHandshake => {}
+                    PostOpenVerdict::Consumed | PostOpenVerdict::Complete => continue,
+                    PostOpenVerdict::ReplyQueued => {
+                        shared.signals.resume_send.notify_one();
                         continue;
                     }
                 }
@@ -125,7 +125,7 @@ impl ReadHalf {
                 }
                 if data.killed {
                     let e = IoErr::from(std::io::ErrorKind::BrokenPipe);
-                    throw_error(e);
+                    record_error(e);
                     return Err((e, SendKillPkt::No));
                 }
                 let is_fin = data
@@ -134,7 +134,7 @@ impl ReadHalf {
                     .is_some_and(|data| data.buf_range.is_empty() && data.frame_len.is_none());
                 let (disposition, recv_eof) = {
                     let mut reliable_layer = shared.reliable_layer.lock().unwrap();
-                    reliable_layer.recv_ack_pkt(AckBallSequence::new(&bufs.ack_from_peer), now);
+                    reliable_layer.recv_ack_pkt(SackBlockSeq::new(&bufs.ack_from_peer), now);
                     if FEC_DEBUG {
                         eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
                     }
@@ -169,9 +169,9 @@ impl ReadHalf {
                 }
                 received_batch.record_eof(recv_eof);
                 recv_pkts.num_ack_segments += 1;
-                shared.coord.sent_pkt_acked.notify_waiters();
+                shared.signals.sent_pkt_acked.notify_waiters();
                 if data.data.is_none() {
-                    shared.coord.session_outbound_progress.notify_one();
+                    shared.signals.session_outbound_progress.notify_one();
                 }
                 let Some(data) = data.data else {
                     shared.log("recv_ack_pkt");
@@ -202,12 +202,12 @@ impl ReadHalf {
                     && reliable_layer.pkt_send_space().accepts_new_pkt()
             };
             if should_resume_send {
-                shared.coord.resume_send.notify_one();
+                shared.signals.resume_send.notify_one();
             }
             return Ok(recv_pkts);
         }
         if !bufs.ack_to_peer.is_empty() {
-            shared.coord.recv_data_pkt.notify_waiters();
+            shared.signals.recv_data_pkt.notify_waiters();
         }
         Ok(recv_pkts)
     }

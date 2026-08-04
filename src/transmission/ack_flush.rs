@@ -111,19 +111,23 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
     let fec_enabled = write_half.fec.is_some();
     let mut pages_sent: usize = 0;
     'ack_pages: loop {
+        let (codec_pkt, wire_pkt) = {
+            let (_, codec_pkt, wire_pkt) = bufs.parts_mut();
+            (codec_pkt, wire_pkt)
+        };
         let written_bytes = {
             let reliable_layer = write_half.reliable_layer.lock().unwrap();
             let queue = reliable_layer.pkt_recv_space().ack_history();
             let ack = EncodeAck {
                 queue,
-                skip,
-                max_take: MAX_NUM_ACK,
+                first_block_index: skip,
+                max_blocks: MAX_NUM_ACK,
             };
             let this_echo = echo_ts.take();
-            encode_ack_data(Some(ack), this_echo, None, &mut bufs.utp).unwrap()
+            encode_ack_data(Some(ack), this_echo, None, codec_pkt).unwrap()
         };
         let res = write_half
-            .send_with_fec(&bufs.utp[..written_bytes], &mut bufs.fec)
+            .send_with_fec(&codec_pkt[..written_bytes], wire_pkt)
             .await;
         match res {
             Ok(_) => {
@@ -147,7 +151,7 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
                 let mut s = write_half.ack_flush.lock().unwrap();
                 s.complete_claim(pages_sent * MAX_NUM_ACK, false);
                 drop(s);
-                write_half.coord.session_outbound_progress.notify_one();
+                write_half.signals.session_outbound_progress.notify_one();
                 break 'ack_pages;
             }
             Err(e) => {
@@ -166,7 +170,7 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
                 s.complete_claim(claimed_acks, claimed_fin);
                 s.last_ack_flush = Some(now);
                 drop(s);
-                write_half.coord.session_outbound_progress.notify_one();
+                write_half.signals.session_outbound_progress.notify_one();
                 break;
             }
             skip = cursor;
@@ -176,7 +180,7 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
                 s.complete_claim(claimed_acks, claimed_fin);
                 s.last_ack_flush = Some(now);
                 drop(s);
-                write_half.coord.session_outbound_progress.notify_one();
+                write_half.signals.session_outbound_progress.notify_one();
                 break;
             }
         } else {
@@ -189,7 +193,7 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
             s.complete_claim(claimed_acks, claimed_fin);
             s.last_ack_flush = Some(now);
             drop(s);
-            write_half.coord.session_outbound_progress.notify_one();
+            write_half.signals.session_outbound_progress.notify_one();
             break;
         }
     }

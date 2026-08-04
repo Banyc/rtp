@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 // intentionally conservative: they let a bulk flow drain a self-inflicted
 // droptail bottleneck without driving the delay gate so hard that interactive
 // cross-traffic keeps getting tail-dropped.
-pub(crate) const GENTLE_PROBE_RATE: f64 = 0.25;
+pub(crate) const GENTLE_BW_PROBE_GAIN: f64 = 0.25;
 pub(crate) const GENTLE_DRAIN_FRAC: f64 = 0.7;
 pub(crate) const GENTLE_ADD_PKTS: f64 = 4.0;
 pub(crate) const GENTLE_ENTER_RTTS: f64 = 3.0;
@@ -40,7 +40,8 @@ pub(crate) struct GentlePreambleConfig {
     pub(crate) control_rtt: Duration,
 }
 
-/// Gentle-mode congestion controller state.
+/// Gentle-mode congestion controller state.  Delay-gated conservative CC
+/// sub-mode.
 ///
 /// Wraps the delay-gated gentle-mode entry/exit, probe, drain-guard, and
 /// gate-hysteresis logic extracted from [`ReliableLayer`].
@@ -76,9 +77,9 @@ impl GentleMode {
         self.gentle_gate_open_since = None;
     }
 
-    /// Gentle-mode entry preamble: track whether the smoothed RTT is building a
+    /// Gentle-mode entry update: track whether the smoothed RTT is building a
     /// queue above the enter tolerance, check loss-exit, and try to enter.
-    pub(crate) fn preamble(
+    pub(crate) fn update_mode(
         &mut self,
         smooth: Duration,
         floor: Duration,
@@ -179,7 +180,7 @@ impl GentleMode {
             self.gentle_gate_open_since = None;
             None
         } else {
-            let probed = delivery_rate * (1. + GENTLE_PROBE_RATE);
+            let probed = delivery_rate * (1. + GENTLE_BW_PROBE_GAIN);
             let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
             let target = (probed + additive).max(send_rate);
             Some(target)

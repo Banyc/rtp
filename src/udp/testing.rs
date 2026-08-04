@@ -3,7 +3,7 @@
 //! unaffected — there is no global drop flag on the production
 //! `UnreliableRead`/`UnreliableWrite` impls.
 //!
-//! Loss is per-instance, not global: each test creates a [`LossRate`] and
+//! Loss is per-instance, not global: each test creates a [`BasisPoints`] and
 //! injects it into the wrappers it wants to be lossy, so tests never interfere
 //! with each other.
 
@@ -14,29 +14,29 @@ use std::sync::{
 
 use super::*;
 
-/// A toggable loss rate in basis points (0–10_000), owned by a single test
+/// A toggable rate in basis points (0–10_000), owned by a single test
 /// and shared (via `Arc`) between the read and write wrappers of one
-/// connection. 0 means no loss; 10_000 means drop every packet.
+/// connection. 0 means no impairment; 10_000 means affect every packet.
 ///
-/// Create one per test with [`LossRate::new`] and pass clones to
+/// Create one per test with [`BasisPoints::new`] and pass clones to
 /// [`LossyRead::new`] / [`LossyWrite::new`].
 #[derive(Debug, Clone)]
-pub struct LossRate(Arc<AtomicUsize>);
+pub struct BasisPoints(Arc<AtomicUsize>);
 
-impl LossRate {
-    /// New loss rate of `bps` basis points (500 = 5%). Clamped to
+impl BasisPoints {
+    /// New rate of `bps` basis points (500 = 5%). Clamped to
     /// `[0, 10_000]`.
     pub fn new(bps: usize) -> Self {
         Self(Arc::new(AtomicUsize::new(bps.min(10_000))))
     }
 
-    /// Set the loss rate to `bps` basis points. Clamped to
+    /// Set the rate to `bps` basis points. Clamped to
     /// `[0, 10_000]`.
     pub fn set(&self, bps: usize) {
         self.0.store(bps.min(10_000), Ordering::Relaxed);
     }
 
-    /// Current loss rate in basis points.
+    /// Current rate in basis points.
     pub fn get(&self) -> usize {
         self.0.load(Ordering::Relaxed)
     }
@@ -49,16 +49,16 @@ impl LossRate {
 }
 
 /// Wrapper around any `UnreliableRead` that drops a fraction of received
-/// packets per the injected [`LossRate`]. Dropped packets are skipped (recv
+/// packets per the injected [`BasisPoints`]. Dropped packets are skipped (recv
 /// keeps waiting for the next one); `try_recv` reports `WouldBlock`.
 #[derive(Debug)]
 pub struct LossyRead<R: UnreliableRead> {
     inner: R,
-    rate: LossRate,
+    rate: BasisPoints,
 }
 
 impl<R: UnreliableRead> LossyRead<R> {
-    pub fn new(read: R, rate: LossRate) -> Self {
+    pub fn new(read: R, rate: BasisPoints) -> Self {
         Self { inner: read, rate }
     }
 }
@@ -84,17 +84,17 @@ impl<R: UnreliableRead + Send + Sync + 'static> UnreliableRead for LossyRead<R> 
 }
 
 /// Wrapper around any `UnreliableWrite` that drops a fraction of sent
-/// packets per the injected [`LossRate`]. A dropped send reports success
+/// packets per the injected [`BasisPoints`]. A dropped send reports success
 /// (the data is "written" then silently discarded), simulating a packet
 /// lost in flight after the sender's kernel has accepted it.
 #[derive(Debug)]
 pub struct LossyWrite<W: UnreliableWrite> {
     inner: W,
-    rate: LossRate,
+    rate: BasisPoints,
 }
 
 impl<W: UnreliableWrite> LossyWrite<W> {
-    pub fn new(write: W, rate: LossRate) -> Self {
+    pub fn new(write: W, rate: BasisPoints) -> Self {
         Self { inner: write, rate }
     }
 }
@@ -111,18 +111,18 @@ impl<W: UnreliableWrite> UnreliableWrite for LossyWrite<W> {
 
 #[derive(Debug, Clone)]
 pub struct ImpairRate {
-    pub loss: LossRate,
-    pub reorder: LossRate,
-    pub duplicate: LossRate,
+    pub loss: BasisPoints,
+    pub reorder: BasisPoints,
+    pub duplicate: BasisPoints,
     applied: Arc<[AtomicUsize; 3]>,
 }
 
 impl ImpairRate {
     pub fn new(loss_bps: usize, reorder_bps: usize, duplicate_bps: usize) -> Self {
         Self {
-            loss: LossRate::new(loss_bps),
-            reorder: LossRate::new(reorder_bps),
-            duplicate: LossRate::new(duplicate_bps),
+            loss: BasisPoints::new(loss_bps),
+            reorder: BasisPoints::new(reorder_bps),
+            duplicate: BasisPoints::new(duplicate_bps),
             applied: Arc::new([const { AtomicUsize::new(0) }; 3]),
         }
     }
@@ -191,7 +191,7 @@ where
         fec,
         ValidMss::try_new(NO_FEC_MSS).unwrap(),
         fec_tuning_from_env(),
-        FrameDelivery::default(),
+        FrameMode::default(),
     )
     .unwrap();
     UnreliableLayer {
@@ -201,16 +201,16 @@ where
         mss,
         fec: fec_state,
         fec_tuning: tuning,
-        frame_delivery: FrameDelivery::default(),
+        frame_delivery: FrameMode::default(),
         rtx_dup: false,
         instream_group_fec: false,
     }
 }
 
 /// Like `wrap_fec` but wraps the read/write pair in lossy injectors driven
-/// by `rate`. Each connection should get its own `LossRate` (or a shared
+/// by `rate`. Each connection should get its own `BasisPoints` (or a shared
 /// one if you want both directions of a single link to share loss state).
-pub fn wrap_fec_lossy<R, W>(read: R, write: W, fec: bool, rate: LossRate) -> UnreliableLayer
+pub fn wrap_fec_lossy<R, W>(read: R, write: W, fec: bool, rate: BasisPoints) -> UnreliableLayer
 where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
@@ -223,7 +223,7 @@ pub fn wrap_fec_lossy_with_mss<R, W>(
     write: W,
     fec: bool,
     mss: usize,
-    rate: LossRate,
+    rate: BasisPoints,
 ) -> UnreliableLayer
 where
     R: UnreliableRead + Send + Sync + 'static,
@@ -244,7 +244,7 @@ pub fn wrap_fec_lossy_with_mss_and_fec_tuning<R, W>(
     fec: bool,
     mss: usize,
     tuning: FecTuning,
-    rate: LossRate,
+    rate: BasisPoints,
 ) -> UnreliableLayer
 where
     R: UnreliableRead + Send + Sync + 'static,
@@ -254,7 +254,7 @@ where
         fec,
         ValidMss::try_new(mss).unwrap(),
         tuning,
-        FrameDelivery::default(),
+        FrameMode::default(),
     )
     .unwrap();
     UnreliableLayer {
@@ -264,7 +264,7 @@ where
         mss,
         fec: fec_state,
         fec_tuning: tuning,
-        frame_delivery: FrameDelivery::default(),
+        frame_delivery: FrameMode::default(),
         rtx_dup: false,
         instream_group_fec: false,
     }

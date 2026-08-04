@@ -1,14 +1,9 @@
 pub(crate) mod ack_flush;
+pub(crate) mod connection;
 pub(crate) mod coordination;
 pub(crate) mod fec;
 pub mod fec_tuning;
-pub mod frame_delivery {
-    //! Path-compatibility shim: the frame-delivery implementation lives in
-    //! [`crate::delivery::frame`].
-    pub use crate::delivery::frame::{FrameDelivery, frame_delivery_from_env};
-}
 pub(crate) mod read_half;
-pub(crate) mod shared;
 pub(crate) mod termination;
 #[cfg(test)]
 pub(crate) mod test_doubles;

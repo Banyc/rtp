@@ -48,8 +48,8 @@ pub struct FecConfig {
     /// Parity depth requested for groups that encode as exactly one data
     /// symbol.  Multi-symbol groups always keep the stock 1:4 ratio and the
     /// spare-token budget gate regardless of this value.  `1` is stock
-    /// behaviour.  See `FecTuning::interactive_parity_depth`.
-    pub interactive_parity_depth: u8,
+    /// behaviour.  See `FecTuning::small_group_parity_count`.
+    pub small_group_parity_count: u8,
 }
 
 /// Encapsulated FEC state owned by the transmission layer. The transmission
@@ -68,7 +68,7 @@ pub struct FecState {
     recovered: VecDeque<Vec<u8>>,
     enc_buf: Vec<u8>,
     symbol_size: usize,
-    interactive_parity_depth: u8,
+    small_group_parity_count: u8,
     stats: Stats,
 }
 
@@ -79,7 +79,7 @@ struct FecStats {
     pub groups_skipped_no_surplus_tokens: usize,
     pub groups_skipped_burst_end: usize,
     pub recovered_symbols: usize,
-    pub dropped_hostile_pkts: usize,
+    pub dropped_malformed_pkts: usize,
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
@@ -91,7 +91,7 @@ struct Stats {
     pub groups_skipped_no_surplus_tokens: usize,
     pub parity_groups_skipped_burst_end: usize,
     pub recovered_symbols: usize,
-    pub dropped_hostile_pkts: usize,
+    pub dropped_malformed_pkts: usize,
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
@@ -104,7 +104,7 @@ impl Stats {
             groups_skipped_no_surplus_tokens: self.groups_skipped_no_surplus_tokens,
             groups_skipped_burst_end: self.parity_groups_skipped_burst_end,
             recovered_symbols: self.recovered_symbols,
-            dropped_hostile_pkts: self.dropped_hostile_pkts,
+            dropped_malformed_pkts: self.dropped_malformed_pkts,
             group_size_skipped_burst_end: self.group_size_skipped_burst_end,
             group_size_skipped_no_surplus_tokens: self.group_size_skipped_no_surplus_tokens,
         }
@@ -122,7 +122,7 @@ impl fmt::Display for FecStats {
             )
             .field("groups_skipped_burst_end", &self.groups_skipped_burst_end)
             .field("recovered_symbols", &self.recovered_symbols)
-            .field("dropped_hostile_pkts", &self.dropped_hostile_pkts)
+            .field("dropped_malformed_pkts", &self.dropped_malformed_pkts)
             .field(
                 "group_size_skipped_burst_end",
                 &fmt_hist(&self.group_size_skipped_burst_end),
@@ -179,8 +179,8 @@ impl FecState {
             recovered: VecDeque::new(),
             enc_buf: vec![0; config.symbol_size * 2],
             symbol_size: config.symbol_size,
-            interactive_parity_depth: config
-                .interactive_parity_depth
+            small_group_parity_count: config
+                .small_group_parity_count
                 .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
             stats: Stats::default(),
         }
@@ -259,8 +259,8 @@ impl FecState {
     /// Stock path passes `false` and keeps the `PARITY_DATA_THRESHOLD` skip.
     ///
     /// **Single-symbol interactive exception:** when the open group has
-    /// exactly one data symbol and `interactive_parity_depth > 1`, the group
-    /// emits up to `interactive_parity_depth` parity copies **bypassing the
+    /// exactly one data symbol and `small_group_parity_count > 1`, the group
+    /// emits up to `small_group_parity_count` parity copies **bypassing the
     /// spare-token budget gate**.  Multi-symbol groups always keep the stock
     /// 1:4 ratio and the budget gate regardless of the configured depth —
     /// ungated depth > 1 on bulk would add ~75% overhead and defeat the
@@ -292,8 +292,8 @@ impl FecState {
         }
         // Single-symbol interactive exception first: it bypasses the budget
         // gate and the threshold/instream skips below.
-        if data_count == 1 && self.interactive_parity_depth > 1 {
-            let depth = self.interactive_parity_depth;
+        if data_count == 1 && self.small_group_parity_count > 1 {
+            let depth = self.small_group_parity_count;
             if FEC_DEBUG {
                 eprintln!(
                     "FEC: flushing {depth} parities for single-symbol group (interactive, budget bypassed)"
@@ -314,7 +314,7 @@ impl FecState {
         // transmission layer's `maybe_flush_full_fec_group`) and at burst end
         // for partial groups (2..7 symbols) via the data-path force-flush.
         // Single-symbol groups (data_count == 1) are handled by the
-        // interactive exception above when `interactive_parity_depth > 1`,
+        // interactive exception above when `small_group_parity_count > 1`,
         // or fall through to the stock path below.
         if instream && data_count >= 2 {
             let parity_count = INSTREAM_PARITY_PER_GROUP as u8;
@@ -348,7 +348,7 @@ impl FecState {
         // parity never impacts throughput of big traffic.  When `instream` is
         // `true`, multi-symbol groups (>= 2) are already handled by the
         // instream branch above; the only instream group that reaches here is
-        // a single-symbol group with `interactive_parity_depth <= 1`, which
+        // a single-symbol group with `small_group_parity_count <= 1`, which
         // falls through to the stock 1:4 parity.  A group above
         // `INSTREAM_DATA_PER_GROUP` should never reach here (the inline flush
         // resets it at 8), but defensively skip it.
@@ -398,7 +398,7 @@ impl FecState {
     ///   `pop_recovered` before reading the next raw packet.
     pub fn decode(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
         if !encodable_wire_pkt(pkt, self.symbol_size) {
-            self.stats.dropped_hostile_pkts += 1;
+            self.stats.dropped_malformed_pkts += 1;
             return None;
         }
         let recovered_before = self.recovered.len();
@@ -412,7 +412,7 @@ impl FecState {
         let hdr_len = match unwound {
             Ok(hdr_len) => hdr_len,
             Err(_) => {
-                self.stats.dropped_hostile_pkts += 1;
+                self.stats.dropped_malformed_pkts += 1;
                 None
             }
         };
@@ -447,8 +447,8 @@ impl FecState {
     /// Test-only accessor for the configured single-symbol interactive
     /// parity depth.
     #[cfg(test)]
-    pub(crate) fn interactive_parity_depth(&self) -> u8 {
-        self.interactive_parity_depth
+    pub(crate) fn small_group_parity_count(&self) -> u8 {
+        self.small_group_parity_count
     }
 
     /// Test-only accessor for the running parity-sent counter.
@@ -458,8 +458,8 @@ impl FecState {
     }
 
     #[cfg(test)]
-    pub(crate) fn dropped_hostile_pkts(&self) -> usize {
-        self.stats.dropped_hostile_pkts
+    pub(crate) fn dropped_malformed_pkts(&self) -> usize {
+        self.stats.dropped_malformed_pkts
     }
 
     /// Print the basic FEC counters to stderr. Only active when `FEC_DEBUG` is
@@ -498,10 +498,10 @@ mod tests {
 
     /// A fresh `FecState` with a given interactive parity depth, sized for a
     /// large-MSS loopback path so single-symbol groups dominate.
-    fn fec_state(symbol_size: usize, interactive_parity_depth: u8) -> FecState {
+    fn fec_state(symbol_size: usize, small_group_parity_count: u8) -> FecState {
         FecState::new(FecConfig {
             symbol_size,
-            interactive_parity_depth,
+            small_group_parity_count,
         })
     }
 
@@ -548,7 +548,7 @@ mod tests {
         tb
     }
 
-    /// A single-symbol group with `interactive_parity_depth = 3` must emit
+    /// A single-symbol group with `small_group_parity_count = 3` must emit
     /// exactly 3 parity copies, bypassing the spare-token budget gate even
     /// when the bucket is empty.
     #[test]
@@ -645,12 +645,12 @@ mod tests {
         );
     }
 
-    /// `FecState::new` clamps a misconfigured `interactive_parity_depth = 0`
+    /// `FecState::new` clamps a misconfigured `small_group_parity_count = 0`
     /// to 1 so the stock path always emits at least 1 parity.
     #[test]
     fn depth_zero_is_clamped_to_one() {
         let fec = fec_state(8192 - 11, 0);
-        assert_eq!(fec.interactive_parity_depth(), 1);
+        assert_eq!(fec.small_group_parity_count(), 1);
     }
 
     #[test]
@@ -659,7 +659,7 @@ mod tests {
         let symbol_size = 8192 - 11;
         let mut fec = fec_state(symbol_size, 40);
         assert_eq!(
-            fec.interactive_parity_depth(),
+            fec.small_group_parity_count(),
             MAX_INTERACTIVE_PARITY_DEPTH,
             "an over-deep request must be clamped to what the decoder accepts"
         );
@@ -934,14 +934,14 @@ mod tests {
                 "parity header {data_count}+{parity_count} must be dropped"
             );
             assert_eq!(
-                fec.dropped_hostile_pkts(),
+                fec.dropped_malformed_pkts(),
                 1,
                 "parity header {data_count}+{parity_count} must be refused before the decoder"
             );
         }
         let mut fec = fec_state(symbol_size, 1);
         assert!(fec.decode(&wire_pkt(0, 20, 20, 5, &body)).is_none());
-        assert_eq!(fec.dropped_hostile_pkts(), 0);
+        assert_eq!(fec.dropped_malformed_pkts(), 0);
     }
 
     #[test]
@@ -952,7 +952,7 @@ mod tests {
         let parity = vec![0xFFu8; symbol_size];
         assert!(fec.decode(&wire_pkt(0, 0, 0, 0, &data0)).is_some());
         assert!(fec.decode(&wire_pkt(0, 2, 2, 1, &parity)).is_none());
-        assert_eq!(fec.dropped_hostile_pkts(), 1);
+        assert_eq!(fec.dropped_malformed_pkts(), 1);
         while fec.pop_recovered().is_some() {}
     }
 

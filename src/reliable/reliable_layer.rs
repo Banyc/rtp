@@ -18,15 +18,15 @@ use crate::io_err::IoErr;
 use crate::{
     codec::data_overhead,
     delivery::{
+        byte_stream::{recv::StockRecvStage, send::StockSendStage},
         frame::{
-            FrameDelivery,
+            FrameMode,
             send::{FrameSendStage, MAX_FRAME_LEN},
         },
-        stock::{recv::StockRecvStage, send::StockSendStage},
     },
     pacer::SendPacer,
     recv_queue::pkt_recv_space::PktRecvSpace,
-    sack::AckBallSequence,
+    sack::SackBlockSeq,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::watchdog_tuning::WatchdogTuning,
 };
@@ -50,7 +50,7 @@ const STAGE_WINDOW_SECS: f64 = 0.005;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 pub(crate) const INIT_SEND_RATE: f64 = 128.;
-const SEND_RATE_PROBE_RATE: f64 = 1.;
+const BW_PROBE_GAIN: f64 = 1.;
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 const PRINT_DEBUG_MSGS: bool = false;
@@ -89,17 +89,17 @@ use super::rate_window::{RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE};
 use super::rate_window::{WindowedDeliveryMax, WindowedRttMin};
 
 #[derive(Debug, Clone)]
-enum SendFinBuf {
-    Empty,
-    Some,
-    EmptyAndBlocked,
+enum FinState {
+    None,
+    Pending,
+    PendingBlocked,
 }
 
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
     send_data_buf: StockSendStage,
-    send_fin_buf: SendFinBuf,
+    send_fin_buf: FinState,
     recv_data_buf: StockRecvStage,
     recv_fin_buf: bool,
     send_rate_limiter: Arc<Mutex<SendPacer>>,
@@ -116,7 +116,7 @@ pub struct ReliableLayer {
     pub(crate) gentle: GentleMode,
     queue_building: bool,
     drain_floor_binding_since: Option<Instant>,
-    frame_delivery: FrameDelivery,
+    frame_delivery: FrameMode,
     frame_send_stage: FrameSendStage,
     pkt_stats_buf: Vec<PacketState>,
     pkt_buf: Vec<dre::Packet>,
@@ -125,7 +125,7 @@ pub struct ReliableLayer {
 impl ReliableLayer {
     pub fn new(
         mss: NonZeroUsize,
-        frame_delivery: FrameDelivery,
+        frame_delivery: FrameMode,
         now: Instant,
     ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
@@ -133,13 +133,13 @@ impl ReliableLayer {
         let this = Self {
             mss,
             send_data_buf: StockSendStage::new(mss),
-            send_fin_buf: SendFinBuf::Empty,
+            send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new(),
-            pkt_recv_space: PktRecvSpace::new(frame_delivery),
+            pkt_recv_space: PktRecvSpace::new(),
             send_rate,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
@@ -160,7 +160,7 @@ impl ReliableLayer {
 
     pub fn new_with_watchdog_tuning(
         mss: NonZeroUsize,
-        frame_delivery: FrameDelivery,
+        frame_delivery: FrameMode,
         now: Instant,
         tuning: WatchdogTuning,
     ) -> (Self, Arc<Mutex<SendPacer>>) {
@@ -169,13 +169,13 @@ impl ReliableLayer {
         let this = Self {
             mss,
             send_data_buf: StockSendStage::new(mss),
-            send_fin_buf: SendFinBuf::Empty,
+            send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new().with_watchdog_tuning(tuning),
-            pkt_recv_space: PktRecvSpace::new(frame_delivery),
+            pkt_recv_space: PktRecvSpace::new(),
             send_rate,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
@@ -200,19 +200,16 @@ impl ReliableLayer {
     }
 
     pub fn is_no_data_to_send(&self) -> bool {
-        self.is_send_buf_empty() && self.pkt_send_space.num_txing_pkts() == 0
+        self.is_send_buf_empty() && self.pkt_send_space.num_in_flight_pkts() == 0
     }
 
     pub fn is_send_buf_empty(&self) -> bool {
         let stock_empty = self.send_data_buf.is_empty()
-            && matches!(
-                self.send_fin_buf,
-                SendFinBuf::Empty | SendFinBuf::EmptyAndBlocked
-            );
+            && matches!(self.send_fin_buf, FinState::None | FinState::PendingBlocked);
         if self.frame_delivery.enabled {
             // In frame mode the staging buffer is unused; the frame send
             // stage is the source of truth for unsent application bytes.
-            stock_empty && self.frame_send_stage.is_empty()
+            stock_empty && !self.frame_send_stage.has_pending_frames()
         } else {
             stock_empty
         }
@@ -221,13 +218,13 @@ impl ReliableLayer {
     pub(crate) fn next_pacing_deadline(&self, now: Instant) -> Option<Instant> {
         let max_sendable_packets =
             if self.pkt_send_space.in_outage_recovery() && self.pkt_send_space.has_rtx(now) {
-                self.pkt_send_space.num_txing_pkts().max(1)
+                self.pkt_send_space.num_in_flight_pkts().max(1)
             } else {
                 let cwnd_headroom = self
                     .pkt_send_space
                     .cwnd()
                     .get()
-                    .saturating_sub(self.pkt_send_space.num_txing_pkts());
+                    .saturating_sub(self.pkt_send_space.num_in_flight_pkts());
                 self.pending_new_packets().min(cwnd_headroom)
             };
         if max_sendable_packets == 0 {
@@ -248,7 +245,7 @@ impl ReliableLayer {
             self.send_data_buf.len()
         };
         let data_packets = pending_bytes.div_ceil(self.max_data_size_per_pkt());
-        let pending_fin = usize::from(matches!(self.send_fin_buf, SendFinBuf::Some));
+        let pending_fin = usize::from(matches!(self.send_fin_buf, FinState::Pending));
         data_packets.saturating_add(pending_fin)
     }
 
@@ -311,14 +308,14 @@ impl ReliableLayer {
     }
 
     pub fn send_fin_buf(&mut self) {
-        if matches!(self.send_fin_buf, SendFinBuf::EmptyAndBlocked) {
+        if matches!(self.send_fin_buf, FinState::PendingBlocked) {
             return;
         }
-        self.send_fin_buf = SendFinBuf::Some;
+        self.send_fin_buf = FinState::Pending;
     }
 
     pub(crate) fn ensure_write_open(&self) -> Result<(), IoErr> {
-        if matches!(self.send_fin_buf, SendFinBuf::Empty) {
+        if matches!(self.send_fin_buf, FinState::None) {
             Ok(())
         } else {
             Err(std::io::ErrorKind::BrokenPipe.into())
@@ -334,7 +331,7 @@ impl ReliableLayer {
     /// Maximum application bytes in a single frame in frame-delivery mode.
     /// In stock (non-frame) mode this returns the byte-stream staging
     /// capacity (`send_data_buf_capacity`), preserving the existing
-    /// `WriteStream` behavior.  In frame-delivery mode, the AsyncWrite
+    /// `AsyncWriteAdapter` behavior.  In frame-delivery mode, the AsyncWrite
     /// adapter must cap each write at this value so one write = one frame
     /// (capping at the byte-stream stage cap would split a large frame
     /// into multiple wire frames, breaking the one-write-one-frame
@@ -415,7 +412,7 @@ impl ReliableLayer {
                 seq: p.seq,
                 data_written,
                 frame_len: p.frame_len,
-                was_repair: true,
+                is_recovery: true,
             });
         }
 
@@ -434,7 +431,7 @@ impl ReliableLayer {
                 seq: p.seq,
                 data_written,
                 frame_len: p.frame_len,
-                was_repair: true,
+                is_recovery: true,
             });
         }
 
@@ -458,8 +455,8 @@ impl ReliableLayer {
             .min(self.send_data_buf.len());
         let pkt_bytes = match (NonZeroUsize::new(pkt_bytes), &self.send_fin_buf) {
             (Some(x), _) => x.get(),
-            (None, SendFinBuf::Some) => {
-                self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
+            (None, FinState::Pending) => {
+                self.send_fin_buf = FinState::PendingBlocked;
                 0
             }
             (None, _) => return None,
@@ -476,7 +473,7 @@ impl ReliableLayer {
             // Restore the FIN buffer state so the FIN is retried later
             // instead of being permanently consumed.
             if pkt_bytes == 0 {
-                self.send_fin_buf = SendFinBuf::Some;
+                self.send_fin_buf = FinState::Pending;
             }
             return None;
         }
@@ -499,7 +496,7 @@ impl ReliableLayer {
             seq: p.seq,
             data_written,
             frame_len: None,
-            was_repair: false,
+            is_recovery: false,
         })
     }
 
@@ -520,11 +517,11 @@ impl ReliableLayer {
 
         let chunk = match self
             .frame_send_stage
-            .next_chunk_len(first_pkt_max_payload, normal_max_payload)
+            .next_chunk(first_pkt_max_payload, normal_max_payload)
         {
             Some(chunk) => Some(chunk),
             None => {
-                if !matches!(self.send_fin_buf, SendFinBuf::Some) {
+                if !matches!(self.send_fin_buf, FinState::Pending) {
                     return None;
                 }
                 None
@@ -541,7 +538,7 @@ impl ReliableLayer {
         }
 
         let Some(chunk) = chunk else {
-            self.send_fin_buf = SendFinBuf::EmptyAndBlocked;
+            self.send_fin_buf = FinState::PendingBlocked;
             let stats = self
                 .connection_stats
                 .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
@@ -551,7 +548,7 @@ impl ReliableLayer {
                 seq: p.seq,
                 data_written: DataPktPayload::Fin,
                 frame_len: None,
-                was_repair: false,
+                is_recovery: false,
             });
         };
 
@@ -573,14 +570,14 @@ impl ReliableLayer {
             seq: p.seq,
             data_written,
             frame_len,
-            was_repair: false,
+            is_recovery: false,
         })
     }
 
     /// Take ACKs from the unreliable layer
     pub fn recv_ack_pkt(
         &mut self,
-        recved: AckBallSequence<'_>,
+        recved: SackBlockSeq<'_>,
         now: Instant,
     ) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
@@ -649,12 +646,11 @@ impl ReliableLayer {
         }
         self.prev_sample_rate = Some(sr.clone());
 
-        self.adjust_send_rate_exponential(&sr, now);
-
+        self.on_rate_sample(&sr, now);
         Some(sr)
     }
 
-    fn adjust_send_rate_exponential(&mut self, sr: &dre::RateSample, now: Instant) {
+    fn on_rate_sample(&mut self, sr: &dre::RateSample, now: Instant) {
         // While an outage-recovery epoch is open, ignore rate samples whose prior
         // time predates the outage cut.  A blackout-spanning sample can report a
         // bogus delivery rate (~acked/outage-length) that would collapse the just-
@@ -687,7 +683,7 @@ impl ReliableLayer {
 
         // ----- Gentle-mode entry/exit and gate hysteresis --------------------
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
-        self.gentle.preamble(
+        self.gentle.update_mode(
             smooth,
             floor,
             self.pkt_send_space.smooth_rtt_var(),
@@ -706,7 +702,7 @@ impl ReliableLayer {
 
         let little_data_loss = loss_event_rate.map(|lr| lr < CC_DATA_LOSS_RATE);
         if self.slow_start {
-            let probed = sr.delivery_rate() * (1. + SEND_RATE_PROBE_RATE);
+            let probed = sr.delivery_rate() * (1. + BW_PROBE_GAIN);
             let caught_up = self.send_rate.get() <= probed;
             if little_data_loss == Some(false) || queue_building || caught_up || sr.is_app_limited()
             {
@@ -715,12 +711,12 @@ impl ReliableLayer {
         }
 
         // ----- Gate-open / probe branch ---------------------------------------
-        let should_probe = little_data_loss != Some(false) && !queue_building;
-        if !should_probe {
+        let bw_probe_exponential = little_data_loss != Some(false) && !queue_building;
+        if !bw_probe_exponential {
             self.gentle.clear_gate_open();
         }
 
-        if should_probe {
+        if bw_probe_exponential {
             self.drain_floor_binding_since = None;
             if let Some(target) = self.gentle.probe(
                 sr.delivery_rate(),
@@ -966,7 +962,7 @@ impl ReliableLayer {
                 not_transmitting_a_packet: true,
                 cwnd_not_full: self.pkt_send_space.accepts_new_pkt(),
                 all_lost_packets_retransmitted: cwnd_stats.all_lost_pkts_rtxed,
-                pipe: cwnd_stats.num_not_lost_txing_pkts as u64,
+                pipe: cwnd_stats.num_not_lost_in_flight_pkts as u64,
             },
         );
     }
@@ -996,16 +992,16 @@ impl ReliableLayer {
         self.mss.get().checked_sub(data_overhead()).unwrap()
     }
 
-    pub fn log(&self) -> Log {
+    pub fn log(&self) -> MetricsRow {
         let now = Instant::now();
         let min_rtt = self.pkt_send_space.min_rtt();
-        Log {
+        MetricsRow {
             tokens: self.send_rate_limiter.lock().unwrap().outdated_tokens(),
             send_rate: self.send_rate.get(),
             loss_rate: self.pkt_send_space.data_loss_rate(now),
-            num_tx_pkts: self.pkt_send_space.num_txing_pkts(),
+            num_in_flight_pkts: self.pkt_send_space.num_in_flight_pkts(),
             num_pkts_in_pipe: self.pkt_send_space.num_pkts_in_pipe(),
-            num_rt_pkts: self.pkt_send_space.num_rtxed_pkts(),
+            num_rtx_pkts: self.pkt_send_space.num_rtxed_pkts(),
             send_seq: self.pkt_send_space.next_seq(),
             min_rtt: min_rtt.map(|t| t.as_millis()),
             rtt: self.pkt_send_space.smooth_rtt().as_millis(),
@@ -1027,13 +1023,13 @@ pub struct DataPkt {
     /// uses this to choose `FRAME_DATA_TS` vs `DATA_TS` on the wire.  `None`
     /// for continuation packets, all stock packets, FIN, and repairs of
     /// continuation packets.  Retransmits/tail-probes inherit the stored
-    /// `TxingPkt.frame_len` so the framing is preserved across repairs.
+    /// `InFlightPkt.frame_len` so the framing is preserved across repairs.
     pub frame_len: Option<u32>,
     /// Whether this packet is a retransmission or a tail-loss probe (a
     /// recovery packet, not new data).  Used by the transmission layer to
     /// decide whether to emit a retransmission-armor duplicate copy
     /// (`RTP_RTX_DUP`).
-    pub was_repair: bool,
+    pub is_recovery: bool,
 }
 #[derive(Debug, Clone)]
 pub enum DataPktPayload {
@@ -1045,7 +1041,7 @@ pub enum DataPktPayload {
 ///
 /// Returns `None` if the probed rate would not exceed the current rate.
 fn probe_send_rate_exponential(current: f64, delivery_rate: f64) -> Option<f64> {
-    let probed = delivery_rate + delivery_rate * SEND_RATE_PROBE_RATE;
+    let probed = delivery_rate + delivery_rate * BW_PROBE_GAIN;
     if probed < current {
         return None;
     }
@@ -1090,13 +1086,13 @@ mod tests {
         INIT_SEND_RATE, MAX_SEND_DATA_BUF_LEN, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR,
         QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
     };
-    use crate::delivery::stock::send::send_data_buf_len;
+    use crate::delivery::byte_stream::send::send_data_buf_len;
     const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 
     const TEST_MSS: usize = 1200;
     use crate::{
         codec::data_overhead,
-        sack::{AckBall, AckBallSequence},
+        sack::{SackBlock, SackBlockSeq},
         udp::NO_FEC_MSS,
     };
 
@@ -1220,7 +1216,7 @@ mod tests {
     fn test_layer(now: Instant) -> super::ReliableLayer {
         super::ReliableLayer::new(
             NonZeroUsize::new(TEST_MSS).unwrap(),
-            crate::delivery::frame::FrameDelivery::default(),
+            crate::delivery::frame::FrameMode::default(),
             now,
         )
         .0
@@ -1268,11 +1264,11 @@ mod tests {
         if let Some(rtt) = rtt {
             rl.sample_rtt(rtt, now);
         }
-        let acks = [AckBall {
+        let acks = [SackBlock {
             start: 0,
             size: NonZeroU64::new(next_seq).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), now);
+        rl.recv_ack_pkt(SackBlockSeq::new(&acks), now);
     }
 
     fn send_one(rl: &mut super::ReliableLayer, now: Instant) -> u64 {
@@ -1303,7 +1299,7 @@ mod tests {
         );
         let (mut frame, _) = super::ReliableLayer::new(
             NonZeroUsize::new(TEST_MSS).unwrap(),
-            crate::delivery::frame::FrameDelivery::enabled(),
+            crate::delivery::frame::FrameMode::enabled(),
             now,
         );
         frame.send_fin_buf();
@@ -1315,11 +1311,11 @@ mod tests {
 
     fn ack_seq(rl: &mut super::ReliableLayer, seq: u64, rtt: Duration, now: Instant) {
         rl.sample_rtt(rtt, now);
-        let acks = [AckBall {
+        let acks = [SackBlock {
             start: seq,
             size: NonZeroU64::new(1).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), now);
+        rl.recv_ack_pkt(SackBlockSeq::new(&acks), now);
     }
 
     /// Feed `count` identical RTT samples in rapid succession to converge the
@@ -1355,11 +1351,11 @@ mod tests {
             return false;
         }
         rl.sample_rtt(rtt, now);
-        let acks = [AckBall {
+        let acks = [SackBlock {
             start: 0,
             size: NonZeroU64::new(hi).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), now).is_some()
+        rl.recv_ack_pkt(SackBlockSeq::new(&acks), now).is_some()
     }
 
     #[test]
@@ -1754,11 +1750,11 @@ mod tests {
         let _ = stall_seq;
         let rto = rl.pkt_send_space.rto_duration();
         let detect_t = t + rto * 2 + Duration::from_millis(1);
-        let acks = [AckBall {
+        let acks = [SackBlock {
             start: 0,
             size: NonZeroU64::new(progress_seq + 1).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBallSequence::new(&acks), detect_t);
+        rl.recv_ack_pkt(SackBlockSeq::new(&acks), detect_t);
 
         // Outage recovery must clear the gentle re-entry cooldown.
         assert!(
@@ -1853,7 +1849,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             NonZeroUsize::new(mss).unwrap(),
-            crate::delivery::frame::FrameDelivery::enabled(),
+            crate::delivery::frame::FrameMode::enabled(),
             now,
         )
         .0;
@@ -1893,7 +1889,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             NonZeroUsize::new(mss).unwrap(),
-            crate::delivery::frame::FrameDelivery::enabled(),
+            crate::delivery::frame::FrameMode::enabled(),
             now,
         )
         .0;
@@ -1921,14 +1917,14 @@ mod tests {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Log {
+pub struct MetricsRow {
     pub tokens: f64,
     pub send_rate: f64,
     pub delivery_rate: Option<f64>,
     pub loss_rate: Option<f64>,
-    pub num_tx_pkts: usize,
+    pub num_in_flight_pkts: usize,
     pub num_pkts_in_pipe: usize,
-    pub num_rt_pkts: usize,
+    pub num_rtx_pkts: usize,
     pub send_seq: u64,
     pub min_rtt: Option<u128>,
     pub rtt: u128,

@@ -14,7 +14,7 @@ use primitive::{
 
 use crate::{
     recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
-    sack::AckBallSequence,
+    sack::SackBlockSeq,
     send_queue::{
         liveness::PeerLiveness,
         loss_event_window::LossEventWindow,
@@ -55,8 +55,8 @@ fn jitter_cap_from_env() -> bool {
 
 #[derive(Debug)]
 pub struct PktSendSpace {
-    send_wnd: SendWnd<u64, Option<TxingPkt>>,
-    num_txing: usize,
+    send_wnd: SendWnd<u64, Option<InFlightPkt>>,
+    num_in_flight: usize,
     reused_buf: ObjPool<Vec<u8>>,
     cwnd: NonZeroUsize,
     out_of_order_seq_end: u64,
@@ -103,7 +103,7 @@ impl PktSendSpace {
     pub fn new() -> Self {
         Self {
             send_wnd: SendWnd::new(0),
-            num_txing: 0,
+            num_in_flight: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
             out_of_order_seq_end: 0,
@@ -158,15 +158,15 @@ impl PktSendSpace {
     }
 
     fn unacked(
-        send_wnd: &SendWnd<u64, Option<TxingPkt>>,
-    ) -> impl Iterator<Item = (u64, &TxingPkt)> {
+        send_wnd: &SendWnd<u64, Option<InFlightPkt>>,
+    ) -> impl Iterator<Item = (u64, &InFlightPkt)> {
         send_wnd
             .iter()
             .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
     }
     fn unacked_mut(
-        send_wnd: &mut SendWnd<u64, Option<TxingPkt>>,
-    ) -> impl Iterator<Item = (u64, &mut TxingPkt)> {
+        send_wnd: &mut SendWnd<u64, Option<InFlightPkt>>,
+    ) -> impl Iterator<Item = (u64, &mut InFlightPkt)> {
         send_wnd
             .iter_mut()
             .filter_map(|(k, v)| v.as_mut().map(|v| (k, v)))
@@ -226,7 +226,7 @@ impl PktSendSpace {
             .is_some()
     }
 
-    pub fn ack(&mut self, recved: AckBallSequence<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+    pub fn ack(&mut self, recved: SackBlockSeq<'_>, acked: &mut Vec<PacketState>, now: Instant) {
         let cumulative_front_before = self.send_wnd.start().or(self.send_wnd.next()).copied();
         let peer_waiting_for_acked_pkts =
             cumulative_front_before.is_some_and(|front| recved.first_unacked() < front);
@@ -263,7 +263,7 @@ impl PktSendSpace {
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
-            self.num_txing -= 1;
+            self.num_in_flight -= 1;
             if s == *self.send_wnd.start().unwrap() {
                 self.send_wnd.pop().unwrap();
                 self.send_wnd.pop_none();
@@ -281,7 +281,7 @@ impl PktSendSpace {
         {
             self.liveness.record_progress();
         }
-        let balls = recved.balls();
+        let balls = recved.blocks();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
             let mut passes: u32 = 0;
             for ball in balls {
@@ -295,7 +295,7 @@ impl PktSendSpace {
                 };
                 passes = passes.saturating_add(u32::try_from(newer).unwrap_or(u32::MAX));
             }
-            p.sack_passes = p.sack_passes.max(passes);
+            p.sacked_above = p.sacked_above.max(passes);
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
@@ -323,7 +323,7 @@ impl PktSendSpace {
     }
 
     pub fn accepts_new_pkt(&self) -> bool {
-        self.num_txing < self.cwnd.get()
+        self.num_in_flight < self.cwnd.get()
     }
 
     /// Sequence number of the current tail packet, if any.
@@ -368,7 +368,7 @@ impl PktSendSpace {
         // Refresh the timestamp/RTO so the probe is tracked as a fresh packet
         // for RTO calculation (the RTO fallback covers a lost probe).
         self_assign::self_assign! {
-            p = TxingPkt {
+            p = InFlightPkt {
                 stats: _,
                 sent_time: now,
                 rtxed: _,
@@ -377,9 +377,9 @@ impl PktSendSpace {
                 frame_len: _,
                 rto,
                 rto_from_tail_probe: true,
-                sack_passes: _,
+                sacked_above: _,
                 fast_loss_rtx_time: _,
-                deferred_loss_stock_deadline: _,
+                deferred_loss_baseline_deadline: _,
             };
         }
         Some(Pkt {
@@ -403,7 +403,7 @@ impl PktSendSpace {
         let rto = self.rtt_stats.rto_duration();
         self.liveness.on_send(now, rto);
 
-        let p = TxingPkt {
+        let p = InFlightPkt {
             stats,
             sent_time: now,
             rtxed: false,
@@ -412,13 +412,13 @@ impl PktSendSpace {
             frame_len,
             rto: self.rtt_stats.rto_duration(),
             rto_from_tail_probe: false,
-            sack_passes: 0,
+            sacked_above: 0,
             fast_loss_rtx_time: None,
-            deferred_loss_stock_deadline: None,
+            deferred_loss_baseline_deadline: None,
         };
 
         self.send_wnd.push(Some(p));
-        self.num_txing += 1;
+        self.num_in_flight += 1;
         self.tlp.reset();
 
         Pkt {
@@ -499,7 +499,7 @@ impl PktSendSpace {
                 && !tail_probe_loss
                 && !is_fast_loss_rtx
                 && now < original_sent_time + stock_window;
-            let stock_deadline_opt = if defer_loss {
+            let baseline_deadline_opt = if defer_loss {
                 Some(original_sent_time + stock_window)
             } else {
                 None
@@ -514,7 +514,7 @@ impl PktSendSpace {
             };
 
             self_assign::self_assign! {
-                p = TxingPkt {
+                p = InFlightPkt {
                     stats: _,
                     sent_time: now,
                     rtxed: true,
@@ -523,15 +523,15 @@ impl PktSendSpace {
                     frame_len: _,
                     rto: self.rtt_stats.rto_duration(),
                     rto_from_tail_probe: false,
-                    sack_passes: _,
+                    sacked_above: _,
                     fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
-                    deferred_loss_stock_deadline: stock_deadline_opt,
+                    deferred_loss_baseline_deadline: baseline_deadline_opt,
                 };
             }
             if defer_loss {
                 self.deferred_losses.push(DeferredLoss {
                     seq: s,
-                    stock_deadline: stock_deadline_opt.unwrap(),
+                    baseline_deadline: baseline_deadline_opt.unwrap(),
                 });
             } else if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
                 let smooth_rtt = self.rtt_stats.smooth_rtt();
@@ -559,7 +559,7 @@ impl PktSendSpace {
         let mut i = 0;
         while i < self.deferred_losses.len() {
             let dl = &self.deferred_losses[i];
-            if now < dl.stock_deadline {
+            if now < dl.baseline_deadline {
                 i += 1;
                 continue;
             }
@@ -678,11 +678,11 @@ impl PktSendSpace {
         }
         CwndStats {
             all_lost_pkts_rtxed,
-            num_not_lost_txing_pkts: not_lost,
+            num_not_lost_in_flight_pkts: not_lost,
         }
     }
-    pub fn num_txing_pkts(&self) -> usize {
-        self.num_txing
+    pub fn num_in_flight_pkts(&self) -> usize {
+        self.num_in_flight
     }
 
     pub fn huge_data_loss(&self, tolerant_loss_rate: UnitR<f64>, now: Instant) -> bool {
@@ -727,7 +727,7 @@ impl PktSendSpace {
         self.pkts_in_pipe().count()
     }
 
-    fn pkts_in_pipe(&self) -> impl Iterator<Item = (u64, &TxingPkt)> + '_ {
+    fn pkts_in_pipe(&self) -> impl Iterator<Item = (u64, &InFlightPkt)> + '_ {
         Self::unacked(&self.send_wnd)
             .take_while(|(s, _)| MinNoneOptCmp(Some(*s)) <= self.max_pipe_seq)
     }
@@ -759,8 +759,8 @@ impl PktSendSpace {
         for dl in &self.deferred_losses {
             min_next_poll_time = Some(
                 min_next_poll_time
-                    .map(|min| min.min(dl.stock_deadline))
-                    .unwrap_or(dl.stock_deadline),
+                    .map(|min| min.min(dl.baseline_deadline))
+                    .unwrap_or(dl.baseline_deadline),
             );
         }
         min_next_poll_time
@@ -779,11 +779,11 @@ impl Default for PktSendSpace {
 #[derive(Debug, Clone, Copy)]
 pub struct CwndStats {
     pub all_lost_pkts_rtxed: bool,
-    pub num_not_lost_txing_pkts: usize,
+    pub num_not_lost_in_flight_pkts: usize,
 }
 
 #[derive(Debug, Clone)]
-struct TxingPkt {
+struct InFlightPkt {
     pub stats: PacketState,
     pub sent_time: Instant,
     pub rtxed: bool,
@@ -806,7 +806,7 @@ struct TxingPkt {
     /// packet.  Used by the evidence-gated fast-loss path: once this reaches
     /// [`FAST_LOSS_SACK_THRESHOLD`], the packet is declared lost without
     /// waiting for the time-based reorder window to expire.
-    pub sack_passes: u32,
+    pub sacked_above: u32,
     /// `Some(t)` if this packet was retransmitted by the evidence-gated
     /// fast-loss path at time `t`.  Used to detect observed reordering: if an
     /// ACK for this packet arrives before `t + min_rtt` could plausibly have
@@ -817,12 +817,12 @@ struct TxingPkt {
     /// congestion-control loss event for that retransmit is *deferred* to the
     /// stock reorder-window deadline (`sent_time_of_original + reorder_window`
     /// computed against the original send time stored in
-    /// `deferred_loss_stock_deadline`).  If the original is acked before that
+    /// `deferred_loss_baseline_deadline`).  If the original is acked before that
     /// deadline the loss event is cancelled (it was reordering, not loss);
     /// otherwise it is recorded exactly once at the deadline.
-    pub deferred_loss_stock_deadline: Option<Instant>,
+    pub deferred_loss_baseline_deadline: Option<Instant>,
 }
-impl TxingPkt {
+impl InFlightPkt {
     pub fn hits_rto(&self, now: Instant) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
         self.rto <= sent_elapsed
@@ -858,7 +858,7 @@ impl TxingPkt {
     /// past it.  The structural arming gate and the observed-reordering
     /// hard-disable are checked by the caller (`PktSendSpace::fast_loss_armed`).
     pub fn is_fast_loss(&self) -> bool {
-        !self.rtxed && self.sack_passes >= FAST_LOSS_SACK_THRESHOLD
+        !self.rtxed && self.sacked_above >= FAST_LOSS_SACK_THRESHOLD
     }
 }
 
@@ -866,14 +866,14 @@ struct SeqOutOfOrder(pub bool);
 
 /// A pending deferred CC loss-event recording for the jitter-tolerant fast-
 /// retransmit path.  The loss event for `seq` was deferred at `rtx_time` to
-/// `stock_deadline` (the original send time + stock reorder window).  When
-/// [`PktSendSpace::poll_deferred_loss`] runs at `now >= stock_deadline` it
+/// `baseline_deadline` (the original send time + stock reorder window).  When
+/// [`PktSendSpace::poll_deferred_loss`] runs at `now >= baseline_deadline` it
 /// records one loss event iff `seq` is still in flight (genuine loss); if the
 /// seq was acked in the meantime the entry was already cancelled by `ack`.
 #[derive(Debug, Clone, Copy)]
 struct DeferredLoss {
     seq: u64,
-    stock_deadline: Instant,
+    baseline_deadline: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -915,12 +915,12 @@ mod tests {
     }
 
     fn ack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
-        let ball = crate::sack::AckBall {
+        let ball = crate::sack::SackBlock {
             start: seq,
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
-        let seq = crate::sack::AckBallSequence::new(&balls);
+        let seq = crate::sack::SackBlockSeq::new(&balls);
         let mut acked = Vec::new();
         space.ack(seq, &mut acked, now);
         acked.len()
@@ -928,39 +928,39 @@ mod tests {
 
     /// SACK a single out-of-order sequence: the peer has received `seq` but
     /// the cumulative ACK point is still below it.  This removes `seq` from
-    /// the send window (it is delivered) and increments `sack_passes` on
+    /// the send window (it is delivered) and increments `sacked_above` on
     /// every older in-flight packet.
     fn sack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
-        let mut peer = crate::sack::AckQueue::new();
+        let mut peer = crate::sack::SackIntervals::new();
         for s in 0..space.next_seq() {
             if space.send_wnd.get(&s).and_then(|o| o.as_ref()).is_none() {
                 peer.insert(s);
             }
         }
         peer.insert(seq);
-        let balls = peer.balls().collect::<Vec<_>>();
-        let recved = crate::sack::AckBallSequence::new(&balls);
+        let balls = peer.blocks().collect::<Vec<_>>();
+        let recved = crate::sack::SackBlockSeq::new(&balls);
         let mut acked = Vec::new();
         space.ack(recved, &mut acked, now);
         acked.len()
     }
 
     fn resack(space: &mut PktSendSpace, seq: u64, now: Instant) {
-        let ball = crate::sack::AckBall {
+        let ball = crate::sack::SackBlock {
             start: seq,
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
         let mut acked = Vec::new();
-        space.ack(crate::sack::AckBallSequence::new(&balls), &mut acked, now);
+        space.ack(crate::sack::SackBlockSeq::new(&balls), &mut acked, now);
     }
 
-    fn sack_passes(space: &PktSendSpace, seq: u64) -> u32 {
+    fn sacked_above(space: &PktSendSpace, seq: u64) -> u32 {
         space
             .send_wnd
             .get(&seq)
             .and_then(|o| o.as_ref())
-            .map(|p| p.sack_passes)
+            .map(|p| p.sacked_above)
             .unwrap_or(0)
     }
 
@@ -991,12 +991,12 @@ mod tests {
     }
 
     fn ack_up_to(space: &mut PktSendSpace, seq: u64, now: Instant) {
-        let ball = crate::sack::AckBall {
+        let ball = crate::sack::SackBlock {
             start: 0,
             size: std::num::NonZeroU64::new(seq + 1).unwrap(),
         };
         let balls = [ball];
-        let seq = crate::sack::AckBallSequence::new(&balls);
+        let seq = crate::sack::SackBlockSeq::new(&balls);
         let mut acked = Vec::new();
         space.ack(seq, &mut acked, now);
     }
@@ -1465,12 +1465,16 @@ mod tests {
         send_packet(&mut space, t0 + ms(3));
 
         // SACK seqs 1, 2, 3 — each is newer than seq 0, so each SACK
-        // increments seq 0's sack_passes by 1.  After three SACKs the
+        // increments seq 0's sacked_above by 1.  After three SACKs the
         // threshold (3) is reached.
         sack_one(&mut space, 1, t0 + ms(10));
         sack_one(&mut space, 2, t0 + ms(11));
         sack_one(&mut space, 3, t0 + ms(12));
-        assert_eq!(sack_passes(&space, 0), 3, "seq 0 should have 3 sack passes");
+        assert_eq!(
+            sacked_above(&space, 0),
+            3,
+            "seq 0 should have 3 sack passes"
+        );
 
         // At t0 + 30 ms the time-based reorder window (~125 ms) has NOT
         // expired, so a stock time-only declaration would not fire.  The
@@ -1491,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_acks_carrying_no_new_information_do_not_earn_sack_passes() {
+    fn duplicate_acks_carrying_no_new_information_do_not_earn_sacked_above() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
@@ -1504,7 +1508,7 @@ mod tests {
         resack(&mut space, 1, t0 + ms(11));
         resack(&mut space, 1, t0 + ms(12));
         assert_eq!(
-            sack_passes(&space, 0),
+            sacked_above(&space, 0),
             1,
             "one newer packet delivered is one sack pass, however often it is re-acked"
         );
@@ -1543,12 +1547,12 @@ mod tests {
         send_packet(&mut space, t0 + ms(3));
 
         // Same SACK evidence as the low-jitter case: three newer packets
-        // SACKed past seq 0.  The sack_passes counter still reaches 3
+        // SACKed past seq 0.  The sacked_above counter still reaches 3
         // (tracking is unconditional), but the declaration must not fire.
         sack_one(&mut space, 1, t0 + ms(10));
         sack_one(&mut space, 2, t0 + ms(11));
         sack_one(&mut space, 3, t0 + ms(12));
-        assert_eq!(sack_passes(&space, 0), 3, "sack passes are always tracked");
+        assert_eq!(sacked_above(&space, 0), 3, "sack passes are always tracked");
 
         // Well before the (large, jitter-dominated) reorder window expires.
         let early = t0 + ms(30);
@@ -1627,7 +1631,7 @@ mod tests {
         sack_one(&mut space, new_front + 1, original_arrives + ms(6));
         sack_one(&mut space, new_front + 2, original_arrives + ms(7));
         sack_one(&mut space, new_front + 3, original_arrives + ms(8));
-        assert_eq!(sack_passes(&space, new_front), 3);
+        assert_eq!(sacked_above(&space, new_front), 3);
 
         let early2 = original_arrives + ms(9);
         assert!(
@@ -1736,13 +1740,13 @@ mod tests {
         for _ in 0..3 {
             send_packet(&mut space, t0);
         }
-        let balls = [crate::sack::AckBall {
+        let balls = [crate::sack::SackBlock {
             start: u64::MAX,
             size: std::num::NonZeroU64::new(1).unwrap(),
         }];
         let mut acked = Vec::new();
         space.ack(
-            crate::sack::AckBallSequence::new(&balls),
+            crate::sack::SackBlockSeq::new(&balls),
             &mut acked,
             t0 + ms(1),
         );
@@ -1766,19 +1770,19 @@ mod tests {
         for _ in 0..3 {
             send_packet(&mut space, t0);
         }
-        let balls = [crate::sack::AckBall {
+        let balls = [crate::sack::SackBlock {
             start: 3,
             size: std::num::NonZeroU64::new(u64::MAX).unwrap(),
         }];
         let mut acked = Vec::new();
         space.ack(
-            crate::sack::AckBallSequence::new(&balls),
+            crate::sack::SackBlockSeq::new(&balls),
             &mut acked,
             t0 + ms(1),
         );
         for s in 0..3 {
             assert_eq!(
-                sack_passes(&space, s),
+                sacked_above(&space, s),
                 0,
                 "seq {s} was credited with newer deliveries the peer never received"
             );
@@ -1798,10 +1802,10 @@ mod tests {
         // Pick a time strictly after the fast window but strictly before the
         // stock window for the original send of seq 0 (sent at t0).
         let fast_deadline = t0 + fast;
-        let stock_deadline = t0 + stock;
+        let baseline_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
         assert!(
-            rtx_t < stock_deadline,
+            rtx_t < baseline_deadline,
             "rtx_t must be before stock deadline"
         );
 
@@ -1836,11 +1840,14 @@ mod tests {
             "one deferred loss entry pending"
         );
         assert_eq!(space.deferred_losses[0].seq, 0);
-        assert_eq!(space.deferred_losses[0].stock_deadline, stock_deadline);
+        assert_eq!(
+            space.deferred_losses[0].baseline_deadline,
+            baseline_deadline
+        );
     }
 
     #[test]
-    fn jitter_cap_deferred_loss_event_records_at_stock_deadline_if_still_unacked() {
+    fn jitter_cap_deferred_loss_event_records_at_baseline_deadline_if_still_unacked() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::with_jitter_cap(true);
         let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
@@ -1848,7 +1855,7 @@ mod tests {
         starve_seq0_with_sacks(&mut space, t0);
 
         let fast_deadline = t0 + fast;
-        let stock_deadline = t0 + stock;
+        let baseline_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
         let rtx = space.rtx(rtx_t).expect("jitter-cap fast rtx fires");
         assert_eq!(rtx.seq, 0);
@@ -1858,7 +1865,7 @@ mod tests {
         );
 
         // Still before the stock deadline: polling must not record anything.
-        let before_deadline = stock_deadline - ms(10);
+        let before_deadline = baseline_deadline - ms(10);
         space.poll_deferred_loss(before_deadline);
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
@@ -1872,7 +1879,7 @@ mod tests {
 
         // At the stock deadline, the packet is still unacked (genuine loss):
         // the deferred loss event must now be recorded exactly once.
-        space.poll_deferred_loss(stock_deadline + ms(1));
+        space.poll_deferred_loss(baseline_deadline + ms(1));
         assert!(
             space.loss_event_window.raw_has_loss_event(),
             "deferred loss event must record at stock deadline if still unacked"
@@ -1885,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn jitter_cap_repaired_before_stock_deadline_is_not_double_counted() {
+    fn jitter_cap_repaired_before_baseline_deadline_is_not_double_counted() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::with_jitter_cap(true);
         let (fast, stock) = settle_high_jitter_f2(&mut space, t0);
@@ -1893,7 +1900,7 @@ mod tests {
         starve_seq0_with_sacks(&mut space, t0);
 
         let fast_deadline = t0 + fast;
-        let stock_deadline = t0 + stock;
+        let baseline_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
         let rtx = space.rtx(rtx_t).expect("jitter-cap fast rtx fires");
         assert_eq!(rtx.seq, 0);
@@ -1907,7 +1914,7 @@ mod tests {
         // this was reordering, not loss.  The deferred entry must be cancelled
         // and no loss event recorded.  Polling after the deadline must NOT
         // double-count a later repair either.
-        let ack_t = stock_deadline - ms(100);
+        let ack_t = baseline_deadline - ms(100);
         assert!(ack_t > rtx_t);
         let acked = ack_one(&mut space, 0, ack_t);
         assert_eq!(acked, 1, "seq 0 must be acked");
@@ -1925,7 +1932,7 @@ mod tests {
 
         // Polling after the stock deadline must not record anything (the
         // entry is gone, no double-count).
-        space.poll_deferred_loss(stock_deadline + ms(1));
+        space.poll_deferred_loss(baseline_deadline + ms(1));
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
             "no double-count after repair before stock deadline"
@@ -1945,9 +1952,9 @@ mod tests {
 
         let fast = space.rtt_stats.fast_reorder_window();
         let fast_deadline = t0 + fast;
-        let stock_deadline = t0 + stock;
+        let baseline_deadline = t0 + stock;
         let between = fast_deadline + ms(50);
-        assert!(between < stock_deadline);
+        assert!(between < baseline_deadline);
         assert!(
             !space.has_rtx(between),
             "toggle off: no rtx before the stock reorder window"
@@ -1963,7 +1970,7 @@ mod tests {
             "toggle off: no deferred loss entries"
         );
 
-        let rtx_t = stock_deadline + ms(1);
+        let rtx_t = baseline_deadline + ms(1);
         assert!(
             space.has_rtx(rtx_t),
             "toggle off: stock rtx fires at stock deadline"
@@ -2041,22 +2048,18 @@ mod tests {
             let send_at = t0 + ms(12) + Duration::from_secs(i * 5);
             let seq = send_packet(&mut space, send_at);
             let balls = [
-                crate::sack::AckBall {
+                crate::sack::SackBlock {
                     start: 0,
                     size: std::num::NonZeroU64::new(1).unwrap(),
                 },
-                crate::sack::AckBall {
+                crate::sack::SackBlock {
                     start: 2,
                     size: std::num::NonZeroU64::new(seq - 1).unwrap(),
                 },
             ];
             let mut acked = Vec::new();
             last_ack = send_at + ms(1);
-            space.ack(
-                crate::sack::AckBallSequence::new(&balls),
-                &mut acked,
-                last_ack,
-            );
+            space.ack(crate::sack::SackBlockSeq::new(&balls), &mut acked, last_ack);
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
             assert_eq!(space.send_wnd.start().copied(), Some(1));
         }
@@ -2080,17 +2083,13 @@ mod tests {
         for i in 0..8 {
             let send_at = t0 + ms(1) + Duration::from_secs(i * 5);
             let seq = send_packet(&mut space, send_at);
-            let balls = [crate::sack::AckBall {
+            let balls = [crate::sack::SackBlock {
                 start: 1,
                 size: std::num::NonZeroU64::new(seq).unwrap(),
             }];
             let mut acked = Vec::new();
             last_ack = send_at + ms(1);
-            space.ack(
-                crate::sack::AckBallSequence::new(&balls),
-                &mut acked,
-                last_ack,
-            );
+            space.ack(crate::sack::SackBlockSeq::new(&balls), &mut acked, last_ack);
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
             assert_eq!(space.send_wnd.start().copied(), Some(0));
         }

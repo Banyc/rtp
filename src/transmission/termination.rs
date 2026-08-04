@@ -12,8 +12,8 @@ use crate::io_err::IoErr;
 const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(675);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PeerReset {
-    NoKill,
+pub(crate) enum KillPolicy {
+    Silent,
     SendKill,
 }
 
@@ -66,7 +66,7 @@ pub(crate) struct KillAttempt {
     inner: Arc<Inner>,
 }
 
-pub(crate) fn channel() -> (TerminationPresser, TerminationWriter, TerminationReaper) {
+pub(crate) fn new_termination() -> (TerminationPresser, TerminationWriter, TerminationReaper) {
     let inner = Arc::new(Inner {
         state: Mutex::new(State {
             first_error: None,
@@ -90,11 +90,11 @@ pub(crate) fn channel() -> (TerminationPresser, TerminationWriter, TerminationRe
 
 impl TerminationPresser {
     pub(crate) fn press_error(&self, error: IoErr) -> bool {
-        self.press(error, None, PeerReset::NoKill)
+        self.press(error, None, KillPolicy::Silent)
     }
     pub(crate) fn press_broken_pipe(
         &self,
-        peer_reset: PeerReset,
+        peer_reset: KillPolicy,
         context: Option<ProactiveTerminationContext>,
     ) -> bool {
         self.press(std::io::ErrorKind::BrokenPipe.into(), context, peer_reset)
@@ -103,7 +103,7 @@ impl TerminationPresser {
         &self,
         error: IoErr,
         context: Option<ProactiveTerminationContext>,
-        peer_reset: PeerReset,
+        peer_reset: KillPolicy,
     ) -> bool {
         let mut request_kill = false;
         let mut finish_kill = false;
@@ -113,7 +113,7 @@ impl TerminationPresser {
                 false
             } else {
                 state.first_error = Some(FirstErrorValue { error, context });
-                if peer_reset == PeerReset::SendKill {
+                if peer_reset == KillPolicy::SendKill {
                     if state.writer_alive {
                         state.kill = KillState::Requested;
                         request_kill = true;
@@ -134,7 +134,7 @@ impl TerminationPresser {
         self.inner.terminal.cancel();
         inserted
     }
-    pub(crate) fn throw_error(&self) -> Result<(), IoErr> {
+    pub(crate) fn check_error(&self) -> Result<(), IoErr> {
         match &self.inner.state.lock().unwrap().first_error {
             Some(first) => Err(first.error),
             None => Ok(()),
@@ -275,8 +275,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_kill_allows_immediate_reap() {
-        let (presser, _writer, reaper) = channel();
-        presser.press_broken_pipe(PeerReset::NoKill, None);
+        let (presser, _writer, reaper) = new_termination();
+        presser.press_broken_pipe(KillPolicy::Silent, None);
         tokio::time::timeout(std::time::Duration::from_millis(100), reaper.ready())
             .await
             .expect("a terminal error without KILL must reap immediately");
@@ -284,8 +284,8 @@ mod tests {
 
     #[tokio::test]
     async fn kill_gates_reap_until_attempt_finishes() {
-        let (presser, writer, reaper) = channel();
-        presser.press_broken_pipe(PeerReset::SendKill, None);
+        let (presser, writer, reaper) = new_termination();
+        presser.press_broken_pipe(KillPolicy::SendKill, None);
         let mut ready = Box::pin(reaper.ready());
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), &mut ready)
@@ -306,8 +306,8 @@ mod tests {
 
     #[tokio::test]
     async fn writer_drop_releases_kill_waiter() {
-        let (presser, writer, reaper) = channel();
-        presser.press_broken_pipe(PeerReset::SendKill, None);
+        let (presser, writer, reaper) = new_termination();
+        presser.press_broken_pipe(KillPolicy::SendKill, None);
         drop(writer);
         tokio::time::timeout(std::time::Duration::from_millis(100), reaper.ready())
             .await
@@ -316,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_close_waits_for_peer_fin_and_outbound_drain() {
-        let (_presser, _writer, reaper) = channel();
+        let (_presser, _writer, reaper) = new_termination();
         let peer_fin = CancellationToken::new();
         let outbound_drained = CancellationToken::new();
         let mut ready = Box::pin(reaper.ready_or_graceful_close(&peer_fin, async {
@@ -338,7 +338,7 @@ mod tests {
     #[tokio::test]
     async fn graceful_close_does_not_poll_drain_before_peer_fin() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let (_presser, _writer, reaper) = channel();
+        let (_presser, _writer, reaper) = new_termination();
         let peer_fin = CancellationToken::new();
         let drain_polled = Arc::new(AtomicBool::new(false));
         let drain = {
@@ -367,10 +367,10 @@ mod tests {
 
     #[tokio::test]
     async fn drain_error_does_not_bypass_pending_kill() {
-        let (presser, writer, reaper) = channel();
+        let (presser, writer, reaper) = new_termination();
         let peer_fin = CancellationToken::new();
         peer_fin.cancel();
-        presser.press_broken_pipe(PeerReset::SendKill, None);
+        presser.press_broken_pipe(KillPolicy::SendKill, None);
         let attempt = writer.take_kill_attempt().expect("KILL request");
         let mut ready = Box::pin(reaper.ready_or_graceful_close(&peer_fin, async {
             Err(std::io::ErrorKind::BrokenPipe.into())
@@ -388,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_close_timeout_permits_reap() {
-        let (_presser, _writer, reaper) = channel();
+        let (_presser, _writer, reaper) = new_termination();
         let peer_fin = CancellationToken::new();
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -404,10 +404,10 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_close_timeout_still_applies_after_drain_error() {
-        let (presser, writer, reaper) = channel();
+        let (presser, writer, reaper) = new_termination();
         let peer_fin = CancellationToken::new();
         peer_fin.cancel();
-        presser.press_broken_pipe(PeerReset::SendKill, None);
+        presser.press_broken_pipe(KillPolicy::SendKill, None);
         let attempt = writer.take_kill_attempt().expect("KILL request");
         tokio::time::timeout(
             std::time::Duration::from_millis(100),

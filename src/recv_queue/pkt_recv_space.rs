@@ -3,11 +3,8 @@ use std::collections::BTreeMap;
 use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
 use crate::{
-    delivery::frame::{
-        FrameDelivery,
-        recv::{RecvPkt, RecvSlot},
-    },
-    sack::AckQueue,
+    delivery::frame::recv::{RecvPkt, RecvSlot},
+    sack::SackIntervals,
 };
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
@@ -35,21 +32,21 @@ pub struct PktRecvSpace {
     slots: BTreeMap<u64, RecvSlot>,
     scan_start: u64,
     reused_buf: ObjPool<Vec<u8>>,
-    ack_history: AckQueue,
+    ack_history: SackIntervals,
 }
 
 impl PktRecvSpace {
-    pub fn new(_frame_delivery: FrameDelivery) -> Self {
+    pub fn new() -> Self {
         Self {
             next: Some(0),
             slots: BTreeMap::new(),
             scan_start: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
-            ack_history: AckQueue::new(),
+            ack_history: SackIntervals::new(),
         }
     }
 
-    pub fn ack_history(&self) -> &AckQueue {
+    pub fn ack_history(&self) -> &SackIntervals {
         &self.ack_history
     }
 
@@ -175,7 +172,7 @@ impl PktRecvSpace {
 
 impl Default for PktRecvSpace {
     fn default() -> Self {
-        Self::new(FrameDelivery::default())
+        Self::new()
     }
 }
 
@@ -185,7 +182,7 @@ mod tests {
 
     #[test]
     fn stock_recv_pop_in_order() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"hello".to_vec(), None));
         assert!(space.recv(1, b"world".to_vec(), None));
         assert_eq!(space.peek().unwrap(), b"hello");
@@ -196,7 +193,7 @@ mod tests {
 
     #[test]
     fn stock_recv_out_of_order() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(1, b"world".to_vec(), None));
         assert!(space.recv(0, b"hello".to_vec(), None));
         assert_eq!(space.pop().unwrap(), b"hello");
@@ -205,28 +202,28 @@ mod tests {
 
     #[test]
     fn stale_seq_is_acked_but_not_inserted() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"a".to_vec(), None));
-        let ack_count_after = space.ack_history().balls().count();
+        let ack_count_after = space.ack_history().blocks().count();
         space.pop();
         assert_eq!(
             space.recv_disposition(0, b"stale".to_vec(), None),
             RecvDisposition::Duplicate
         );
         assert!(!space.slots.contains_key(&0));
-        assert_eq!(space.ack_history().balls().count(), ack_count_after);
+        assert_eq!(space.ack_history().blocks().count(), ack_count_after);
     }
 
     #[test]
     fn window_capacity_rejects() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         let far_seq = MAX_NUM_RECVING_PKTS as u64; // seq 0 is next, so seq 8192 is out of window
         assert!(!space.recv(far_seq, b"x".to_vec(), None));
     }
 
     #[test]
     fn duplicate_acked_but_not_reinserted() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"a".to_vec(), None));
         assert_eq!(
             space.recv_disposition(0, b"b".to_vec(), None),
@@ -241,7 +238,7 @@ mod tests {
 
     #[test]
     fn fin_empty_payload_no_frame_len() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         // FIN: empty payload, no frame_len.
         assert!(space.recv(0, vec![], None));
         assert_eq!(space.peek().unwrap().len(), 0);
@@ -251,7 +248,7 @@ mod tests {
 
     #[test]
     fn tombstone_prefix_collapses() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         // Insert tombstones ahead of the cursor.
         space.slots.insert(0, RecvSlot::Tombstone);
         space.slots.insert(1, RecvSlot::Tombstone);
@@ -270,7 +267,7 @@ mod tests {
 
     #[test]
     fn pop_skips_head_tombstones() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         space.slots.insert(0, RecvSlot::Tombstone);
         space.slots.insert(
             1,
@@ -289,7 +286,7 @@ mod tests {
 
     #[test]
     fn ooo_complete_frame_delivers_past_sequence_hole() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Hole at seq 0; deliver a complete 1-packet frame at seq 1 first.
         assert!(space.recv(1, b"frame1".to_vec(), Some(6)));
         let frame = space.pop_complete_frame().unwrap();
@@ -303,7 +300,7 @@ mod tests {
 
     #[test]
     fn multi_packet_frame_waits_for_all_its_packets() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Frame of 11 bytes across 3 packets: seq 1 (start, 6 bytes), seq 2 (3 bytes), seq 3 (2 bytes).
         // Send all but the last.
         assert!(space.recv(1, b"hello ".to_vec(), Some(11)));
@@ -319,7 +316,7 @@ mod tests {
 
     #[test]
     fn frame_reassembly_survives_shuffled_arrival() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Frame A: seq 0 (start, len 4), seq 1 (cont)
         // Frame B: seq 2 (start, len 4), seq 3 (cont)
         // Deliver in reverse order to test contiguity handling.
@@ -343,7 +340,7 @@ mod tests {
 
     #[test]
     fn frame_continuation_with_own_frame_len_starts_new_run() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Frame: seq 1 (start, len 6)
         // But seq 2 is a new frame start (len 3), not a continuation — gap in seq 1's run.
         // Then seq 3 would be continuation of seq 2's frame.
@@ -360,21 +357,21 @@ mod tests {
 
     #[test]
     fn ack_generation_unaffected_by_early_delivery() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Insert packets out of order and verify ack_history is stock.
         assert!(space.recv(2, b"c".to_vec(), None));
         assert!(space.recv(0, b"a".to_vec(), None));
         assert!(space.recv(1, b"b".to_vec(), None));
 
         // ack_history should contain all three (merged into one ball 0..3).
-        let balls: Vec<_> = space.ack_history().balls().collect();
+        let balls: Vec<_> = space.ack_history().blocks().collect();
         assert_eq!(balls.len(), 1);
         assert_eq!(balls[0].start, 0);
         assert_eq!(balls[0].size.get(), 3);
 
         // After pop_complete_frame or pop, ack_history is NOT touched.
         space.pop();
-        let balls_after: Vec<_> = space.ack_history().balls().collect();
+        let balls_after: Vec<_> = space.ack_history().blocks().collect();
         assert_eq!(balls_after.len(), 1);
         assert_eq!(balls_after[0].start, 0);
         assert_eq!(balls_after[0].size.get(), 3);
@@ -382,7 +379,7 @@ mod tests {
 
     #[test]
     fn pop_complete_frame_tombstones_count_toward_window() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Deliver a frame at seq 1, leaving a hole at seq 0.
         assert!(space.recv(1, b"x".to_vec(), Some(1)));
         space.pop_complete_frame();
@@ -400,7 +397,7 @@ mod tests {
 
     #[test]
     fn mode_off_is_stock_byte_identical() {
-        let mut space = PktRecvSpace::new(FrameDelivery::default());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"hello".to_vec(), None));
         assert!(space.recv(2, b"world".to_vec(), None));
         assert!(space.recv(1, b" ".to_vec(), None));
@@ -419,7 +416,7 @@ mod tests {
     /// `WouldBlock` forever (connections hung on close).
     #[test]
     fn fin_at_head_after_all_data_delivered() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Deliver a data frame at seq 0, then a FIN at seq 1.
         assert!(space.recv(0, b"data".to_vec(), Some(4)));
         assert!(space.recv(1, vec![], None));
@@ -440,14 +437,14 @@ mod tests {
 
     #[test]
     fn a_frame_is_delivered_at_its_declared_length() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"ABCDEFGH".to_vec(), Some(4)));
         assert_eq!(space.pop_complete_frame().unwrap(), b"ABCD");
     }
 
     #[test]
     fn a_multi_packet_frame_stops_at_its_declared_length() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"AB".to_vec(), Some(5)));
         assert!(space.recv(1, b"CDEFGH".to_vec(), None));
         assert_eq!(space.pop_complete_frame().unwrap(), b"ABCDE");
@@ -455,7 +452,7 @@ mod tests {
 
     #[test]
     fn oversize_frame_len_cannot_pin_the_in_order_cursor() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         assert_eq!(
             space.recv_disposition(0, b"poison".to_vec(), Some(u32::MAX)),
             RecvDisposition::Rejected
@@ -468,7 +465,7 @@ mod tests {
 
     #[test]
     fn zero_frame_len_is_rejected() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         assert_eq!(
             space.recv_disposition(0, vec![], Some(0)),
             RecvDisposition::Rejected
@@ -479,7 +476,7 @@ mod tests {
 
     #[test]
     fn max_frame_len_is_still_accepted() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         let max = crate::delivery::frame::send::MAX_FRAME_LEN;
         assert_eq!(
             space.recv_disposition(0, vec![0u8; 1], Some(max as u32)),
@@ -491,7 +488,7 @@ mod tests {
     /// behind an out-of-order gap does NOT surface EOF until the gap fills.
     #[test]
     fn fin_behind_gap_does_not_surface_eof() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         // Gap at seq 0; FIN at seq 1 (but seq 0 is missing).
         assert!(space.recv(1, vec![], None));
 
@@ -517,7 +514,7 @@ mod tests {
 
     #[test]
     fn a_late_packet_below_the_scan_cursor_still_completes_its_frame() {
-        let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+        let mut space = PktRecvSpace::new();
         for seq in 2..64 {
             assert!(space.recv(seq, b"x".to_vec(), Some(1)));
         }
@@ -543,7 +540,7 @@ mod tests {
     fn ooo_pop_cost(outstanding: u64) -> f64 {
         let mut best = f64::MAX;
         for _ in 0..3 {
-            let mut space = PktRecvSpace::new(FrameDelivery::enabled());
+            let mut space = PktRecvSpace::new();
             for seq in 1..=outstanding {
                 assert!(space.recv(seq, b"x".to_vec(), Some(1)));
             }

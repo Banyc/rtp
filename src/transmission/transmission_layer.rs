@@ -5,11 +5,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::{fec::FecState, fec_tuning::FecTuning};
-use crate::delivery::frame::FrameDelivery;
+use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
-use crate::sack::AckBall;
-
-pub use crate::send_queue::liveness::PeerStall;
+use crate::sack::SackBlock;
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
@@ -66,18 +64,26 @@ pub(crate) type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 /// to avoid per-call allocation.
 #[derive(Debug)]
 pub struct SendBufs {
-    pub(crate) data: Vec<u8>,
-    pub(crate) utp: Vec<u8>,
-    pub(crate) fec: Vec<u8>,
+    payload: Vec<u8>,
+    codec_pkt: Vec<u8>,
+    wire_pkt: Vec<u8>,
 }
 
 impl SendBufs {
     pub fn new() -> Self {
         Self {
-            data: vec![0; BUF_SIZE],
-            utp: vec![0; BUF_SIZE],
-            fec: vec![0; BUF_SIZE],
+            payload: vec![0; BUF_SIZE],
+            codec_pkt: vec![0; BUF_SIZE],
+            wire_pkt: vec![0; BUF_SIZE],
         }
+    }
+
+    pub(crate) fn parts_mut(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>) {
+        (&mut self.payload, &mut self.codec_pkt, &mut self.wire_pkt)
+    }
+
+    pub(crate) fn wire_pkt_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.wire_pkt
     }
 }
 
@@ -91,8 +97,8 @@ impl Default for SendBufs {
 /// to avoid per-call allocation.
 #[derive(Debug)]
 pub struct RecvBufs {
-    pub utp: Vec<u8>,
-    pub ack_from_peer: Vec<AckBall>,
+    pub codec_pkt: Vec<u8>,
+    pub ack_from_peer: Vec<SackBlock>,
     pub ack_to_peer: Vec<u64>,
     pub codec_pkts: Vec<Vec<u8>>,
 }
@@ -100,7 +106,7 @@ pub struct RecvBufs {
 impl RecvBufs {
     pub fn new() -> Self {
         Self {
-            utp: vec![0; BUF_SIZE],
+            codec_pkt: vec![0; BUF_SIZE],
             ack_from_peer: vec![],
             ack_to_peer: vec![],
             codec_pkts: vec![],
@@ -122,7 +128,7 @@ pub struct UnreliableLayer {
     pub(crate) mss: NonZeroUsize,
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
-    pub(crate) frame_delivery: FrameDelivery,
+    pub(crate) frame_delivery: FrameMode,
     /// Retransmission-armor duplicate-copy toggle.  Set once at construction
     /// from the connect/accept config (which reads `RTP_RTX_DUP` in
     /// `Default`); the shared session state is seeded from here.
@@ -142,7 +148,6 @@ pub struct RecvPkts {
 
 #[derive(Debug, Clone)]
 pub enum SendKillPkt {
-    Yes,
     No,
 }
 
@@ -197,16 +202,16 @@ pub struct LogConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Log<'a> {
+pub struct MetricsRow<'a> {
     pub time: u128,
     pub op: &'a str,
 
     pub tokens: f64,
     pub send_rate: f64,
     pub loss_rate: Option<f64>,
-    pub num_tx_pkts: usize,
+    pub num_in_flight_pkts: usize,
     pub num_pkts_in_pipe: usize,
-    pub num_rt_pkts: usize,
+    pub num_rtx_pkts: usize,
     pub send_seq: u64,
     pub min_rtt: Option<u128>,
     pub rtt: u128,

@@ -3,11 +3,11 @@ use std::{future::Future, pin::Pin, task::Poll};
 
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 
-use super::stream::{ReadSocket, WriteSocket};
+use super::stream::{ConnReader, ConnWriter};
 
 use crate::transmission::{
+    connection::{Connection, new_connection, new_connection_with_watchdog_tuning},
     read_half::ReadHalf,
-    shared::{Shared, build_parts, build_parts_with_watchdog_tuning},
     termination::TerminationReaper,
     transmission_layer::{LogConfig, RecvBufs, SendBufs, SendKillPkt, UnreliableLayer},
     watchdog_tuning::WatchdogTuning,
@@ -15,12 +15,12 @@ use crate::transmission::{
 };
 
 #[derive(Debug)]
-#[must_use = "the RTP session supervisor must be retained and awaited"]
-pub struct SessionSupervisor {
+#[must_use = "the RTP session handle must be retained and awaited"]
+pub struct SessionHandle {
     join: JoinHandle<()>,
 }
 
-impl Future for SessionSupervisor {
+impl Future for SessionHandle {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.join).poll(cx) {
@@ -37,7 +37,7 @@ impl Future for SessionSupervisor {
 pub fn socket(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
-) -> (ReadSocket, WriteSocket, SessionSupervisor) {
+) -> (ConnReader, ConnWriter, SessionHandle) {
     build_socket(TransmissionLayer::new(unreliable_layer, log_config))
 }
 
@@ -45,7 +45,7 @@ pub fn socket_with_watchdog_tuning(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
     tuning: WatchdogTuning,
-) -> (ReadSocket, WriteSocket, SessionSupervisor) {
+) -> (ConnReader, ConnWriter, SessionHandle) {
     build_socket(TransmissionLayer::new_with_watchdog_tuning(
         unreliable_layer,
         log_config,
@@ -53,21 +53,21 @@ pub fn socket_with_watchdog_tuning(
     ))
 }
 
-type SocketParts = (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper);
+type SocketParts = (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper);
 
 /// The composed session before the driver tasks are spawned.  Production
 /// [`socket`] / [`socket_with_watchdog_tuning`] hand one to [`build_socket`],
 /// which spawns the write/read driver tasks; the test facade holds the same
 /// composition to poke the write/read halves directly without spawning them.
 pub(crate) struct TransmissionLayer {
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) shared: Arc<Connection>,
     pub(crate) write_half: WriteHalf,
     pub(crate) read_half: ReadHalf,
     pub(crate) termination_reaper: TerminationReaper,
 }
 
 impl std::ops::Deref for TransmissionLayer {
-    type Target = Shared;
+    type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
         &self.shared
@@ -86,7 +86,7 @@ impl TransmissionLayer {
     }
 
     pub(crate) fn new(unreliable_layer: UnreliableLayer, log_config: Option<LogConfig>) -> Self {
-        Self::from_parts(build_parts(unreliable_layer, log_config))
+        Self::from_parts(new_connection(unreliable_layer, log_config))
     }
 
     pub(crate) fn new_with_watchdog_tuning(
@@ -94,7 +94,7 @@ impl TransmissionLayer {
         log_config: Option<LogConfig>,
         tuning: WatchdogTuning,
     ) -> Self {
-        Self::from_parts(build_parts_with_watchdog_tuning(
+        Self::from_parts(new_connection_with_watchdog_tuning(
             unreliable_layer,
             log_config,
             tuning,
@@ -112,13 +112,13 @@ impl TransmissionLayer {
     }
 }
 
-fn build_socket(parts: TransmissionLayer) -> (ReadSocket, WriteSocket, SessionSupervisor) {
+fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHandle) {
     let (shared, write_half, read_half, termination_reaper) = parts.into_parts();
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
     let stop_drivers = tokio_util::sync::CancellationToken::new();
-    let mut events = JoinSet::new();
-    events.spawn({
+    let mut drivers = JoinSet::new();
+    drivers.spawn({
         let stop_drivers = stop_drivers.clone();
         async move {
             let mut write_half = write_half;
@@ -150,7 +150,7 @@ fn build_socket(parts: TransmissionLayer) -> (ReadSocket, WriteSocket, SessionSu
             }
         }
     });
-    events.spawn({
+    drivers.spawn({
         let read_shutdown = read_shutdown.clone();
         let stop_drivers = stop_drivers.clone();
         let shared = Arc::clone(&shared);
@@ -175,13 +175,7 @@ fn build_socket(parts: TransmissionLayer) -> (ReadSocket, WriteSocket, SessionSu
                 };
                 let recv_pkts = match recv_result {
                     Ok(recv_pkts) => recv_pkts,
-                    Err((_e, should_send_kill_pkt)) => {
-                        match should_send_kill_pkt {
-                            SendKillPkt::Yes => {
-                                shared.request_kill_and_abort();
-                            }
-                            SendKillPkt::No => (),
-                        }
+                    Err((_e, SendKillPkt::No)) => {
                         return;
                     }
                 };
@@ -192,55 +186,55 @@ fn build_socket(parts: TransmissionLayer) -> (ReadSocket, WriteSocket, SessionSu
             }
         }
     });
-    let supervisor = SessionSupervisor {
+    let supervisor = SessionHandle {
         join: tokio::spawn({
             let read_shutdown = read_shutdown.clone();
             let write_shutdown = write_shutdown.clone();
             let stop_drivers = stop_drivers.clone();
             let shared = Arc::clone(&shared);
             async move {
-                let mut events = events;
+                let mut drivers = drivers;
                 let first_exit = 'session: {
                     tokio::select! {
                         () = write_shutdown.cancelled() => { shared.send_fin_buf(); shared.resume_send().notify_one(); }
                         () = termination_reaper.ready() => break 'session None,
-                        result = next_event_exit(&mut events) => break 'session Some(result),
+                        result = next_driver_exit(&mut drivers) => break 'session Some(result),
                     }
                     tokio::select! {
                         () = read_shutdown.cancelled() => (),
                         () = termination_reaper.ready() => break 'session None,
-                        result = next_event_exit(&mut events) => break 'session Some(result),
+                        result = next_driver_exit(&mut drivers) => break 'session Some(result),
                     }
                     tokio::select! {
                         () = termination_reaper.ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained()) => break 'session None,
-                        result = next_event_exit(&mut events) => break 'session Some(result),
+                        result = next_driver_exit(&mut drivers) => break 'session Some(result),
                     }
                 };
                 stop_drivers.cancel();
-                join_drivers(events, first_exit, &shared).await
+                join_drivers(drivers, first_exit, &shared).await
             }
         }),
     };
-    let read = ReadSocket {
+    let read = ConnReader {
         transmission_layer: Arc::clone(&shared),
         frame_buf: Vec::new(),
         _shutdown_guard: read_shutdown.drop_guard(),
     };
-    let write = WriteSocket {
+    let write = ConnWriter {
         transmission_layer: Arc::clone(&shared),
         _shutdown_guard: write_shutdown.drop_guard(),
     };
     (read, write, supervisor)
 }
 
-async fn next_event_exit(events: &mut JoinSet<()>) -> Result<(), JoinError> {
-    events.join_next().await.unwrap_or(Ok(()))
+async fn next_driver_exit(drivers: &mut JoinSet<()>) -> Result<(), JoinError> {
+    drivers.join_next().await.unwrap_or(Ok(()))
 }
 
 async fn join_drivers(
-    mut events: JoinSet<()>,
+    mut drivers: JoinSet<()>,
     first_exit: Option<Result<(), JoinError>>,
-    shared: &Shared,
+    shared: &Connection,
 ) {
     let unexpected_clean_exit =
         first_exit.as_ref().is_some_and(Result::is_ok) && !shared.termination.has_error();
@@ -258,7 +252,7 @@ async fn join_drivers(
                 Err(_error) => {}
             }
         }
-        result = events.join_next().await;
+        result = drivers.join_next().await;
         if result.is_none() {
             break;
         }
@@ -277,6 +271,7 @@ mod tests {
     use tokio::net::UdpSocket;
 
     use crate::io_err::IoErr;
+    use crate::transmission::test_doubles::PendingRead;
     use crate::udp::wrap_fec;
 
     use super::*;
@@ -456,17 +451,6 @@ mod tests {
     #[tokio::test]
     async fn supervisor_waits_for_requested_kill_attempt_before_reaping() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        #[derive(Debug)]
-        struct PendingRead;
-        #[async_trait::async_trait]
-        impl crate::transmission::transmission_layer::UnreliableRead for PendingRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::WouldBlock.into())
-            }
-            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                std::future::pending().await
-            }
-        }
         #[derive(Debug)]
         struct KillGateWrite {
             kill_started: Arc<tokio::sync::Notify>,

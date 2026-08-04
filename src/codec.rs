@@ -5,9 +5,8 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tap::Pipe;
 use thiserror::Error;
 
-pub use crate::delivery::frame::wire::frame_data_overhead;
 use crate::delivery::frame::wire::{FRAME_DATA_TS_CMD, decode_frame_data_ts, encode_frame_data_ts};
-use crate::sack::{AckBall, AckQueue};
+use crate::sack::{SackBlock, SackIntervals};
 
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
@@ -17,6 +16,7 @@ const ECHO_TS_CMD: u8 = 4;
 // cmd 5 (`FRAME_DATA_TS_CMD`) belongs to frame-delivery mode; see
 // `crate::delivery::frame::wire`.
 
+#[cfg(test)]
 pub fn in_cmd_space(buf: u8) -> bool {
     matches!(
         buf,
@@ -41,11 +41,11 @@ pub fn encode_ack_data(
     let mut wtr = io::Cursor::new(buf);
     if let Some(EncodeAck {
         queue,
-        skip,
-        max_take,
+        first_block_index,
+        max_blocks,
     }) = ack
     {
-        for ack in queue.balls().skip(skip).take(max_take) {
+        for ack in queue.blocks().skip(first_block_index).take(max_blocks) {
             wtr.write_u8(ACK_CMD)
                 .pipe(wrap_insufficient_buffer_size_err)?;
             encode_ack(&mut wtr, ack)?;
@@ -93,9 +93,9 @@ pub fn encode_ack_data(
 }
 #[derive(Debug, Clone)]
 pub struct EncodeAck<'a> {
-    pub queue: &'a AckQueue,
-    pub skip: usize,
-    pub max_take: usize,
+    pub queue: &'a SackIntervals,
+    pub first_block_index: usize,
+    pub max_blocks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -127,7 +127,7 @@ pub struct DecodedDataPkt {
     pub frame_len: Option<u32>,
     pub buf_range: std::ops::Range<usize>,
 }
-pub fn decode(buf: &[u8], ack: &mut Vec<AckBall>) -> Result<Decoded, DecodeError> {
+pub fn decode(buf: &[u8], ack: &mut Vec<SackBlock>) -> Result<Decoded, DecodeError> {
     let mut killed = false;
     let mut echo_ts = None;
     let mut rdr = io::Cursor::new(buf);
@@ -178,7 +178,7 @@ pub fn decode(buf: &[u8], ack: &mut Vec<AckBall>) -> Result<Decoded, DecodeError
     })
 }
 
-fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: AckBall) -> Result<(), EncodeError> {
+fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: SackBlock) -> Result<(), EncodeError> {
     wtr.write_u64::<BigEndian>(ack.start)
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u64::<BigEndian>(ack.size.get())
@@ -186,11 +186,11 @@ fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: AckBall) -> Result<(), Encod
     Ok(())
 }
 
-fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<AckBall, DecodeError> {
+fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<SackBlock, DecodeError> {
     let start = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
     let size = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
     let size = NonZeroU64::new(size).ok_or(DecodeError::Corrupted)?;
-    Ok(AckBall { start, size })
+    Ok(SackBlock { start, size })
 }
 
 pub const fn data_overhead() -> usize {
@@ -286,18 +286,18 @@ pub enum DecodeError {
 #[cfg(test)]
 mod tests {
     use super::{DecodeError, EncodeAck, EncodeData, decode, encode_ack_data};
-    use crate::sack::AckQueue;
+    use crate::sack::SackIntervals;
 
     #[test]
     fn roundtrip_ack_echo_data() {
-        let mut queue = AckQueue::new();
+        let mut queue = SackIntervals::new();
         for seq in 10..15 {
             queue.insert(seq);
         }
         let ack = EncodeAck {
             queue: &queue,
-            skip: 0,
-            max_take: 64,
+            first_block_index: 0,
+            max_blocks: 64,
         };
         let data = EncodeData {
             seq: 42,

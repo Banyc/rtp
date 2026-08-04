@@ -1,5 +1,5 @@
 #[derive(Debug)]
-pub(crate) struct Coordination {
+pub(crate) struct Signals {
     pub(crate) sent_data_pkt: tokio::sync::Notify,
     pub(crate) recv_data_pkt: tokio::sync::Notify,
     pub(crate) sent_pkt_acked: tokio::sync::Notify,
@@ -9,7 +9,7 @@ pub(crate) struct Coordination {
     pub(crate) recv_eof: tokio_util::sync::CancellationToken,
 }
 
-impl Coordination {
+impl Signals {
     pub(crate) fn new() -> Self {
         Self {
             sent_data_pkt: tokio::sync::Notify::new(),

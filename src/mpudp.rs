@@ -5,10 +5,10 @@ use mpudp::{conn::MpUdpConn, listen::MpUdpListener, read::MpUdpRead, write::MpUd
 
 use crate::io_err::IoErr;
 use crate::{
-    socket::{ReadSocket, SessionSupervisor, WriteSocket, socket},
+    delivery::frame::FrameMode,
+    socket::{ConnReader, ConnWriter, SessionHandle, socket},
     transmission::{
         fec_tuning::FecTuning,
-        frame_delivery::FrameDelivery,
         transmission_layer::{UnreliableRead, UnreliableWrite},
     },
     udp::{
@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-pub const MSS: usize = 1400;
+pub const MPUDP_MSS: usize = 1400;
 const DISPATCHER_BUF_SIZE: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 #[derive(Debug)]
@@ -42,9 +42,9 @@ impl Listener {
 }
 #[derive(Debug)]
 pub struct Conn {
-    pub read: ReadSocket,
-    pub write: WriteSocket,
-    pub supervisor: SessionSupervisor,
+    pub read: ConnReader,
+    pub write: ConnWriter,
+    pub supervisor: SessionHandle,
 }
 impl Conn {
     pub async fn connect_with(
@@ -65,7 +65,7 @@ async fn convert_conn(
     conn: MpUdpConn,
     log_config: Option<LogConfig<'_>>,
     tuning: FecTuning,
-    frame_delivery: FrameDelivery,
+    frame_delivery: FrameMode,
 ) -> io::Result<Conn> {
     let log_config = match log_config {
         Some(c) => {
@@ -82,7 +82,7 @@ async fn convert_conn(
         Box::new(r),
         Box::new(w),
         false,
-        ValidMss::try_new(MSS).unwrap(),
+        ValidMss::try_new(MPUDP_MSS).unwrap(),
         tuning,
         frame_delivery,
     )?;

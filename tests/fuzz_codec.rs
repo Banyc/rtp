@@ -1,5 +1,4 @@
-use rtp::codec::{DecodedDataPkt, decode};
-use rtp::testing::SplitMix64;
+use rtp::testing::{DecodedDataPkt, SplitMix64, decode};
 
 const ROUNDS: usize = 400_000;
 

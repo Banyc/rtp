@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::shared::Shared;
-use super::termination::{PeerReset, TerminationWriter};
+use super::connection::Connection;
+use super::termination::{KillPolicy, TerminationWriter};
 use super::transmission_layer::{
     FEC_DEBUG, PRINT_DEBUG_MSGS, ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
@@ -11,7 +11,7 @@ use crate::io_err::IoErr;
 use crate::pacer::SendWake;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SendPass {
+pub(crate) struct SendLoopResult {
     pub(crate) made_progress: bool,
     pub(crate) wake: SendWake,
 }
@@ -19,12 +19,12 @@ pub(crate) struct SendPass {
 #[derive(Debug)]
 pub struct WriteHalf {
     pub(crate) utp_write: Box<dyn UnreliableWrite>,
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) shared: Arc<Connection>,
     pub(crate) termination_writer: TerminationWriter,
 }
 
 impl std::ops::Deref for WriteHalf {
-    type Target = Shared;
+    type Target = Connection;
     fn deref(&self) -> &Self::Target {
         &self.shared
     }
@@ -42,8 +42,8 @@ impl WriteHalf {
         Some(result)
     }
 
-    async fn throw_error_after_requested_kill(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        match self.termination.throw_error() {
+    async fn check_error_after_requested_kill(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
+        match self.termination.check_error() {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = self.try_send_requested_kill(bufs).await;
@@ -78,7 +78,7 @@ impl WriteHalf {
             return;
         }
         self.termination
-            .press_broken_pipe(PeerReset::SendKill, Some(context));
+            .press_broken_pipe(KillPolicy::SendKill, Some(context));
     }
 
     #[cfg(test)]
@@ -86,10 +86,10 @@ impl WriteHalf {
         self.send_pkts_inner(bufs, Instant::now()).await
     }
 
-    pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendPass, IoErr> {
+    pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendLoopResult, IoErr> {
         let now = Instant::now();
         let made_progress = self.send_pkts_inner(bufs, now).await?;
-        Ok(SendPass {
+        Ok(SendLoopResult {
             made_progress,
             wake: self.next_send_wake(now),
         })
@@ -100,7 +100,7 @@ impl WriteHalf {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
         self.proactively_terminate_stalled_session();
-        self.throw_error_after_requested_kill(bufs).await?;
+        self.check_error_after_requested_kill(bufs).await?;
         self.send_due_post_open_response().await?;
         let mut written_bytes = 0;
         let mut written_fin = false;
@@ -108,10 +108,11 @@ impl WriteHalf {
             if self.try_send_requested_kill(bufs).await.is_some() {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
-            self.throw_error_after_requested_kill(bufs).await?;
+            self.check_error_after_requested_kill(bufs).await?;
+            let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
             let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_pkt(&mut bufs.data, now)
+                reliable_layer.send_data_pkt(payload, now)
             };
             self.log("send_data_pkt");
             let Some(p) = res else {
@@ -130,20 +131,20 @@ impl WriteHalf {
                     0
                 }
             };
-            let was_repair = p.was_repair;
+            let is_recovery = p.is_recovery;
             let queue_building = self.reliable_layer.lock().unwrap().queue_building();
             let data = EncodeData {
                 seq: p.seq,
                 send_ts: Some(self.wire_ts(now)),
                 frame_len: p.frame_len,
-                data: &bufs.data[..data_written],
+                data: &payload[..data_written],
             };
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
             let instream = self.instream_group_fec_enabled();
             let has_fec = self.fec.is_some() || instream;
-            let wants_dup = self.rtx_dup() && was_repair && !queue_building;
+            let wants_dup = self.rtx_dup() && is_recovery && !queue_building;
             let (primary_res, send_buf): (_, Option<&[u8]>) = if !has_fec {
                 let ts = data.send_ts.unwrap_or(0);
                 let cmd: u8 = match data.frame_len {
@@ -165,27 +166,27 @@ impl WriteHalf {
                     hdr[13..15].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
                     15
                 };
-                let payload = &bufs.data[..data_written];
+                let payload_slice = &payload[..data_written];
                 let iov = [
                     std::io::IoSlice::new(&hdr[..hdr_len]),
-                    std::io::IoSlice::new(payload),
+                    std::io::IoSlice::new(payload_slice),
                 ];
                 let res = self.utp_write.send_vectored(&iov).await;
                 let dup_buf = if wants_dup {
-                    let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
-                    Some(&bufs.utp[..n])
+                    let n = encode_ack_data(None, None, Some(data), codec_pkt).unwrap();
+                    Some(&codec_pkt[..n])
                 } else {
                     None
                 };
                 (res, dup_buf)
             } else {
-                let n = encode_ack_data(None, None, Some(data), &mut bufs.utp).unwrap();
-                let utp_pkt = &bufs.utp[..n];
+                let n = encode_ack_data(None, None, Some(data), codec_pkt).unwrap();
+                let utp_pkt = &codec_pkt[..n];
                 let send_buf: &[u8] = match self.fec.as_ref() {
                     Some(fec) => {
                         let mut fec = fec.lock().unwrap();
-                        let fec_n = fec.encode_data(utp_pkt, &mut bufs.fec, instream);
-                        &bufs.fec[..fec_n]
+                        let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
+                        &wire_pkt[..fec_n]
                     }
                     None => utp_pkt,
                 };
@@ -235,14 +236,14 @@ impl WriteHalf {
             if PRINT_DEBUG_MSGS {
                 println!("send_pkts: {{ data: {written_bytes}; fin: {written_fin} }}");
             }
-            self.coord.sent_data_pkt.notify_waiters();
+            self.signals.sent_data_pkt.notify_waiters();
         }
         if self.fec.is_some() {
-            let stock_can_send_tail_fec =
+            let baseline_can_send_tail_fec =
                 { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
             let data_path = true;
             let can_send_tail_fec = self.fec_instream_flush
-                || stock_can_send_tail_fec
+                || baseline_can_send_tail_fec
                 || (data_path && self.instream_group_fec_enabled());
             self.close_fec_burst(now, can_send_tail_fec).await?;
         }
@@ -352,7 +353,7 @@ impl WriteHalf {
         let mut buf = [0; 1];
         encode_kill(&mut buf).unwrap();
         let fec_enabled = self.fec.is_some();
-        let res = self.send_with_fec(&buf, &mut bufs.fec).await;
+        let res = self.send_with_fec(&buf, bufs.wire_pkt_mut()).await;
         if res.is_err() && fec_enabled {
             self.skip_open_fec_group();
         }
@@ -369,10 +370,10 @@ impl WriteHalf {
     #[cfg(test)]
     pub async fn send_kill_and_abort(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         self.termination
-            .press_broken_pipe(PeerReset::SendKill, None);
+            .press_broken_pipe(KillPolicy::SendKill, None);
         match self.try_send_requested_kill(bufs).await {
             Some(result) => result,
-            None => self.termination.throw_error(),
+            None => self.termination.check_error(),
         }
     }
 

@@ -12,11 +12,11 @@ use crate::io_err::IoErr;
 #[cfg(test)]
 use crate::transmission::transmission_layer::UnreliableLayer;
 use crate::{
-    delivery::frame::{FrameDelivery, frame_delivery_from_env},
+    delivery::frame::{FrameMode, frame_delivery_from_env},
     handshake::{client_opening_handshake, server_opening_handshake},
     socket::{
-        FrameReader, FrameWriter, ReadSocket, SessionSupervisor, WriteSocket, into_frame_io_parts,
-        socket, socket_with_watchdog_tuning,
+        ConnReader, ConnWriter, FrameByteReader, FrameByteWriter, SessionHandle,
+        into_frame_io_parts, socket, socket_with_watchdog_tuning,
     },
     transmission::{
         fec_tuning::{FecTuning, fec_tuning_from_env},
@@ -41,7 +41,7 @@ mod raw_send;
 /// unaffected — there is no global drop flag on the production
 /// `UnreliableRead`/`UnreliableWrite` impls.
 ///
-/// Loss is per-instance, not global: each test creates a [`LossRate`] and
+/// Loss is per-instance, not global: each test creates a [`BasisPoints`] and
 /// injects it into the wrappers it wants to be lossy, so tests never interfere
 /// with each other.
 #[cfg(test)]
@@ -122,7 +122,7 @@ async fn connect_udp(
     Err(last_error.expect("resolve_socket_addrs returned at least one address"))
 }
 
-pub type Handshake = tokio::task::JoinHandle<std::io::Result<Accepted>>;
+pub type AcceptTask = tokio::task::JoinHandle<std::io::Result<Accepted>>;
 
 #[derive(Debug)]
 pub struct Listener {
@@ -135,8 +135,8 @@ impl Listener {
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
-        let responder = crate::probe::ProbeResponder::new(probe_echo_socket(&udp));
-        let dispatch: Dispatch<SocketAddr, SocketAddr, Packet> =
+        let responder = crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp));
+        let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
             Arc::new(move |addr: &SocketAddr, packet: Packet| {
                 if responder.observe(addr, packet.as_ref()) {
                     return None;
@@ -174,8 +174,8 @@ impl Listener {
     /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
     ///
     /// You should keep this method in a loop.
-    pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<Handshake> {
-        let accepted = self.listener.accept().await?;
+    pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<AcceptTask> {
+        let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         Ok(tokio::spawn(async move {
             accept(
@@ -199,7 +199,7 @@ impl Listener {
         &self,
         config: AcceptConfig,
     ) -> std::io::Result<Accepted> {
-        let accepted = self.listener.accept().await?;
+        let accepted = self.listener.poll_next_conn().await?;
         accept(
             accepted,
             false,
@@ -221,7 +221,7 @@ impl Listener {
         &self,
         config: AcceptConfig,
     ) -> std::io::Result<FrameDeliveryAccept> {
-        let accepted = self.listener.accept().await?;
+        let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
         Ok(tokio::spawn(async move {
@@ -231,7 +231,7 @@ impl Listener {
                 config.fec,
                 config.mss.resolve()?,
                 config.fec_tuning,
-                FrameDelivery::enabled(),
+                FrameMode::enabled(),
                 config.rtx_dup,
                 config.instream_group_fec,
                 raw_fd,
@@ -249,20 +249,20 @@ impl Listener {
 }
 #[derive(Debug)]
 pub struct Accepted {
-    pub read: ReadSocket,
-    pub write: WriteSocket,
-    pub supervisor: SessionSupervisor,
+    pub read: ConnReader,
+    pub write: ConnWriter,
+    pub supervisor: SessionHandle,
     pub peer_addr: SocketAddr,
 }
 
 #[derive(Debug)]
 pub struct FrameDeliveryIo {
-    pub read: FrameReader,
-    pub write: FrameWriter,
-    pub supervisor: SessionSupervisor,
+    pub read: FrameByteReader,
+    pub write: FrameByteWriter,
+    pub supervisor: SessionHandle,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
-    pub probe_tap: Option<crate::probe::ProbeTap>,
+    pub probe_tap: Option<crate::path_probe::EchoDemux>,
 }
 pub type FrameDeliveryAccept = tokio::task::JoinHandle<std::io::Result<FrameDeliveryIo>>;
 
@@ -277,7 +277,7 @@ pub struct AcceptConfig {
     pub fec: bool,
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
-    pub frame_delivery: FrameDelivery,
+    pub frame_delivery: FrameMode,
     pub rtx_dup: bool,
     pub instream_group_fec: bool,
 }
@@ -306,7 +306,7 @@ pub struct ConnectConfig<'a> {
     pub fec: bool,
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
-    pub frame_delivery: FrameDelivery,
+    pub frame_delivery: FrameMode,
     pub rtx_dup: bool,
     pub instream_group_fec: bool,
     pub watchdog: Option<WatchdogTuning>,
@@ -328,13 +328,14 @@ impl<'a> Default for ConnectConfig<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept(
     accepted: IdentityConn,
     handshake: bool,
     fec: bool,
     mss: ValidMss,
     tuning: FecTuning,
-    frame_delivery: FrameDelivery,
+    frame_delivery: FrameMode,
     rtx_dup: bool,
     instream_group_fec: bool,
     raw_fd: MaybeRawFd,
@@ -369,12 +370,12 @@ async fn accept(
 }
 
 fn make_frame_delivery_io(
-    read: ReadSocket,
-    write: WriteSocket,
-    supervisor: SessionSupervisor,
+    read: ConnReader,
+    write: ConnWriter,
+    supervisor: SessionHandle,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-    probe_tap: Option<crate::probe::ProbeTap>,
+    probe_tap: Option<crate::path_probe::EchoDemux>,
 ) -> std::io::Result<FrameDeliveryIo> {
     let (read, write) = into_frame_io_parts(read, write)?.into_parts();
     Ok(FrameDeliveryIo {
@@ -421,12 +422,12 @@ async fn connect_configured(
 
 #[derive(Debug)]
 pub struct Connected {
-    pub read: ReadSocket,
-    pub write: WriteSocket,
-    pub supervisor: SessionSupervisor,
+    pub read: ConnReader,
+    pub write: ConnWriter,
+    pub supervisor: SessionHandle,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
-    pub probe_tap: Option<crate::probe::ProbeTap>,
+    pub probe_tap: Option<crate::path_probe::EchoDemux>,
 }
 
 impl FrameDeliveryIo {
@@ -439,7 +440,7 @@ impl FrameDeliveryIo {
             bind,
             addr,
             ConnectConfig {
-                frame_delivery: FrameDelivery::enabled(),
+                frame_delivery: FrameMode::enabled(),
                 ..config
             },
         )
@@ -463,7 +464,7 @@ impl FrameDeliveryIo {
             socket,
             addr,
             ConnectConfig {
-                frame_delivery: FrameDelivery::enabled(),
+                frame_delivery: FrameMode::enabled(),
                 ..config
             },
         )
@@ -484,7 +485,7 @@ impl FrameDeliveryIo {
 #[async_trait]
 impl UnreliableRead for IdentityConnRead {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-        let pkt = Self::recv(self).try_recv().map_err(|e| match e {
+        let pkt = self.read_half().try_recv().map_err(|e| match e {
             tokio::sync::mpsc::error::TryRecvError::Empty => std::io::ErrorKind::WouldBlock,
             tokio::sync::mpsc::error::TryRecvError::Disconnected => {
                 std::io::ErrorKind::UnexpectedEof
@@ -496,7 +497,8 @@ impl UnreliableRead for IdentityConnRead {
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-        let pkt = Self::recv(self)
+        let pkt = self
+            .read_half()
             .recv()
             .await
             .ok_or(std::io::ErrorKind::UnexpectedEof)?;
@@ -622,6 +624,73 @@ impl LogConfig<'_> {
     }
 }
 
+use udp_listener::{Classify, Conn, ConnRead, ConnWrite, Packet, UtpListener};
+fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
+    let echo = udp.try_clone_std().ok()?;
+    echo.set_nonblocking(true).ok()?;
+    Some(echo)
+}
+async fn connect_bound(
+    udp: VectoredUdpSocket,
+    config: ConnectConfig<'_>,
+) -> std::io::Result<Connected> {
+    let ConnectConfig {
+        log_config,
+        handshake,
+        fec,
+        mss,
+        fec_tuning,
+        frame_delivery,
+        rtx_dup,
+        instream_group_fec,
+        watchdog,
+    } = config;
+    let local_addr = udp.local_addr()?;
+    let peer_addr = udp.peer_addr()?;
+    let log_config = match log_config {
+        Some(c) => Some(
+            c.transmission_layer_log_config(local_addr, peer_addr)
+                .await?,
+        ),
+        None => None,
+    };
+    let udp = Arc::new(udp);
+    let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(Arc::clone(&udp));
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        Box::new(filtered_read),
+        Box::new(udp),
+        fec,
+        mss.resolve()?,
+        fec_tuning,
+        frame_delivery,
+    )?;
+    unreliable_layer.rtx_dup = rtx_dup;
+    unreliable_layer.instream_group_fec = instream_group_fec;
+    if handshake {
+        client_opening_handshake(&mut unreliable_layer).await?;
+    }
+    let (read, write, supervisor) = match watchdog {
+        Some(tuning) => socket_with_watchdog_tuning(unreliable_layer, log_config, tuning),
+        None => socket(unreliable_layer, log_config),
+    };
+    Ok(Connected {
+        read,
+        write,
+        supervisor,
+        local_addr,
+        peer_addr,
+        probe_tap: Some(probe_tap),
+    })
+}
+pub async fn connect_with_socket(
+    socket: VectoredUdpSocket,
+    addr: SocketAddr,
+    config: ConnectConfig<'_>,
+) -> std::io::Result<Connected> {
+    socket.connect(dialable_addr(addr)).await?;
+    connect_bound(socket, config).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +782,7 @@ mod tests {
             false,
             ValidMss::try_new(NO_FEC_MSS).unwrap(),
             FecTuning::default(),
-            FrameDelivery::default(),
+            FrameMode::default(),
         )
         .unwrap();
         assert_eq!(layer.mss.get(), NO_FEC_MSS);
@@ -744,7 +813,7 @@ mod tests {
             true,
             ValidMss::try_new(NO_FEC_MSS).unwrap(),
             FecTuning::default(),
-            FrameDelivery::default(),
+            FrameMode::default(),
         )
         .unwrap();
         assert!(layer.fec.is_some());
@@ -839,7 +908,7 @@ mod tests {
     /// payload first packets.
     #[test]
     fn frame_delivery_mss_to_small_for_first_frame_header_errors() {
-        use crate::delivery::frame::FrameDelivery;
+        use crate::delivery::frame::FrameMode;
         // An MSS that is large enough for `data_overhead` but too small for
         // `frame_data_overhead` (data_overhead + 4).
         let mss = crate::codec::data_overhead() + 1;
@@ -849,7 +918,7 @@ mod tests {
             false,
             ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            FrameDelivery::enabled(),
+            FrameMode::enabled(),
         );
         assert!(matches!(
             res,
@@ -881,7 +950,7 @@ mod tests {
         let addr = spawn_accept_loop(listener);
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
-        let probe = crate::probe::encode_probe(crate::probe::ProbeEcho {
+        let probe = crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
             nonce: 0xDEAD_BEEF,
             timestamp_micros: 12345,
         });
@@ -891,10 +960,10 @@ mod tests {
             .await
             .expect("probe echo timed out")
             .unwrap();
-        let echo = crate::probe::decode_echo(&buf[..n]).expect("not a probe echo");
+        let echo = crate::path_probe::decode_echo(&buf[..n]).expect("not a probe echo");
         assert_eq!(
             echo,
-            crate::probe::ProbeEcho {
+            crate::path_probe::ProbeEcho {
                 nonce: 0xDEAD_BEEF,
                 timestamp_micros: 12345
             }
@@ -914,7 +983,7 @@ mod tests {
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober
             .send_to(
-                &crate::probe::encode_probe(crate::probe::ProbeEcho {
+                &crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
                     nonce: 1,
                     timestamp_micros: 2,
                 }),
@@ -942,10 +1011,12 @@ mod tests {
         prober.connect(addr).await.unwrap();
         for nonce in 0..200u64 {
             let _ = prober
-                .send(&crate::probe::encode_probe(crate::probe::ProbeEcho {
-                    nonce,
-                    timestamp_micros: 0,
-                }))
+                .send(&crate::path_probe::encode_probe(
+                    crate::path_probe::ProbeEcho {
+                        nonce,
+                        timestamp_micros: 0,
+                    },
+                ))
                 .await;
         }
         let mut echoes = 0usize;
@@ -953,7 +1024,7 @@ mod tests {
         while let Ok(Ok(n)) =
             tokio::time::timeout(std::time::Duration::from_millis(300), prober.recv(&mut buf)).await
         {
-            if crate::probe::decode_echo(&buf[..n]).is_some() {
+            if crate::path_probe::decode_echo(&buf[..n]).is_some() {
                 echoes += 1;
             }
         }
@@ -1009,7 +1080,7 @@ mod tests {
         let mut buf = [0; 16];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"data");
-        tap.send_probe(crate::probe::ProbeEcho {
+        tap.send_probe(crate::path_probe::ProbeEcho {
             nonce: 99,
             timestamp_micros: 7,
         })
@@ -1090,70 +1161,4 @@ mod tests {
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
-}
-use udp_listener::{Conn, ConnRead, ConnWrite, Dispatch, Packet, UtpListener};
-fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
-    let echo = udp.try_clone_std().ok()?;
-    echo.set_nonblocking(true).ok()?;
-    Some(echo)
-}
-async fn connect_bound(
-    udp: VectoredUdpSocket,
-    config: ConnectConfig<'_>,
-) -> std::io::Result<Connected> {
-    let ConnectConfig {
-        log_config,
-        handshake,
-        fec,
-        mss,
-        fec_tuning,
-        frame_delivery,
-        rtx_dup,
-        instream_group_fec,
-        watchdog,
-    } = config;
-    let local_addr = udp.local_addr()?;
-    let peer_addr = udp.peer_addr()?;
-    let log_config = match log_config {
-        Some(c) => Some(
-            c.transmission_layer_log_config(local_addr, peer_addr)
-                .await?,
-        ),
-        None => None,
-    };
-    let udp = Arc::new(udp);
-    let (probe_tap, filtered_read) = crate::probe::client_probe_tap(Arc::clone(&udp));
-    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Box::new(filtered_read),
-        Box::new(udp),
-        fec,
-        mss.resolve()?,
-        fec_tuning,
-        frame_delivery,
-    )?;
-    unreliable_layer.rtx_dup = rtx_dup;
-    unreliable_layer.instream_group_fec = instream_group_fec;
-    if handshake {
-        client_opening_handshake(&mut unreliable_layer).await?;
-    }
-    let (read, write, supervisor) = match watchdog {
-        Some(tuning) => socket_with_watchdog_tuning(unreliable_layer, log_config, tuning),
-        None => socket(unreliable_layer, log_config),
-    };
-    Ok(Connected {
-        read,
-        write,
-        supervisor,
-        local_addr,
-        peer_addr,
-        probe_tap: Some(probe_tap),
-    })
-}
-pub async fn connect_with_socket(
-    socket: VectoredUdpSocket,
-    addr: SocketAddr,
-    config: ConnectConfig<'_>,
-) -> std::io::Result<Connected> {
-    socket.connect(dialable_addr(addr)).await?;
-    connect_bound(socket, config).await
 }

@@ -342,7 +342,7 @@ mod tests {
             fec,
             crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             tuning,
-            crate::delivery::frame::FrameDelivery::default(),
+            crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
         ul.rtx_dup = enabled;
@@ -377,8 +377,8 @@ mod tests {
             }),
             true,
             crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::transmission::fec_tuning::FecTuning::mindiv(),
-            crate::delivery::frame::FrameDelivery::default(),
+            crate::transmission::fec_tuning::FecTuning::max_diversity(),
+            crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
         (TransmissionLayer::new(unreliable, None), attempts)
@@ -409,8 +409,8 @@ mod tests {
         );
         assert_eq!(recorder.lock().unwrap().count(), 1);
         assert!(
-            bufs.utp.iter().all(|&byte| byte == 0),
-            "the fast path re-encoded the packet into bufs.utp for a send with no duplicate"
+            bufs.parts_mut().1.iter().all(|&byte| byte == 0),
+            "the fast path re-encoded the packet into bufs.codec_pkt for a send with no duplicate"
         );
     }
 
@@ -424,7 +424,7 @@ mod tests {
             Err(std::io::ErrorKind::ConnectionReset.into())
         );
         assert_eq!(
-            tl.throw_error(),
+            tl.check_error(),
             Err(std::io::ErrorKind::ConnectionReset.into())
         );
         assert!(tl.termination.terminal().is_cancelled());
@@ -446,7 +446,7 @@ mod tests {
         stage_small_message(&tl);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_pkts(&mut bufs).await, Ok(true));
-        assert_eq!(tl.throw_error(), Ok(()));
+        assert_eq!(tl.check_error(), Ok(()));
         assert!(!tl.termination.terminal().is_cancelled());
         assert_eq!(
             attempts.load(Ordering::SeqCst),
@@ -461,7 +461,7 @@ mod tests {
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_kill_and_abort(&mut bufs).await, Ok(()));
-        assert_eq!(tl.throw_error(), Err(std::io::ErrorKind::BrokenPipe.into()));
+        assert_eq!(tl.check_error(), Err(std::io::ErrorKind::BrokenPipe.into()));
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             2,
@@ -536,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
         use crate::transmission::fec_tuning::FecTuning;
-        let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::mindiv());
+        let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
         let payload = vec![0u8; 100];
         let now = Instant::now();
         {
@@ -549,7 +549,7 @@ mod tests {
         let n = recorder.lock().unwrap().count();
         assert_eq!(
             n, 4,
-            "mindiv single-symbol burst must emit 1 data + 3 parity = 4 datagrams, got {n}"
+            "max_diversity single-symbol burst must emit 1 data + 3 parity = 4 datagrams, got {n}"
         );
     }
 
@@ -593,7 +593,7 @@ mod tests {
             fec,
             crate::udp::ValidMss::try_new(mss).unwrap(),
             crate::transmission::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default(),
+            crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
         ul.rtx_dup = enabled;
@@ -888,7 +888,7 @@ mod tests {
                 reliable.recv_data_pkt(seq, None, b"x");
             }
             assert_eq!(
-                reliable.pkt_recv_space().ack_history().balls().count(),
+                reliable.pkt_recv_space().ack_history().blocks().count(),
                 MAX_NUM_ACK,
                 "the history must hold exactly one page of balls"
             );
@@ -1068,7 +1068,7 @@ mod tests {
             false,
             crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             FecTuning::default(),
-            crate::delivery::frame::FrameDelivery::default(),
+            crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
         let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
@@ -1088,7 +1088,7 @@ mod tests {
         });
         kill_started.notified().await;
         assert_eq!(
-            shared.throw_error(),
+            shared.check_error(),
             Err(std::io::ErrorKind::BrokenPipe.into()),
             "local fatal state must be visible while KILL delivery is blocked"
         );
@@ -1156,7 +1156,7 @@ mod tests {
         tail_started.notified().await;
         assert_eq!(sends.load(Ordering::SeqCst), 2);
         assert_eq!(
-            shared.throw_error(),
+            shared.check_error(),
             Err(std::io::ErrorKind::BrokenPipe.into())
         );
         assert!(shared.termination.terminal().is_cancelled());

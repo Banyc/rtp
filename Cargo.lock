@@ -179,9 +179,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -189,9 +189,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
 dependencies = [
  "anstream",
  "anstyle",
@@ -454,7 +454,7 @@ dependencies = [
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.56)",
  "rand 0.8.7",
  "tokio",
- "udp_listener",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13)",
 ]
 
 [[package]]
@@ -555,6 +555,16 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "primitive"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/primitive.git?tag=v0.0.55#57489ef98acfcfb819e048964805ef16a386787f"
+dependencies = [
+ "anyhow",
+ "num-traits",
+ "thiserror",
 ]
 
 [[package]]
@@ -709,7 +719,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tokio_udp",
- "udp_listener",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.15)",
 ]
 
 [[package]]
@@ -900,6 +910,7 @@ dependencies = [
 [[package]]
 name = "tokio_udp"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/tokio_udp.git?tag=v0.0.3#b8f36184f041930551f6ea87bcb2156da91b2b68"
 dependencies = [
  "bytes",
  "socket2",
@@ -940,6 +951,17 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
+dependencies = [
+ "bytes",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
+ "tokio",
+]
+
+[[package]]
+name = "udp_listener"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.15#d0e16f49886772cd98bb0edd6631a02465605223"
 dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",

@@ -5,20 +5,18 @@ use std::sync::{
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::ack_flush::AckFlushState;
-use super::coordination::Coordination;
+use super::coordination::Signals;
 use super::fec::FecState;
 use super::read_half::ReadHalf;
-use super::termination::{
-    PeerReset, TerminationPresser, TerminationReaper, channel as termination_channel,
-};
+use super::termination::{KillPolicy, TerminationPresser, TerminationReaper, new_termination};
 use super::transmission_layer::{
-    Log, LogConfig, PRINT_DEBUG_MSGS, ReliableLayerLogger, UnreliableLayer,
+    LogConfig, MetricsRow, PRINT_DEBUG_MSGS, ReliableLayerLogger, UnreliableLayer,
 };
 use super::ts_echo::RecentEchoes;
 use super::watchdog_tuning::WatchdogTuning;
 use super::write_half::WriteHalf;
 
-use crate::handshake::{ClaimedResponse, Observation, PostOpenHandshake};
+use crate::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
 use crate::io_err::IoErr;
 use crate::pacer::{SendPacer, SendWake};
 use crate::reliable::reliable_layer::ReliableLayer;
@@ -51,7 +49,7 @@ impl ReceivedBatch {
 }
 
 #[derive(Debug)]
-pub struct Shared {
+pub struct Connection {
     pub(crate) reliable_layer: Mutex<ReliableLayer>,
     pub(crate) ack_flush: Mutex<AckFlushState>,
     post_open_handshake: Option<Mutex<PostOpenHandshake>>,
@@ -59,7 +57,7 @@ pub struct Shared {
     pub(crate) fec: Option<Mutex<FecState>>,
     pub(crate) send_rate_limiter: Arc<Mutex<SendPacer>>,
     pub(crate) termination: TerminationPresser,
-    pub(crate) coord: Coordination,
+    pub(crate) signals: Signals,
     pub(crate) rtx_dup: std::sync::atomic::AtomicBool,
     pub(crate) fec_instream_flush: bool,
     pub(crate) instream_group_fec_enabled: std::sync::atomic::AtomicBool,
@@ -67,10 +65,10 @@ pub struct Shared {
     pub(crate) reliable_layer_logger: Option<ReliableLayerLogger>,
 }
 
-pub fn build_parts(
+pub fn new_connection(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
-) -> (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper) {
+) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
     let (reliable_layer, send_rate_limiter) =
@@ -84,9 +82,9 @@ pub fn build_parts(
             .expect("open log file");
         Mutex::new(csv::WriterBuilder::new().from_writer(file))
     });
-    let (termination, termination_writer, termination_reaper) = termination_channel();
+    let (termination, termination_writer, termination_reaper) = new_termination();
     let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
-    let shared = Arc::new(Shared {
+    let shared = Arc::new(Connection {
         reliable_layer: Mutex::new(reliable_layer),
         ack_flush: Mutex::new(AckFlushState::new()),
         post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
@@ -94,7 +92,7 @@ pub fn build_parts(
         fec: unreliable_layer.fec.map(Mutex::new),
         send_rate_limiter,
         termination,
-        coord: Coordination::new(),
+        signals: Signals::new(),
         rtx_dup: std::sync::atomic::AtomicBool::new(unreliable_layer.rtx_dup),
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
@@ -116,11 +114,11 @@ pub fn build_parts(
     (shared, write_half, read_half, termination_reaper)
 }
 
-pub fn build_parts_with_watchdog_tuning(
+pub fn new_connection_with_watchdog_tuning(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
     tuning: WatchdogTuning,
-) -> (Arc<Shared>, WriteHalf, ReadHalf, TerminationReaper) {
+) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
     let (reliable_layer, send_rate_limiter) =
@@ -134,9 +132,9 @@ pub fn build_parts_with_watchdog_tuning(
             .expect("open log file");
         Mutex::new(csv::WriterBuilder::new().from_writer(file))
     });
-    let (termination, termination_writer, termination_reaper) = termination_channel();
+    let (termination, termination_writer, termination_reaper) = new_termination();
     let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
-    let shared = Arc::new(Shared {
+    let shared = Arc::new(Connection {
         reliable_layer: Mutex::new(reliable_layer),
         ack_flush: Mutex::new(AckFlushState::new()),
         post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
@@ -144,7 +142,7 @@ pub fn build_parts_with_watchdog_tuning(
         fec: unreliable_layer.fec.map(Mutex::new),
         send_rate_limiter,
         termination,
-        coord: Coordination::new(),
+        signals: Signals::new(),
         rtx_dup: std::sync::atomic::AtomicBool::new(unreliable_layer.rtx_dup),
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
@@ -166,9 +164,9 @@ pub fn build_parts_with_watchdog_tuning(
     (shared, write_half, read_half, termination_reaper)
 }
 
-impl Shared {
+impl Connection {
     pub fn resume_send(&self) -> &tokio::sync::Notify {
-        &self.coord.resume_send
+        &self.signals.resume_send
     }
 
     pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
@@ -190,17 +188,17 @@ impl Shared {
             .map(|fec| fec.lock().unwrap().recovered_symbols())
     }
 
-    pub fn throw_error(&self) -> Result<(), IoErr> {
-        self.termination.throw_error()
+    pub fn check_error(&self) -> Result<(), IoErr> {
+        self.termination.check_error()
     }
 
     pub fn request_kill_and_abort(&self) {
         self.termination
-            .press_broken_pipe(PeerReset::SendKill, None);
+            .press_broken_pipe(KillPolicy::SendKill, None);
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<usize, IoErr> {
-        self.termination.throw_error()?;
+        self.termination.check_error()?;
         if data.is_empty() {
             self.reliable_layer.lock().unwrap().ensure_write_open()?;
             return Ok(0);
@@ -208,42 +206,42 @@ impl Shared {
         let result = if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
             self.send_frame(data).await
         } else {
-            self.send_stock(data).await
+            self.send_bytes(data).await
         };
-        self.termination.throw_error()?;
+        self.termination.check_error()?;
         result
     }
 
-    async fn send_stock(&self, data: &[u8]) -> Result<usize, IoErr> {
+    async fn send_bytes(&self, data: &[u8]) -> Result<usize, IoErr> {
         let now = Instant::now();
-        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
+        let mut sent_data_pkt = self.signals.sent_data_pkt.notified();
         loop {
-            self.termination.throw_error()?;
+            self.termination.check_error()?;
             let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_buf(data, now)
             }?;
             self.log("send_data_buf");
             if 0 < written_bytes {
-                self.coord.resume_send.notify_one();
+                self.signals.resume_send.notify_one();
                 return Ok(written_bytes);
             }
-            self.termination.throw_error()?;
+            self.termination.check_error()?;
             tokio::select! {
                 _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            self.termination.throw_error()?;
-            sent_data_pkt = self.coord.sent_data_pkt.notified();
+            self.termination.check_error()?;
+            sent_data_pkt = self.signals.sent_data_pkt.notified();
         }
     }
 
     pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, IoErr> {
         let now = Instant::now();
         let frame_len = frame.len();
-        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
+        let mut sent_data_pkt = self.signals.sent_data_pkt.notified();
         loop {
-            self.termination.throw_error()?;
+            self.termination.check_error()?;
             let result = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_frame_buf(frame, now)
@@ -251,17 +249,17 @@ impl Shared {
             match result {
                 Ok(()) => {
                     self.log("send_frame_buf");
-                    self.coord.resume_send.notify_one();
+                    self.signals.resume_send.notify_one();
                     return Ok(frame_len);
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
-                    self.termination.throw_error()?;
+                    self.termination.check_error()?;
                     tokio::select! {
                         _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
-                    self.termination.throw_error()?;
-                    sent_data_pkt = self.coord.sent_data_pkt.notified();
+                    self.termination.check_error()?;
+                    sent_data_pkt = self.signals.sent_data_pkt.notified();
                 }
                 Err(error) => return Err(error),
             }
@@ -270,41 +268,45 @@ impl Shared {
 
     pub fn send_fin_buf(&self) {
         self.reliable_layer.lock().unwrap().send_fin_buf();
-        self.coord.resume_send.notify_one();
+        self.signals.resume_send.notify_one();
     }
 
     pub fn recv_fin(&self) -> &tokio_util::sync::CancellationToken {
-        &self.coord.recv_fin
+        &self.signals.recv_fin
     }
 
     #[cfg(test)]
     pub fn recv_eof(&self) -> &tokio_util::sync::CancellationToken {
-        &self.coord.recv_eof
+        &self.signals.recv_eof
     }
 
-    pub(crate) fn observe_post_open_handshake(&self, datagram: &[u8], now: Instant) -> Observation {
+    pub(crate) fn observe_post_open_handshake(
+        &self,
+        datagram: &[u8],
+        now: Instant,
+    ) -> PostOpenVerdict {
         if !self.post_open_handshake_active.load(Ordering::Acquire) {
-            return Observation::NotHandshake;
+            return PostOpenVerdict::NotHandshake;
         }
         let Some(handshake) = &self.post_open_handshake else {
-            return Observation::NotHandshake;
+            return PostOpenVerdict::NotHandshake;
         };
         let mut handshake = handshake.lock().unwrap();
         let observation = handshake.observe(datagram, now);
-        if observation == Observation::Complete || handshake.expired(now) {
+        if observation == PostOpenVerdict::Complete || handshake.expired(now) {
             self.post_open_handshake_active
                 .store(false, Ordering::Release);
         }
         observation
     }
 
-    pub(crate) fn claim_post_open_response(&self, now: Instant) -> Option<ClaimedResponse> {
+    pub(crate) fn claim_post_open_response(&self, now: Instant) -> Option<DueResponse> {
         if !self.post_open_handshake_active.load(Ordering::Acquire) {
             return None;
         }
         let handshake = self.post_open_handshake.as_ref()?;
         let mut handshake = handshake.lock().unwrap();
-        let response = handshake.claim_response(now);
+        let response = handshake.take_due_response(now);
         if handshake.expired(now) {
             self.post_open_handshake_active
                 .store(false, Ordering::Release);
@@ -358,9 +360,9 @@ impl Shared {
     }
 
     pub async fn no_data_to_send(&self) -> Result<(), IoErr> {
-        let mut sent_pkt_acked = self.coord.sent_pkt_acked.notified();
+        let mut sent_pkt_acked = self.signals.sent_pkt_acked.notified();
         loop {
-            self.termination.throw_error()?;
+            self.termination.check_error()?;
             if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
                 return Ok(());
             }
@@ -368,14 +370,14 @@ impl Shared {
                 () = sent_pkt_acked => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            sent_pkt_acked = self.coord.sent_pkt_acked.notified();
+            sent_pkt_acked = self.signals.sent_pkt_acked.notified();
         }
     }
 
     pub(crate) async fn session_outbound_drained(&self) -> Result<(), IoErr> {
         loop {
-            let progress = self.coord.session_outbound_progress.notified();
-            self.termination.throw_error()?;
+            let progress = self.signals.session_outbound_progress.notified();
+            self.termination.check_error()?;
             let reliable_drained = self.reliable_layer.lock().unwrap().is_no_data_to_send();
             let ack_drained = {
                 let ack_flush = self.ack_flush.lock().unwrap();
@@ -392,9 +394,9 @@ impl Shared {
     }
 
     pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
-        let mut sent_data_pkt = self.coord.sent_data_pkt.notified();
+        let mut sent_data_pkt = self.signals.sent_data_pkt.notified();
         loop {
-            self.termination.throw_error()?;
+            self.termination.check_error()?;
             if self.reliable_layer.lock().unwrap().is_send_buf_empty() {
                 return Ok(());
             }
@@ -402,7 +404,7 @@ impl Shared {
                 _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            sent_data_pkt = self.coord.sent_data_pkt.notified();
+            sent_data_pkt = self.signals.sent_data_pkt.notified();
         }
     }
 
@@ -413,18 +415,18 @@ impl Shared {
             ack_flush.record(batch.pending_acks, batch.fin_ack, batch.echo_ts);
         }
         if ack_work_added {
-            self.coord.resume_send.notify_one();
+            self.signals.resume_send.notify_one();
         }
         if batch.recv_fin {
-            self.coord.recv_fin.cancel();
+            self.signals.recv_fin.cancel();
         }
         self.publish_recv_eof(batch.recv_eof);
-        self.coord.session_outbound_progress.notify_one();
+        self.signals.session_outbound_progress.notify_one();
     }
 
     fn publish_recv_eof(&self, recv_eof: bool) {
-        if recv_eof && !self.coord.recv_eof.is_cancelled() {
-            self.coord.recv_eof.cancel();
+        if recv_eof && !self.signals.recv_eof.is_cancelled() {
+            self.signals.recv_eof.cancel();
             if let Some(fec) = self.fec.as_ref() {
                 fec.lock().unwrap().debug_print_stats();
             }
@@ -438,10 +440,10 @@ impl Shared {
         if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
+        let mut recv_data_pkt = self.signals.recv_data_pkt.notified();
         let read_bytes = loop {
-            self.termination.throw_error()?;
-            if self.coord.recv_eof.is_cancelled() {
+            self.termination.check_error()?;
+            if self.signals.recv_eof.is_cancelled() {
                 return Ok(0);
             }
             let (read_bytes, recv_eof) = {
@@ -464,15 +466,15 @@ impl Shared {
                 () = recv_data_pkt => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            recv_data_pkt = self.coord.recv_data_pkt.notified();
+            recv_data_pkt = self.signals.recv_data_pkt.notified();
         };
         Ok(read_bytes)
     }
 
     pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, IoErr> {
-        let mut recv_data_pkt = self.coord.recv_data_pkt.notified();
+        let mut recv_data_pkt = self.signals.recv_data_pkt.notified();
         loop {
-            self.termination.throw_error()?;
+            self.termination.check_error()?;
             let (res, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let res = reliable_layer.recv_frame_buf();
@@ -492,7 +494,7 @@ impl Shared {
                         () = recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
-                    recv_data_pkt = self.coord.recv_data_pkt.notified();
+                    recv_data_pkt = self.signals.recv_data_pkt.notified();
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -508,15 +510,15 @@ impl Shared {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let log = self.reliable_layer.lock().unwrap().log();
-        let log = Log {
+        let log = MetricsRow {
             op,
             time: time.as_micros(),
             tokens: log.tokens,
             send_rate: log.send_rate,
             loss_rate: log.loss_rate,
-            num_tx_pkts: log.num_tx_pkts,
+            num_in_flight_pkts: log.num_in_flight_pkts,
             num_pkts_in_pipe: log.num_pkts_in_pipe,
-            num_rt_pkts: log.num_rt_pkts,
+            num_rtx_pkts: log.num_rtx_pkts,
             send_seq: log.send_seq,
             min_rtt: log.min_rtt,
             rtt: log.rtt,
@@ -539,22 +541,16 @@ mod tests {
     use core::num::NonZeroUsize;
     use std::time::Instant;
 
-    use async_trait::async_trait;
-
-    use crate::delivery::frame::FrameDelivery;
+    use crate::delivery::frame::FrameMode;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
-    use crate::io_err::IoErr;
     use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
-    use crate::transmission::test_doubles::BlockingWrite;
-    use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead};
+    use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
+    use crate::transmission::transmission_layer::UnreliableLayer;
 
-    use super::build_parts;
+    use super::new_connection;
 
-    #[derive(Debug)]
-    struct PendingRead;
-
-    fn pending_layer(frame_delivery: FrameDelivery) -> UnreliableLayer {
+    fn pending_layer(frame_delivery: FrameMode) -> UnreliableLayer {
         UnreliableLayer {
             utp_read: Box::new(PendingRead),
             utp_write: Box::new(BlockingWrite::new()),
@@ -568,21 +564,10 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl UnreliableRead for PendingRead {
-        fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-            Err(std::io::ErrorKind::WouldBlock.into())
-        }
-
-        async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-            std::future::pending().await
-        }
-    }
-
     #[tokio::test]
     async fn broken_pipe_outranks_full_frame_queue() {
-        let layer = pending_layer(FrameDelivery::enabled());
-        let (shared, _write_half, _read_half, _reaper) = build_parts(layer, None);
+        let layer = pending_layer(FrameMode::enabled());
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
         let full_frame = vec![0; MAX_FRAME_LEN];
         shared
             .reliable_layer
@@ -609,7 +594,7 @@ mod tests {
     fn idle_sender_waits_for_an_event_without_a_timer() {
         let now = Instant::now();
         let (shared, _write_half, _read_half, _reaper) =
-            build_parts(pending_layer(FrameDelivery::default()), None);
+            new_connection(pending_layer(FrameMode::default()), None);
         assert_eq!(shared.next_send_wake(now), SendWake::Event);
     }
 
@@ -617,7 +602,7 @@ mod tests {
     fn pacing_block_uses_a_one_shot_batch_deadline() {
         let now = Instant::now();
         let (shared, _write_half, _read_half, _reaper) =
-            build_parts(pending_layer(FrameDelivery::default()), None);
+            new_connection(pending_layer(FrameMode::default()), None);
         let payload = vec![0; crate::udp::NO_FEC_MSS * 2];
         assert!(
             shared
@@ -643,7 +628,7 @@ mod tests {
     fn congestion_window_block_waits_for_ack_or_protocol_deadline() {
         let now = Instant::now();
         let (shared, _write_half, _read_half, _reaper) =
-            build_parts(pending_layer(FrameDelivery::default()), None);
+            new_connection(pending_layer(FrameMode::default()), None);
         let mut reliable = shared.reliable_layer.lock().unwrap();
         reliable.set_cwnd_for_test(NonZeroUsize::new(1).unwrap());
         let payload = vec![0; crate::udp::NO_FEC_MSS * 2];
