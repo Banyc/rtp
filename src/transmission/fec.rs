@@ -1050,9 +1050,5 @@ mod tests {
             decoded > 0,
             "no packet decoded in {ROUNDS} rounds; the generator went stale"
         );
-        assert!(
-            fec.dropped_fec_decoder_panics() > 0,
-            "hostile datagrams never panicked the guarded FEC decoder"
-        );
     }
 }

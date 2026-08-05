@@ -737,7 +737,13 @@ mod tests {
         .unwrap();
         println!("connected");
         let mut buf = [0; 1024];
-        let n = connected.read.recv(&mut buf).await.unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the echo")
+        .unwrap();
         assert_eq!(msg_1, &buf[..n]);
     }
 
@@ -857,7 +863,13 @@ mod tests {
                 tokio::spawn(async move {
                     let mut accepted = accepted;
                     let mut buf = vec![0; msg.len()];
-                    let n = accepted.read.recv(&mut buf).await.unwrap();
+                    let n = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        accepted.read.recv(&mut buf),
+                    )
+                    .await
+                    .expect("server: timed out waiting for the large message")
+                    .unwrap();
                     assert_eq!(msg, &buf[..n]);
                     accepted.write.send(b"\x01").await.unwrap();
                 });
@@ -877,8 +889,14 @@ mod tests {
         .await
         .unwrap();
         let mut buf = [0; 1];
-        connected.write.send(&msg).await.unwrap();
-        connected.read.recv(&mut buf).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), connected.write.send(&msg))
+            .await
+            .expect("client: timed out sending the large message")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), connected.read.recv(&mut buf))
+            .await
+            .expect("client: timed out waiting for the server ack")
+            .unwrap();
     }
 
     /// Invariant 1: a writer whose `try_send` always returns WouldBlock

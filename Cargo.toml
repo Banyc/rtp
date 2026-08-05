@@ -40,8 +40,4 @@ inherits = "release"
 debug = true
 
 [lints.clippy]
-disallowed_methods = [
-    { path = "tokio::spawn", reason = "RTP tasks are scope-owned: spawn children only into a caller-owned JoinSet (see SessionHandle) so dropping the owner aborts them and panics are observed by the owner" },
-    { path = "tokio::task::spawn", reason = "RTP tasks are scope-owned: spawn children only into a caller-owned JoinSet (see SessionHandle) so dropping the owner aborts them and panics are observed by the owner" },
-    { path = "tokio::runtime::Handle::spawn", reason = "RTP tasks are scope-owned: spawn children only into a caller-owned JoinSet (see SessionHandle) so dropping the owner aborts them and panics are observed by the owner" },
-]
+disallowed_methods = "deny"

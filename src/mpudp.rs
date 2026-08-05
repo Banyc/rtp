@@ -173,7 +173,13 @@ mod tests {
         .unwrap();
         println!("connected");
         let mut buf = [0; 1024];
-        let n = connected.read.recv(&mut buf).await.unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the echo")
+        .unwrap();
         assert_eq!(msg_1, &buf[..n]);
     }
 
