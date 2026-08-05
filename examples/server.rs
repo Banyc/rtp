@@ -45,6 +45,7 @@ async fn main() {
                 })
                 .await
                 .unwrap();
+            let accepted = tokio::spawn(accepted);
             tokio::spawn(async move {
                 loop {
                     if listener

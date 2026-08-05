@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, fmt, num::NonZeroU64, time::Instant};
+use std::{cell::Cell, collections::VecDeque, fmt, num::NonZeroU64, time::Instant};
 
 use fec::{de::FecDecoder, en::FecEncoder};
 use primitive::io::token_bucket::TokenBucket;
@@ -42,6 +42,31 @@ const INSTREAM_PARITY_PER_GROUP: usize = 4;
 const PARITY_BUDGET_DEN: usize = 3;
 const GROUP_SIZE_HIST_LEN: usize = MAX_DATA_PER_GROUP + 1;
 
+thread_local! {
+    static IN_FEC_DECODE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct FecDecodeGuard;
+impl Drop for FecDecodeGuard {
+    fn drop(&mut self) {
+        IN_FEC_DECODE.with(|flag| flag.set(false));
+    }
+}
+
+fn suppress_fec_decoder_panic_hook() {
+    use std::panic::{set_hook, take_hook};
+    use std::sync::OnceLock;
+    static HOOK: OnceLock<()> = OnceLock::new();
+    HOOK.get_or_init(|| {
+        let default = take_hook();
+        set_hook(Box::new(move |info| {
+            if !IN_FEC_DECODE.with(Cell::get) {
+                default(info);
+            }
+        }));
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct FecConfig {
     pub symbol_size: usize,
@@ -80,6 +105,7 @@ struct FecStats {
     pub groups_skipped_burst_end: usize,
     pub recovered_symbols: usize,
     pub dropped_malformed_pkts: usize,
+    pub dropped_fec_decoder_panics: usize,
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
@@ -92,6 +118,7 @@ struct Stats {
     pub parity_groups_skipped_burst_end: usize,
     pub recovered_symbols: usize,
     pub dropped_malformed_pkts: usize,
+    pub dropped_fec_decoder_panics: usize,
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
@@ -105,6 +132,7 @@ impl Stats {
             groups_skipped_burst_end: self.parity_groups_skipped_burst_end,
             recovered_symbols: self.recovered_symbols,
             dropped_malformed_pkts: self.dropped_malformed_pkts,
+            dropped_fec_decoder_panics: self.dropped_fec_decoder_panics,
             group_size_skipped_burst_end: self.group_size_skipped_burst_end,
             group_size_skipped_no_surplus_tokens: self.group_size_skipped_no_surplus_tokens,
         }
@@ -123,6 +151,7 @@ impl fmt::Display for FecStats {
             .field("groups_skipped_burst_end", &self.groups_skipped_burst_end)
             .field("recovered_symbols", &self.recovered_symbols)
             .field("dropped_malformed_pkts", &self.dropped_malformed_pkts)
+            .field("dropped_fec_decoder_panics", &self.dropped_fec_decoder_panics)
             .field(
                 "group_size_skipped_burst_end",
                 &fmt_hist(&self.group_size_skipped_burst_end),
@@ -404,15 +433,20 @@ impl FecState {
         let recovered_before = self.recovered.len();
         let decoder = &mut self.decoder;
         let recovered = &mut self.recovered;
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decoder.decode(pkt, |data| {
-                recovered.push_back(data.to_vec());
-            })
-        }));
+        let unwound = {
+            suppress_fec_decoder_panic_hook();
+            IN_FEC_DECODE.with(|flag| flag.set(true));
+            let _guard = FecDecodeGuard;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                decoder.decode(pkt, |data| {
+                    recovered.push_back(data.to_vec());
+                })
+            }))
+        };
         let hdr_len = match unwound {
             Ok(hdr_len) => hdr_len,
             Err(_) => {
-                self.stats.dropped_malformed_pkts += 1;
+                self.stats.dropped_fec_decoder_panics += 1;
                 None
             }
         };
@@ -460,6 +494,11 @@ impl FecState {
     #[cfg(test)]
     pub(crate) fn dropped_malformed_pkts(&self) -> usize {
         self.stats.dropped_malformed_pkts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped_fec_decoder_panics(&self) -> usize {
+        self.stats.dropped_fec_decoder_panics
     }
 
     /// Print the basic FEC counters to stderr. Only active when `FEC_DEBUG` is
@@ -952,7 +991,7 @@ mod tests {
         let parity = vec![0xFFu8; symbol_size];
         assert!(fec.decode(&wire_pkt(0, 0, 0, 0, &data0)).is_some());
         assert!(fec.decode(&wire_pkt(0, 2, 2, 1, &parity)).is_none());
-        assert_eq!(fec.dropped_malformed_pkts(), 1);
+        assert_eq!(fec.dropped_fec_decoder_panics(), 1);
         while fec.pop_recovered().is_some() {}
     }
 
@@ -1010,6 +1049,10 @@ mod tests {
         assert!(
             decoded > 0,
             "no packet decoded in {ROUNDS} rounds; the generator went stale"
+        );
+        assert!(
+            fec.dropped_fec_decoder_panics() > 0,
+            "hostile datagrams never panicked the guarded FEC decoder"
         );
     }
 }

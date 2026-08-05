@@ -122,7 +122,7 @@ async fn connect_udp(
     Err(last_error.expect("resolve_socket_addrs returned at least one address"))
 }
 
-pub type AcceptTask = tokio::task::JoinHandle<std::io::Result<Accepted>>;
+pub type AcceptTask = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Accepted>> + Send>>;
 
 #[derive(Debug)]
 pub struct Listener {
@@ -166,18 +166,21 @@ impl Listener {
             .await
     }
 
-    /// Accept a connection and run the server opening handshake inside the
-    /// returned task.  All tuning (FEC, MSS, frame delivery, retransmission
-    /// armor, in-stream group FEC) comes from `config`; see [`AcceptConfig`]
-    /// for the env-vs-default rules.
+    /// Accept a connection and run the server opening handshake in the
+    /// returned, unspawned accept future.  All tuning (FEC, MSS, frame
+    /// delivery, retransmission armor, in-stream group FEC) comes from
+    /// `config`; see [`AcceptConfig`] for the env-vs-default rules.
     ///
     /// Side-effect: This method also dispatches pkts to all the accepted UDP sockets.
     ///
-    /// You should keep this method in a loop.
+    /// The returned future must be spawned (e.g. into a [`tokio::task::JoinSet`])
+    /// for the handshake and session setup to run; awaiting it inline would
+    /// block the accept loop on the handshake.  You should keep this method in
+    /// a loop.
     pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<AcceptTask> {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
-        Ok(tokio::spawn(async move {
+        Ok(Box::pin(async move {
             accept(
                 accepted,
                 true,
@@ -216,7 +219,8 @@ impl Listener {
 
     /// [`Self::accept_without_handshake_with()`] wrapped into
     /// [`FrameDeliveryIo`] halves; the accepted session skips the server
-    /// opening handshake.
+    /// opening handshake.  Returns an unspawned accept future that must be
+    /// spawned (e.g. into a [`tokio::task::JoinSet`]) by the caller.
     pub async fn accept_frame_delivery(
         &self,
         config: AcceptConfig,
@@ -224,7 +228,7 @@ impl Listener {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
-        Ok(tokio::spawn(async move {
+        Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
                 false,
@@ -264,7 +268,7 @@ pub struct FrameDeliveryIo {
     pub peer_addr: SocketAddr,
     pub probe_tap: Option<crate::path_probe::EchoDemux>,
 }
-pub type FrameDeliveryAccept = tokio::task::JoinHandle<std::io::Result<FrameDeliveryIo>>;
+pub type FrameDeliveryAccept = std::pin::Pin<Box<dyn Future<Output = std::io::Result<FrameDeliveryIo>> + Send>>;
 
 /// Tuning for [`Listener::accept_with`] / [`Listener::accept_without_handshake_with`].
 ///
@@ -711,7 +715,7 @@ mod tests {
                     .await
                     .unwrap();
                 tokio::spawn(async move {
-                    let mut accepted = accepted.await.unwrap().unwrap();
+                    let mut accepted = accepted.await.unwrap();
                     accepted.write.send(msg_1).await.unwrap();
                     let mut buf = [0; 1];
                     accepted.read.recv(&mut buf).await.unwrap();

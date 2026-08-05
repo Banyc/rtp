@@ -1,0 +1,19 @@
+[package]
+name = "rtp-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rtp = { path = ".." }
+
+[[bin]]
+name = "codec_decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

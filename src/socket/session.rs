@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::{future::Future, pin::Pin, task::Poll};
 
-use tokio::task::{JoinError, JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinSet};
 
 use super::stream::{ConnReader, ConnWriter};
 
@@ -17,19 +17,20 @@ use crate::transmission::{
 #[derive(Debug)]
 #[must_use = "the RTP session handle must be retained and awaited"]
 pub struct SessionHandle {
-    join: JoinHandle<()>,
+    tasks: JoinSet<()>,
 }
 
 impl Future for SessionHandle {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.join).poll(cx) {
+        match Pin::new(&mut self.tasks).poll_join_next(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(()),
-            Poll::Ready(Err(error)) if error.is_panic() => {
+            Poll::Ready(Some(Ok(()))) => Poll::Ready(()),
+            Poll::Ready(Some(Err(error))) if error.is_panic() => {
                 std::panic::resume_unwind(error.into_panic())
             }
-            Poll::Ready(Err(_)) => Poll::Ready(()),
+            Poll::Ready(Some(Err(_))) => Poll::Ready(()),
+            Poll::Ready(None) => Poll::Ready(()),
         }
     }
 }
@@ -186,35 +187,35 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
             }
         }
     });
-    let supervisor = SessionHandle {
-        join: tokio::spawn({
-            let read_shutdown = read_shutdown.clone();
-            let write_shutdown = write_shutdown.clone();
-            let stop_drivers = stop_drivers.clone();
-            let shared = Arc::clone(&shared);
-            async move {
-                let mut drivers = drivers;
-                let first_exit = 'session: {
-                    tokio::select! {
-                        () = write_shutdown.cancelled() => { shared.send_fin_buf(); shared.resume_send().notify_one(); }
-                        () = termination_reaper.ready() => break 'session None,
-                        result = next_driver_exit(&mut drivers) => break 'session Some(result),
-                    }
-                    tokio::select! {
-                        () = read_shutdown.cancelled() => (),
-                        () = termination_reaper.ready() => break 'session None,
-                        result = next_driver_exit(&mut drivers) => break 'session Some(result),
-                    }
-                    tokio::select! {
-                        () = termination_reaper.ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained()) => break 'session None,
-                        result = next_driver_exit(&mut drivers) => break 'session Some(result),
-                    }
-                };
-                stop_drivers.cancel();
-                join_drivers(drivers, first_exit, &shared).await
-            }
-        }),
-    };
+    let mut tasks = JoinSet::new();
+    tasks.spawn({
+        let read_shutdown = read_shutdown.clone();
+        let write_shutdown = write_shutdown.clone();
+        let stop_drivers = stop_drivers.clone();
+        let shared = Arc::clone(&shared);
+        async move {
+            let mut drivers = drivers;
+            let first_exit = 'session: {
+                tokio::select! {
+                    () = write_shutdown.cancelled() => { shared.send_fin_buf(); shared.resume_send().notify_one(); }
+                    () = termination_reaper.ready() => break 'session None,
+                    result = next_driver_exit(&mut drivers) => break 'session Some(result),
+                }
+                tokio::select! {
+                    () = read_shutdown.cancelled() => (),
+                    () = termination_reaper.ready() => break 'session None,
+                    result = next_driver_exit(&mut drivers) => break 'session Some(result),
+                }
+                tokio::select! {
+                    () = termination_reaper.ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained()) => break 'session None,
+                    result = next_driver_exit(&mut drivers) => break 'session Some(result),
+                }
+            };
+            stop_drivers.cancel();
+            join_drivers(drivers, first_exit, &shared).await
+        }
+    });
+    let supervisor = SessionHandle { tasks };
     let read = ConnReader {
         transmission_layer: Arc::clone(&shared),
         frame_buf: Vec::new(),
@@ -761,5 +762,67 @@ mod tests {
             .expect("response receive timed out")
             .expect("duplicate payload falsely reset the RTP session");
         assert_eq!(&buf[..response_len], response);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_session_handle_aborts_the_driver_children() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::transmission::test_doubles::PendingWrite;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let layer = wrap_fec(
+            Box::new(PendingRead),
+            Box::new(PendingWrite {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                cancelled: Arc::clone(&cancelled),
+            }),
+            false,
+        );
+        let (_read, mut write, supervisor) = socket(layer, None);
+        assert_eq!(write.send(b"payload").await.unwrap(), 7);
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the writer never blocked inside the unreliable send");
+        drop(supervisor);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if cancelled.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the session handle did not abort the blocked writer");
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_drains_all_driver_children() {
+        #[derive(Debug)]
+        struct FailedRead;
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableRead for FailedRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            }
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::ConnectionReset.into())
+            }
+        }
+        #[derive(Debug)]
+        struct NoopWrite;
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for NoopWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+                Ok(buf.len())
+            }
+        }
+        let layer = wrap_fec(Box::new(FailedRead), Box::new(NoopWrite), false);
+        let (_read, _write, supervisor) = socket(layer, None);
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("the supervisor did not drain its driver children on normal shutdown");
     }
 }
