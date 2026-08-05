@@ -870,7 +870,21 @@ mod tests {
                     .await
                     .expect("server: timed out waiting for the large message")
                     .unwrap();
-                    assert_eq!(msg, &buf[..n]);
+                    let mut offset = n;
+                    while offset < msg.len() {
+                        let k = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            accepted.read.recv(&mut buf[offset..]),
+                        )
+                        .await
+                        .expect("server: timed out reading the rest of the large message")
+                        .unwrap();
+                        if k == 0 {
+                            break;
+                        }
+                        offset += k;
+                    }
+                    assert_eq!(msg, &buf[..offset]);
                     accepted.write.send(b"\x01").await.unwrap();
                 });
             }
@@ -889,10 +903,20 @@ mod tests {
         .await
         .unwrap();
         let mut buf = [0; 1];
-        tokio::time::timeout(std::time::Duration::from_secs(10), connected.write.send(&msg))
+        // `send` stages only up to the send-rate cap at once, so loop until the
+        // whole message is handed to the reliable layer.
+        let mut written = 0;
+        while written < msg.len() {
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                connected.write.send(&msg[written..]),
+            )
             .await
             .expect("client: timed out sending the large message")
             .unwrap();
+            assert!(0 < n, "send must make progress");
+            written += n;
+        }
         tokio::time::timeout(std::time::Duration::from_secs(10), connected.read.recv(&mut buf))
             .await
             .expect("client: timed out waiting for the server ack")
