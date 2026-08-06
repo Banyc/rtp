@@ -184,6 +184,7 @@ fn timeout() -> io::Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{

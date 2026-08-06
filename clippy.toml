@@ -2,6 +2,11 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "RTP tasks are scope-owned: spawn children only into a caller-owned JoinSet (see SessionHandle) so dropping the owner aborts them and panics are observed by the owner" },
     { path = "tokio::task::spawn", reason = "RTP tasks are scope-owned: spawn children only into a caller-owned JoinSet (see SessionHandle) so dropping the owner aborts them and panics are observed by the owner" },
     { path = "tokio::runtime::Handle::spawn", reason = "RTP tasks are scope-owned: spawn children only into a caller-owned JoinSet (see SessionHandle) so dropping the owner aborts them and panics are observed by the owner" },
-    { path = "tokio::sync::mpsc::unbounded_channel", reason = "no unbounded channels: they queue without bound under backpressure and can exhaust memory; use tokio::sync::mpsc::channel(N) so producers await a bounded slot" },
-    { path = "mpsc::unbounded_channel", reason = "no unbounded channels: they queue without bound under backpressure and can exhaust memory; use mpsc::channel(N) so producers await a bounded slot" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a named bounded mpsc capacity" },
+    { path = "tokio::sync::mpsc::Sender::blocking_send", reason = "do not block runtime synchronization" },
+]
+disallowed-types = [
+  { path = "tokio::sync::mpsc::UnboundedSender", reason = "use bounded mpsc::Sender" },
+  { path = "tokio::sync::mpsc::UnboundedReceiver", reason = "use bounded mpsc::Receiver" },
+  { path = "tokio::sync::Semaphore", reason = "use atomic/RAII admission plus watch or Notify" },
 ]

@@ -696,6 +696,7 @@ pub async fn connect_with_socket(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

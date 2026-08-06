@@ -280,6 +280,7 @@ async fn join_drivers(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use tokio::net::UdpSocket;
 

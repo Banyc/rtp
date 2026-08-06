@@ -7,6 +7,11 @@ use tokio::{
     net::{TcpStream, lookup_host},
 };
 
+#[path = "support/session_scope.rs"]
+mod session_scope;
+
+use session_scope::TransportScope;
+
 #[derive(Debug, Parser)]
 pub struct Cli {
     /// The server address
@@ -23,6 +28,8 @@ pub struct Cli {
 async fn main() {
     let args = Cli::parse();
     let fec = args.fec;
+
+    let mut scope = TransportScope::new();
 
     let (protocol, internet_addresses) = args.server.split_once("://").unwrap();
     let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();
@@ -51,9 +58,18 @@ async fn main() {
             )
             .await
             .unwrap();
+            let rtp::udp::Connected {
+                read,
+                write,
+                supervisor,
+                local_addr: _,
+                peer_addr: _,
+                probe_tap: _,
+            } = connected;
+            scope.supervise_session("rtp", supervisor);
             (
-                Box::new(connected.read.into_async_read()),
-                Box::new(connected.write.into_async_write()),
+                Box::new(read.into_async_read()),
+                Box::new(write.into_async_write()),
             )
         }
         "rtpm" => {
@@ -75,21 +91,31 @@ async fn main() {
             )
             .await
             .unwrap();
+            let rtp::mpudp::Conn {
+                read,
+                write,
+                supervisor,
+            } = connected;
+            scope.supervise_session("rtpm", supervisor);
             (
-                Box::new(connected.read.into_async_read()),
-                Box::new(connected.write.into_async_write()),
+                Box::new(read.into_async_read()),
+                Box::new(write.into_async_write()),
             )
         }
         _ => panic!("unknown protocol `{protocol}`"),
     };
     println!("connected");
 
-    let mut res = args.file_transfer.perform(read, write).await.unwrap();
-    res.write.shutdown().await.unwrap();
-    println!("shutdown");
-    let mut buf = [0; 1];
-    let n = res.read.read(&mut buf).await.unwrap();
-    assert_eq!(n, 0);
+    scope
+        .race(async move {
+            let mut res = args.file_transfer.perform(read, write).await.unwrap();
+            res.write.shutdown().await.unwrap();
+            println!("shutdown");
+            let mut buf = [0; 1];
+            let n = res.read.read(&mut buf).await.unwrap();
+            assert_eq!(n, 0);
 
-    println!("{}", res.stats);
+            println!("{}", res.stats);
+        })
+        .await;
 }

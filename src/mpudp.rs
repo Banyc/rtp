@@ -133,6 +133,7 @@ impl UnreliableWrite for MpUdpWrite {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::path::Path;
 

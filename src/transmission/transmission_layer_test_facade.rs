@@ -50,6 +50,7 @@ impl TransmissionLayer {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::transmission::test_doubles::BlockingWrite;

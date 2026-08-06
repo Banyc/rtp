@@ -1,3 +1,5 @@
+#![warn(clippy::disallowed_methods, clippy::disallowed_types)]
+
 pub mod io_err;
 pub mod keyed_udp;
 pub mod mpudp;

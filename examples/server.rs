@@ -5,7 +5,13 @@ use file_transfer::FileTransferCommand;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, lookup_host},
+    task::JoinSet,
 };
+
+#[path = "support/session_scope.rs"]
+mod session_scope;
+
+use session_scope::{TransportScope, TransportTaskExit};
 
 #[derive(Debug, Parser)]
 pub struct Cli {
@@ -21,6 +27,8 @@ pub struct Cli {
 async fn main() {
     let args = Cli::parse();
     let fec = args.fec;
+
+    let mut scope = TransportScope::new();
 
     let (protocol, internet_addresses) = args.listen.split_once("://").unwrap();
     let internet_addresses = internet_addresses.split(',').collect::<Vec<_>>();
@@ -38,32 +46,29 @@ async fn main() {
             let listener = rtp::udp::Listener::bind(internet_addresses[0])
                 .await
                 .unwrap();
-            let accepted = listener
-                .accept_with(rtp::udp::AcceptConfig {
+            let (first_tx, first_rx) = tokio::sync::oneshot::channel::<rtp::udp::Accepted>();
+            scope.spawn(run_udp_accept_driver(
+                listener,
+                rtp::udp::AcceptConfig {
                     fec,
                     ..rtp::udp::AcceptConfig::default()
-                })
+                },
+                first_tx,
+            ));
+            let accepted = scope
+                .race(first_rx)
                 .await
-                .unwrap();
-            let accepted = tokio::spawn(accepted);
-            tokio::spawn(async move {
-                loop {
-                    if listener
-                        .accept_with(rtp::udp::AcceptConfig {
-                            fec,
-                            ..rtp::udp::AcceptConfig::default()
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            let accepted = accepted.await.unwrap().unwrap();
+                .expect("rtp accept driver failed");
+            let rtp::udp::Accepted {
+                read,
+                write,
+                supervisor,
+                peer_addr: _,
+            } = accepted;
+            scope.supervise_session("rtp", supervisor);
             (
-                Box::new(accepted.read.into_async_read()),
-                Box::new(accepted.write.into_async_write()),
+                Box::new(read.into_async_read()),
+                Box::new(write.into_async_write()),
             )
         }
         "rtpm" => {
@@ -73,40 +78,113 @@ async fn main() {
                 let socket_addrs = lookup_host(internet_address).await.unwrap();
                 all_socket_addrs.extend(socket_addrs);
             }
-            let mut listener =
+            let listener =
                 rtp::mpudp::Listener::bind(all_socket_addrs.into_iter(), max_session_conns)
                     .await
                     .unwrap();
-            let accepted = listener
-                .accept_with(rtp::udp::AcceptConfig::default())
+            let (first_tx, first_rx) = tokio::sync::oneshot::channel::<rtp::mpudp::Conn>();
+            scope.spawn(run_mpudp_accept_driver(
+                listener,
+                rtp::udp::AcceptConfig::default(),
+                first_tx,
+            ));
+            let accepted = scope
+                .race(first_rx)
                 .await
-                .unwrap();
-            tokio::spawn(async move {
-                loop {
-                    if listener
-                        .accept_with(rtp::udp::AcceptConfig::default())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+                .expect("rtpm accept driver failed");
+            let rtp::mpudp::Conn {
+                read,
+                write,
+                supervisor,
+            } = accepted;
+            scope.supervise_session("rtpm", supervisor);
             (
-                Box::new(accepted.read.into_async_read()),
-                Box::new(accepted.write.into_async_write()),
+                Box::new(read.into_async_read()),
+                Box::new(write.into_async_write()),
             )
         }
         _ => panic!("unknown protocol `{protocol}`"),
     };
     println!("accepted");
 
-    let mut res = args.file_transfer.perform(read, write).await.unwrap();
-    res.write.shutdown().await.unwrap();
-    println!("shutdown");
-    let mut buf = [0; 1];
-    let n = res.read.read(&mut buf).await.unwrap();
-    assert_eq!(n, 0);
+    scope
+        .race(async move {
+            let mut res = args.file_transfer.perform(read, write).await.unwrap();
+            res.write.shutdown().await.unwrap();
+            println!("shutdown");
+            let mut buf = [0; 1];
+            let n = res.read.read(&mut buf).await.unwrap();
+            assert_eq!(n, 0);
 
-    println!("{}", res.stats);
+            println!("{}", res.stats);
+        })
+        .await;
+}
+
+async fn run_udp_accept_driver(
+    listener: rtp::udp::Listener,
+    config: rtp::udp::AcceptConfig,
+    first_tx: tokio::sync::oneshot::Sender<rtp::udp::Accepted>,
+) -> TransportTaskExit {
+    let mut first_tx = Some(first_tx);
+    let mut handshakes = JoinSet::new();
+    loop {
+        tokio::select! {
+            next = listener.accept_with(config) => {
+                match next {
+                    Ok(task) => {
+                        handshakes.spawn(task);
+                    }
+                    Err(error) => return TransportTaskExit::DriverFailed {
+                        driver: "rtp_accept",
+                        detail: error.to_string(),
+                    },
+                }
+            }
+            joined = handshakes.join_next(), if !handshakes.is_empty() => {
+                match joined {
+                    Some(Ok(Ok(accepted))) => match first_tx.take() {
+                        Some(tx) => {
+                            let _ = tx.send(accepted);
+                        }
+                        None => drop(accepted),
+                    },
+                    Some(Ok(Err(error))) => {
+                        eprintln!("RTP handshake rejected: {}", error);
+                    }
+                    Some(Err(error)) if error.is_panic() => {
+                        std::panic::resume_unwind(error.into_panic());
+                    }
+                    Some(Err(error)) => return TransportTaskExit::DriverFailed {
+                        driver: "rtp_handshake",
+                        detail: error.to_string(),
+                    },
+                    None => unreachable!("guard excludes an empty handshake set"),
+                }
+            }
+        }
+    }
+}
+
+async fn run_mpudp_accept_driver(
+    mut listener: rtp::mpudp::Listener,
+    config: rtp::udp::AcceptConfig,
+    first_tx: tokio::sync::oneshot::Sender<rtp::mpudp::Conn>,
+) -> TransportTaskExit {
+    let mut first_tx = Some(first_tx);
+    match listener.accept_with(config).await {
+        Ok(accepted) => match first_tx.take() {
+            Some(tx) => {
+                let _ = tx.send(accepted);
+            }
+            None => drop(accepted),
+        },
+        Err(error) => {
+            return TransportTaskExit::DriverFailed {
+                driver: "rtpm_accept",
+                detail: error.to_string(),
+            };
+        }
+    }
+    std::future::pending::<TransportTaskExit>().await
 }
