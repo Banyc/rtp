@@ -1000,6 +1000,15 @@ mod tests {
 
     use crate::testing::SplitMix64;
 
+    /// Drives the production guarded `FecState::decode` with 50,000
+    /// deterministic hostile datagrams (out-of-range group/symbol IDs, random
+    /// data/parity counts, and truncated bodies) and asserts every decoded
+    /// payload and recovered symbol stays within its bound. A third-party
+    /// decoder panic is caught by the unwind guard and counted separately as
+    /// `dropped_fec_decoder_panics` (asserted by the sibling
+    /// recovered-symbol test), not folded into `dropped_malformed_pkts`. The
+    /// guard still runs the process panic hook before returning, so a
+    /// remotely reachable decoder panic can amplify stderr.
     #[test]
     fn a_hostile_datagram_never_escapes_the_fec_decoder() {
         const ROUNDS: usize = 50_000;

@@ -24,12 +24,13 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     if let Some(pkt) = decoded.data {
+        let range = pkt.buf_range;
         assert!(
-            pkt.buf_range.start <= pkt.buf_range.end && pkt.buf_range.end <= data.len(),
-            "{pkt.buf_range:?} is outside a {}-byte packet",
+            range.start <= range.end && range.end <= data.len(),
+            "{range:?} is outside a {}-byte packet",
             data.len(),
         );
-        let _ = &data[pkt.buf_range];
+        let _ = &data[range];
         assert!(
             pkt.frame_len.is_none() || pkt.send_ts.is_some(),
             "frame_len without send_ts"

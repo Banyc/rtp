@@ -7,7 +7,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rtp = { path = ".." }
+rtp = { path = "..", features = ["testing"] }
 
 [[bin]]
 name = "codec_decode"

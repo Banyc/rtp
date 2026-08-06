@@ -5,6 +5,7 @@ pub mod keyed_udp;
 pub mod mpudp;
 pub mod path_probe;
 pub mod socket;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod udp;
 
