@@ -151,7 +151,10 @@ impl fmt::Display for FecStats {
             .field("groups_skipped_burst_end", &self.groups_skipped_burst_end)
             .field("recovered_symbols", &self.recovered_symbols)
             .field("dropped_malformed_pkts", &self.dropped_malformed_pkts)
-            .field("dropped_fec_decoder_panics", &self.dropped_fec_decoder_panics)
+            .field(
+                "dropped_fec_decoder_panics",
+                &self.dropped_fec_decoder_panics,
+            )
             .field(
                 "group_size_skipped_burst_end",
                 &fmt_hist(&self.group_size_skipped_burst_end),

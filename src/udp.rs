@@ -268,7 +268,8 @@ pub struct FrameDeliveryIo {
     pub peer_addr: SocketAddr,
     pub probe_tap: Option<crate::path_probe::EchoDemux>,
 }
-pub type FrameDeliveryAccept = std::pin::Pin<Box<dyn Future<Output = std::io::Result<FrameDeliveryIo>> + Send>>;
+pub type FrameDeliveryAccept =
+    std::pin::Pin<Box<dyn Future<Output = std::io::Result<FrameDeliveryIo>> + Send>>;
 
 /// Tuning for [`Listener::accept_with`] / [`Listener::accept_without_handshake_with`].
 ///
@@ -918,10 +919,13 @@ mod tests {
             assert!(0 < n, "send must make progress");
             written += n;
         }
-        tokio::time::timeout(std::time::Duration::from_secs(10), connected.read.recv(&mut buf))
-            .await
-            .expect("client: timed out waiting for the server ack")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the server ack")
+        .unwrap();
     }
 
     /// Invariant 1: a writer whose `try_send` always returns WouldBlock

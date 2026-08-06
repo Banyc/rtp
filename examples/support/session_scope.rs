@@ -1,13 +1,12 @@
 // Shared by the client and server example binaries. Each binary only uses a
 // subset of this API, so dead-code analysis per binary is expected.
-#![allow(dead_code)]
-
 use std::future::Future;
 use tokio::task::JoinSet;
 
 #[derive(Debug)]
 pub enum TransportTaskExit {
     SessionEnded(&'static str),
+    #[allow(dead_code)]
     DriverFailed {
         driver: &'static str,
         detail: String,
@@ -32,6 +31,7 @@ impl TransportScope {
         });
     }
 
+    #[allow(dead_code)]
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = TransportTaskExit> + Send + 'static,
@@ -49,11 +49,16 @@ impl TransportScope {
             value = &mut operation => value,
             joined = self.tasks.join_next(), if !self.tasks.is_empty() => {
                 match joined {
-                    Some(Ok(exit)) => panic!("transport child exited early: {:?}", exit),
+                    Some(Ok(TransportTaskExit::SessionEnded(name))) => {
+                        panic!("transport child exited early: session {name} ended")
+                    }
+                    Some(Ok(TransportTaskExit::DriverFailed { driver, detail })) => {
+                        panic!("transport child exited early: driver {driver} failed: {detail}")
+                    }
                     Some(Err(error)) if error.is_panic() => {
                         std::panic::resume_unwind(error.into_panic())
                     }
-                    Some(Err(error)) => panic!("transport child failed to join: {}", error),
+                    Some(Err(error)) => panic!("transport child failed to join: {error}"),
                     None => unreachable!("guard excludes an empty task set"),
                 }
             }
@@ -71,5 +76,11 @@ mod tests {
         let mut scope = TransportScope::new();
         scope.supervise_session("test", rtp::socket::SessionHandle::idle());
         scope.race(std::future::pending::<()>()).await;
+    }
+
+    #[tokio::test]
+    async fn race_returns_the_operation_value() {
+        let mut scope = TransportScope::new();
+        assert_eq!(scope.race(async { 7_u8 }).await, 7);
     }
 }

@@ -172,19 +172,20 @@ async fn run_mpudp_accept_driver(
     first_tx: tokio::sync::oneshot::Sender<rtp::mpudp::Conn>,
 ) -> TransportTaskExit {
     let mut first_tx = Some(first_tx);
-    match listener.accept_with(config).await {
-        Ok(accepted) => match first_tx.take() {
-            Some(tx) => {
-                let _ = tx.send(accepted);
+    loop {
+        match listener.accept_with(config).await {
+            Ok(accepted) => match first_tx.take() {
+                Some(tx) => {
+                    let _ = tx.send(accepted);
+                }
+                None => drop(accepted),
+            },
+            Err(error) => {
+                return TransportTaskExit::DriverFailed {
+                    driver: "rtpm_accept",
+                    detail: error.to_string(),
+                };
             }
-            None => drop(accepted),
-        },
-        Err(error) => {
-            return TransportTaskExit::DriverFailed {
-                driver: "rtpm_accept",
-                detail: error.to_string(),
-            };
         }
     }
-    std::future::pending::<TransportTaskExit>().await
 }
