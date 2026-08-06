@@ -35,6 +35,18 @@ impl Future for SessionHandle {
     }
 }
 
+impl SessionHandle {
+    /// An idle session handle with no driver tasks: holding it keeps nothing
+    /// alive and dropping it aborts nothing. Used where a session-shaped value
+    /// is required without a live transport (e.g. composing lane state in
+    /// tests).
+    pub fn idle() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+        }
+    }
+}
+
 pub fn socket(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
@@ -766,8 +778,8 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_session_handle_aborts_the_driver_children() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use crate::transmission::test_doubles::PendingWrite;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let cancelled = Arc::new(AtomicBool::new(false));
