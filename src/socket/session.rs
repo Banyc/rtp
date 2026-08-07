@@ -25,11 +25,10 @@ impl Future for SessionHandle {
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.tasks).poll_join_next(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Ok(()))) => Poll::Ready(()),
-            Poll::Ready(Some(Err(error))) if error.is_panic() => {
-                std::panic::resume_unwind(error.into_panic())
+            Poll::Ready(Some(result)) => {
+                result.unwrap();
+                Poll::Ready(())
             }
-            Poll::Ready(Some(Err(_))) => Poll::Ready(()),
             Poll::Ready(None) => Poll::Ready(()),
         }
     }
@@ -251,27 +250,15 @@ async fn join_drivers(
 ) {
     let unexpected_clean_exit =
         first_exit.as_ref().is_some_and(Result::is_ok) && !shared.termination.has_error();
-    let mut panic_payload = None;
     let mut result = first_exit;
     loop {
         if let Some(result) = result.take() {
-            match result {
-                Ok(()) => {}
-                Err(error) if error.is_panic() => {
-                    if panic_payload.is_none() {
-                        panic_payload = Some(error.into_panic());
-                    }
-                }
-                Err(_error) => {}
-            }
+            result.unwrap();
         }
         result = drivers.join_next().await;
         if result.is_none() {
             break;
         }
-    }
-    if let Some(payload) = panic_payload {
-        std::panic::resume_unwind(payload);
     }
     assert!(
         !unexpected_clean_exit,
