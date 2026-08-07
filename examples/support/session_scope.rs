@@ -189,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stops_a_perpetual_driver() {
         let mut scope = TransportScope::new();
-        scope.spawn(|stop| async move {
+        scope.spawn(|mut stop| async move {
             let _ = stop.changed().await;
             TransportTaskExit::Stopped
         });
@@ -245,8 +245,9 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "injected session epilog panic")]
     async fn observe_session_exit_resumes_a_panic() {
-        let handle = tokio::spawn(async { panic!("injected session epilog panic") });
-        let error = handle.await.unwrap_err();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { panic!("injected session epilog panic") });
+        let error = tasks.join_next().await.unwrap().unwrap_err();
         observe_session_exit(Err(error));
     }
 }
