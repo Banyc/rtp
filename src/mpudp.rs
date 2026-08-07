@@ -210,9 +210,11 @@ mod tests {
         assert_eq!(msg_1, &buf[..n]);
         // The echo is confirmed: release the server's wait.
         echo_received.notify_one();
-        // Send the application-level receipt and drain it onto the wire.
+        // Send the application-level receipt and drain it onto the wire.  The
+        // drain result must not be ignored: the epilog below only proves the
+        // server acked the receipt if it actually reached the wire.
         connected.write.send(b"\x00").await.unwrap();
-        let _ = connected.write.send_buf_empty().await;
+        connected.write.send_buf_empty().await.unwrap();
         // Wait for the server to ack the receipt before releasing our session.
         receipt_acked.notified().await;
         // The server task has ended and released its listener and session.
