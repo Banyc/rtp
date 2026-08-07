@@ -181,18 +181,7 @@ impl Listener {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         Ok(Box::pin(async move {
-            accept(
-                accepted,
-                true,
-                config.fec,
-                config.mss.resolve()?,
-                config.fec_tuning,
-                config.frame_delivery,
-                config.rtx_dup,
-                config.instream_group_fec,
-                raw_fd,
-            )
-            .await
+            accept(accepted, raw_fd, AcceptSetup::from_config(true, config)?).await
         }))
     }
 
@@ -205,14 +194,8 @@ impl Listener {
         let accepted = self.listener.poll_next_conn().await?;
         accept(
             accepted,
-            false,
-            config.fec,
-            config.mss.resolve()?,
-            config.fec_tuning,
-            config.frame_delivery,
-            config.rtx_dup,
-            config.instream_group_fec,
             self.raw_fd,
+            AcceptSetup::from_config(false, config)?,
         )
         .await
     }
@@ -231,14 +214,8 @@ impl Listener {
         Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
-                false,
-                config.fec,
-                config.mss.resolve()?,
-                config.fec_tuning,
-                FrameMode::enabled(),
-                config.rtx_dup,
-                config.instream_group_fec,
                 raw_fd,
+                AcceptSetup::from_config(false, config)?.with_frame_delivery(FrameMode::enabled()),
             )
             .await?;
             let Accepted {
@@ -333,9 +310,12 @@ impl<'a> Default for ConnectConfig<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn accept(
-    accepted: IdentityConn,
+/// Tuning for the private [`accept`] helper: bundles the settings splashed
+/// out of a public [`AcceptConfig`] (plus the `handshake` flag and the
+/// already-resolved [`ValidMss`]) so the accept path takes a single config
+/// argument in the `(data, …, config)` shape used across the crate.
+#[derive(Debug, Clone, Copy)]
+struct AcceptSetup {
     handshake: bool,
     fec: bool,
     mss: ValidMss,
@@ -343,8 +323,47 @@ async fn accept(
     frame_delivery: FrameMode,
     rtx_dup: bool,
     instream_group_fec: bool,
+}
+
+impl AcceptSetup {
+    /// Resolve [`AcceptConfig`] into the validated form used by [`accept`].
+    /// `handshake` is supplied by the caller because the public API splits
+    /// the with/without-handshake entry points rather than exposing it as a
+    /// field on [`AcceptConfig`].
+    fn from_config(handshake: bool, config: AcceptConfig) -> std::io::Result<Self> {
+        Ok(Self {
+            handshake,
+            fec: config.fec,
+            mss: config.mss.resolve()?,
+            tuning: config.fec_tuning,
+            frame_delivery: config.frame_delivery,
+            rtx_dup: config.rtx_dup,
+            instream_group_fec: config.instream_group_fec,
+        })
+    }
+
+    /// Override the frame-delivery mode; used by `accept_frame_delivery`
+    /// which always forces [`FrameMode::enabled`] regardless of the config.
+    fn with_frame_delivery(mut self, frame_delivery: FrameMode) -> Self {
+        self.frame_delivery = frame_delivery;
+        self
+    }
+}
+
+async fn accept(
+    accepted: IdentityConn,
     raw_fd: MaybeRawFd,
+    setup: AcceptSetup,
 ) -> std::io::Result<Accepted> {
+    let AcceptSetup {
+        handshake,
+        fec,
+        mss,
+        tuning,
+        frame_delivery,
+        rtx_dup,
+        instream_group_fec,
+    } = setup;
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
     let write = RawFdConnWrite {
