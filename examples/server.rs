@@ -145,26 +145,17 @@ async fn run_udp_accept_driver(
             }
             _ = stop.changed() => return TransportTaskExit::Stopped,
             joined = handshakes.join_next(), if !handshakes.is_empty() => {
-                match joined {
-                    Some(Ok(Ok(accepted))) => match first_tx.take() {
+                let result = joined.expect("guarded non-empty").unwrap();
+                match result {
+                    Ok(accepted) => match first_tx.take() {
                         Some(tx) => {
                             let _ = tx.send(accepted);
                         }
                         None => drop(accepted),
                     },
-                    Some(Ok(Err(error))) => {
+                    Err(error) => {
                         eprintln!("RTP handshake rejected: {}", error);
                     }
-                    Some(Err(error)) => match error.try_into_panic() {
-                        // A panicked handshake task surfaces its panic (the
-                        // payload is raised rather than resumed here).
-                        Ok(payload) => std::panic::panic_any(payload),
-                        Err(error) => return TransportTaskExit::DriverFailed {
-                            driver: "rtp_handshake",
-                            detail: error.to_string(),
-                        },
-                    },
-                    None => unreachable!("guard excludes an empty handshake set"),
                 }
             }
         }
