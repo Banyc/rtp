@@ -12,17 +12,26 @@ pub enum TransportTaskExit {
         driver: &'static str,
         detail: String,
     },
+    /// A perpetual accept driver observed the scope's stop signal and
+    /// exited cleanly. This is the expected outcome during shutdown.
+    #[allow(dead_code)]
+    Stopped,
 }
 
 pub struct TransportScope {
     /// Perpetual accept drivers. These never end on their own in a healthy
-    /// run; on shutdown they are aborted and drained so they never outlive
-    /// the foreground operation.
+    /// run; on shutdown they observe the stop signal and exit with
+    /// [`TransportTaskExit::Stopped`] so they never outlive the foreground
+    /// operation.
     drivers: JoinSet<TransportTaskExit>,
     /// RTP/MPUDP session supervisors. Each task wraps a [`SessionHandle`]
     /// future. On shutdown these are *joined* (not aborted) so the session
     /// epilog — FIN/KILL exchange and driver reaping — runs to completion.
     sessions: JoinSet<TransportTaskExit>,
+    /// Stop signal for the perpetual accept drivers. `shutdown` sends
+    /// `true`; each driver holds a `watch::Receiver` (granted via `spawn`)
+    /// and exits with [`TransportTaskExit::Stopped`] once it observes it.
+    stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl TransportScope {
@@ -30,6 +39,7 @@ impl TransportScope {
         Self {
             drivers: JoinSet::new(),
             sessions: JoinSet::new(),
+            stop_tx: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -41,11 +51,12 @@ impl TransportScope {
     }
 
     #[allow(dead_code)]
-    pub fn spawn<F>(&mut self, task: F)
+    pub fn spawn<F, Fut>(&mut self, driver: F)
     where
-        F: Future<Output = TransportTaskExit> + Send + 'static,
+        F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut,
+        Fut: Future<Output = TransportTaskExit> + Send + 'static,
     {
-        self.drivers.spawn(task);
+        self.drivers.spawn(driver(self.stop_tx.subscribe()));
     }
 
     pub async fn race<F, T>(&mut self, operation: F) -> T
@@ -66,6 +77,9 @@ impl TransportScope {
                     TransportTaskExit::DriverFailed { driver, detail } => {
                         panic!("transport child exited early: driver {driver} failed: {detail}")
                     }
+                    TransportTaskExit::Stopped => {
+                        panic!("transport child exited early: driver stopped before shutdown")
+                    }
                 }
             }
             joined = self.drivers.join_next(), if !self.drivers.is_empty() => {
@@ -78,6 +92,9 @@ impl TransportScope {
                     TransportTaskExit::DriverFailed { driver, detail } => {
                         panic!("transport child exited early: driver {driver} failed: {detail}")
                     }
+                    TransportTaskExit::Stopped => {
+                        panic!("transport child exited early: driver stopped before shutdown")
+                    }
                 }
             }
         };
@@ -85,17 +102,17 @@ impl TransportScope {
         value
     }
 
-    /// Orderly teardown once the foreground operation has finished:
-    /// abort and drain the perpetual accept drivers first, then normally
-    /// join the session supervisors so each session's epilog (FIN/KILL
-    /// exchange and driver reaping) is allowed to complete.
+    /// Orderly teardown once the foreground operation has finished: signal
+    /// the perpetual accept drivers to stop, then normally join and drain
+    /// them, and finally join the session supervisors so each session's
+    /// epilog (FIN/KILL exchange and driver reaping) is allowed to complete.
     ///
-    /// Both drain loops observe their join results: only the expected
-    /// cancellation of an aborted driver is ignored. A driver that failed
-    /// or panicked before the abort took effect, and any session that
-    /// panicked during its epilog, is surfaced rather than swallowed.
+    /// Both drain loops unwrap their join results: only the graceful
+    /// [`TransportTaskExit::Stopped`] driver exit is expected. A driver
+    /// that failed or panicked before stopping, and any session that
+    /// panicked during its epilog, surfaces rather than being swallowed.
     async fn shutdown(&mut self) {
-        self.drivers.abort_all();
+        let _ = self.stop_tx.send(true);
         while let Some(result) = self.drivers.join_next().await {
             observe_driver_exit(result);
         }
@@ -117,35 +134,37 @@ impl Drop for TransportScope {
 }
 
 /// Observe a perpetual accept driver's exit during shutdown. The only
-/// expected result is cancellation (the abort we just issued); any other
-/// outcome — a driver that failed or panicked before the abort landed —
-/// is surfaced rather than swallowed.
+/// expected result is the graceful [`TransportTaskExit::Stopped`]; any
+/// other outcome — a driver that failed or panicked before stopping — is
+/// surfaced rather than swallowed. A panic surfaces through the join
+/// result's `unwrap`, which carries the original panic message.
 fn observe_driver_exit(result: Result<TransportTaskExit, tokio::task::JoinError>) {
-    match result {
-        Ok(TransportTaskExit::SessionEnded(name)) => {
+    let exit = result.unwrap();
+    match exit {
+        TransportTaskExit::Stopped => {}
+        TransportTaskExit::SessionEnded(name) => {
             panic!("transport driver exited unexpectedly: session {name} ended")
         }
-        Ok(TransportTaskExit::DriverFailed { driver, detail }) => {
+        TransportTaskExit::DriverFailed { driver, detail } => {
             panic!("transport driver {driver} failed during shutdown: {detail}")
         }
-        Err(error) if error.is_cancelled() => {}
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => panic!("transport driver failed to join during shutdown: {error}"),
     }
 }
 
 /// Observe a session supervisor's exit during shutdown. Sessions are
 /// joined, not aborted, so they must finish cleanly; a panic during the
-/// epilog (FIN/KILL exchange or driver reaping) is resumed, and any
-/// other failure is surfaced.
+/// epilog (FIN/KILL exchange or driver reaping) surfaces through the join
+/// result's `unwrap`, and any other failure is surfaced.
 fn observe_session_exit(result: Result<TransportTaskExit, tokio::task::JoinError>) {
-    match result {
-        Ok(TransportTaskExit::SessionEnded(_)) => {}
-        Ok(TransportTaskExit::DriverFailed { driver, detail }) => {
+    let exit = result.unwrap();
+    match exit {
+        TransportTaskExit::SessionEnded(_) => {}
+        TransportTaskExit::DriverFailed { driver, detail } => {
             panic!("transport session {driver} reported a driver failure during shutdown: {detail}")
         }
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => panic!("transport session failed to join during shutdown: {error}"),
+        TransportTaskExit::Stopped => {
+            panic!("transport session stopped unexpectedly during shutdown")
+        }
     }
 }
 
@@ -168,17 +187,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_ignores_an_aborted_driver() {
+    async fn shutdown_stops_a_perpetual_driver() {
         let mut scope = TransportScope::new();
-        scope.spawn(std::future::pending::<TransportTaskExit>());
-        scope.race(async { 7_u8 }).await;
+        scope.spawn(|stop| async move {
+            let _ = stop.changed().await;
+            TransportTaskExit::Stopped
+        });
+        assert_eq!(scope.race(async { 7_u8 }).await, 7);
     }
 
     #[tokio::test]
     #[should_panic(expected = "transport driver rtp_accept failed during shutdown")]
     async fn shutdown_surfaces_a_driver_that_failed_before_the_abort() {
         let mut scope = TransportScope::new();
-        scope.spawn(async {
+        scope.spawn(|_stop| async move {
             TransportTaskExit::DriverFailed {
                 driver: "rtp_accept",
                 detail: "listener closed".into(),
@@ -200,7 +222,7 @@ mod tests {
     #[should_panic(expected = "injected driver panic")]
     async fn shutdown_resumes_a_driver_panic_that_beat_the_abort() {
         let mut scope = TransportScope::new();
-        scope.spawn(async {
+        scope.spawn(|_stop| async move {
             panic!("injected driver panic");
         });
         scope.race(std::future::pending::<()>()).await;

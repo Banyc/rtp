@@ -47,14 +47,17 @@ async fn main() {
                 .await
                 .unwrap();
             let (first_tx, first_rx) = tokio::sync::oneshot::channel::<rtp::udp::Accepted>();
-            scope.spawn(run_udp_accept_driver(
-                listener,
-                rtp::udp::AcceptConfig {
-                    fec,
-                    ..rtp::udp::AcceptConfig::default()
-                },
-                first_tx,
-            ));
+            scope.spawn(|stop| {
+                run_udp_accept_driver(
+                    listener,
+                    rtp::udp::AcceptConfig {
+                        fec,
+                        ..rtp::udp::AcceptConfig::default()
+                    },
+                    first_tx,
+                    stop,
+                )
+            });
             let accepted = scope
                 .race(first_rx)
                 .await
@@ -83,11 +86,9 @@ async fn main() {
                     .await
                     .unwrap();
             let (first_tx, first_rx) = tokio::sync::oneshot::channel::<rtp::mpudp::Conn>();
-            scope.spawn(run_mpudp_accept_driver(
-                listener,
-                rtp::udp::AcceptConfig::default(),
-                first_tx,
-            ));
+            scope.spawn(|stop| {
+                run_mpudp_accept_driver(listener, rtp::udp::AcceptConfig::default(), first_tx, stop)
+            });
             let accepted = scope
                 .race(first_rx)
                 .await
@@ -125,6 +126,7 @@ async fn run_udp_accept_driver(
     listener: rtp::udp::Listener,
     config: rtp::udp::AcceptConfig,
     first_tx: tokio::sync::oneshot::Sender<rtp::udp::Accepted>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> TransportTaskExit {
     let mut first_tx = Some(first_tx);
     let mut handshakes = JoinSet::new();
@@ -141,6 +143,7 @@ async fn run_udp_accept_driver(
                     },
                 }
             }
+            _ = stop.changed() => return TransportTaskExit::Stopped,
             joined = handshakes.join_next(), if !handshakes.is_empty() => {
                 match joined {
                     Some(Ok(Ok(accepted))) => match first_tx.take() {
@@ -152,12 +155,14 @@ async fn run_udp_accept_driver(
                     Some(Ok(Err(error))) => {
                         eprintln!("RTP handshake rejected: {}", error);
                     }
-                    Some(Err(error)) if error.is_panic() => {
-                        std::panic::resume_unwind(error.into_panic());
-                    }
-                    Some(Err(error)) => return TransportTaskExit::DriverFailed {
-                        driver: "rtp_handshake",
-                        detail: error.to_string(),
+                    Some(Err(error)) => match error.try_into_panic() {
+                        // A panicked handshake task surfaces its panic (the
+                        // payload is raised rather than resumed here).
+                        Ok(payload) => std::panic::panic_any(payload),
+                        Err(error) => return TransportTaskExit::DriverFailed {
+                            driver: "rtp_handshake",
+                            detail: error.to_string(),
+                        },
                     },
                     None => unreachable!("guard excludes an empty handshake set"),
                 }
@@ -170,22 +175,28 @@ async fn run_mpudp_accept_driver(
     mut listener: rtp::mpudp::Listener,
     config: rtp::udp::AcceptConfig,
     first_tx: tokio::sync::oneshot::Sender<rtp::mpudp::Conn>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> TransportTaskExit {
     let mut first_tx = Some(first_tx);
     loop {
-        match listener.accept_with(config).await {
-            Ok(accepted) => match first_tx.take() {
-                Some(tx) => {
-                    let _ = tx.send(accepted);
+        tokio::select! {
+            next = listener.accept_with(config) => {
+                match next {
+                    Ok(accepted) => match first_tx.take() {
+                        Some(tx) => {
+                            let _ = tx.send(accepted);
+                        }
+                        None => drop(accepted),
+                    },
+                    Err(error) => {
+                        return TransportTaskExit::DriverFailed {
+                            driver: "rtpm_accept",
+                            detail: error.to_string(),
+                        };
+                    }
                 }
-                None => drop(accepted),
-            },
-            Err(error) => {
-                return TransportTaskExit::DriverFailed {
-                    driver: "rtpm_accept",
-                    detail: error.to_string(),
-                };
             }
+            _ = stop.changed() => return TransportTaskExit::Stopped,
         }
     }
 }
