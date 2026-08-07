@@ -773,7 +773,7 @@ mod tests {
         );
         assert_eq!(frame, expected, "frame contents must match");
         drop(a_r);
-        let _ = send_tasks.join_next().await;
+        drop(send_tasks.join_next().await.unwrap().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]

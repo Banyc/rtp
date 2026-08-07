@@ -1083,9 +1083,16 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let shared = Arc::clone(&tl.shared);
         let mut send_tasks = tokio::task::JoinSet::new();
+        // The parked KILL delivery is cancelled through a watch inside the
+        // task, so the task exits normally instead of being aborted (no
+        // cancelled JoinError to tolerate); the pending operation is dropped.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         send_tasks.spawn(async move {
             let mut bufs = SendBufs::new();
-            tl.send_pkts(&mut bufs).await
+            tokio::select! {
+                result = tl.send_pkts(&mut bufs) => Some(result),
+                _ = stop_rx.changed() => None,
+            }
         });
         kill_started.notified().await;
         assert_eq!(
@@ -1118,12 +1125,12 @@ mod tests {
             datagrams.iter().any(|datagram| datagram.as_slice() == [2]),
             "a KILL datagram must be attempted, got {datagrams:?}"
         );
-        send_tasks.abort_all();
-        while let Some(result) = send_tasks.join_next().await {
-            if let Err(error) = result {
-                assert!(error.is_cancelled(), "{error}");
-            }
-        }
+        stop_tx.send(true).unwrap();
+        let exit = send_tasks.join_next().await.unwrap().unwrap();
+        assert!(
+            exit.is_none(),
+            "KILL delivery must be cancelled, not completed"
+        );
     }
 
     #[tokio::test]
@@ -1158,9 +1165,16 @@ mod tests {
         let mut transmission = TransmissionLayer::new(unreliable, None);
         let shared = Arc::clone(&transmission.shared);
         let mut send_tasks = tokio::task::JoinSet::new();
+        // The parked operation is cancelled through a watch inside the task,
+        // so the task exits normally instead of being aborted (no cancelled
+        // JoinError to tolerate); the pending operation is dropped.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         send_tasks.spawn(async move {
             let mut bufs = SendBufs::new();
-            transmission.send_kill_and_abort(&mut bufs).await
+            tokio::select! {
+                result = transmission.send_kill_and_abort(&mut bufs) => Some(result),
+                _ = stop_rx.changed() => None,
+            }
         });
         tail_started.notified().await;
         assert_eq!(sends.load(Ordering::SeqCst), 2);
@@ -1170,12 +1184,12 @@ mod tests {
         );
         assert!(shared.termination.terminal().is_cancelled());
         assert!(send_tasks.try_join_next().is_none());
-        send_tasks.abort_all();
-        while let Some(result) = send_tasks.join_next().await {
-            if let Err(error) = result {
-                assert!(error.is_cancelled(), "{error}");
-            }
-        }
+        stop_tx.send(true).unwrap();
+        let exit = send_tasks.join_next().await.unwrap().unwrap();
+        assert!(
+            exit.is_none(),
+            "the stalled operation must be cancelled, not completed"
+        );
     }
 
     #[tokio::test]
