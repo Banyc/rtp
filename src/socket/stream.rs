@@ -383,7 +383,6 @@ impl AsyncAsyncWrite for ConnWriter {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -562,7 +561,8 @@ mod tests {
         let send_buf_clone = send_buf.clone();
         let recv_done = Arc::new(tokio::sync::Notify::new());
         let recv_done_clone = recv_done.clone();
-        let sender = tokio::spawn(async move {
+        let mut send_tasks = tokio::task::JoinSet::new();
+        send_tasks.spawn(async move {
             let _b_w = b_w;
             a.write_all(&send_buf_clone).await.unwrap();
             recv_done_clone.notified().await;
@@ -571,7 +571,7 @@ mod tests {
         b_r.read_exact(&mut recv_buf).await.unwrap();
         assert_eq!(send_buf, recv_buf);
         recv_done.notify_waiters();
-        sender.await.unwrap();
+        send_tasks.join_next().await.unwrap().unwrap();
         let recovered = b_r.inner().fec_recovered_symbols();
         assert!(recovered.is_some(), "FEC should be enabled on receiver");
         assert!(
@@ -615,7 +615,8 @@ mod tests {
             sent.push(m.clone());
         }
         let sent_for_server = sent.clone();
-        let server_task = tokio::spawn(async move {
+        let mut server_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
             let mut buf = vec![0u8; msg_len];
             for expected in &sent_for_server {
                 let n = b_r.recv(&mut buf).await.unwrap();
@@ -632,7 +633,7 @@ mod tests {
         }
         drop(a_w);
         drop(a_r);
-        let recovered = server_task.await.unwrap();
+        let recovered = server_tasks.join_next().await.unwrap().unwrap();
         assert!(recovered.is_some(), "FEC should be enabled on the receiver");
         assert!(
             recovered.unwrap() > 0,
@@ -754,7 +755,8 @@ mod tests {
         let payload: Vec<u8> = (0..frame_size).map(|i| (i % 251) as u8).collect();
         let expected = payload.clone();
         let mut a_stream = a_w.into_async_write();
-        let send_task = tokio::spawn(async move {
+        let mut send_tasks = tokio::task::JoinSet::new();
+        send_tasks.spawn(async move {
             a_stream.write_all(&payload).await.unwrap();
             a_stream.shutdown().await.ok();
             a_stream
@@ -771,7 +773,7 @@ mod tests {
         );
         assert_eq!(frame, expected, "frame contents must match");
         drop(a_r);
-        let _ = send_task.await;
+        let _ = send_tasks.join_next().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1110,7 +1112,8 @@ mod tests {
             let b_w = b_w.into_async_write();
             let expected = send_buf.clone();
             let recv_done = Arc::new(tokio::sync::Notify::new());
-            let sender = tokio::spawn({
+            let mut send_tasks = tokio::task::JoinSet::new();
+            send_tasks.spawn({
                 let recv_done = recv_done.clone();
                 async move {
                     let _b_w = b_w;
@@ -1125,7 +1128,7 @@ mod tests {
                 .unwrap();
             assert_eq!(expected, recv_buf, "fec={fec}: the stream arrived corrupt");
             recv_done.notify_waiters();
-            sender.await.unwrap();
+            send_tasks.join_next().await.unwrap().unwrap();
             let (dropped, reordered, duplicated) = rate_a.applied();
             assert!(
                 dropped > 0 && reordered > 0 && duplicated > 0,
@@ -1162,7 +1165,8 @@ mod tests {
         let b_w = b_w.into_async_write();
         let expected = send_buf.clone();
         let recv_done = Arc::new(tokio::sync::Notify::new());
-        let sender = tokio::spawn({
+        let mut send_tasks = tokio::task::JoinSet::new();
+        send_tasks.spawn({
             let recv_done = recv_done.clone();
             async move {
                 let _b_w = b_w;
@@ -1177,7 +1181,7 @@ mod tests {
             .unwrap();
         assert_eq!(expected, recv_buf);
         recv_done.notify_waiters();
-        sender.await.unwrap();
+        send_tasks.join_next().await.unwrap().unwrap();
         let (_, _, duplicated) = rate_a.applied();
         assert!(duplicated > 0, "no packet was actually duplicated");
     }

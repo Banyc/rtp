@@ -50,7 +50,6 @@ impl TransmissionLayer {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::transmission::test_doubles::BlockingWrite;
@@ -1083,7 +1082,8 @@ mod tests {
         assert!(tl.send_pkts(&mut bufs).await.is_ok());
         tokio::time::sleep(Duration::from_secs(2)).await;
         let shared = Arc::clone(&tl.shared);
-        let send = tokio::spawn(async move {
+        let mut send_tasks = tokio::task::JoinSet::new();
+        send_tasks.spawn(async move {
             let mut bufs = SendBufs::new();
             tl.send_pkts(&mut bufs).await
         });
@@ -1097,7 +1097,10 @@ mod tests {
             shared.termination.terminal().is_cancelled(),
             "session cancellation must be published before KILL delivery completes"
         );
-        assert!(!send.is_finished(), "KILL delivery must still be pending");
+        assert!(
+            send_tasks.try_join_next().is_none(),
+            "KILL delivery must still be pending"
+        );
         let err = shared
             .termination
             .io_error(std::io::ErrorKind::BrokenPipe.into());
@@ -1115,8 +1118,12 @@ mod tests {
             datagrams.iter().any(|datagram| datagram.as_slice() == [2]),
             "a KILL datagram must be attempted, got {datagrams:?}"
         );
-        send.abort();
-        assert!(send.await.unwrap_err().is_cancelled());
+        send_tasks.abort_all();
+        while let Some(result) = send_tasks.join_next().await {
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "{error}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1150,7 +1157,8 @@ mod tests {
         );
         let mut transmission = TransmissionLayer::new(unreliable, None);
         let shared = Arc::clone(&transmission.shared);
-        let send = tokio::spawn(async move {
+        let mut send_tasks = tokio::task::JoinSet::new();
+        send_tasks.spawn(async move {
             let mut bufs = SendBufs::new();
             transmission.send_kill_and_abort(&mut bufs).await
         });
@@ -1161,9 +1169,13 @@ mod tests {
             Err(std::io::ErrorKind::BrokenPipe.into())
         );
         assert!(shared.termination.terminal().is_cancelled());
-        assert!(!send.is_finished());
-        send.abort();
-        assert!(send.await.unwrap_err().is_cancelled());
+        assert!(send_tasks.try_join_next().is_none());
+        send_tasks.abort_all();
+        while let Some(result) = send_tasks.join_next().await {
+            if let Err(error) = result {
+                assert!(error.is_cancelled(), "{error}");
+            }
+        }
     }
 
     #[tokio::test]

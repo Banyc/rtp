@@ -184,7 +184,6 @@ fn timeout() -> io::Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{
@@ -943,7 +942,8 @@ mod tests {
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let cancelled = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn({
+        let mut task = tokio::task::JoinSet::new();
+        task.spawn({
             let started = Arc::clone(&started);
             let release = Arc::clone(&release);
             let cancelled = Arc::clone(&cancelled);
@@ -958,10 +958,10 @@ mod tests {
         });
         started.notified().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!task.is_finished());
+        assert!(task.try_join_next().is_none());
         assert!(!cancelled.load(Ordering::SeqCst));
         release.notify_one();
-        task.await.unwrap().unwrap();
+        task.join_next().await.unwrap().unwrap().unwrap();
         assert!(!cancelled.load(Ordering::SeqCst));
     }
 }

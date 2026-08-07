@@ -716,7 +716,6 @@ pub async fn connect_with_socket(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -726,7 +725,9 @@ mod tests {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
         let msg_1 = b"hello";
-        tokio::spawn(async move {
+        let mut server_tasks = tokio::task::JoinSet::new();
+        let mut handler_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
             loop {
                 let accepted = listener
                     .accept_with(AcceptConfig {
@@ -735,7 +736,7 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                tokio::spawn(async move {
+                handler_tasks.spawn(async move {
                     let mut accepted = accepted.await.unwrap();
                     accepted.write.send(msg_1).await.unwrap();
                     let mut buf = [0; 1];
@@ -870,7 +871,9 @@ mod tests {
         };
         let msg_for_server = msg.clone();
 
-        tokio::spawn(async move {
+        let mut server_tasks = tokio::task::JoinSet::new();
+        let mut handler_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
             loop {
                 let accepted = listener
                     .accept_without_handshake_with(AcceptConfig {
@@ -881,7 +884,7 @@ mod tests {
                     .await
                     .unwrap();
                 let msg = msg_for_server.clone();
-                tokio::spawn(async move {
+                handler_tasks.spawn(async move {
                     let mut accepted = accepted;
                     let mut buf = vec![0; msg.len()];
                     let n = tokio::time::timeout(
@@ -1006,9 +1009,9 @@ mod tests {
         assert_eq!(MssConfig::Custom(9_000).resolve().unwrap().get(), 9_000);
     }
 
-    fn spawn_accept_loop(listener: Listener) -> SocketAddr {
+    fn spawn_accept_loop(tasks: &mut tokio::task::JoinSet<()>, listener: Listener) -> SocketAddr {
         let addr = listener.local_addr();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 if listener.accept_without_handshake().await.is_err() {
                     break;
@@ -1021,7 +1024,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn listener_echoes_probe_with_direction_flipped() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        let addr = spawn_accept_loop(listener);
+        let mut tasks = tokio::task::JoinSet::new();
+        let addr = spawn_accept_loop(&mut tasks, listener);
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
         let probe = crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
@@ -1050,10 +1054,9 @@ mod tests {
     async fn probes_never_create_connection_state() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
-        let accept =
-            tokio::spawn(
-                async move { listener.accept_without_handshake().await.unwrap().peer_addr },
-            );
+        let mut accept_tasks = tokio::task::JoinSet::new();
+        accept_tasks
+            .spawn(async move { listener.accept_without_handshake().await.unwrap().peer_addr });
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober
             .send_to(
@@ -1067,20 +1070,26 @@ mod tests {
             .unwrap();
         let mut buf = [0u8; 64];
         prober.recv(&mut buf).await.unwrap();
-        assert!(!accept.is_finished(), "a probe created connection state");
+        assert!(
+            accept_tasks.try_join_next().is_none(),
+            "a probe created connection state"
+        );
         let real = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         real.send_to(b"payload", addr).await.unwrap();
-        let accepted_peer = tokio::time::timeout(std::time::Duration::from_secs(2), accept)
-            .await
-            .expect("accept timed out")
-            .unwrap();
+        let accepted_peer =
+            tokio::time::timeout(std::time::Duration::from_secs(2), accept_tasks.join_next())
+                .await
+                .expect("accept timed out")
+                .unwrap()
+                .unwrap();
         assert_eq!(accepted_peer, real.local_addr().unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_floods_are_rate_limited_per_source() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        let addr = spawn_accept_loop(listener);
+        let mut tasks = tokio::task::JoinSet::new();
+        let addr = spawn_accept_loop(&mut tasks, listener);
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober.connect(addr).await.unwrap();
         for nonce in 0..200u64 {
@@ -1109,21 +1118,26 @@ mod tests {
         );
     }
 
-    fn spawn_greeting_server(listener: Listener, reply: &'static [u8]) -> SocketAddr {
+    fn spawn_greeting_server(
+        tasks: &mut tokio::task::JoinSet<()>,
+        listener: Listener,
+        reply: &'static [u8],
+    ) -> SocketAddr {
         let addr = listener.local_addr();
         let listener = Arc::new(listener);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut accepted = listener.accept_without_handshake().await.unwrap();
-            tokio::spawn({
+            let mut keepalive = tokio::task::JoinSet::new();
+            {
                 let listener = Arc::clone(&listener);
-                async move {
+                keepalive.spawn(async move {
                     loop {
                         if listener.accept_without_handshake().await.is_err() {
                             break;
                         }
                     }
-                }
-            });
+                });
+            }
             let mut buf = [0u8; 64];
             let _ = accepted.read.recv(&mut buf).await;
             accepted.write.send(reply).await.unwrap();
@@ -1135,7 +1149,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_tap_probes_the_sessions_own_tuple() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        let addr = spawn_greeting_server(listener, b"data");
+        let mut tasks = tokio::task::JoinSet::new();
+        let addr = spawn_greeting_server(&mut tasks, listener, b"data");
         let mut connected = connect_with(
             "127.0.0.1:0",
             addr,
@@ -1176,7 +1191,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_with_socket_preserves_the_bound_local_addr() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        let addr = spawn_greeting_server(listener, b"hello");
+        let mut tasks = tokio::task::JoinSet::new();
+        let addr = spawn_greeting_server(&mut tasks, listener, b"hello");
         let socket = VectoredUdpSocket::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
@@ -1217,7 +1233,8 @@ mod tests {
     async fn dialing_a_wildcard_listener_addr_stays_connected() {
         let listener = Listener::bind("0.0.0.0:0").await.unwrap();
         assert!(listener.local_addr().ip().is_unspecified());
-        let addr = spawn_greeting_server(listener, b"hello");
+        let mut tasks = tokio::task::JoinSet::new();
+        let addr = spawn_greeting_server(&mut tasks, listener, b"hello");
         let mut connected = connect_with(
             "0.0.0.0:0",
             addr,

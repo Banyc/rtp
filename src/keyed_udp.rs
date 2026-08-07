@@ -357,7 +357,6 @@ fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<(K, P
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -435,9 +434,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(accepted.dispatch_key, key);
-            tokio::spawn({
+            let mut keepalive = tokio::task::JoinSet::new();
+            {
                 let server = server.clone();
-                async move {
+                keepalive.spawn(async move {
                     loop {
                         let _ = server
                             .accept_with(AcceptConfig {
@@ -446,8 +446,8 @@ mod tests {
                             })
                             .await;
                     }
-                }
-            });
+                });
+            }
             let mut buf = vec![0; 1024];
             let n = accepted.read.recv(&mut buf).await.unwrap();
             let m = &buf[..n];
@@ -464,14 +464,15 @@ mod tests {
                 .unwrap();
             println!("connected");
             let client = Arc::new(client);
-            tokio::spawn({
+            let mut dispatch = tokio::task::JoinSet::new();
+            {
                 let client = client.clone();
-                async move {
+                dispatch.spawn(async move {
                     loop {
                         client.dispatch().await.unwrap();
                     }
-                }
-            });
+                });
+            }
             let mut accepted = client
                 .open_without_handshake_with(
                     key,
@@ -507,7 +508,8 @@ mod tests {
         let pong = b"pong";
 
         let (pong_acked_tx, pong_acked_rx) = tokio::sync::oneshot::channel();
-        let server_task = tokio::spawn(async move {
+        let mut server_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
             let mut accepted = server
                 .accept_with(AcceptConfig {
                     fec,
@@ -563,7 +565,8 @@ mod tests {
 
         // Start the dispatch loop on a clone. The server reply should now arrive.
         let dispatch_client = Arc::clone(&client);
-        let dispatch_task = tokio::spawn(async move {
+        let mut dispatch_tasks = tokio::task::JoinSet::new();
+        dispatch_tasks.spawn(async move {
             loop {
                 if dispatch_client.dispatch().await.is_err() {
                     break;
@@ -580,11 +583,13 @@ mod tests {
         // Confirm receipt so the server can release its listener and session.
         let _ = pong_acked_tx.send(());
 
-        // Cleanup: release the opened session, then stop the dispatch loop
-        // (it also breaks on the error the closed server socket may surface).
+        // Cleanup: release the opened session, then await the server task
+        // (it finishes once the pong is acked); the dispatch loop is aborted
+        // via JoinSet drop.
         drop(opened);
-        dispatch_task.abort();
-        server_task.await.unwrap();
+        while let Some(result) = server_tasks.join_next().await {
+            result.unwrap();
+        }
     }
 
     /// Fix #3: `keyed_writer_delivers_via_raw_path_when_writability_never_ready`

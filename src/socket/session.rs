@@ -267,7 +267,6 @@ async fn join_drivers(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use tokio::net::UdpSocket;
 
@@ -362,14 +361,16 @@ mod tests {
             false,
         );
         let (_read, _write, supervisor) = socket(layer, None);
-        let owner = tokio::spawn(supervisor);
+        let mut owner_tasks = tokio::task::JoinSet::new();
+        owner_tasks.spawn(supervisor);
         tokio::time::timeout(Duration::from_secs(1), dropped_rx)
             .await
             .expect("a panicked RTP event task left the peer task alive")
             .expect("writer drop probe was lost");
-        let error = tokio::time::timeout(Duration::from_secs(1), owner)
+        let error = tokio::time::timeout(Duration::from_secs(1), owner_tasks.join_next())
             .await
             .expect("RTP supervisor did not finish joining its drivers")
+            .expect("RTP supervisor JoinSet was empty")
             .expect_err("RTP driver panic did not cascade to the owning task");
         assert!(error.is_panic());
     }
@@ -426,7 +427,8 @@ mod tests {
             false,
         );
         let (_read, mut write, supervisor) = socket(layer, None);
-        let owner = tokio::spawn(supervisor);
+        let mut owner_tasks = tokio::task::JoinSet::new();
+        owner_tasks.spawn(supervisor);
         assert_eq!(write.send(b"payload").await.unwrap(), 7);
         tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
@@ -434,7 +436,7 @@ mod tests {
         fail.notify_one();
         tokio::task::yield_now().await;
         assert!(
-            !owner.is_finished(),
+            owner_tasks.try_join_next().is_none(),
             "the supervisor returned before joining the in-flight writer"
         );
         assert!(
@@ -442,9 +444,10 @@ mod tests {
             "the suicide signal cancelled an in-flight unreliable send"
         );
         release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), owner)
+        tokio::time::timeout(Duration::from_secs(1), owner_tasks.join_next())
             .await
             .expect("the supervisor did not join the released writer")
+            .expect("the supervisor JoinSet was empty")
             .expect("the supervisor failed after a clean cooperative stop");
         assert!(dropped.load(Ordering::SeqCst));
     }
