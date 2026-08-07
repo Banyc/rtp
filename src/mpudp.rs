@@ -140,7 +140,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_connect() {
+    async fn test_connect() -> std::io::Result<()> {
         let max_session_conns = NonZeroUsize::new(1 << 10).unwrap();
         let mut listener = Listener::bind(
             ["127.0.0.1:0"].map(|x| x.parse().unwrap()).into_iter(),
@@ -152,11 +152,15 @@ mod tests {
         let msg_1 = b"hello";
 
         // Notify handshakes: `echo_received` proves the client got the echo,
-        // `receipt_acked` proves the server read the client's receipt.  Each
-        // `notify_one()` is ordering-safe (a stored permit satisfies a waiter
-        // registered later), so neither side can miss the other's signal.
+        // `receipt_seen` proves the server read and validated the client's
+        // receipt, and `release_server` lets the client hold the server's
+        // session open until the client has proved the wire is quiescent.
+        // Each `notify_one()` is ordering-safe (a stored permit satisfies a
+        // waiter registered later), so neither side can miss the other's
+        // signal.
         let echo_received = std::sync::Arc::new(tokio::sync::Notify::new());
-        let receipt_acked = std::sync::Arc::new(tokio::sync::Notify::new());
+        let receipt_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_server = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // One function-scoped JoinSet owns the listener and the accepted
         // read/write/supervisor halves together: a single supervised server
@@ -165,7 +169,8 @@ mod tests {
         let mut server = tokio::task::JoinSet::new();
         server.spawn({
             let echo_received = std::sync::Arc::clone(&echo_received);
-            let receipt_acked = std::sync::Arc::clone(&receipt_acked);
+            let receipt_seen = std::sync::Arc::clone(&receipt_seen);
+            let release_server = std::sync::Arc::clone(&release_server);
             async move {
                 let mut accepted = listener.accept_with(AcceptConfig::default()).await.unwrap();
                 println!("accepted");
@@ -181,9 +186,13 @@ mod tests {
                 let mut receipt = [0; 1];
                 let n = accepted.read.recv(&mut receipt).await.unwrap();
                 assert_eq!(n, 1);
-                receipt_acked.notify_one();
-                // Drain anything still staged before the session is released.
-                let _ = accepted.write.send_buf_empty().await;
+                assert_eq!(receipt, [0]);
+                // The receipt has been read and validated; tell the client.
+                receipt_seen.notify_one();
+                // Hold the session open until the client releases us: dropping
+                // it now would tear the connection down before the client can
+                // prove the wire is quiescent.
+                release_server.notified().await;
             }
         });
 
@@ -211,18 +220,25 @@ mod tests {
         // The echo is confirmed: release the server's wait.
         echo_received.notify_one();
         // Send the application-level receipt and drain it onto the wire.  The
-        // drain result must not be ignored: the epilog below only proves the
-        // server acked the receipt if it actually reached the wire.
+        // drain result is propagated: the proof below only holds if the bytes
+        // actually reached the wire.
         connected.write.send(b"\x00").await.unwrap();
-        connected.write.send_buf_empty().await.unwrap();
-        // Wait for the server to ack the receipt before releasing our session.
-        receipt_acked.notified().await;
-        // The server task has ended and released its listener and session.
+        connected.write.send_buf_empty().await?;
+        // Prove zero in-flight packets and that the receipt has been acked by
+        // the peer's reliable layer: `no_data_to_send` waits until the send
+        // buffer is empty AND every sent packet has been acked.
+        connected.write.transmission_layer.no_data_to_send().await?;
+        // Await the server's application-level receipt confirmation separately.
+        receipt_seen.notified().await;
+        // Release the server's session and join it; the set must be empty.
+        release_server.notify_one();
         server
             .join_next()
             .await
             .expect("server task missing")
             .unwrap();
+        assert!(server.is_empty());
+        Ok(())
     }
 
     fn mpudp_header(with_payload: bool) -> [u8; 17] {
