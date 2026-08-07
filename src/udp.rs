@@ -888,6 +888,10 @@ mod tests {
                     }
                     assert_eq!(msg, &buf[..offset]);
                     accepted.write.send(b"\x01").await.unwrap();
+                    // Drain the send buffer before releasing the supervisor:
+                    // `send` only stages the one-byte ack, so it must reach
+                    // the wire before the write driver may be reaped.
+                    accepted.write.send_buf_empty().await.unwrap();
                 });
             }
         });

@@ -453,6 +453,10 @@ mod tests {
             let m = &buf[..n];
             assert_eq!(m, msg_1);
             accepted.write.send(msg_1).await.unwrap();
+            // Drain the send buffer before releasing the supervisor: `send`
+            // only stages bytes, so the echo must reach the wire before the
+            // write driver may be reaped.
+            accepted.write.send_buf_empty().await.unwrap();
         });
         tasks.spawn(async move {
             let client = Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
@@ -502,6 +506,7 @@ mod tests {
         let ping = b"ping";
         let pong = b"pong";
 
+        let (pong_acked_tx, pong_acked_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
             let mut accepted = server
                 .accept_with(AcceptConfig {
@@ -515,6 +520,14 @@ mod tests {
             let n = accepted.read.recv(&mut buf).await.unwrap();
             assert_eq!(&buf[..n], ping);
             accepted.write.send(pong).await.unwrap();
+            // Drain the send buffer so the pong is on the wire before the
+            // session may be released.
+            accepted.write.send_buf_empty().await.unwrap();
+            // Keep the server listener and the accepted session alive until
+            // the client confirms it received the pong: dropping the socket
+            // any earlier lets a client ACK surface ECONNREFUSED on the
+            // client's connected socket.
+            let _ = pong_acked_rx.await;
         });
 
         let client = Arc::new(
@@ -552,7 +565,9 @@ mod tests {
         let dispatch_client = Arc::clone(&client);
         let dispatch_task = tokio::spawn(async move {
             loop {
-                dispatch_client.dispatch().await.unwrap();
+                if dispatch_client.dispatch().await.is_err() {
+                    break;
+                }
             }
         });
 
@@ -562,7 +577,11 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[..n], pong);
 
-        // Cleanup: close the read side so the dispatch loop can exit.
+        // Confirm receipt so the server can release its listener and session.
+        let _ = pong_acked_tx.send(());
+
+        // Cleanup: release the opened session, then stop the dispatch loop
+        // (it also breaks on the error the closed server socket may surface).
         drop(opened);
         dispatch_task.abort();
         server_task.await.unwrap();

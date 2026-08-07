@@ -150,14 +150,24 @@ mod tests {
         .unwrap();
         let addrs = listener.local_addrs().collect::<Vec<SocketAddr>>();
         let msg_1 = b"hello";
-        tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
             loop {
                 let mut accepted = listener.accept_with(AcceptConfig::default()).await.unwrap();
                 println!("accepted");
+                // The handler owns read, write, and supervisor together so the
+                // supervisor is retained for the handler's entire lifetime;
+                // the outer accept iteration must never drop it.
                 tokio::spawn(async move {
                     accepted.write.send(msg_1).await.unwrap();
                     let mut buf = [0; 1];
-                    accepted.read.recv(&mut buf).await.unwrap();
+                    // Wait for the client's application-level receipt before
+                    // releasing the supervisor: the echo must be confirmed
+                    // received before the write driver may be reaped.
+                    let _ = accepted.read.recv(&mut buf).await;
+                    // Drain the send buffer so the write driver is never
+                    // aborted mid-transmission.
+                    let _ = accepted.write.send_buf_empty().await;
                 });
             }
         });
@@ -182,6 +192,11 @@ mod tests {
         .expect("client: timed out waiting for the echo")
         .unwrap();
         assert_eq!(msg_1, &buf[..n]);
+        // Application-level receipt: confirm the echo so the server can
+        // release its session without racing the write driver.
+        connected.write.send(b"\x00").await.unwrap();
+        let _ = connected.write.send_buf_empty().await;
+        tasks.abort_all();
     }
 
     fn mpudp_header(with_payload: bool) -> [u8; 17] {
