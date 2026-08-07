@@ -69,13 +69,26 @@ fn a_hostile_datagram_never_yields_a_range_outside_it() {
             continue;
         };
         decoded_count += 1;
-        if let Some(DecodedDataPkt { buf_range, .. }) = decoded.data {
+        if let Some(DecodedDataPkt {
+            buf_range,
+            frame_len,
+            send_ts,
+            ..
+        }) = decoded.data
+        {
             assert!(
                 buf_range.start <= buf_range.end && buf_range.end <= pkt.len(),
                 "{buf_range:?} is outside a {}-byte packet {pkt:02x?}",
                 pkt.len(),
             );
             let _ = &pkt[buf_range];
+            // Mirror the libFuzzer target's frame/timestamp invariant: only
+            // the FRAME_DATA_TS command may report a frame length, and that
+            // wire form must carry the timestamp first.
+            assert!(
+                frame_len.is_none() || send_ts.is_some(),
+                "frame_len without send_ts"
+            );
         }
         for ack in &acks {
             assert!(ack.end() >= ack.start, "{ack:?} wrapped");

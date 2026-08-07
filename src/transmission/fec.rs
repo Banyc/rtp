@@ -1063,4 +1063,67 @@ mod tests {
             "no packet decoded in {ROUNDS} rounds; the generator went stale"
         );
     }
+
+    /// Direct decoder hostile test: bypasses `FecState::decode`'s
+    /// `catch_unwind` guard and drives the third-party `FecDecoder` directly,
+    /// so any reachable decoder panic fails the test instead of being folded
+    /// into a malformed-packet count.  `encodable_wire_pkt` is applied first —
+    /// the production precondition — so failures are attributed only to inputs
+    /// that can actually reach the decoder.
+    #[test]
+    fn a_guarded_hostile_datagram_never_panics_the_fec_decoder() {
+        const ROUNDS: usize = 50_000;
+        let symbol_size = 1424 - fec_hdr_size();
+        let mut rng = SplitMix64::new(0xfec_5eed);
+        let mut fec = fec_state(symbol_size, 1);
+        let mut decodable = 0_usize;
+        for round in 0..ROUNDS {
+            let group_id = rng.below(4) as u64;
+            let symbol_id = rng.below(MAX_GROUP_SIZE + 2) as u8;
+            let (data_count, parity_count) = match rng.below(4) {
+                0 => (0, 0),
+                1 => (
+                    1,
+                    rng.below(MAX_INTERACTIVE_PARITY_DEPTH as usize) as u8 + 1,
+                ),
+                2 => (
+                    INSTREAM_DATA_PER_GROUP as u8,
+                    INSTREAM_PARITY_PER_GROUP as u8,
+                ),
+                _ => (rng.byte(), rng.byte()),
+            };
+            let body_len = match rng.below(4) {
+                0 => symbol_size,
+                _ => rng.below(symbol_size + 1),
+            };
+            let body: Vec<u8> = (0..body_len).map(|_| rng.byte()).collect();
+            let mut pkt = wire_pkt(group_id, symbol_id, data_count, parity_count, &body);
+            if rng.below(8) == 0 && !pkt.is_empty() {
+                let n = rng.below(pkt.len());
+                pkt.truncate(n);
+            }
+            if !encodable_wire_pkt(&pkt, symbol_size) {
+                continue;
+            }
+            decodable += 1;
+            // No catch_unwind here: a third-party decoder panic fails the test.
+            if let Some(hdr_len) = fec.decoder.decode(&pkt, |recovered| {
+                assert!(
+                    recovered.len() <= symbol_size,
+                    "round {round}: decoder recovered {} bytes from a {symbol_size}-byte symbol",
+                    recovered.len()
+                );
+            }) {
+                assert!(
+                    hdr_len <= pkt.len(),
+                    "round {round}: a {}-byte packet yielded a {hdr_len}-byte header",
+                    pkt.len()
+                );
+            }
+        }
+        assert!(
+            decodable * 4 > ROUNDS,
+            "only {decodable}/{ROUNDS} generated packets passed the production guard; the generator went stale"
+        );
+    }
 }

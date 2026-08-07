@@ -150,27 +150,43 @@ mod tests {
         .unwrap();
         let addrs = listener.local_addrs().collect::<Vec<SocketAddr>>();
         let msg_1 = b"hello";
-        let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(async move {
-            loop {
+
+        // Notify handshakes: `echo_received` proves the client got the echo,
+        // `receipt_acked` proves the server read the client's receipt.  Each
+        // `notify_one()` is ordering-safe (a stored permit satisfies a waiter
+        // registered later), so neither side can miss the other's signal.
+        let echo_received = std::sync::Arc::new(tokio::sync::Notify::new());
+        let receipt_acked = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // One function-scoped JoinSet owns the listener and the accepted
+        // read/write/supervisor halves together: a single supervised server
+        // task holds all four, so no detached task can outlive the supervisor
+        // or drop it mid-write.
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn({
+            let echo_received = std::sync::Arc::clone(&echo_received);
+            let receipt_acked = std::sync::Arc::clone(&receipt_acked);
+            async move {
                 let mut accepted = listener.accept_with(AcceptConfig::default()).await.unwrap();
                 println!("accepted");
-                // The handler owns read, write, and supervisor together so the
-                // supervisor is retained for the handler's entire lifetime;
-                // the outer accept iteration must never drop it.
-                tokio::spawn(async move {
-                    accepted.write.send(msg_1).await.unwrap();
-                    let mut buf = [0; 1];
-                    // Wait for the client's application-level receipt before
-                    // releasing the supervisor: the echo must be confirmed
-                    // received before the write driver may be reaped.
-                    let _ = accepted.read.recv(&mut buf).await;
-                    // Drain the send buffer so the write driver is never
-                    // aborted mid-transmission.
-                    let _ = accepted.write.send_buf_empty().await;
-                });
+                accepted.write.send(msg_1).await.unwrap();
+                // Drain the staged echo before anything can proceed: `send`
+                // only stages bytes, so the write driver must put them on the
+                // wire first.
+                accepted.write.send_buf_empty().await.unwrap();
+                // Wait for the client's confirmation that the echo arrived.
+                echo_received.notified().await;
+                // Read the client's receipt: the reliable layer hands it up in
+                // order, so this is a genuine application-level ack.
+                let mut receipt = [0; 1];
+                let n = accepted.read.recv(&mut receipt).await.unwrap();
+                assert_eq!(n, 1);
+                receipt_acked.notify_one();
+                // Drain anything still staged before the session is released.
+                let _ = accepted.write.send_buf_empty().await;
             }
         });
+
         let mut connected = Conn::connect_with(
             addrs.into_iter(),
             ConnectConfig {
@@ -192,11 +208,19 @@ mod tests {
         .expect("client: timed out waiting for the echo")
         .unwrap();
         assert_eq!(msg_1, &buf[..n]);
-        // Application-level receipt: confirm the echo so the server can
-        // release its session without racing the write driver.
+        // The echo is confirmed: release the server's wait.
+        echo_received.notify_one();
+        // Send the application-level receipt and drain it onto the wire.
         connected.write.send(b"\x00").await.unwrap();
         let _ = connected.write.send_buf_empty().await;
-        tasks.abort_all();
+        // Wait for the server to ack the receipt before releasing our session.
+        receipt_acked.notified().await;
+        // The server task has ended and released its listener and session.
+        server
+            .join_next()
+            .await
+            .expect("server task missing")
+            .unwrap();
     }
 
     fn mpudp_header(with_payload: bool) -> [u8; 17] {
