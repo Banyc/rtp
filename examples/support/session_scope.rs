@@ -57,33 +57,27 @@ impl TransportScope {
             biased;
             value = &mut operation => value,
             joined = self.sessions.join_next(), if !self.sessions.is_empty() => {
-                match joined {
-                    Some(Ok(TransportTaskExit::SessionEnded(name))) => {
+                let joined = joined.unwrap();
+                let exit = joined.unwrap();
+                match exit {
+                    TransportTaskExit::SessionEnded(name) => {
                         panic!("transport child exited early: session {name} ended")
                     }
-                    Some(Ok(TransportTaskExit::DriverFailed { driver, detail })) => {
+                    TransportTaskExit::DriverFailed { driver, detail } => {
                         panic!("transport child exited early: driver {driver} failed: {detail}")
                     }
-                    Some(Err(error)) if error.is_panic() => {
-                        std::panic::resume_unwind(error.into_panic())
-                    }
-                    Some(Err(error)) => panic!("transport child failed to join: {error}"),
-                    None => unreachable!("guard excludes an empty session set"),
                 }
             }
             joined = self.drivers.join_next(), if !self.drivers.is_empty() => {
-                match joined {
-                    Some(Ok(TransportTaskExit::SessionEnded(name))) => {
+                let joined = joined.unwrap();
+                let exit = joined.unwrap();
+                match exit {
+                    TransportTaskExit::SessionEnded(name) => {
                         panic!("transport child exited early: session {name} ended")
                     }
-                    Some(Ok(TransportTaskExit::DriverFailed { driver, detail })) => {
+                    TransportTaskExit::DriverFailed { driver, detail } => {
                         panic!("transport child exited early: driver {driver} failed: {detail}")
                     }
-                    Some(Err(error)) if error.is_panic() => {
-                        std::panic::resume_unwind(error.into_panic())
-                    }
-                    Some(Err(error)) => panic!("transport child failed to join: {error}"),
-                    None => unreachable!("guard excludes an empty driver set"),
                 }
             }
         };
