@@ -1009,45 +1009,49 @@ mod tests {
         assert_eq!(MssConfig::Custom(9_000).resolve().unwrap().get(), 9_000);
     }
 
-    fn spawn_accept_loop(tasks: &mut tokio::task::JoinSet<()>, listener: Listener) -> SocketAddr {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_echoes_probe_with_direction_flipped() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
-        tasks.spawn(async move {
+        let accept_loop = async move {
             loop {
                 if listener.accept_without_handshake().await.is_err() {
                     break;
                 }
             }
-        });
-        addr
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn listener_echoes_probe_with_direction_flipped() {
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        let mut tasks = tokio::task::JoinSet::new();
-        let addr = spawn_accept_loop(&mut tasks, listener);
+        };
+        tokio::pin!(accept_loop);
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        prober.connect(addr).await.unwrap();
-        let probe = crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
-            nonce: 0xDEAD_BEEF,
-            timestamp_micros: 12345,
-        });
-        prober.send(&probe).await.unwrap();
-        let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
-            .await
-            .expect("probe echo timed out")
-            .unwrap();
-        let echo = crate::path_probe::decode_echo(&buf[..n]).expect("not a probe echo");
-        assert_eq!(
-            echo,
-            crate::path_probe::ProbeEcho {
-                nonce: 0xDEAD_BEEF,
-                timestamp_micros: 12345
+        tokio::select! {
+            () = &mut accept_loop => {
+                // The accept loop ended before the probe body completed; the
+                // listener failed unexpectedly.
+                panic!("accept loop ended before the probe body completed");
             }
-        );
-        assert_eq!(buf[..8], probe[..8]);
-        assert_eq!(buf[9..n], probe[9..]);
+            () = async {
+                prober.connect(addr).await.unwrap();
+                let probe = crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
+                    nonce: 0xDEAD_BEEF,
+                    timestamp_micros: 12345,
+                });
+                prober.send(&probe).await.unwrap();
+                let mut buf = [0u8; 64];
+                let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
+                    .await
+                    .expect("probe echo timed out")
+                    .unwrap();
+                let echo = crate::path_probe::decode_echo(&buf[..n]).expect("not a probe echo");
+                assert_eq!(
+                    echo,
+                    crate::path_probe::ProbeEcho {
+                        nonce: 0xDEAD_BEEF,
+                        timestamp_micros: 12345
+                    }
+                );
+                assert_eq!(buf[..8], probe[..8]);
+                assert_eq!(buf[9..n], probe[9..]);
+            } => {}
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1088,34 +1092,53 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_floods_are_rate_limited_per_source() {
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        let mut tasks = tokio::task::JoinSet::new();
-        let addr = spawn_accept_loop(&mut tasks, listener);
-        let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        prober.connect(addr).await.unwrap();
-        for nonce in 0..200u64 {
-            let _ = prober
-                .send(&crate::path_probe::encode_probe(
-                    crate::path_probe::ProbeEcho {
-                        nonce,
-                        timestamp_micros: 0,
-                    },
-                ))
-                .await;
-        }
-        let mut echoes = 0usize;
-        let mut buf = [0u8; 64];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), prober.recv(&mut buf)).await
-        {
-            if crate::path_probe::decode_echo(&buf[..n]).is_some() {
-                echoes += 1;
+        let addr = listener.local_addr();
+        let accept_loop = async move {
+            loop {
+                if listener.accept_without_handshake().await.is_err() {
+                    break;
+                }
             }
+        };
+        tokio::pin!(accept_loop);
+        let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::select! {
+            () = &mut accept_loop => {
+                // The accept loop ended before the probe body completed; the
+                // listener failed unexpectedly.
+                panic!("accept loop ended before the probe body completed");
+            }
+            () = async {
+                prober.connect(addr).await.unwrap();
+                for nonce in 0..200u64 {
+                    let _ = prober
+                        .send(&crate::path_probe::encode_probe(
+                            crate::path_probe::ProbeEcho {
+                                nonce,
+                                timestamp_micros: 0,
+                            },
+                        ))
+                        .await;
+                }
+                let mut echoes = 0usize;
+                let mut buf = [0u8; 64];
+                while let Ok(Ok(n)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    prober.recv(&mut buf),
+                )
+                .await
+                {
+                    if crate::path_probe::decode_echo(&buf[..n]).is_some() {
+                        echoes += 1;
+                    }
+                }
+                assert!(echoes >= 1, "no probe was answered at all");
+                assert!(
+                    echoes <= 48,
+                    "flood was not rate limited: {echoes} echoes for 200 probes"
+                );
+            } => {}
         }
-        assert!(echoes >= 1, "no probe was answered at all");
-        assert!(
-            echoes <= 48,
-            "flood was not rate limited: {echoes} echoes for 200 probes"
-        );
     }
 
     fn spawn_greeting_server(
@@ -1127,21 +1150,33 @@ mod tests {
         let listener = Arc::new(listener);
         tasks.spawn(async move {
             let mut accepted = listener.accept_without_handshake().await.unwrap();
-            let mut keepalive = tokio::task::JoinSet::new();
-            {
-                let listener = Arc::clone(&listener);
-                keepalive.spawn(async move {
-                    loop {
-                        if listener.accept_without_handshake().await.is_err() {
-                            break;
-                        }
+            let drainer = async move {
+                loop {
+                    if listener.accept_without_handshake().await.is_err() {
+                        break;
                     }
-                });
-            }
+                }
+            };
+            tokio::pin!(drainer);
             let mut buf = [0u8; 64];
-            let _ = accepted.read.recv(&mut buf).await;
+            tokio::select! {
+                () = &mut drainer => {
+                    // The accept-drainer returned early: the listener failed.
+                    panic!("accept drainer ended before the greeting completed");
+                }
+                n = accepted.read.recv(&mut buf) => {
+                    let _ = n;
+                }
+            }
             accepted.write.send(reply).await.unwrap();
-            let _ = accepted.read.recv(&mut buf).await;
+            tokio::select! {
+                () = &mut drainer => {
+                    panic!("accept drainer ended before the greeting completed");
+                }
+                n = accepted.read.recv(&mut buf) => {
+                    let _ = n;
+                }
+            }
         });
         addr
     }
