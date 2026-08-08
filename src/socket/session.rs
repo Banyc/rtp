@@ -327,6 +327,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "injected RTP read panic")]
     async fn event_task_panic_reaps_the_rest_of_the_rtp_session() {
         #[derive(Debug)]
         struct PanickingRead;
@@ -367,12 +368,13 @@ mod tests {
             .await
             .expect("a panicked RTP event task left the peer task alive")
             .expect("writer drop probe was lost");
-        let error = tokio::time::timeout(Duration::from_secs(1), owner_tasks.join_next())
+        // The panic cascades: the supervisor re-raises the event-task panic,
+        // so joining it unwraps into this test with the original message.
+        tokio::time::timeout(Duration::from_secs(1), owner_tasks.join_next())
             .await
             .expect("RTP supervisor did not finish joining its drivers")
             .expect("RTP supervisor JoinSet was empty")
-            .expect_err("RTP driver panic did not cascade to the owning task");
-        assert!(error.is_panic());
+            .unwrap();
     }
 
     #[tokio::test]
