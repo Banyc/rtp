@@ -33,11 +33,6 @@ file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.
 rtp = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["test-util"] }
 
-# [patch."https://github.com/Banyc/udp_listener.git"]
-# udp_listener = { path = "../udp_listener" }
-# [patch."https://github.com/Banyc/tokio_udp.git"]
-# tokio_udp = { path = "../tokio_udp" }
-
 [profile.profiling]
 inherits = "release"
 debug = true
