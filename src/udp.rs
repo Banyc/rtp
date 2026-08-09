@@ -141,7 +141,11 @@ impl Listener {
                 if responder.observe(addr, packet.as_ref()) {
                     return None;
                 }
-                Some((*addr, packet))
+                Some(Classified {
+                    key: *addr,
+                    value: packet,
+                    policy: DispatchPolicy::Create,
+                })
             });
         let listener = UtpListener::new(
             udp,
@@ -648,7 +652,9 @@ impl LogConfig<'_> {
     }
 }
 
-use udp_listener::{Classify, Conn, ConnRead, ConnWrite, Packet, UtpListener};
+use udp_listener::{
+    Classified, Classify, Conn, ConnRead, ConnWrite, DispatchPolicy, Packet, UtpListener,
+};
 fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
     let echo = udp.try_clone_std().ok()?;
     echo.set_nonblocking(true).ok()?;

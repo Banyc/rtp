@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
 use tokio_util::bytes::Buf;
-use udp_listener::{ConnWrite, Packet, UtpListener};
+use udp_listener::{Classified, ConnWrite, DispatchPolicy, Packet, UtpListener};
 
 use crate::delivery::frame::FrameMode;
 use crate::{
@@ -350,10 +350,14 @@ impl DispatchKey for u128 {
     }
 }
 
-fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<(K, Packet)> {
+fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<Classified<K, Packet>> {
     let (n, key) = K::decode(&pkt)?;
     pkt.advance(n);
-    Some((key, pkt))
+    Some(Classified {
+        key,
+        value: pkt,
+        policy: DispatchPolicy::Create,
+    })
 }
 
 #[cfg(test)]
