@@ -8,9 +8,9 @@ use super::transmission_layer::{
 use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
 use crate::{
+    ack::AckBlocks,
     codec::decode,
     handshake::{PostOpenVerdict, is_post_open_candidate},
-    sack::SackBlockSeq,
 };
 
 pub struct ReadHalf {
@@ -134,7 +134,7 @@ impl ReadHalf {
                     .is_some_and(|data| data.buf_range.is_empty() && data.frame_len.is_none());
                 let (disposition, recv_eof) = {
                     let mut reliable_layer = shared.reliable_layer.lock().unwrap();
-                    reliable_layer.recv_ack_pkt(SackBlockSeq::new(&bufs.ack_from_peer), now);
+                    reliable_layer.recv_ack_pkt(AckBlocks::new(&bufs.ack_from_peer), now);
                     if FEC_DEBUG {
                         eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
                     }

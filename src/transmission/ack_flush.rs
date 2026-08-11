@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use super::transmission_layer::SendBufs;
 use super::ts_echo::TsEcho;
 use super::write_half::WriteHalf;
-use crate::codec::{EncodeAck, encode_ack_data};
+use crate::ack::{EncodeAck, next_page_cursor};
+use crate::codec::encode_ack_data;
 use crate::io_err::IoErr;
 
 pub(crate) const MAX_NUM_ACK: usize = 64;
@@ -192,11 +193,7 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
             }
         } else {
             let mut s = write_half.ack_flush.lock().unwrap();
-            if cursor + MAX_NUM_ACK < history_count {
-                s.ack_page_cursor = cursor + MAX_NUM_ACK;
-            } else {
-                s.ack_page_cursor = MAX_NUM_ACK;
-            }
+            s.ack_page_cursor = next_page_cursor(cursor, history_count, MAX_NUM_ACK);
             s.complete_claim(claimed_acks, claimed_fin);
             s.last_ack_flush = Some(now);
             drop(s);

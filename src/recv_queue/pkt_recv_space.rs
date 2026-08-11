@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
 use crate::{
+    ack::AckHistory,
     delivery::frame::recv::{RecvPkt, RecvSlot},
-    sack::SackIntervals,
 };
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
@@ -32,7 +32,7 @@ pub struct PktRecvSpace {
     slots: BTreeMap<u64, RecvSlot>,
     scan_start: u64,
     reused_buf: ObjPool<Vec<u8>>,
-    ack_history: SackIntervals,
+    ack_history: AckHistory,
 }
 
 impl PktRecvSpace {
@@ -42,11 +42,11 @@ impl PktRecvSpace {
             slots: BTreeMap::new(),
             scan_start: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
-            ack_history: SackIntervals::new(),
+            ack_history: AckHistory::new(),
         }
     }
 
-    pub fn ack_history(&self) -> &SackIntervals {
+    pub fn ack_history(&self) -> &AckHistory {
         &self.ack_history
     }
 

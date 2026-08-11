@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::{fec::FecState, fec_tuning::FecTuning};
+use crate::ack::AckInterval;
 use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
-use crate::sack::SackBlock;
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
@@ -98,7 +98,7 @@ impl Default for SendBufs {
 #[derive(Debug)]
 pub struct RecvBufs {
     pub codec_pkt: Vec<u8>,
-    pub ack_from_peer: Vec<SackBlock>,
+    pub ack_from_peer: Vec<AckInterval>,
     pub ack_to_peer: Vec<u64>,
     pub codec_pkts: Vec<Vec<u8>>,
 }

@@ -13,7 +13,7 @@ Treat RTP like TCP for behavior common to reliable stream transports. In particu
   - main entry: [[src/reliable/reliable_layer.rs]]
   - send window: [[src/send_queue/pkt_send_space.rs]]
   - recv window: [[src/recv_queue/pkt_recv_space.rs]]
-  - SACK managing: [[src/sack.rs]]
+  - ACK calculation: [[src/ack/]] (intervals, wire selection, sender interpretation)
 - a dead simple codec for packet encoding/decoding
   - main entry: [[src/codec.rs]]
   - wireshark dissector: [[wireshark/rtp.dissector.lua]]

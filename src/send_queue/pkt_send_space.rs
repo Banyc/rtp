@@ -13,8 +13,8 @@ use primitive::{
 };
 
 use crate::{
+    ack::AckBlocks,
     recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
-    sack::SackBlockSeq,
     send_queue::{
         liveness::PeerLiveness,
         loss_event_window::LossEventWindow,
@@ -226,7 +226,7 @@ impl PktSendSpace {
             .is_some()
     }
 
-    pub fn ack(&mut self, recved: SackBlockSeq<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+    pub fn ack(&mut self, recved: AckBlocks<'_>, acked: &mut Vec<PacketState>, now: Instant) {
         let cumulative_front_before = self.send_wnd.start().or(self.send_wnd.next()).copied();
         let peer_waiting_for_acked_pkts =
             cumulative_front_before.is_some_and(|front| recved.first_unacked() < front);
@@ -240,7 +240,7 @@ impl PktSendSpace {
         self.unacked_buf
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
-        recved.ack(&self.unacked_buf, &mut self.ack_buf);
+        recved.acked_set(&self.unacked_buf, &mut self.ack_buf);
         let delivered = self.ack_buf.len();
         if delivered > 0 {
             self.tlp.reset();
@@ -281,21 +281,8 @@ impl PktSendSpace {
         {
             self.liveness.record_progress();
         }
-        let balls = recved.blocks();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
-            let mut passes: u32 = 0;
-            for ball in balls {
-                let ball_end = ball.end().min(sent_end);
-                let newer = if s < ball.start {
-                    ball_end.saturating_sub(ball.start)
-                } else if s < ball_end {
-                    ball_end - s - 1
-                } else {
-                    0
-                };
-                passes = passes.saturating_add(u32::try_from(newer).unwrap_or(u32::MAX));
-            }
-            p.sacked_above = p.sacked_above.max(passes);
+            p.sacked_above = p.sacked_above.max(recved.sacked_above_count(s, sent_end));
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
@@ -915,12 +902,12 @@ mod tests {
     }
 
     fn ack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
-        let ball = crate::sack::SackBlock {
+        let ball = crate::ack::AckInterval {
             start: seq,
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
-        let seq = crate::sack::SackBlockSeq::new(&balls);
+        let seq = crate::ack::AckBlocks::new(&balls);
         let mut acked = Vec::new();
         space.ack(seq, &mut acked, now);
         acked.len()
@@ -931,7 +918,7 @@ mod tests {
     /// the send window (it is delivered) and increments `sacked_above` on
     /// every older in-flight packet.
     fn sack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
-        let mut peer = crate::sack::SackIntervals::new();
+        let mut peer = crate::ack::AckHistory::new();
         for s in 0..space.next_seq() {
             if space.send_wnd.get(&s).and_then(|o| o.as_ref()).is_none() {
                 peer.insert(s);
@@ -939,20 +926,20 @@ mod tests {
         }
         peer.insert(seq);
         let balls = peer.blocks().collect::<Vec<_>>();
-        let recved = crate::sack::SackBlockSeq::new(&balls);
+        let recved = crate::ack::AckBlocks::new(&balls);
         let mut acked = Vec::new();
         space.ack(recved, &mut acked, now);
         acked.len()
     }
 
     fn resack(space: &mut PktSendSpace, seq: u64, now: Instant) {
-        let ball = crate::sack::SackBlock {
+        let ball = crate::ack::AckInterval {
             start: seq,
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
         let mut acked = Vec::new();
-        space.ack(crate::sack::SackBlockSeq::new(&balls), &mut acked, now);
+        space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, now);
     }
 
     fn sacked_above(space: &PktSendSpace, seq: u64) -> u32 {
@@ -991,12 +978,12 @@ mod tests {
     }
 
     fn ack_up_to(space: &mut PktSendSpace, seq: u64, now: Instant) {
-        let ball = crate::sack::SackBlock {
+        let ball = crate::ack::AckInterval {
             start: 0,
             size: std::num::NonZeroU64::new(seq + 1).unwrap(),
         };
         let balls = [ball];
-        let seq = crate::sack::SackBlockSeq::new(&balls);
+        let seq = crate::ack::AckBlocks::new(&balls);
         let mut acked = Vec::new();
         space.ack(seq, &mut acked, now);
     }
@@ -1740,16 +1727,12 @@ mod tests {
         for _ in 0..3 {
             send_packet(&mut space, t0);
         }
-        let balls = [crate::sack::SackBlock {
+        let balls = [crate::ack::AckInterval {
             start: u64::MAX,
             size: std::num::NonZeroU64::new(1).unwrap(),
         }];
         let mut acked = Vec::new();
-        space.ack(
-            crate::sack::SackBlockSeq::new(&balls),
-            &mut acked,
-            t0 + ms(1),
-        );
+        space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, t0 + ms(1));
         assert!(
             space.out_of_order_seq_end <= space.next_seq(),
             "the peer moved the gap bound to {} with only {} sequences sent",
@@ -1770,16 +1753,12 @@ mod tests {
         for _ in 0..3 {
             send_packet(&mut space, t0);
         }
-        let balls = [crate::sack::SackBlock {
+        let balls = [crate::ack::AckInterval {
             start: 3,
             size: std::num::NonZeroU64::new(u64::MAX).unwrap(),
         }];
         let mut acked = Vec::new();
-        space.ack(
-            crate::sack::SackBlockSeq::new(&balls),
-            &mut acked,
-            t0 + ms(1),
-        );
+        space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, t0 + ms(1));
         for s in 0..3 {
             assert_eq!(
                 sacked_above(&space, s),
@@ -2048,18 +2027,18 @@ mod tests {
             let send_at = t0 + ms(12) + Duration::from_secs(i * 5);
             let seq = send_packet(&mut space, send_at);
             let balls = [
-                crate::sack::SackBlock {
+                crate::ack::AckInterval {
                     start: 0,
                     size: std::num::NonZeroU64::new(1).unwrap(),
                 },
-                crate::sack::SackBlock {
+                crate::ack::AckInterval {
                     start: 2,
                     size: std::num::NonZeroU64::new(seq - 1).unwrap(),
                 },
             ];
             let mut acked = Vec::new();
             last_ack = send_at + ms(1);
-            space.ack(crate::sack::SackBlockSeq::new(&balls), &mut acked, last_ack);
+            space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, last_ack);
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
             assert_eq!(space.send_wnd.start().copied(), Some(1));
         }
@@ -2083,13 +2062,13 @@ mod tests {
         for i in 0..8 {
             let send_at = t0 + ms(1) + Duration::from_secs(i * 5);
             let seq = send_packet(&mut space, send_at);
-            let balls = [crate::sack::SackBlock {
+            let balls = [crate::ack::AckInterval {
                 start: 1,
                 size: std::num::NonZeroU64::new(seq).unwrap(),
             }];
             let mut acked = Vec::new();
             last_ack = send_at + ms(1);
-            space.ack(crate::sack::SackBlockSeq::new(&balls), &mut acked, last_ack);
+            space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, last_ack);
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
             assert_eq!(space.send_wnd.start().copied(), Some(0));
         }

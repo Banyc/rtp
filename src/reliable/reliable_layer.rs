@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::io_err::IoErr;
 use crate::{
+    ack::AckBlocks,
     codec::data_overhead,
     delivery::{
         byte_stream::{recv::StockRecvStage, send::StockSendStage},
@@ -26,7 +27,6 @@ use crate::{
     },
     pacer::SendPacer,
     recv_queue::pkt_recv_space::PktRecvSpace,
-    sack::SackBlockSeq,
     send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::watchdog_tuning::WatchdogTuning,
 };
@@ -575,11 +575,7 @@ impl ReliableLayer {
     }
 
     /// Take ACKs from the unreliable layer
-    pub fn recv_ack_pkt(
-        &mut self,
-        recved: SackBlockSeq<'_>,
-        now: Instant,
-    ) -> Option<dre::RateSample> {
+    pub fn recv_ack_pkt(&mut self, recved: AckBlocks<'_>, now: Instant) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
         // An ACK means the link has delivered something.  Try to open an outage-
@@ -1091,8 +1087,8 @@ mod tests {
 
     const TEST_MSS: usize = 1200;
     use crate::{
+        ack::{AckBlocks, AckInterval},
         codec::data_overhead,
-        sack::{SackBlock, SackBlockSeq},
         udp::NO_FEC_MSS,
     };
 
@@ -1264,11 +1260,11 @@ mod tests {
         if let Some(rtt) = rtt {
             rl.sample_rtt(rtt, now);
         }
-        let acks = [SackBlock {
+        let acks = [AckInterval {
             start: 0,
             size: NonZeroU64::new(next_seq).unwrap(),
         }];
-        rl.recv_ack_pkt(SackBlockSeq::new(&acks), now);
+        rl.recv_ack_pkt(AckBlocks::new(&acks), now);
     }
 
     fn send_one(rl: &mut super::ReliableLayer, now: Instant) -> u64 {
@@ -1311,11 +1307,11 @@ mod tests {
 
     fn ack_seq(rl: &mut super::ReliableLayer, seq: u64, rtt: Duration, now: Instant) {
         rl.sample_rtt(rtt, now);
-        let acks = [SackBlock {
+        let acks = [AckInterval {
             start: seq,
             size: NonZeroU64::new(1).unwrap(),
         }];
-        rl.recv_ack_pkt(SackBlockSeq::new(&acks), now);
+        rl.recv_ack_pkt(AckBlocks::new(&acks), now);
     }
 
     /// Feed `count` identical RTT samples in rapid succession to converge the
@@ -1351,11 +1347,11 @@ mod tests {
             return false;
         }
         rl.sample_rtt(rtt, now);
-        let acks = [SackBlock {
+        let acks = [AckInterval {
             start: 0,
             size: NonZeroU64::new(hi).unwrap(),
         }];
-        rl.recv_ack_pkt(SackBlockSeq::new(&acks), now).is_some()
+        rl.recv_ack_pkt(AckBlocks::new(&acks), now).is_some()
     }
 
     #[test]
@@ -1750,11 +1746,11 @@ mod tests {
         let _ = stall_seq;
         let rto = rl.pkt_send_space.rto_duration();
         let detect_t = t + rto * 2 + Duration::from_millis(1);
-        let acks = [SackBlock {
+        let acks = [AckInterval {
             start: 0,
             size: NonZeroU64::new(progress_seq + 1).unwrap(),
         }];
-        rl.recv_ack_pkt(SackBlockSeq::new(&acks), detect_t);
+        rl.recv_ack_pkt(AckBlocks::new(&acks), detect_t);
 
         // Outage recovery must clear the gentle re-entry cooldown.
         assert!(
