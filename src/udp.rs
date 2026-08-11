@@ -212,6 +212,29 @@ impl Listener {
         &self,
         config: AcceptConfig,
     ) -> std::io::Result<FrameDeliveryAccept> {
+        self.accept_frame_delivery_configured(false, config).await
+    }
+
+    /// [`Self::accept_frame_delivery()`] but running the server opening
+    /// handshake inside the returned, unspawned accept future (the protected
+    /// path).  The returned future, not this outer listener poll, performs
+    /// accept/session setup, so callers can own it in a [`tokio::task::JoinSet`]
+    /// while continuing to dispatch UDP packets.
+    pub async fn accept_frame_delivery_with_handshake(
+        &self,
+        config: AcceptConfig,
+    ) -> std::io::Result<FrameDeliveryAccept> {
+        self.accept_frame_delivery_configured(true, config).await
+    }
+
+    /// Shared implementation: polls the next connection and returns an
+    /// unspawned accept future that runs `handshake` (when selected) plus
+    /// session setup inside itself.
+    async fn accept_frame_delivery_configured(
+        &self,
+        handshake: bool,
+        config: AcceptConfig,
+    ) -> std::io::Result<FrameDeliveryAccept> {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
@@ -219,7 +242,8 @@ impl Listener {
             let accepted = accept(
                 accepted,
                 raw_fd,
-                AcceptSetup::from_config(false, config)?.with_frame_delivery(FrameMode::enabled()),
+                AcceptSetup::from_config(handshake, config)?
+                    .with_frame_delivery(FrameMode::enabled()),
             )
             .await?;
             let Accepted {
