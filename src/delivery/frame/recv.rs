@@ -86,7 +86,9 @@ pub(crate) fn pop_complete_frame(
     for offset in 0..packet_count {
         let seq = frame_start.advance(offset);
         if let Some(RecvSlot::Data(pkt)) = slots.insert(seq, RecvSlot::Tombstone) {
-            frame_bytes.extend_from_slice(&pkt.data);
+            let remaining = frame_len as usize - frame_bytes.len();
+            let copy_len = remaining.min(pkt.data.len());
+            frame_bytes.extend_from_slice(&pkt.data[..copy_len]);
             reused_buf.put(pkt.data);
         }
     }
