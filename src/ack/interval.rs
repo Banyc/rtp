@@ -184,6 +184,16 @@ pub(crate) enum CumulativePosition {
     Future,
 }
 
+/// The outcome of a single [`AckBlocks::analyze`] pass: whether the peer's
+/// cumulative next is current, the highest clipped SACK block start (the
+/// reorder bound), and whether any selective evidence was present.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AckAnalysis {
+    pub(crate) cumulative_is_current: bool,
+    pub(crate) highest_sacked: Option<SequenceNumber>,
+    pub(crate) has_sack_evidence: bool,
+}
+
 /// Sender-side view over the ACK blocks received from the peer.  All
 /// interpretation of what an incoming ACK means is computed here, relative
 /// to the sender's `(send_start, sent_span)` coordinate system: cumulative
@@ -225,16 +235,6 @@ impl<'a> AckBlocks<'a> {
         }
     }
 
-    /// Whether the peer's cumulative next is current — i.e. the peer has
-    /// responded to the current window.  A stale or future cumulative value
-    /// means the peer is not tracking our window.
-    pub(crate) fn cumulative_is_current(&self, send_start: SequenceNumber, sent_span: u64) -> bool {
-        matches!(
-            self.cumulative_position(send_start, sent_span),
-            CumulativePosition::Current(_)
-        )
-    }
-
     /// The wire's selective blocks clipped to the already-sent span, as
     /// `(start, end)` forward offsets from `send_start`.  Hostile input —
     /// ranges outside the span, huge sizes that wrap — is bounded here; the
@@ -263,32 +263,27 @@ impl<'a> AckBlocks<'a> {
         })
     }
 
-    /// The start of the highest *clipped* acked block: the newest in-span
-    /// sequence the peer has reported, used to bound how far an
-    /// out-of-order ACK can advance the sender's reorder knowledge.
-    pub(crate) fn highest_sacked(
-        &self,
-        send_start: SequenceNumber,
-        sent_span: u64,
-    ) -> Option<SequenceNumber> {
-        self.valid_block_offsets(send_start, sent_span)
-            .max_by_key(|&(start, _)| start)
-            .map(|(start, _)| send_start.advance(start))
-    }
-
     /// Normalize the hostile wire input once: clip to the sent span, sort by
     /// logical start offset, and merge overlapping ranges (but not merely
     /// adjacent ones).  After this, SACK membership is a set and
     /// overlapping/duplicate ranges can no longer inflate loss evidence.
+    /// Returns the start of the highest *clipped* acked block — the newest
+    /// in-span sequence the peer reported, captured before merging so it
+    /// bounds how far an out-of-order ACK advances the reorder knowledge.
     fn normalize_block_offsets(
         &self,
         send_start: SequenceNumber,
         sent_span: u64,
         block_offsets: &mut Vec<(u64, u64)>,
-    ) {
+    ) -> Option<SequenceNumber> {
         block_offsets.clear();
         block_offsets.extend(self.valid_block_offsets(send_start, sent_span));
-        block_offsets.sort_unstable_by_key(|&(start, _)| start);
+        if !block_offsets.is_sorted_by_key(|&(start, _)| start) {
+            block_offsets.sort_unstable_by_key(|&(start, _)| start);
+        }
+        let highest_sacked = block_offsets
+            .last()
+            .map(|&(start, _)| send_start.advance(start));
         let mut merged_len = 0;
         for read in 0..block_offsets.len() {
             let (start, end) = block_offsets[read];
@@ -300,15 +295,18 @@ impl<'a> AckBlocks<'a> {
             }
         }
         block_offsets.truncate(merged_len);
+        highest_sacked
     }
 
     /// One bounded wrapping-safe linear analysis of this ACK against the
     /// sender's in-flight window: computes, in a single pass per direction,
     /// which `unacked` sequences are delivered (cumulative prefix plus
     /// normalized selective blocks) and the dup-ACK-pass evidence above each
-    /// one.  `unacked` must be in increasing logical offset order (as
-    /// produced by `SendWindow::iter`).  `block_offsets`, `acked`, and
-    /// `sacked_above` are caller-owned reusable buffers.
+    /// one, plus the analysis summary.  `unacked` must be in increasing
+    /// logical offset order (as produced by `SendWindow::iter`).
+    /// `block_offsets`, `acked`, and `sacked_above` are caller-owned reusable
+    /// buffers; `sacked_above` is always resized to `unacked.len()` and
+    /// zero-filled even for a cumulative-only ACK.
     pub(crate) fn analyze(
         &self,
         send_start: SequenceNumber,
@@ -317,8 +315,8 @@ impl<'a> AckBlocks<'a> {
         block_offsets: &mut Vec<(u64, u64)>,
         acked: &mut Vec<SequenceNumber>,
         sacked_above: &mut Vec<u32>,
-    ) {
-        self.normalize_block_offsets(send_start, sent_span, block_offsets);
+    ) -> AckAnalysis {
+        let highest_sacked = self.normalize_block_offsets(send_start, sent_span, block_offsets);
         let cumulative = match self.cumulative_position(send_start, sent_span) {
             CumulativePosition::Current(offset) => Some(offset),
             CumulativePosition::Stale | CumulativePosition::Future => None,
@@ -337,8 +335,16 @@ impl<'a> AckBlocks<'a> {
                 acked.push(seq);
             }
         }
+        let analysis = AckAnalysis {
+            cumulative_is_current: cumulative.is_some(),
+            highest_sacked,
+            has_sack_evidence: !block_offsets.is_empty(),
+        };
         sacked_above.clear();
         sacked_above.resize(unacked.len(), 0);
+        if block_offsets.is_empty() {
+            return analysis;
+        }
         let mut block_index = block_offsets.len();
         let mut complete_blocks_above = 0u64;
         for (sequence_index, &seq) in unacked.iter().enumerate().rev() {
@@ -357,6 +363,7 @@ impl<'a> AckBlocks<'a> {
                 u32::try_from(complete_blocks_above.saturating_add(inside_current_block))
                     .unwrap_or(u32::MAX);
         }
+        analysis
     }
 }
 
@@ -599,16 +606,30 @@ mod tests {
         // start is u64::MAX-1.
         let blocks = [iv(u64::MAX - 1, 2)];
         let recved = AckBlocks::new(seq(u64::MAX - 2), &blocks);
-        assert_eq!(
-            recved.highest_sacked(send_start, sent_span),
-            Some(seq(u64::MAX - 1))
+        acked.clear();
+        let analysis = recved.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
         );
+        assert_eq!(analysis.highest_sacked, Some(seq(u64::MAX - 1)));
         // A fully-clipped range must not advance the reorder bound.
         let blocks = [iv(0, 10)];
         let recved = AckBlocks::new(seq(u64::MAX - 2), &blocks);
+        acked.clear();
+        let analysis = recved.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
         assert_eq!(
-            recved.highest_sacked(send_start, sent_span),
-            None,
+            analysis.highest_sacked, None,
             "a fully-clipped range must not advance the reorder bound"
         );
     }

@@ -236,20 +236,11 @@ impl PktSendSpace {
     pub fn ack(&mut self, recved: AckBlocks<'_>, acked: &mut Vec<PacketState>, now: Instant) {
         let send_start = self.send_wnd.start();
         let sent_span = self.send_wnd.len() as u64;
-        let peer_response = recved.cumulative_is_current(send_start, sent_span);
-        if let Some(seq) = recved.highest_sacked(send_start, sent_span) {
-            let replace = self.out_of_order_seq_end.is_none_or(|current| {
-                send_start.forward_distance_to(current) < send_start.forward_distance_to(seq)
-            });
-            if replace {
-                self.out_of_order_seq_end = Some(seq);
-            }
-        }
         self.unacked_buf.clear();
         self.unacked_buf
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
-        recved.analyze(
+        let analysis = recved.analyze(
             send_start,
             sent_span,
             &self.unacked_buf,
@@ -257,6 +248,15 @@ impl PktSendSpace {
             &mut self.ack_buf,
             &mut self.sacked_above_buf,
         );
+        let peer_response = analysis.cumulative_is_current;
+        if let Some(seq) = analysis.highest_sacked {
+            let replace = self.out_of_order_seq_end.is_none_or(|current| {
+                send_start.forward_distance_to(current) < send_start.forward_distance_to(seq)
+            });
+            if replace {
+                self.out_of_order_seq_end = Some(seq);
+            }
+        }
         let delivered = self.ack_buf.len();
         let peer_response = peer_response || delivered > 0;
         if delivered > 0 {
@@ -303,11 +303,13 @@ impl PktSendSpace {
         {
             self.out_of_order_seq_end = None;
         }
-        for (&sequence, &sacked_above) in self.unacked_buf.iter().zip(&self.sacked_above_buf) {
-            let Some(Some(packet)) = self.send_wnd.get_mut(&sequence) else {
-                continue;
-            };
-            packet.sacked_above = packet.sacked_above.max(sacked_above);
+        if analysis.has_sack_evidence {
+            for (&sequence, &sacked_above) in self.unacked_buf.iter().zip(&self.sacked_above_buf) {
+                let Some(Some(packet)) = self.send_wnd.get_mut(&sequence) else {
+                    continue;
+                };
+                packet.sacked_above = packet.sacked_above.max(sacked_above);
+            }
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
