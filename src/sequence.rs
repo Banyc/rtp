@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 
 /// Half the sequence space.  Forward distances at or above this value are
 /// ambiguous or stale and must never be treated as "ahead".
@@ -195,12 +196,6 @@ impl<V> SequenceMap<V> {
         &self.window
     }
 
-    /// Logical-first key: the smallest retained key in wrapping order
-    /// (`[anchor..]` then `[..anchor)`).
-    pub(crate) fn first_logical(&self) -> Option<SequenceNumber> {
-        self.iter().next().map(|(k, _)| k)
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
@@ -262,63 +257,38 @@ impl<V> SequenceMap<V> {
 
     /// Greatest retained key logically before `seq`, crossing the physical
     /// zero boundary when required.
-    pub(crate) fn predecessor(&self, seq: SequenceNumber) -> Option<SequenceNumber> {
-        let key = RawSequenceKey(seq.to_wire());
-        let anchor = RawSequenceKey(self.window.anchor().to_wire());
-        if key >= anchor {
+    pub(crate) fn predecessor(&self, seq: SequenceNumber) -> Option<(SequenceNumber, &V)> {
+        let anchor = RawSequenceKey(self.window.anchor().0);
+        let seq = RawSequenceKey(seq.0);
+        let found = if seq >= anchor {
             // Keys before `seq` are the high keys in `[anchor, seq)`; the
             // wrapped low segment `[..anchor)` is logically *after* `seq`.
             self.inner
-                .range(anchor..key)
+                .range((Included(anchor), Excluded(seq)))
                 .next_back()
-                .map(|(k, _)| SequenceNumber::from_wire(k.0))
         } else {
-            // `seq` sits in the wrapped low segment: keys before it are the
-            // whole high segment `[anchor..]` plus the low keys below it.
-            let below = self.inner.range(..key).next_back();
-            let high = self.inner.range(anchor..).next_back();
-            match (below, high) {
-                (Some(b), Some(h)) => Some(SequenceNumber::from_wire(if h.0.0 > b.0.0 {
-                    h.0.0
-                } else {
-                    b.0.0
-                })),
-                (Some(b), None) => Some(SequenceNumber::from_wire(b.0.0)),
-                (None, Some(h)) => Some(SequenceNumber::from_wire(h.0.0)),
-                (None, None) => None,
-            }
-        }
+            self.inner
+                .range((Unbounded, Excluded(seq)))
+                .next_back()
+                .or_else(|| self.inner.range((Included(anchor), Unbounded)).next_back())
+        }?;
+        Some((SequenceNumber(found.0.0), found.1))
     }
 
     /// Smallest retained key logically after `seq`, crossing the physical
     /// zero boundary when required.
-    pub(crate) fn successor(&self, seq: SequenceNumber) -> Option<SequenceNumber> {
-        use std::ops::Bound;
-        let key = RawSequenceKey(seq.to_wire());
-        let anchor = RawSequenceKey(self.window.anchor().to_wire());
-        let above = self
-            .inner
-            .range((Bound::Excluded(key), Bound::Unbounded))
-            .next();
-        if key >= anchor {
-            // `seq` sits at/after the anchor: keys after it are the physical
-            // tail above it, then the wrapped low segment `[0..anchor)`.
-            above
-                .map(|(k, _)| SequenceNumber::from_wire(k.0))
-                .or_else(|| {
-                    self.inner
-                        .range(..anchor)
-                        .next()
-                        .map(|(k, _)| SequenceNumber::from_wire(k.0))
-                })
+    pub(crate) fn successor(&self, seq: SequenceNumber) -> Option<(SequenceNumber, &V)> {
+        let anchor = RawSequenceKey(self.window.anchor().0);
+        let seq = RawSequenceKey(seq.0);
+        let found = if seq >= anchor {
+            self.inner
+                .range((Excluded(seq), Unbounded))
+                .next()
+                .or_else(|| self.inner.range((Unbounded, Excluded(anchor))).next())
         } else {
-            // `seq` sits in the wrapped low segment: keys after it are the
-            // low keys in `(seq..anchor)`; the physical tail above `seq` is
-            // logically before it.
-            above
-                .filter(|(k, _)| k.0 < anchor.0)
-                .map(|(k, _)| SequenceNumber::from_wire(k.0))
-        }
+            self.inner.range((Excluded(seq), Excluded(anchor))).next()
+        }?;
+        Some((SequenceNumber(found.0.0), found.1))
     }
 
     /// Move the window anchor, retaining only keys that stay inside the new
@@ -441,10 +411,6 @@ pub(crate) fn le(a: SequenceNumber, b: SequenceNumber) -> bool {
     a == b || a.forward_distance_to(b) < HALF_SEQUENCE_SPACE
 }
 
-pub(crate) fn ge(a: SequenceNumber, b: SequenceNumber) -> bool {
-    le(b, a)
-}
-
 /// The lesser of two in-window sequences.
 pub(crate) fn min(a: SequenceNumber, b: SequenceNumber) -> SequenceNumber {
     if le(a, b) { a } else { b }
@@ -542,8 +508,18 @@ mod tests {
             "logical iteration must chain [anchor..] then [..anchor) exactly once"
         );
         // Predecessor/successor cross the physical zero boundary.
-        assert_eq!(map.predecessor(seq(0)), Some(seq(u64::MAX)));
-        assert_eq!(map.successor(seq(u64::MAX)), Some(seq(0)));
+        assert_eq!(
+            map.predecessor(seq(0)).map(|(sequence, _)| sequence),
+            Some(seq(u64::MAX))
+        );
+        assert_eq!(
+            map.predecessor(seq(1)).map(|(sequence, _)| sequence),
+            Some(seq(0))
+        );
+        assert_eq!(
+            map.successor(seq(u64::MAX)).map(|(sequence, _)| sequence),
+            Some(seq(0))
+        );
         assert_eq!(map.predecessor(seq(u64::MAX - 2)), None);
         assert_eq!(map.successor(seq(1)), None);
     }

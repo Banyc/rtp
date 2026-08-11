@@ -8,7 +8,7 @@ use primitive::{
 };
 
 use crate::{
-    ack::AckBlocks,
+    ack::{AckBlocks, MAX_ACK_BLOCKS},
     recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
     send_queue::{
         liveness::PeerLiveness,
@@ -17,7 +17,7 @@ use crate::{
         rtt_stats::RttStats,
         tlp::TailLossProber,
     },
-    sequence::{HALF_SEQUENCE_SPACE, SendWindow, SequenceNumber, le, lt},
+    sequence::{SendWindow, SequenceNumber, le, lt},
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
@@ -55,7 +55,7 @@ pub struct PktSendSpace {
     num_in_flight: usize,
     reused_buf: ObjPool<Vec<u8>>,
     cwnd: NonZeroUsize,
-    out_of_order_seq_end: SequenceNumber,
+    out_of_order_seq_end: Option<SequenceNumber>,
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: Option<SequenceNumber>,
     loss_event_window: LossEventWindow,
@@ -94,6 +94,8 @@ pub struct PktSendSpace {
     // reused buffers
     unacked_buf: Vec<SequenceNumber>,
     ack_buf: Vec<SequenceNumber>,
+    ack_block_buf: Vec<(u64, u64)>,
+    sacked_above_buf: Vec<u32>,
 }
 impl PktSendSpace {
     pub fn new() -> Self {
@@ -103,13 +105,13 @@ impl PktSendSpace {
     /// Send space seeded at `initial_seq` (handshake-derived directional
     /// start); `new()` is the zero-seeded form used by connections opened
     /// without the handshake.
-    pub fn new_at(initial_seq: SequenceNumber) -> Self {
+    pub(crate) fn new_at(initial_seq: SequenceNumber) -> Self {
         Self {
             send_wnd: SendWindow::new(initial_seq),
             num_in_flight: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
-            out_of_order_seq_end: initial_seq,
+            out_of_order_seq_end: None,
             max_pipe_seq: None,
             loss_event_window: LossEventWindow::new(),
             tlp: TailLossProber::new(),
@@ -121,6 +123,8 @@ impl PktSendSpace {
             jitter_cap: jitter_cap_from_env(),
             unacked_buf: vec![],
             ack_buf: vec![],
+            ack_block_buf: Vec::with_capacity(MAX_ACK_BLOCKS),
+            sacked_above_buf: vec![],
         }
     }
 
@@ -230,30 +234,31 @@ impl PktSendSpace {
     }
 
     pub fn ack(&mut self, recved: AckBlocks<'_>, acked: &mut Vec<PacketState>, now: Instant) {
-        // All interpretation of the incoming ACK happens relative to the
-        // original (send_start, sent_span): cumulative next is current only
-        // when its forward offset is within the sent span, stale/future
-        // values and ranges beyond the sent span never release anything.
         let send_start = self.send_wnd.start();
-        let sent_end = self.send_wnd.next();
-        let sent_span = send_start.forward_distance_to(sent_end);
-        let peer_waiting_for_acked_pkts = lt(recved.next(), send_start);
-        if let Some(seq) = recved.out_of_order_seq_end(send_start, sent_span) {
-            // Compare out-of-order positions only by forward distance from
-            // the current send anchor: a stale bound (more than half a space
-            // behind) is replaced by any in-span report.
-            let cur_fd = send_start.forward_distance_to(self.out_of_order_seq_end);
-            let new_fd = send_start.forward_distance_to(seq);
-            if new_fd < HALF_SEQUENCE_SPACE && (cur_fd >= HALF_SEQUENCE_SPACE || new_fd > cur_fd) {
-                self.out_of_order_seq_end = seq;
+        let sent_span = self.send_wnd.len() as u64;
+        let peer_response = recved.cumulative_is_current(send_start, sent_span);
+        if let Some(seq) = recved.highest_sacked(send_start, sent_span) {
+            let replace = self.out_of_order_seq_end.is_none_or(|current| {
+                send_start.forward_distance_to(current) < send_start.forward_distance_to(seq)
+            });
+            if replace {
+                self.out_of_order_seq_end = Some(seq);
             }
         }
         self.unacked_buf.clear();
         self.unacked_buf
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
-        recved.acked_set(send_start, sent_span, &self.unacked_buf, &mut self.ack_buf);
+        recved.analyze(
+            send_start,
+            sent_span,
+            &self.unacked_buf,
+            &mut self.ack_block_buf,
+            &mut self.ack_buf,
+            &mut self.sacked_above_buf,
+        );
         let delivered = self.ack_buf.len();
+        let peer_response = peer_response || delivered > 0;
         if delivered > 0 {
             self.tlp.reset();
         }
@@ -272,31 +277,41 @@ impl PktSendSpace {
                 }
             }
         }
+        let mut cumulative_advance = 0;
         for &s in &self.ack_buf {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
             self.num_in_flight -= 1;
+            if self.send_wnd.start() == s {
+                self.send_wnd.pop().unwrap();
+                cumulative_advance += 1 + self.send_wnd.pop_none();
+            }
             if !self.deferred_losses.is_empty() {
                 self.deferred_losses.retain(|dl| dl.seq != s);
             }
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
-        // Clear only actually acknowledged entries; the acknowledged empty
-        // prefix is popped and liveness progress is recorded only when the
-        // removal count is nonzero (selective-only ACKs never fake progress).
-        let removed = self.send_wnd.pop_none();
-        if removed > 0 {
+        if cumulative_advance > 0 {
             self.liveness.record_progress();
         }
-        for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
-            p.sacked_above = p
-                .sacked_above
-                .max(recved.sacked_above_count(send_start, sent_span, s));
+        let current_start = self.send_wnd.start();
+        let current_span = self.send_wnd.len() as u64;
+        if self
+            .out_of_order_seq_end
+            .is_some_and(|seq| current_start.forward_distance_to(seq) > current_span)
+        {
+            self.out_of_order_seq_end = None;
+        }
+        for (&sequence, &sacked_above) in self.unacked_buf.iter().zip(&self.sacked_above_buf) {
+            let Some(Some(packet)) = self.send_wnd.get_mut(&sequence) else {
+                continue;
+            };
+            packet.sacked_above = packet.sacked_above.max(sacked_above);
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
-        if peer_waiting_for_acked_pkts && delivered == 0 {
+        if !peer_response {
             return;
         }
         if self.send_wnd.is_empty() {
@@ -438,7 +453,8 @@ impl PktSendSpace {
         Self::unacked(&self.send_wnd)
             .take(self.cwnd.get())
             .any(|(s, p)| {
-                let is_seq_out_of_order = SeqOutOfOrder(lt(s, out_of_order_seq_end));
+                let is_seq_out_of_order =
+                    SeqOutOfOrder(out_of_order_seq_end.is_some_and(|end| lt(s, end)));
                 let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
                 let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, rtx_window, now);
                 let fast_loss = fast_loss_armed && p.is_fast_loss();
@@ -457,7 +473,8 @@ impl PktSendSpace {
         };
         let fast_loss_armed = self.fast_loss_armed();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
-            let is_seq_out_of_order = SeqOutOfOrder(lt(s, out_of_order_seq_end));
+            let is_seq_out_of_order =
+                SeqOutOfOrder(out_of_order_seq_end.is_some_and(|end| lt(s, end)));
             let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
             let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, rtx_window, now);
             let fast_loss = fast_loss_armed && p.is_fast_loss();
@@ -743,7 +760,7 @@ impl PktSendSpace {
             let t = p.next_rto_time();
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
-            if lt(s, self.out_of_order_seq_end) {
+            if self.out_of_order_seq_end.is_some_and(|end| lt(s, end)) {
                 let rw_t = p.sent_time + rtx_window;
                 min_next_poll_time =
                     Some(min_next_poll_time.map(|min| min.min(rw_t)).unwrap_or(rw_t));
@@ -890,7 +907,7 @@ pub struct Pkt<'a> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CWND_SEND_RATE_SCALE, INIT_CWND, PktSendSpace};
+    use super::{CWND_SEND_RATE_SCALE, INIT_CWND, MAX_ACK_BLOCKS, PktSendSpace};
     use crate::sequence::SequenceNumber;
     use primitive::ops::float::PosR;
 
@@ -1739,9 +1756,9 @@ mod tests {
         sack_one(space, 1, t0 + ms(10));
         sack_one(space, 2, t0 + ms(11));
         sack_one(space, 3, t0 + ms(12));
-        // seq 0 is below out_of_order_seq_end (= 3), so the reorder-window
-        // path applies to it.
-        assert_ne!(space.out_of_order_seq_end, sq(0));
+        // seq 0 is below out_of_order_seq_end (= 1, the highest SACKed
+        // block start), so the reorder-window path applies to it.
+        assert!(space.out_of_order_seq_end.is_some());
     }
 
     #[test]
@@ -1763,8 +1780,10 @@ mod tests {
             t0 + ms(1),
         );
         assert!(
-            crate::sequence::le(space.out_of_order_seq_end, space.next_seq()),
-            "the peer moved the gap bound to {} with only {} sequences sent",
+            space
+                .out_of_order_seq_end
+                .is_none_or(|end| crate::sequence::le(end, space.next_seq())),
+            "the peer moved the gap bound to {:?} with only {} sequences sent",
             space.out_of_order_seq_end,
             space.next_seq(),
         );
@@ -2201,6 +2220,51 @@ mod tests {
         assert!(
             space.liveness.ever_progressed,
             "an in-order cumulative ack must record progress"
+        );
+    }
+
+    fn sack_apply_cost(num_blocks: usize) -> f64 {
+        // One timing pass: a full send window, then one ack carrying
+        // `num_blocks` adjacent SACK blocks over the upper half of the
+        // window (the same total covered span regardless of block count).
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let mut space = PktSendSpace::new();
+            for _ in 0..crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS {
+                send_packet(&mut space, t0);
+            }
+            let send_start = space.send_wnd.start();
+            let sent_span = space.send_wnd.len() as u64;
+            let region_start = sent_span / 2;
+            let region_len = sent_span - region_start;
+            let block_size = region_len / num_blocks as u64;
+            let mut balls = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks as u64 {
+                let start = send_start.advance(region_start + i * block_size);
+                balls.push(crate::ack::AckInterval {
+                    start,
+                    size: std::num::NonZeroU64::new(block_size.max(1)).unwrap(),
+                });
+            }
+            let recved = crate::ack::AckBlocks::new(send_start, &balls);
+            let mut acked = Vec::new();
+            let start = Instant::now();
+            space.ack(recved, &mut acked, t0);
+            best = best.min(start.elapsed().as_nanos() as f64);
+        }
+        best
+    }
+
+    #[test]
+    #[ignore = "perf lane: wall-clock ns/ack ratio; run with cargo test --release -- --ignored"]
+    fn applying_many_sacks_remains_linear_in_the_send_window() {
+        let one = sack_apply_cost(1);
+        let many = sack_apply_cost(MAX_ACK_BLOCKS);
+        assert!(
+            many < one * 16.0,
+            "{many:.1} ns/ack with {MAX_ACK_BLOCKS} SACK blocks against {one:.1} ns with one over a full {} packet window: the per-ack cost grows with the number of blocks",
+            crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
         );
     }
 }

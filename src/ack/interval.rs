@@ -15,8 +15,9 @@
 
 use core::num::NonZeroU64;
 
+use crate::ack::MAX_ACK_BLOCKS;
 use crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS;
-use crate::sequence::{HALF_SEQUENCE_SPACE, SequenceMap, SequenceNumber, ge, le, lt};
+use crate::sequence::{HALF_SEQUENCE_SPACE, SequenceMap, SequenceNumber};
 
 /// One contiguous interval of received sequence numbers:
 /// `[start, start + size)`.
@@ -29,12 +30,25 @@ impl AckInterval {
     /// One past the last sequence covered by this interval, advancing with
     /// wrapping arithmetic (no saturation: an interval reaching the end of
     /// the sequence space continues at zero).
-    pub fn end(&self) -> SequenceNumber {
+    pub fn end(self) -> SequenceNumber {
         self.start.advance(self.size.get())
     }
 
-    pub fn contains(&self, seq: SequenceNumber) -> bool {
-        ge(seq, self.start) && lt(seq, self.end())
+    fn merge_forward(&self, later: Self) -> Option<Self> {
+        let later_offset = self.start.forward_distance_to(later.start);
+        if later_offset > self.size.get() || later_offset >= HALF_SEQUENCE_SPACE {
+            return None;
+        }
+
+        let merged_size = self
+            .size
+            .get()
+            .max(later_offset.checked_add(later.size.get())?);
+
+        Some(Self {
+            start: self.start,
+            size: NonZeroU64::new(merged_size).unwrap(),
+        })
     }
 }
 
@@ -67,13 +81,6 @@ impl AckHistory {
         self.next
     }
 
-    fn interval_at(&self, start: SequenceNumber) -> AckInterval {
-        AckInterval {
-            start,
-            size: *self.start_to_size.get(&start).unwrap(),
-        }
-    }
-
     /// Record a received sequence number, merging it into the neighbouring
     /// intervals when they touch.  Values outside the receive window are
     /// ignored; a receipt already covered by an existing interval is a
@@ -82,69 +89,50 @@ impl AckHistory {
     /// wrapping range that reaches past it) it is folded into `next` — the
     /// map only ever holds noncumulative selective ranges — and the map
     /// anchor moves with it.
-    pub fn insert(&mut self, seq: SequenceNumber) {
-        if !self.start_to_size.window().contains(seq) {
+    pub(crate) fn insert(&mut self, seq: SequenceNumber) {
+        if self.next.forward_distance_to(seq) >= MAX_NUM_RECVING_PKTS as u64 {
             return;
         }
-        let prev = self
+
+        if self.start_to_size.contains_key(&seq) {
+            return;
+        }
+
+        let previous = self
             .start_to_size
             .predecessor(seq)
-            .map(|start| self.interval_at(start));
-        let next = self
+            .map(|(start, &size)| AckInterval { start, size });
+
+        let following = self
             .start_to_size
             .successor(seq)
-            .map(|start| self.interval_at(start));
-        if let Some(prev) = prev
-            && prev.contains(seq)
-        {
-            // Already covered: duplicate receipt.
-            return;
-        }
-        let mut start = seq;
-        let mut end = seq.advance(1);
-        let mut merged_prev = false;
-        if let Some(prev) = prev
-            && prev.end() == seq
-        {
-            // Touching predecessor: extend the merged range backwards.
-            start = prev.start;
-            merged_prev = true;
-        }
-        if let Some(next) = next
-            && next.start == end
-        {
-            // Touching successor: extend the merged range forwards and
-            // drop the successor (the merged range replaces it).
-            end = next.end();
-            self.start_to_size.remove(&next.start);
-        }
-        if le(start, self.next) && lt(self.next, end) {
-            // The merged range covers the cumulative front (beginning at it,
-            // or wrapping past it): everything up to `end` is now cumulative.
-            // Any predecessor folded into the range is cumulative too and is
-            // dropped with it.
-            if merged_prev {
-                self.start_to_size.remove(&start);
-            }
-            self.next = end;
-            self.fold_cumulative_prefix();
-            self.start_to_size.move_anchor(self.next);
-        } else {
-            let size = NonZeroU64::new(start.forward_distance_to(end)).unwrap();
-            self.start_to_size.insert(start, size);
-        }
-    }
+            .map(|(start, &size)| AckInterval { start, size });
 
-    /// Fold every selective range that begins exactly at the cumulative
-    /// front into `next` (in-order receipts made contiguous by a hole
-    /// filling).
-    fn fold_cumulative_prefix(&mut self) {
-        while let Some(first) = self.start_to_size.first_logical()
-            && first == self.next
+        let mut interval = AckInterval {
+            start: seq,
+            size: NonZeroU64::new(1).unwrap(),
+        };
+
+        if let Some(previous) = previous
+            && let Some(merged) = previous.merge_forward(interval)
         {
-            let size = *self.start_to_size.get(&first).unwrap();
-            self.start_to_size.remove(&first);
-            self.next = first.advance(size.get());
+            self.start_to_size.remove(&previous.start);
+            interval = merged;
+        }
+
+        if let Some(following) = following
+            && let Some(merged) = interval.merge_forward(following)
+        {
+            self.start_to_size.remove(&following.start);
+            interval = merged;
+        }
+
+        self.start_to_size.insert(interval.start, interval.size);
+
+        if interval.start == self.next {
+            self.start_to_size.remove(&interval.start);
+            self.next = interval.end();
+            self.start_to_size.move_anchor(self.next);
         }
     }
 
@@ -176,6 +164,19 @@ impl Default for AckHistory {
     }
 }
 
+/// Classification of the peer's cumulative next relative to the sender's
+/// `(send_start, sent_span)` coordinate system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CumulativePosition {
+    /// The cumulative next is within the sent span; carries its forward
+    /// offset from `send_start`.
+    Current(u64),
+    /// More than half a space behind the window head: already passed.
+    Stale,
+    /// Ahead of the sent span but within the forward half space.
+    Future,
+}
+
 /// Sender-side view over the ACK blocks received from the peer.  All
 /// interpretation of what an incoming ACK means is computed here, relative
 /// to the sender's `(send_start, sent_span)` coordinate system: cumulative
@@ -190,151 +191,165 @@ pub struct AckBlocks<'a> {
     blocks: &'a [AckInterval],
 }
 impl<'a> AckBlocks<'a> {
-    /// `blocks` must be in increasing order.
-    pub fn new(next: SequenceNumber, blocks: &'a [AckInterval]) -> Self {
+    /// `blocks` must be in increasing order (the encoder emits them sorted;
+    /// hostile input is normalized by [`Self::normalize_block_offsets`]).
+    pub(crate) fn new(next: SequenceNumber, blocks: &'a [AckInterval]) -> Self {
+        debug_assert!(blocks.len() <= MAX_ACK_BLOCKS);
         Self { next, blocks }
     }
 
     /// The peer's cumulative next (one past the last packet it received in
-    /// order).
-    pub fn next(&self) -> SequenceNumber {
-        self.next
-    }
-
-    /// The valid cumulative front relative to `(send_start, sent_span)`:
-    /// `Some(next)` when the forward offset of `next` is within the sent
-    /// span (including exactly at `sent_end`, the fully-acked window), and
-    /// `None` when it is stale or future.
-    fn valid_cumulative_next(
+    /// order), classified relative to `(send_start, sent_span)`: current
+    /// when its forward offset is within the sent span (including exactly at
+    /// `sent_end`, the fully-acked window), stale when over half-space,
+    /// otherwise future.
+    fn cumulative_position(
         &self,
         send_start: SequenceNumber,
         sent_span: u64,
-    ) -> Option<SequenceNumber> {
+    ) -> CumulativePosition {
         let offset = send_start.forward_distance_to(self.next);
         if offset <= sent_span {
-            Some(self.next)
+            CumulativePosition::Current(offset)
+        } else if offset > HALF_SEQUENCE_SPACE {
+            CumulativePosition::Stale
         } else {
-            None
+            CumulativePosition::Future
         }
     }
 
-    /// Clip a selective block to the already-sent span
-    /// `[send_start, send_start + sent_span)`; `None` when the block does
-    /// not intersect the span.
-    fn clipped_block(
+    /// Whether the peer's cumulative next is current — i.e. the peer has
+    /// responded to the current window.  A stale or future cumulative value
+    /// means the peer is not tracking our window.
+    pub(crate) fn cumulative_is_current(&self, send_start: SequenceNumber, sent_span: u64) -> bool {
+        matches!(
+            self.cumulative_position(send_start, sent_span),
+            CumulativePosition::Current(_)
+        )
+    }
+
+    /// The wire's selective blocks clipped to the already-sent span, as
+    /// `(start, end)` forward offsets from `send_start`.  Hostile input —
+    /// ranges outside the span, huge sizes that wrap — is bounded here; the
+    /// caller may reorder and merge the result.
+    fn valid_block_offsets(
         &self,
         send_start: SequenceNumber,
         sent_span: u64,
-        block: AckInterval,
-    ) -> Option<AckInterval> {
-        let mut rel_start = send_start.forward_distance_to(block.start);
-        if rel_start > HALF_SEQUENCE_SPACE {
-            // The block starts before the window head.
-            rel_start = 0;
-        }
-        let mut rel_end = send_start.forward_distance_to(block.end());
-        if rel_end > HALF_SEQUENCE_SPACE {
-            // The block ends before the window head.
-            rel_end = 0;
-        }
-        let rel_end = rel_end.min(sent_span);
-        if rel_end <= rel_start || rel_start >= sent_span {
-            return None;
-        }
-        Some(AckInterval {
-            start: send_start.advance(rel_start),
-            size: NonZeroU64::new(rel_end - rel_start).unwrap(),
+    ) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.blocks.iter().filter_map(move |block| {
+            let mut rel_start = send_start.forward_distance_to(block.start);
+            if rel_start > HALF_SEQUENCE_SPACE {
+                // The block starts before the window head.
+                rel_start = 0;
+            }
+            let mut rel_end = send_start.forward_distance_to(block.end());
+            if rel_end > HALF_SEQUENCE_SPACE {
+                // The block ends before the window head.
+                rel_end = 0;
+            }
+            let rel_end = rel_end.min(sent_span);
+            if rel_end <= rel_start || rel_start >= sent_span {
+                return None;
+            }
+            Some((rel_start, rel_end))
         })
-    }
-
-    fn clipped_blocks(
-        &self,
-        send_start: SequenceNumber,
-        sent_span: u64,
-    ) -> impl Iterator<Item = AckInterval> + '_ {
-        self.blocks
-            .iter()
-            .filter_map(move |block| self.clipped_block(send_start, sent_span, *block))
     }
 
     /// The start of the highest *clipped* acked block: the newest in-span
     /// sequence the peer has reported, used to bound how far an
     /// out-of-order ACK can advance the sender's reorder knowledge.
-    pub fn out_of_order_seq_end(
+    pub(crate) fn highest_sacked(
         &self,
         send_start: SequenceNumber,
         sent_span: u64,
     ) -> Option<SequenceNumber> {
-        self.clipped_blocks(send_start, sent_span)
-            .last()
-            .map(|block| block.start)
+        self.valid_block_offsets(send_start, sent_span)
+            .max_by_key(|&(start, _)| start)
+            .map(|(start, _)| send_start.advance(start))
     }
 
-    /// Push, in increasing order, every sequence in `unacked` that is acked
-    /// by the valid cumulative prefix or by a clipped selective block.
-    /// `unacked` must be in increasing logical order.
-    pub fn acked_set(
+    /// Normalize the hostile wire input once: clip to the sent span, sort by
+    /// logical start offset, and merge overlapping ranges (but not merely
+    /// adjacent ones).  After this, SACK membership is a set and
+    /// overlapping/duplicate ranges can no longer inflate loss evidence.
+    fn normalize_block_offsets(
+        &self,
+        send_start: SequenceNumber,
+        sent_span: u64,
+        block_offsets: &mut Vec<(u64, u64)>,
+    ) {
+        block_offsets.clear();
+        block_offsets.extend(self.valid_block_offsets(send_start, sent_span));
+        block_offsets.sort_unstable_by_key(|&(start, _)| start);
+        let mut merged_len = 0;
+        for read in 0..block_offsets.len() {
+            let (start, end) = block_offsets[read];
+            if merged_len > 0 && start < block_offsets[merged_len - 1].1 {
+                block_offsets[merged_len - 1].1 = block_offsets[merged_len - 1].1.max(end);
+            } else {
+                block_offsets[merged_len] = (start, end);
+                merged_len += 1;
+            }
+        }
+        block_offsets.truncate(merged_len);
+    }
+
+    /// One bounded wrapping-safe linear analysis of this ACK against the
+    /// sender's in-flight window: computes, in a single pass per direction,
+    /// which `unacked` sequences are delivered (cumulative prefix plus
+    /// normalized selective blocks) and the dup-ACK-pass evidence above each
+    /// one.  `unacked` must be in increasing logical offset order (as
+    /// produced by `SendWindow::iter`).  `block_offsets`, `acked`, and
+    /// `sacked_above` are caller-owned reusable buffers.
+    pub(crate) fn analyze(
         &self,
         send_start: SequenceNumber,
         sent_span: u64,
         unacked: &[SequenceNumber],
+        block_offsets: &mut Vec<(u64, u64)>,
         acked: &mut Vec<SequenceNumber>,
+        sacked_above: &mut Vec<u32>,
     ) {
-        if unacked.is_empty() {
-            return;
-        }
-        let mut unacked_i = 0;
-        let mut block_i = 0;
-        if let Some(cumulative_end) = self.valid_cumulative_next(send_start, sent_span) {
-            while unacked_i < unacked.len() && lt(unacked[unacked_i], cumulative_end) {
-                acked.push(unacked[unacked_i]);
-                unacked_i += 1;
+        self.normalize_block_offsets(send_start, sent_span, block_offsets);
+        let cumulative = match self.cumulative_position(send_start, sent_span) {
+            CumulativePosition::Current(offset) => Some(offset),
+            CumulativePosition::Stale | CumulativePosition::Future => None,
+        };
+        let mut block_index = 0;
+        for &seq in unacked {
+            let offset = send_start.forward_distance_to(seq);
+            while block_index < block_offsets.len() && block_offsets[block_index].1 <= offset {
+                block_index += 1;
+            }
+            let cumulatively_acked = cumulative.is_some_and(|front| offset < front);
+            let selectively_acked = block_offsets
+                .get(block_index)
+                .is_some_and(|&(start, end)| start <= offset && offset < end);
+            if cumulatively_acked || selectively_acked {
+                acked.push(seq);
             }
         }
-        while block_i < self.blocks.len() && unacked_i < unacked.len() {
-            let Some(block) = self.clipped_block(send_start, sent_span, self.blocks[block_i])
-            else {
-                block_i += 1;
-                continue;
-            };
-            let unacked_seq = unacked[unacked_i];
-            if lt(unacked_seq, block.start) {
-                unacked_i += 1;
-                continue;
+        sacked_above.clear();
+        sacked_above.resize(unacked.len(), 0);
+        let mut block_index = block_offsets.len();
+        let mut complete_blocks_above = 0u64;
+        for (sequence_index, &seq) in unacked.iter().enumerate().rev() {
+            let offset = send_start.forward_distance_to(seq);
+            while block_index > 0 && block_offsets[block_index - 1].0 > offset {
+                block_index -= 1;
+                let (start, end) = block_offsets[block_index];
+                complete_blocks_above = complete_blocks_above.saturating_add(end - start);
             }
-            if !block.contains(unacked_seq) {
-                block_i += 1;
-                continue;
-            }
-            acked.push(unacked_seq);
-            unacked_i += 1;
+            let inside_current_block = block_index
+                .checked_sub(1)
+                .map(|index| block_offsets[index])
+                .filter(|&(start, end)| start <= offset && offset < end)
+                .map_or(0, |(_, end)| end - offset - 1);
+            sacked_above[sequence_index] =
+                u32::try_from(complete_blocks_above.saturating_add(inside_current_block))
+                    .unwrap_or(u32::MAX);
         }
-    }
-
-    /// How many newer in-flight packets the *clipped* blocks ack past
-    /// `unacked_seq` (bounded by the sent span).  Each acked packet with a
-    /// higher sequence counts as one "pass"; the sum across blocks is the
-    /// dup-ACK-pass evidence used by evidence-gated fast loss, mirroring the
-    /// classic dup-ACK threshold of 3.
-    pub fn sacked_above_count(
-        &self,
-        send_start: SequenceNumber,
-        sent_span: u64,
-        unacked_seq: SequenceNumber,
-    ) -> u32 {
-        let mut passes: u32 = 0;
-        for block in self.clipped_blocks(send_start, sent_span) {
-            let block_end = block.end();
-            let newer = if lt(unacked_seq, block.start) {
-                block.size.get()
-            } else if lt(unacked_seq, block_end) {
-                unacked_seq.forward_distance_to(block_end) - 1
-            } else {
-                0
-            };
-            passes = passes.saturating_add(u32::try_from(newer).unwrap_or(u32::MAX));
-        }
-        passes
     }
 }
 
@@ -352,25 +367,6 @@ mod tests {
             start: seq(start),
             size: NonZeroU64::new(size).unwrap(),
         }
-    }
-
-    #[test]
-    fn test_ack_interval() {
-        let a = iv(1, 1);
-        let b = iv(1, 2);
-        assert!(a.contains(seq(1)));
-        assert!(!a.contains(seq(2)));
-        assert!(b.contains(seq(2)));
-        assert_eq!(b.end(), seq(3));
-    }
-
-    #[test]
-    fn interval_end_wraps() {
-        let block = iv(u64::MAX, 2);
-        assert_eq!(block.end(), seq(1));
-        assert!(block.contains(seq(u64::MAX)));
-        assert!(block.contains(seq(0)));
-        assert!(!block.contains(seq(1)));
     }
 
     #[test]
@@ -498,11 +494,20 @@ mod tests {
         let send_start = seq(u64::MAX - 2);
         let sent_span = 3u64;
         let in_flight = [seq(u64::MAX - 2), seq(u64::MAX - 1), seq(u64::MAX)];
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut evidence = Vec::new();
 
         // Fully-acked window: cumulative next == sent_end (seq 0 after wrap).
         let recved = AckBlocks::new(seq(0), &[]);
-        let mut acked = Vec::new();
-        recved.acked_set(send_start, sent_span, &in_flight, &mut acked);
+        recved.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
         assert_eq!(
             acked.len(),
             3,
@@ -511,61 +516,91 @@ mod tests {
 
         // Cumulative next exactly one past the first packet.
         let recved = AckBlocks::new(seq(u64::MAX - 1), &[]);
-        let mut acked = Vec::new();
-        recved.acked_set(send_start, sent_span, &in_flight, &mut acked);
+        acked.clear();
+        recved.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
         assert_eq!(acked, vec![seq(u64::MAX - 2)]);
 
         // Stale cumulative next (before the window): nothing released by the
         // prefix; a clipped selective block still releases in-window packets.
         let blocks = [iv(u64::MAX - 1, 2)];
         let stale = AckBlocks::new(seq(u64::MAX - 5), &blocks);
-        let mut acked = Vec::new();
-        stale.acked_set(send_start, sent_span, &in_flight, &mut acked);
+        acked.clear();
+        stale.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
         assert_eq!(acked, vec![seq(u64::MAX - 1), seq(u64::MAX)]);
 
         // Future cumulative next (beyond what was sent): no prefix release.
         let future = AckBlocks::new(seq(5), &[]);
-        let mut acked = Vec::new();
-        future.acked_set(send_start, sent_span, &in_flight, &mut acked);
+        acked.clear();
+        future.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
         assert!(acked.is_empty());
 
         // A block beyond the sent span is clipped away entirely.
         let blocks = [iv(5, 10)];
         let beyond = AckBlocks::new(seq(u64::MAX - 2), &blocks);
-        let mut acked = Vec::new();
-        beyond.acked_set(send_start, sent_span, &in_flight, &mut acked);
+        acked.clear();
+        beyond.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
         assert!(
             acked.is_empty(),
             "a range beyond sent_span must release nothing"
         );
 
-        // sacked_above counts only clipped ranges: [MAX, 2) clips to {MAX}
-        // at the sent end, so it is one pass above MAX-2 and MAX-1.
+        // Evidence counts only clipped ranges: [MAX, 2) clips to {MAX} at
+        // the sent end, so it is one pass above MAX-2 and MAX-1 and zero at
+        // MAX itself.
         let blocks = [iv(u64::MAX, 2)];
         let recved = AckBlocks::new(seq(u64::MAX - 2), &blocks);
-        assert_eq!(
-            recved.sacked_above_count(send_start, sent_span, seq(u64::MAX - 2)),
-            1
+        acked.clear();
+        recved.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
         );
-        assert_eq!(
-            recved.sacked_above_count(send_start, sent_span, seq(u64::MAX - 1)),
-            1
-        );
-        assert_eq!(
-            recved.sacked_above_count(send_start, sent_span, seq(u64::MAX)),
-            0
-        );
-        // The second block of [u64::MAX-1, 2] is clipped at sent_end (seq 0).
+        assert_eq!(evidence, vec![1, 1, 0]);
+
+        // [u64::MAX-1, 2) is clipped at sent_end (seq 0); the highest SACKed
+        // start is u64::MAX-1.
         let blocks = [iv(u64::MAX - 1, 2)];
         let recved = AckBlocks::new(seq(u64::MAX - 2), &blocks);
         assert_eq!(
-            recved.out_of_order_seq_end(send_start, sent_span),
+            recved.highest_sacked(send_start, sent_span),
             Some(seq(u64::MAX - 1))
         );
+        // A fully-clipped range must not advance the reorder bound.
         let blocks = [iv(0, 10)];
         let recved = AckBlocks::new(seq(u64::MAX - 2), &blocks);
         assert_eq!(
-            recved.out_of_order_seq_end(send_start, sent_span),
+            recved.highest_sacked(send_start, sent_span),
             None,
             "a fully-clipped range must not advance the reorder bound"
         );
@@ -576,15 +611,194 @@ mod tests {
         let send_start = seq(100);
         let sent_span = 5u64;
         let in_flight: Vec<_> = (100..105).map(seq).collect();
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut evidence = Vec::new();
         for (next, want) in [
             (seq(99), vec![]),
             (seq(106), vec![]),
             (seq(103), vec![seq(100), seq(101), seq(102)]),
         ] {
             let recved = AckBlocks::new(next, &[]);
-            let mut acked = Vec::new();
-            recved.acked_set(send_start, sent_span, &in_flight, &mut acked);
+            acked.clear();
+            recved.analyze(
+                send_start,
+                sent_span,
+                &in_flight,
+                &mut block_offsets,
+                &mut acked,
+                &mut evidence,
+            );
             assert_eq!(acked, want, "cumulative next {next}");
+        }
+    }
+
+    #[test]
+    fn sender_analysis_is_linear_and_wrapping_safe() {
+        // Send window of 8 packets straddling u64::MAX -> 0.  The cumulative
+        // next at offset 2 covers offsets 0..2; selective blocks at offsets
+        // [3, 5) (seqs 0, 1) and [6, 7) (seq 3) cover the rest.
+        let send_start = seq(u64::MAX - 2);
+        let sent_span = 8u64;
+        let unacked = [
+            seq(u64::MAX - 2),
+            seq(u64::MAX - 1),
+            seq(u64::MAX),
+            seq(0),
+            seq(1),
+            seq(2),
+            seq(3),
+            seq(4),
+        ];
+        let blocks = [iv(0, 2), iv(3, 1)];
+        let recved = AckBlocks::new(send_start.advance(2), &blocks);
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut evidence = Vec::new();
+        recved.analyze(
+            send_start,
+            sent_span,
+            &unacked,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
+        let delivered: Vec<u64> = acked
+            .iter()
+            .map(|s| send_start.forward_distance_to(*s))
+            .collect();
+        assert_eq!(delivered, vec![0, 1, 3, 4, 6]);
+        assert_eq!(evidence, vec![3, 3, 3, 2, 1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn overlapping_sacks_do_not_multiply_loss_evidence() {
+        let send_start = seq(0);
+        let sent_span = 8u64;
+        let unacked: Vec<_> = (0..8).map(seq).collect();
+        // Two overlapping wire ranges [3, 6) and [4, 7): normalized to the
+        // union [3, 7), so membership is a set and evidence cannot
+        // double-count the overlap.
+        let blocks = [iv(3, 3), iv(4, 3)];
+        let recved = AckBlocks::new(seq(0), &blocks);
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut evidence = Vec::new();
+        recved.analyze(
+            send_start,
+            sent_span,
+            &unacked,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
+        let delivered: Vec<u64> = acked
+            .iter()
+            .map(|s| send_start.forward_distance_to(*s))
+            .collect();
+        assert_eq!(delivered, vec![3, 4, 5, 6], "only 3..=6 is acknowledged");
+        assert_eq!(
+            evidence[0], 4,
+            "the union [3, 7) is exactly four passes above sequence zero, not six"
+        );
+    }
+
+    #[test]
+    fn linear_sender_analysis_matches_a_packet_by_packet_model() {
+        let mut rng = crate::testing::SplitMix64::new(0x05ee_da11);
+        for case in 0..256 {
+            let send_start = match case % 4 {
+                0 => seq(0),
+                1 => seq(u64::MAX - 1),
+                2 => seq(u64::MAX / 2),
+                _ => seq(rng.next_u64()),
+            };
+            let sent_span = 1 + rng.next_u64() % 64;
+            // Cumulative next: current / future / stale / arbitrary-wrapping.
+            let cumulative_offset = match case % 4 {
+                0 => rng.next_u64() % (sent_span + 1),
+                1 => sent_span + 1 + rng.next_u64() % (HALF_SEQUENCE_SPACE - sent_span),
+                2 => HALF_SEQUENCE_SPACE + 1 + rng.next_u64() % (u64::MAX - HALF_SEQUENCE_SPACE),
+                _ => rng.next_u64(),
+            };
+            let cumulative_next = send_start.advance(cumulative_offset);
+            // Up to 64 wire ranges, unsorted, overlapping, half biased near
+            // the window and half arbitrary (hostile).
+            let num_blocks = (rng.next_u64() % 65) as usize;
+            let mut wire_blocks: Vec<(u64, u64)> = Vec::new();
+            for _ in 0..num_blocks {
+                let start = if rng.next_u64().is_multiple_of(2) {
+                    send_start
+                        .advance(rng.next_u64() % (sent_span * 3 + 1))
+                        .to_wire()
+                } else {
+                    rng.next_u64()
+                };
+                let size = 1 + rng.next_u64() % 32;
+                wire_blocks.push((start, size));
+            }
+            let blocks: Vec<AckInterval> = wire_blocks
+                .iter()
+                .map(|&(start, size)| AckInterval {
+                    start: seq(start),
+                    size: NonZeroU64::new(size).unwrap(),
+                })
+                .collect();
+            let recved = AckBlocks::new(cumulative_next, &blocks);
+            let unacked: Vec<SequenceNumber> = (0..sent_span)
+                .map(|offset| send_start.advance(offset))
+                .collect();
+            let mut block_offsets = Vec::new();
+            let mut acked = Vec::new();
+            let mut evidence = Vec::new();
+            recved.analyze(
+                send_start,
+                sent_span,
+                &unacked,
+                &mut block_offsets,
+                &mut acked,
+                &mut evidence,
+            );
+
+            // Reference: a boolean packet-set model of clipped coverage.
+            let mut covered = vec![false; sent_span as usize];
+            for &(raw_start, size) in &wire_blocks {
+                let mut rel_start = send_start.forward_distance_to(seq(raw_start));
+                if rel_start > HALF_SEQUENCE_SPACE {
+                    rel_start = 0;
+                }
+                let mut rel_end = send_start.forward_distance_to(seq(raw_start).advance(size));
+                if rel_end > HALF_SEQUENCE_SPACE {
+                    rel_end = 0;
+                }
+                let rel_end = rel_end.min(sent_span);
+                if rel_end <= rel_start || rel_start >= sent_span {
+                    continue;
+                }
+                for offset in rel_start..rel_end {
+                    covered[offset as usize] = true;
+                }
+            }
+            let cumulative_front = if cumulative_offset <= sent_span {
+                Some(cumulative_offset)
+            } else {
+                None
+            };
+            let mut ref_acked: Vec<u64> = Vec::new();
+            let mut ref_evidence = vec![0u32; sent_span as usize];
+            for offset in 0..sent_span {
+                let index = offset as usize;
+                if cumulative_front.is_some_and(|front| offset < front) || covered[index] {
+                    ref_acked.push(offset);
+                }
+                ref_evidence[index] = covered[index + 1..].iter().filter(|&&c| c).count() as u32;
+            }
+            let delivered: Vec<u64> = acked
+                .iter()
+                .map(|s| send_start.forward_distance_to(*s))
+                .collect();
+            assert_eq!(delivered, ref_acked, "case {case}: delivered mismatch");
+            assert_eq!(evidence, ref_evidence, "case {case}: evidence mismatch");
         }
     }
 }
