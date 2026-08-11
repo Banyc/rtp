@@ -15,6 +15,7 @@ use primitive::{
 use serde::{Deserialize, Serialize};
 
 use crate::io_err::IoErr;
+use crate::sequence::{InitialSequences, SequenceNumber};
 use crate::{
     ack::AckBlocks,
     codec::data_overhead,
@@ -123,10 +124,24 @@ pub struct ReliableLayer {
 }
 
 impl ReliableLayer {
+    #[cfg(test)]
     pub fn new(
         mss: NonZeroUsize,
         frame_delivery: FrameMode,
         now: Instant,
+    ) -> (Self, Arc<Mutex<SendPacer>>) {
+        Self::new_at(mss, frame_delivery, now, InitialSequences::ZERO)
+    }
+
+    /// Construct with handshake-derived directional initial sequences:
+    /// `PktSendSpace` starts at `initial_sequences.send` and `PktRecvSpace`
+    /// at `initial_sequences.recv`.  The zero-seeded `new()` keeps skipped-
+    /// handshake peers zero-compatible.
+    pub fn new_at(
+        mss: NonZeroUsize,
+        frame_delivery: FrameMode,
+        now: Instant,
+        initial_sequences: InitialSequences,
     ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
@@ -138,8 +153,8 @@ impl ReliableLayer {
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
-            pkt_send_space: PktSendSpace::new(),
-            pkt_recv_space: PktRecvSpace::new(),
+            pkt_send_space: PktSendSpace::new_at(initial_sequences.send),
+            pkt_recv_space: PktRecvSpace::new_at(initial_sequences.recv),
             send_rate,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
@@ -158,10 +173,11 @@ impl ReliableLayer {
         (this, send_rate_limiter)
     }
 
-    pub fn new_with_watchdog_tuning(
+    pub fn new_with_watchdog_tuning_at(
         mss: NonZeroUsize,
         frame_delivery: FrameMode,
         now: Instant,
+        initial_sequences: InitialSequences,
         tuning: WatchdogTuning,
     ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
@@ -174,8 +190,9 @@ impl ReliableLayer {
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
             connection_stats: ConnectionState::new(now),
-            pkt_send_space: PktSendSpace::new().with_watchdog_tuning(tuning),
-            pkt_recv_space: PktRecvSpace::new(),
+            pkt_send_space: PktSendSpace::new_at(initial_sequences.send)
+                .with_watchdog_tuning(tuning),
+            pkt_recv_space: PktRecvSpace::new_at(initial_sequences.recv),
             send_rate,
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
@@ -891,7 +908,7 @@ impl ReliableLayer {
     /// Duplicate and stale packets remain ACKable without becoming new data.
     pub(crate) fn recv_data_pkt(
         &mut self,
-        seq: u64,
+        seq: SequenceNumber,
         frame_len: Option<u32>,
         pkt: &[u8],
     ) -> crate::recv_queue::pkt_recv_space::RecvDisposition {
@@ -998,12 +1015,12 @@ impl ReliableLayer {
             num_in_flight_pkts: self.pkt_send_space.num_in_flight_pkts(),
             num_pkts_in_pipe: self.pkt_send_space.num_pkts_in_pipe(),
             num_rtx_pkts: self.pkt_send_space.num_rtxed_pkts(),
-            send_seq: self.pkt_send_space.next_seq(),
+            send_seq: self.pkt_send_space.next_seq().to_wire(),
             min_rtt: min_rtt.map(|t| t.as_millis()),
             rtt: self.pkt_send_space.smooth_rtt().as_millis(),
             cwnd: self.pkt_send_space.cwnd().get(),
             num_rx_pkts: self.pkt_recv_space.num_recved_pkts(),
-            recv_seq: self.pkt_recv_space.next_seq(),
+            recv_seq: self.pkt_recv_space.next_seq().map(|s| s.to_wire()),
             delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),
             app_limited: self.prev_sample_rate.as_ref().map(|sr| sr.is_app_limited()),
         }
@@ -1012,7 +1029,7 @@ impl ReliableLayer {
 
 #[derive(Debug, Clone)]
 pub struct DataPkt {
-    pub seq: u64,
+    pub seq: SequenceNumber,
     pub data_written: DataPktPayload,
     /// Application frame length this packet belongs to.  `Some` only for the
     /// first packet of a frame in frame-delivery mode; the transmission layer
@@ -1254,20 +1271,20 @@ mod tests {
 
     fn ack_all(rl: &mut super::ReliableLayer, rtt: Option<Duration>, now: Instant) {
         let next_seq = rl.pkt_send_space().next_seq();
-        if next_seq == 0 {
+        if next_seq == crate::sequence::SequenceNumber::ZERO {
             return;
         }
         if let Some(rtt) = rtt {
             rl.sample_rtt(rtt, now);
         }
         let acks = [AckInterval {
-            start: 0,
-            size: NonZeroU64::new(next_seq).unwrap(),
+            start: crate::sequence::SequenceNumber::ZERO,
+            size: NonZeroU64::new(next_seq.to_wire()).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBlocks::new(&acks), now);
+        rl.recv_ack_pkt(AckBlocks::new(next_seq, &acks), now);
     }
 
-    fn send_one(rl: &mut super::ReliableLayer, now: Instant) -> u64 {
+    fn send_one(rl: &mut super::ReliableLayer, now: Instant) -> crate::sequence::SequenceNumber {
         let payload = vec![0u8; 100];
         let mut pkt = vec![0u8; TEST_MSS];
         assert_eq!(
@@ -1308,10 +1325,16 @@ mod tests {
     fn ack_seq(rl: &mut super::ReliableLayer, seq: u64, rtt: Duration, now: Instant) {
         rl.sample_rtt(rtt, now);
         let acks = [AckInterval {
-            start: seq,
+            start: crate::sequence::SequenceNumber::from_wire(seq),
             size: NonZeroU64::new(1).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBlocks::new(&acks), now);
+        rl.recv_ack_pkt(
+            AckBlocks::new(
+                crate::sequence::SequenceNumber::from_wire(seq).advance(1),
+                &acks,
+            ),
+            now,
+        );
     }
 
     /// Feed `count` identical RTT samples in rapid succession to converge the
@@ -1348,10 +1371,14 @@ mod tests {
         }
         rl.sample_rtt(rtt, now);
         let acks = [AckInterval {
-            start: 0,
+            start: crate::sequence::SequenceNumber::ZERO,
             size: NonZeroU64::new(hi).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBlocks::new(&acks), now).is_some()
+        rl.recv_ack_pkt(
+            AckBlocks::new(crate::sequence::SequenceNumber::from_wire(hi), &acks),
+            now,
+        )
+        .is_some()
     }
 
     #[test]
@@ -1488,7 +1515,7 @@ mod tests {
             }
             t = round_start + drop_rtt;
             let next_seq = rl.pkt_send_space().next_seq();
-            ack_prefix(&mut rl, next_seq, drop_rtt, t);
+            ack_prefix(&mut rl, next_seq.to_wire(), drop_rtt, t);
         }
 
         // After ~10 s (3 s grace + 7 excess RTTs) the floor has decayed well
@@ -1513,7 +1540,7 @@ mod tests {
         for _ in 0..8 {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(700);
-            ack_seq(&mut rl, seq, Duration::from_millis(600), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(600), t);
         }
         assert!(
             rl.pkt_send_space.smooth_rtt() >= Duration::from_millis(500),
@@ -1530,7 +1557,7 @@ mod tests {
         loop {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(1100);
-            ack_seq(&mut rl, seq, Duration::from_millis(1000), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(1000), t);
             if rl.gentle.gentle_mode() {
                 break;
             }
@@ -1576,7 +1603,7 @@ mod tests {
         for _ in 0..20 {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(1100);
-            ack_seq(&mut rl, seq, Duration::from_millis(1000), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(1000), t);
 
             let smooth = rl.pkt_send_space.smooth_rtt();
             let live_floor = rl.rtt_floor.update(t, smooth);
@@ -1630,7 +1657,7 @@ mod tests {
         for _ in 0..6 {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(250);
-            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
         }
         feed_rtt(&mut rl, 20, Duration::from_millis(800), t);
         t += Duration::from_millis(1);
@@ -1638,7 +1665,7 @@ mod tests {
         loop {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(900);
-            ack_seq(&mut rl, seq, Duration::from_millis(800), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
             if rl.gentle.gentle_mode() {
                 break;
             }
@@ -1659,7 +1686,7 @@ mod tests {
         let gate_open_start = loop {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(250);
-            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
             if let Some(open_since) = rl.gentle.gentle_gate_open_since() {
                 break open_since;
             }
@@ -1673,7 +1700,7 @@ mod tests {
         loop {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(250);
-            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
             if !rl.gentle.gentle_mode() {
                 break;
             }
@@ -1702,7 +1729,7 @@ mod tests {
         for _ in 0..6 {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(250);
-            ack_seq(&mut rl, seq, Duration::from_millis(200), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
         }
         feed_rtt(&mut rl, 20, Duration::from_millis(800), t);
         t += Duration::from_millis(1);
@@ -1710,7 +1737,7 @@ mod tests {
         loop {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(900);
-            ack_seq(&mut rl, seq, Duration::from_millis(800), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
             if rl.gentle.gentle_mode() {
                 break;
             }
@@ -1723,7 +1750,7 @@ mod tests {
         loop {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(900);
-            ack_seq(&mut rl, seq, Duration::from_millis(800), t);
+            ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
             if !rl.gentle.gentle_mode() {
                 break;
             }
@@ -1740,17 +1767,28 @@ mod tests {
         // next packet stall for two RTOs and trigger an outage reset.
         let progress_seq = send_one(&mut rl, t);
         t += Duration::from_millis(50);
-        ack_seq(&mut rl, progress_seq, Duration::from_millis(50), t);
+        ack_seq(
+            &mut rl,
+            progress_seq.to_wire(),
+            Duration::from_millis(50),
+            t,
+        );
 
         let stall_seq = send_one(&mut rl, t);
         let _ = stall_seq;
         let rto = rl.pkt_send_space.rto_duration();
         let detect_t = t + rto * 2 + Duration::from_millis(1);
         let acks = [AckInterval {
-            start: 0,
-            size: NonZeroU64::new(progress_seq + 1).unwrap(),
+            start: crate::sequence::SequenceNumber::ZERO,
+            size: NonZeroU64::new(progress_seq.to_wire() + 1).unwrap(),
         }];
-        rl.recv_ack_pkt(AckBlocks::new(&acks), detect_t);
+        rl.recv_ack_pkt(
+            AckBlocks::new(
+                crate::sequence::SequenceNumber::from_wire(progress_seq.to_wire() + 1),
+                &acks,
+            ),
+            detect_t,
+        );
 
         // Outage recovery must clear the gentle re-entry cooldown.
         assert!(
@@ -1769,7 +1807,7 @@ mod tests {
         for _ in 0..4 {
             let seq = send_one(&mut rl, t);
             t += prime_rtt;
-            ack_seq(&mut rl, seq, prime_rtt, t);
+            ack_seq(&mut rl, seq.to_wire(), prime_rtt, t);
         }
         assert!(
             rl.pkt_send_space().smooth_rtt() <= Duration::from_millis(120),
@@ -1789,7 +1827,7 @@ mod tests {
         {
             let seq = send_one(&mut rl, t);
             t += rtt_hi;
-            ack_seq(&mut rl, seq, rtt_hi, t);
+            ack_seq(&mut rl, seq.to_wire(), rtt_hi, t);
         }
 
         let smooth = rl.pkt_send_space().smooth_rtt();
@@ -1825,7 +1863,7 @@ mod tests {
             sample_idx += 1;
             let seq = send_one(&mut rl, t);
             t += rtt;
-            ack_seq(&mut rl, seq, rtt, t);
+            ack_seq(&mut rl, seq.to_wire(), rtt, t);
             assert!(
                 !rl.gentle.gentle_mode(),
                 "gentle_mode must stay false at sample {} (t={:?})",

@@ -15,6 +15,7 @@ use crate::codec::{
     DecodeError, DecodedDataPkt, EncodeError, data_overhead, wrap_corrupted_err,
     wrap_insufficient_buffer_size_err,
 };
+use crate::sequence::SequenceNumber;
 
 /// Codec command byte for the first packet of a frame in frame-delivery mode.
 pub(crate) const FRAME_DATA_TS_CMD: u8 = 5;
@@ -27,12 +28,12 @@ pub const fn frame_data_overhead() -> usize {
 
 pub(crate) fn encode_frame_data_ts(
     wtr: &mut io::Cursor<&mut [u8]>,
-    seq: u64,
+    seq: SequenceNumber,
     send_ts: u32,
     frame_len: u32,
     data: &[u8],
 ) -> Result<(), EncodeError> {
-    wtr.write_u64::<BigEndian>(seq)
+    wtr.write_u64::<BigEndian>(seq.to_wire())
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u32::<BigEndian>(send_ts)
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -58,7 +59,7 @@ pub(crate) fn decode_frame_data_ts(
     }
     let start = rdr.position() as usize;
     Ok(DecodedDataPkt {
-        seq,
+        seq: SequenceNumber::from_wire(seq),
         send_ts: Some(send_ts),
         frame_len: Some(frame_len),
         buf_range: start..end,
@@ -80,7 +81,7 @@ mod tests {
         use crate::codec::{EncodeData, decode, encode_ack_data};
 
         let data = EncodeData {
-            seq: 7,
+            seq: crate::sequence::SequenceNumber::from_wire(7),
             send_ts: Some(99_999),
             frame_len: Some(20_000),
             data: b"frame-body",
@@ -91,7 +92,7 @@ mod tests {
         let decoded = decode(&buf[..n], &mut acks, None).unwrap();
         assert!(acks.is_empty());
         let data = decoded.data.unwrap();
-        assert_eq!(data.seq, 7);
+        assert_eq!(data.seq, crate::sequence::SequenceNumber::from_wire(7));
         assert_eq!(data.send_ts, Some(99_999));
         assert_eq!(data.frame_len, Some(20_000));
         assert_eq!(&buf[data.buf_range], b"frame-body");

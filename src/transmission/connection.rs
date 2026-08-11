@@ -74,8 +74,12 @@ pub fn new_connection(
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
-    let (reliable_layer, send_rate_limiter) =
-        ReliableLayer::new(unreliable_layer.mss, frame_delivery, now);
+    let (reliable_layer, send_rate_limiter) = ReliableLayer::new_at(
+        unreliable_layer.mss,
+        frame_delivery,
+        now,
+        unreliable_layer.initial_sequences,
+    );
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -125,8 +129,13 @@ pub fn new_connection_with_watchdog_tuning(
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
-    let (reliable_layer, send_rate_limiter) =
-        ReliableLayer::new_with_watchdog_tuning(unreliable_layer.mss, frame_delivery, now, tuning);
+    let (reliable_layer, send_rate_limiter) = ReliableLayer::new_with_watchdog_tuning_at(
+        unreliable_layer.mss,
+        frame_delivery,
+        now,
+        unreliable_layer.initial_sequences,
+        tuning,
+    );
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -565,6 +574,7 @@ mod tests {
             utp_write: Box::new(BlockingWrite::new()),
             post_open_handshake: None,
             session_tag: None,
+            initial_sequences: crate::sequence::InitialSequences::ZERO,
             mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
             fec_tuning: FecTuning::default(),

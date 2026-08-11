@@ -7,8 +7,15 @@ fn packet(rng: &mut SplitMix64) -> Vec<u8> {
     for _ in 0..1 + rng.below(6) {
         match rng.below(6) {
             0 => {
+                // Latest-only ACK command: command byte + eight-byte
+                // cumulative next + one-byte bounded count + count
+                // sixteen-byte (start, size) ranges.
                 out.push(0);
-                out.extend((0..16).map(|_| rng.byte()));
+                out.extend((0..8).map(|_| rng.byte()));
+                out.push(rng.below(64 + 1) as u8);
+                for _ in 0..out[out.len() - 1] {
+                    out.extend((0..16).map(|_| rng.byte()));
+                }
             }
             1 => {
                 out.push(1);
@@ -90,8 +97,11 @@ fn a_hostile_datagram_never_yields_a_range_outside_it() {
                 "frame_len without send_ts"
             );
         }
+        // The postcondition for a decoded selective interval is that it has
+        // nonzero size (the decoder rejects zero-size ranges); `end >= start`
+        // is invalid across wrap.
         for ack in &acks {
-            assert!(ack.end() >= ack.start, "{ack:?} wrapped");
+            assert!(ack.size.get() != 0, "{ack:?} has zero size");
         }
     }
     assert!(

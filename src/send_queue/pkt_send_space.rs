@@ -4,12 +4,7 @@ use std::time::Instant;
 use dre::PacketState;
 use primitive::{
     arena::obj_pool::{ObjPool, buf_pool},
-    ops::{
-        float::{PosR, UnitR},
-        len::LenExt,
-        opt_cmp::MinNoneOptCmp,
-    },
-    queue::send_wnd::SendWnd,
+    ops::float::{PosR, UnitR},
 };
 
 use crate::{
@@ -22,6 +17,7 @@ use crate::{
         rtt_stats::RttStats,
         tlp::TailLossProber,
     },
+    sequence::{HALF_SEQUENCE_SPACE, SendWindow, SequenceNumber, le, lt},
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
@@ -55,13 +51,13 @@ fn jitter_cap_from_env() -> bool {
 
 #[derive(Debug)]
 pub struct PktSendSpace {
-    send_wnd: SendWnd<u64, Option<InFlightPkt>>,
+    send_wnd: SendWindow<Option<InFlightPkt>>,
     num_in_flight: usize,
     reused_buf: ObjPool<Vec<u8>>,
     cwnd: NonZeroUsize,
-    out_of_order_seq_end: u64,
+    out_of_order_seq_end: SequenceNumber,
     /// Any sequence after this does not participate in data loss analysis.
-    max_pipe_seq: MinNoneOptCmp<u64>,
+    max_pipe_seq: Option<SequenceNumber>,
     loss_event_window: LossEventWindow,
     /// RFC 8985 tail-loss-probe engine.
     tlp: TailLossProber,
@@ -96,18 +92,25 @@ pub struct PktSendSpace {
     jitter_cap: bool,
 
     // reused buffers
-    unacked_buf: Vec<u64>,
-    ack_buf: Vec<u64>,
+    unacked_buf: Vec<SequenceNumber>,
+    ack_buf: Vec<SequenceNumber>,
 }
 impl PktSendSpace {
     pub fn new() -> Self {
+        Self::new_at(SequenceNumber::ZERO)
+    }
+
+    /// Send space seeded at `initial_seq` (handshake-derived directional
+    /// start); `new()` is the zero-seeded form used by connections opened
+    /// without the handshake.
+    pub fn new_at(initial_seq: SequenceNumber) -> Self {
         Self {
-            send_wnd: SendWnd::new(0),
+            send_wnd: SendWindow::new(initial_seq),
             num_in_flight: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
-            out_of_order_seq_end: 0,
-            max_pipe_seq: MinNoneOptCmp(None),
+            out_of_order_seq_end: initial_seq,
+            max_pipe_seq: None,
             loss_event_window: LossEventWindow::new(),
             tlp: TailLossProber::new(),
             liveness: PeerLiveness::new(),
@@ -158,15 +161,15 @@ impl PktSendSpace {
     }
 
     fn unacked(
-        send_wnd: &SendWnd<u64, Option<InFlightPkt>>,
-    ) -> impl Iterator<Item = (u64, &InFlightPkt)> {
+        send_wnd: &SendWindow<Option<InFlightPkt>>,
+    ) -> impl Iterator<Item = (SequenceNumber, &InFlightPkt)> {
         send_wnd
             .iter()
             .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
     }
     fn unacked_mut(
-        send_wnd: &mut SendWnd<u64, Option<InFlightPkt>>,
-    ) -> impl Iterator<Item = (u64, &mut InFlightPkt)> {
+        send_wnd: &mut SendWindow<Option<InFlightPkt>>,
+    ) -> impl Iterator<Item = (SequenceNumber, &mut InFlightPkt)> {
         send_wnd
             .iter_mut()
             .filter_map(|(k, v)| v.as_mut().map(|v| (k, v)))
@@ -188,8 +191,8 @@ impl PktSendSpace {
         self.cwnd = cwnd;
     }
 
-    pub fn next_seq(&self) -> u64 {
-        *self.send_wnd.next().unwrap()
+    pub fn next_seq(&self) -> SequenceNumber {
+        self.send_wnd.next()
     }
 
     pub fn num_rtxed_pkts(&self) -> usize {
@@ -227,20 +230,29 @@ impl PktSendSpace {
     }
 
     pub fn ack(&mut self, recved: AckBlocks<'_>, acked: &mut Vec<PacketState>, now: Instant) {
-        let cumulative_front_before = self.send_wnd.start().or(self.send_wnd.next()).copied();
-        let peer_waiting_for_acked_pkts =
-            cumulative_front_before.is_some_and(|front| recved.first_unacked() < front);
-        let sent_end = self.send_wnd.next().copied().unwrap_or(u64::MAX);
-        if let Some(seq) = recved.out_of_order_seq_end()
-            && seq < sent_end
-        {
-            self.out_of_order_seq_end = self.out_of_order_seq_end.max(seq);
+        // All interpretation of the incoming ACK happens relative to the
+        // original (send_start, sent_span): cumulative next is current only
+        // when its forward offset is within the sent span, stale/future
+        // values and ranges beyond the sent span never release anything.
+        let send_start = self.send_wnd.start();
+        let sent_end = self.send_wnd.next();
+        let sent_span = send_start.forward_distance_to(sent_end);
+        let peer_waiting_for_acked_pkts = lt(recved.next(), send_start);
+        if let Some(seq) = recved.out_of_order_seq_end(send_start, sent_span) {
+            // Compare out-of-order positions only by forward distance from
+            // the current send anchor: a stale bound (more than half a space
+            // behind) is replaced by any in-span report.
+            let cur_fd = send_start.forward_distance_to(self.out_of_order_seq_end);
+            let new_fd = send_start.forward_distance_to(seq);
+            if new_fd < HALF_SEQUENCE_SPACE && (cur_fd >= HALF_SEQUENCE_SPACE || new_fd > cur_fd) {
+                self.out_of_order_seq_end = seq;
+            }
         }
         self.unacked_buf.clear();
         self.unacked_buf
             .extend(Self::unacked(&self.send_wnd).map(|(k, _)| k));
         self.ack_buf.clear();
-        recved.acked_set(&self.unacked_buf, &mut self.ack_buf);
+        recved.acked_set(send_start, sent_span, &self.unacked_buf, &mut self.ack_buf);
         let delivered = self.ack_buf.len();
         if delivered > 0 {
             self.tlp.reset();
@@ -264,25 +276,23 @@ impl PktSendSpace {
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
             self.num_in_flight -= 1;
-            if s == *self.send_wnd.start().unwrap() {
-                self.send_wnd.pop().unwrap();
-                self.send_wnd.pop_none();
-            }
             if !self.deferred_losses.is_empty() {
                 self.deferred_losses.retain(|dl| dl.seq != s);
             }
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
-        let cumulative_front_after = self.send_wnd.start().or(self.send_wnd.next()).copied();
-        if cumulative_front_before
-            .zip(cumulative_front_after)
-            .is_some_and(|(before, after)| before < after)
-        {
+        // Clear only actually acknowledged entries; the acknowledged empty
+        // prefix is popped and liveness progress is recorded only when the
+        // removal count is nonzero (selective-only ACKs never fake progress).
+        let removed = self.send_wnd.pop_none();
+        if removed > 0 {
             self.liveness.record_progress();
         }
         for (s, p) in Self::unacked_mut(&mut self.send_wnd) {
-            p.sacked_above = p.sacked_above.max(recved.sacked_above_count(s, sent_end));
+            p.sacked_above = p
+                .sacked_above
+                .max(recved.sacked_above_count(send_start, sent_span, s));
         }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
@@ -313,13 +323,13 @@ impl PktSendSpace {
         self.num_in_flight < self.cwnd.get()
     }
 
-    /// Sequence number of the current tail packet, if any.
-    fn tail_seq(&self) -> Option<u64> {
-        let next = self.send_wnd.next().copied()?;
-        if next == 0 {
+    /// Sequence number of the current tail packet, if any (only when the
+    /// window is nonempty; the tail is `next.retreat(1)`).
+    fn tail_seq(&self) -> Option<SequenceNumber> {
+        if self.send_wnd.is_empty() {
             return None;
         }
-        Some(next - 1)
+        Some(self.send_wnd.next().retreat(1))
     }
 
     /// Whether the tail packet is still unacked and enough time has passed for
@@ -383,9 +393,9 @@ impl PktSendSpace {
         frame_len: Option<u32>,
         now: Instant,
     ) -> Pkt<'_> {
-        let s = *self.send_wnd.next().unwrap();
+        let s = self.send_wnd.next();
 
-        self.max_pipe_seq = MinNoneOptCmp(Some(s));
+        self.max_pipe_seq = Some(s);
 
         let rto = self.rtt_stats.rto_duration();
         self.liveness.on_send(now, rto);
@@ -428,7 +438,7 @@ impl PktSendSpace {
         Self::unacked(&self.send_wnd)
             .take(self.cwnd.get())
             .any(|(s, p)| {
-                let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
+                let is_seq_out_of_order = SeqOutOfOrder(lt(s, out_of_order_seq_end));
                 let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
                 let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, rtx_window, now);
                 let fast_loss = fast_loss_armed && p.is_fast_loss();
@@ -447,7 +457,7 @@ impl PktSendSpace {
         };
         let fast_loss_armed = self.fast_loss_armed();
         for (s, p) in Self::unacked_mut(&mut self.send_wnd).take(self.cwnd.get()) {
-            let is_seq_out_of_order = SeqOutOfOrder(s < out_of_order_seq_end);
+            let is_seq_out_of_order = SeqOutOfOrder(lt(s, out_of_order_seq_end));
             let is_pre_outage_loss = self.outage.is_pre_outage_loss(p.sent_time);
             let time_based = p.is_rtx(is_seq_out_of_order, is_pre_outage_loss, rtx_window, now);
             let fast_loss = fast_loss_armed && p.is_fast_loss();
@@ -493,8 +503,8 @@ impl PktSendSpace {
             };
 
             // fresh pkt for this cwnd
-            let considered_new_in_cwnd = if self.max_pipe_seq < MinNoneOptCmp(Some(s)) {
-                self.max_pipe_seq = MinNoneOptCmp(Some(s));
+            let considered_new_in_cwnd = if self.max_pipe_seq.is_some_and(|m| lt(m, s)) {
+                self.max_pipe_seq = Some(s);
                 true
             } else {
                 false
@@ -586,7 +596,7 @@ impl PktSendSpace {
         };
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
 
-        let last_seq_in_cwnd = || {
+        let last_seq_in_cwnd = || -> Option<SequenceNumber> {
             if let Some(s) = Self::unacked(&self.send_wnd).map(|(k, _)| k).nth(cwnd) {
                 return Some(s);
             }
@@ -598,8 +608,10 @@ impl PktSendSpace {
         let last_seq_in_cwnd = last_seq_in_cwnd();
 
         // Retract max sequence in pipe
-        if MinNoneOptCmp(last_seq_in_cwnd) < self.max_pipe_seq {
-            self.max_pipe_seq = MinNoneOptCmp(last_seq_in_cwnd);
+        if let Some(last) = last_seq_in_cwnd
+            && self.max_pipe_seq.is_some_and(|m| lt(last, m))
+        {
+            self.max_pipe_seq = Some(last);
         }
     }
 
@@ -714,9 +726,9 @@ impl PktSendSpace {
         self.pkts_in_pipe().count()
     }
 
-    fn pkts_in_pipe(&self) -> impl Iterator<Item = (u64, &InFlightPkt)> + '_ {
+    fn pkts_in_pipe(&self) -> impl Iterator<Item = (SequenceNumber, &InFlightPkt)> + '_ {
         Self::unacked(&self.send_wnd)
-            .take_while(|(s, _)| MinNoneOptCmp(Some(*s)) <= self.max_pipe_seq)
+            .take_while(|(s, _)| self.max_pipe_seq.is_some_and(|m| le(*s, m)))
     }
 
     pub fn next_poll_time(&self) -> Option<Instant> {
@@ -731,7 +743,7 @@ impl PktSendSpace {
             let t = p.next_rto_time();
             let t = min_next_poll_time.map(|min| min.min(t)).unwrap_or(t);
             min_next_poll_time = Some(t);
-            if s < self.out_of_order_seq_end {
+            if lt(s, self.out_of_order_seq_end) {
                 let rw_t = p.sent_time + rtx_window;
                 min_next_poll_time =
                     Some(min_next_poll_time.map(|min| min.min(rw_t)).unwrap_or(rw_t));
@@ -859,13 +871,13 @@ struct SeqOutOfOrder(pub bool);
 /// seq was acked in the meantime the entry was already cancelled by `ack`.
 #[derive(Debug, Clone, Copy)]
 struct DeferredLoss {
-    seq: u64,
+    seq: SequenceNumber,
     baseline_deadline: Instant,
 }
 
 #[derive(Debug, Clone)]
 pub struct Pkt<'a> {
-    pub seq: u64,
+    pub seq: SequenceNumber,
     pub data: &'a [u8],
     /// Application frame length this packet belongs to.  `Some` only for the
     /// first packet of a frame in frame-delivery mode; the transmission layer
@@ -879,7 +891,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{CWND_SEND_RATE_SCALE, INIT_CWND, PktSendSpace};
+    use crate::sequence::SequenceNumber;
     use primitive::ops::float::PosR;
+
+    fn sq(n: u64) -> SequenceNumber {
+        SequenceNumber::from_wire(n)
+    }
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -892,7 +909,7 @@ mod tests {
         }
     }
 
-    fn send_packet(space: &mut PktSendSpace, now: Instant) -> u64 {
+    fn send_packet(space: &mut PktSendSpace, now: Instant) -> SequenceNumber {
         use dre::ConnectionState;
         let data = vec![0u8; 1];
         let stats = ConnectionState::new(now).send_packet_2(now, space.no_pkts_in_flight());
@@ -902,14 +919,15 @@ mod tests {
     }
 
     fn ack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
+        // The peer received `seq` in order: its cumulative front is one past.
         let ball = crate::ack::AckInterval {
-            start: seq,
+            start: SequenceNumber::from_wire(seq),
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
-        let seq = crate::ack::AckBlocks::new(&balls);
+        let recved = crate::ack::AckBlocks::new(SequenceNumber::from_wire(seq).advance(1), &balls);
         let mut acked = Vec::new();
-        space.ack(seq, &mut acked, now);
+        space.ack(recved, &mut acked, now);
         acked.len()
     }
 
@@ -919,14 +937,19 @@ mod tests {
     /// every older in-flight packet.
     fn sack_one(space: &mut PktSendSpace, seq: u64, now: Instant) -> usize {
         let mut peer = crate::ack::AckHistory::new();
-        for s in 0..space.next_seq() {
-            if space.send_wnd.get(&s).and_then(|o| o.as_ref()).is_none() {
-                peer.insert(s);
+        for s in 0..space.next_seq().to_wire() {
+            if space
+                .send_wnd
+                .get(&SequenceNumber::from_wire(s))
+                .and_then(|o| o.as_ref())
+                .is_none()
+            {
+                peer.insert(SequenceNumber::from_wire(s));
             }
         }
-        peer.insert(seq);
+        peer.insert(SequenceNumber::from_wire(seq));
         let balls = peer.blocks().collect::<Vec<_>>();
-        let recved = crate::ack::AckBlocks::new(&balls);
+        let recved = crate::ack::AckBlocks::new(peer.next(), &balls);
         let mut acked = Vec::new();
         space.ack(recved, &mut acked, now);
         acked.len()
@@ -934,18 +957,19 @@ mod tests {
 
     fn resack(space: &mut PktSendSpace, seq: u64, now: Instant) {
         let ball = crate::ack::AckInterval {
-            start: seq,
+            start: SequenceNumber::from_wire(seq),
             size: std::num::NonZeroU64::new(1).unwrap(),
         };
         let balls = [ball];
         let mut acked = Vec::new();
-        space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, now);
+        // The peer re-acks `seq` without advancing its cumulative front.
+        space.ack(crate::ack::AckBlocks::new(sq(0), &balls), &mut acked, now);
     }
 
     fn sacked_above(space: &PktSendSpace, seq: u64) -> u32 {
         space
             .send_wnd
-            .get(&seq)
+            .get(&SequenceNumber::from_wire(seq))
             .and_then(|o| o.as_ref())
             .map(|p| p.sacked_above)
             .unwrap_or(0)
@@ -965,6 +989,7 @@ mod tests {
         // We do this by pulling the packet out, marking it as already retransmitted,
         // and then putting it back as a retransmitted copy.  The original send time
         // is preserved so it still looks like a pre-outage packet.
+        let seq = SequenceNumber::from_wire(seq);
         let p = space.send_wnd.get_mut(&seq).unwrap().take().unwrap();
         let mut retransmitted = p.clone();
         retransmitted.rtxed = true;
@@ -979,13 +1004,13 @@ mod tests {
 
     fn ack_up_to(space: &mut PktSendSpace, seq: u64, now: Instant) {
         let ball = crate::ack::AckInterval {
-            start: 0,
+            start: sq(0),
             size: std::num::NonZeroU64::new(seq + 1).unwrap(),
         };
         let balls = [ball];
-        let seq = crate::ack::AckBlocks::new(&balls);
+        let recved = crate::ack::AckBlocks::new(SequenceNumber::from_wire(seq).advance(1), &balls);
         let mut acked = Vec::new();
-        space.ack(seq, &mut acked, now);
+        space.ack(recved, &mut acked, now);
     }
 
     #[test]
@@ -1008,7 +1033,7 @@ mod tests {
         assert!(space.has_tail_probe(t2), "probe should fire by 250 ms");
 
         let p = space.tail_probe(t2).unwrap();
-        assert_eq!(p.seq, 1);
+        assert_eq!(p.seq, sq(1));
 
         // Second probe requires another full PTO window.
         let t3 = t2 + ms(150);
@@ -1016,7 +1041,7 @@ mod tests {
         let t4 = t2 + ms(250);
         assert!(space.has_tail_probe(t4), "second probe should fire");
         let p = space.tail_probe(t4).unwrap();
-        assert_eq!(p.seq, 1);
+        assert_eq!(p.seq, sq(1));
 
         // Budget is exhausted after two probes.
         let t5 = t4 + ms(500);
@@ -1123,7 +1148,7 @@ mod tests {
         // helper but is at the front of the window; it should still be exempt.
         let rtx = space.rtx(t0 + ms(600)).unwrap();
         assert!(
-            rtx.seq == 1 || rtx.seq == 2,
+            rtx.seq == sq(1) || rtx.seq == sq(2),
             "expected pre-outage rtx, got {rtx_seq}",
             rtx_seq = rtx.seq
         );
@@ -1371,13 +1396,13 @@ mod tests {
         let t1 = t0 + ms(210);
         assert!(space.has_tail_probe(t1), "first probe should be due");
         let p1 = space.tail_probe(t1).unwrap();
-        assert_eq!(p1.seq, 1);
+        assert_eq!(p1.seq, sq(1));
 
         // Second probe fires after another PTO window.
         let t2 = t1 + ms(210);
         assert!(space.has_tail_probe(t2), "second probe should be due");
         let p2 = space.tail_probe(t2).unwrap();
-        assert_eq!(p2.seq, 1);
+        assert_eq!(p2.seq, sq(1));
 
         // Full-RTO retransmit off the lowered floor fires around 300 ms after the
         // second probe.  It must not record a congestion loss event because the
@@ -1386,7 +1411,7 @@ mod tests {
         let rtx = space
             .rtx(t3)
             .expect("full RTO should fire after tail probes");
-        assert_eq!(rtx.seq, 1);
+        assert_eq!(rtx.seq, sq(1));
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
             "post-TLP full-RTO rtx must not arm a loss event"
@@ -1423,7 +1448,7 @@ mod tests {
         // Wait for the full RTO (1 s floor on steady low-RTT path) and retransmit.
         let rtx_t = t0 + ms(2) + space.rto_duration() + ms(1);
         let rtx = space.rtx(rtx_t).expect("RTO should fire");
-        assert_eq!(rtx.seq, 1);
+        assert_eq!(rtx.seq, sq(1));
 
         // A non-tail-probe retransmit must record the loss event for congestion
         // accounting and outage detection.
@@ -1478,7 +1503,7 @@ mod tests {
         let rtx = space
             .rtx(early)
             .expect("fast loss should retransmit seq 0 before the reorder window");
-        assert_eq!(rtx.seq, 0, "fast loss should target the starved seq 0");
+        assert_eq!(rtx.seq, sq(0), "fast loss should target the starved seq 0");
     }
 
     #[test]
@@ -1576,12 +1601,12 @@ mod tests {
         // Fast-loss retransmit of seq 0 fires before the reorder window.
         let rtx_t = t0 + ms(30);
         let rtx = space.rtx(rtx_t).expect("fast loss should fire for seq 0");
-        assert_eq!(rtx.seq, 0);
+        assert_eq!(rtx.seq, sq(0));
         // The retransmit is recorded as a fast-loss rtx for reordering检测.
         assert_eq!(
             space
                 .send_wnd
-                .get(&0)
+                .get(&sq(0))
                 .and_then(|o| o.as_ref())
                 .unwrap()
                 .fast_loss_rtx_time,
@@ -1655,7 +1680,7 @@ mod tests {
 
         let rtx_t = t0 + ms(30);
         let rtx = space.rtx(rtx_t).expect("fast loss should fire for seq 0");
-        assert_eq!(rtx.seq, 0);
+        assert_eq!(rtx.seq, sq(0));
 
         // A fast-loss retransmit is a genuine loss declaration, not a TLP
         // probe, so it must record a congestion loss event exactly as a
@@ -1670,7 +1695,7 @@ mod tests {
         // packet carries no TLP marker.
         let p = space
             .send_wnd
-            .get(&0)
+            .get(&sq(0))
             .and_then(|o| o.as_ref())
             .expect("seq 0 still in flight after rtx");
         assert!(
@@ -1716,7 +1741,7 @@ mod tests {
         sack_one(space, 3, t0 + ms(12));
         // seq 0 is below out_of_order_seq_end (= 3), so the reorder-window
         // path applies to it.
-        assert!(space.out_of_order_seq_end > 0);
+        assert_ne!(space.out_of_order_seq_end, sq(0));
     }
 
     #[test]
@@ -1728,13 +1753,17 @@ mod tests {
             send_packet(&mut space, t0);
         }
         let balls = [crate::ack::AckInterval {
-            start: u64::MAX,
+            start: sq(u64::MAX),
             size: std::num::NonZeroU64::new(1).unwrap(),
         }];
         let mut acked = Vec::new();
-        space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, t0 + ms(1));
+        space.ack(
+            crate::ack::AckBlocks::new(sq(0), &balls),
+            &mut acked,
+            t0 + ms(1),
+        );
         assert!(
-            space.out_of_order_seq_end <= space.next_seq(),
+            crate::sequence::le(space.out_of_order_seq_end, space.next_seq()),
             "the peer moved the gap bound to {} with only {} sequences sent",
             space.out_of_order_seq_end,
             space.next_seq(),
@@ -1754,11 +1783,15 @@ mod tests {
             send_packet(&mut space, t0);
         }
         let balls = [crate::ack::AckInterval {
-            start: 3,
+            start: sq(3),
             size: std::num::NonZeroU64::new(u64::MAX).unwrap(),
         }];
         let mut acked = Vec::new();
-        space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, t0 + ms(1));
+        space.ack(
+            crate::ack::AckBlocks::new(sq(0), &balls),
+            &mut acked,
+            t0 + ms(1),
+        );
         for s in 0..3 {
             assert_eq!(
                 sacked_above(&space, s),
@@ -1802,7 +1835,7 @@ mod tests {
         let rtx = space
             .rtx(rtx_t)
             .expect("jitter-cap fast rtx must fire before the stock reorder window");
-        assert_eq!(rtx.seq, 0);
+        assert_eq!(rtx.seq, sq(0));
 
         // *** The loss event must NOT be recorded at rtx time — it is deferred
         // to the stock deadline.  Recording it here is the goodput-collapse
@@ -1818,7 +1851,7 @@ mod tests {
             1,
             "one deferred loss entry pending"
         );
-        assert_eq!(space.deferred_losses[0].seq, 0);
+        assert_eq!(space.deferred_losses[0].seq, sq(0));
         assert_eq!(
             space.deferred_losses[0].baseline_deadline,
             baseline_deadline
@@ -1837,7 +1870,7 @@ mod tests {
         let baseline_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
         let rtx = space.rtx(rtx_t).expect("jitter-cap fast rtx fires");
-        assert_eq!(rtx.seq, 0);
+        assert_eq!(rtx.seq, sq(0));
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
             "no loss event at rtx time (deferred)"
@@ -1882,7 +1915,7 @@ mod tests {
         let baseline_deadline = t0 + stock;
         let rtx_t = fast_deadline + ms(50);
         let rtx = space.rtx(rtx_t).expect("jitter-cap fast rtx fires");
-        assert_eq!(rtx.seq, 0);
+        assert_eq!(rtx.seq, sq(0));
         assert!(
             !space.loss_event_window.raw_has_loss_event(),
             "no loss event at rtx time (deferred)"
@@ -1955,7 +1988,7 @@ mod tests {
             "toggle off: stock rtx fires at stock deadline"
         );
         let rtx = space.rtx(rtx_t).expect("stock rtx at stock deadline");
-        assert_eq!(rtx.seq, 0);
+        assert_eq!(rtx.seq, sq(0));
         assert!(
             space.loss_event_window.raw_has_loss_event(),
             "toggle off: stock rtx records loss event immediately (no deferral)"
@@ -2019,28 +2052,32 @@ mod tests {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
-        assert_eq!(send_packet(&mut space, t0), 0);
+        assert_eq!(send_packet(&mut space, t0), sq(0));
         assert_eq!(ack_one(&mut space, 0, t0 + ms(10)), 1);
-        assert_eq!(send_packet(&mut space, t0 + ms(11)), 1);
+        assert_eq!(send_packet(&mut space, t0 + ms(11)), sq(1));
         let mut last_ack = t0 + ms(11);
         for i in 0..8 {
             let send_at = t0 + ms(12) + Duration::from_secs(i * 5);
             let seq = send_packet(&mut space, send_at);
             let balls = [
                 crate::ack::AckInterval {
-                    start: 0,
+                    start: sq(0),
                     size: std::num::NonZeroU64::new(1).unwrap(),
                 },
                 crate::ack::AckInterval {
-                    start: 2,
-                    size: std::num::NonZeroU64::new(seq - 1).unwrap(),
+                    start: sq(2),
+                    size: std::num::NonZeroU64::new(seq.to_wire() - 1).unwrap(),
                 },
             ];
             let mut acked = Vec::new();
             last_ack = send_at + ms(1);
-            space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, last_ack);
+            space.ack(
+                crate::ack::AckBlocks::new(sq(1), &balls),
+                &mut acked,
+                last_ack,
+            );
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
-            assert_eq!(space.send_wnd.start().copied(), Some(1));
+            assert_eq!(space.send_wnd.start(), sq(1));
         }
         let no_resp = space.no_resp_for(last_ack);
         let no_progress = space.no_progress_for(last_ack);
@@ -2057,20 +2094,24 @@ mod tests {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
-        assert_eq!(send_packet(&mut space, t0), 0);
+        assert_eq!(send_packet(&mut space, t0), sq(0));
         let mut last_ack = t0;
         for i in 0..8 {
             let send_at = t0 + ms(1) + Duration::from_secs(i * 5);
             let seq = send_packet(&mut space, send_at);
             let balls = [crate::ack::AckInterval {
-                start: 1,
-                size: std::num::NonZeroU64::new(seq).unwrap(),
+                start: sq(1),
+                size: std::num::NonZeroU64::new(seq.to_wire()).unwrap(),
             }];
             let mut acked = Vec::new();
             last_ack = send_at + ms(1);
-            space.ack(crate::ack::AckBlocks::new(&balls), &mut acked, last_ack);
+            space.ack(
+                crate::ack::AckBlocks::new(sq(0), &balls),
+                &mut acked,
+                last_ack,
+            );
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
-            assert_eq!(space.send_wnd.start().copied(), Some(0));
+            assert_eq!(space.send_wnd.start(), sq(0));
         }
         let no_resp = space.no_resp_for(last_ack);
         let no_progress = space.no_progress_for(last_ack);
@@ -2080,5 +2121,86 @@ mod tests {
             "the initial cumulative hole must age even before first progress; no_progress={no_progress:?}"
         );
         assert!(space.should_terminate_session(last_ack));
+    }
+
+    #[test]
+    fn cumulative_ack_releases_a_send_window_across_u64_wrap() {
+        let t0 = Instant::now();
+        // Seed the send window just before the wrap so the three sent
+        // packets straddle u64::MAX → 0.
+        let mut space = PktSendSpace::new_at(sq(u64::MAX - 2));
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        assert_eq!(space.send_wnd.start(), sq(u64::MAX - 2));
+        assert_eq!(space.next_seq(), sq(0), "the next sequence wrapped to 0");
+        assert_eq!(space.num_in_flight_pkts(), 3);
+        // The peer received all three: its cumulative next is one past the
+        // last packet (seq 0, past the wrap).  The whole window must release.
+        let acked = ack_one(&mut space, u64::MAX, t0 + ms(3));
+        assert_eq!(
+            acked, 3,
+            "a cumulative ack must release the whole window across the wrap"
+        );
+        assert!(space.no_pkts_in_flight());
+        assert_eq!(space.send_wnd.start(), space.send_wnd.next());
+    }
+
+    #[test]
+    fn selective_responses_across_wrap_do_not_fake_cumulative_progress() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new_at(sq(u64::MAX - 2));
+        settle_rtt_at(&mut space, t0);
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        assert!(!space.liveness.ever_progressed);
+
+        // A selective-only response: the peer's cumulative front stays at
+        // MAX-2 while it SACKs the wrapped tail (seq MAX).
+        let mut peer = crate::ack::AckHistory::new_at(sq(u64::MAX - 2));
+        peer.insert(sq(u64::MAX));
+        let balls = peer.blocks().collect::<Vec<_>>();
+        let recved = crate::ack::AckBlocks::new(peer.next(), &balls);
+        let mut acked = Vec::new();
+        space.ack(recved, &mut acked, t0 + ms(10));
+        assert_eq!(acked.len(), 1, "only the SACKed tail is released");
+        assert_eq!(
+            space.send_wnd.start(),
+            sq(u64::MAX - 2),
+            "the cumulative front must not advance on a selective-only response"
+        );
+        assert_eq!(space.num_in_flight_pkts(), 2);
+        assert!(
+            !space.liveness.ever_progressed,
+            "selective-only responses must not fake cumulative progress"
+        );
+
+        // SACKing the middle packet too: still selective-only.
+        let mut peer = crate::ack::AckHistory::new_at(sq(u64::MAX - 2));
+        peer.insert(sq(u64::MAX));
+        peer.insert(sq(u64::MAX - 1));
+        let balls = peer.blocks().collect::<Vec<_>>();
+        let recved = crate::ack::AckBlocks::new(peer.next(), &balls);
+        let mut acked = Vec::new();
+        space.ack(recved, &mut acked, t0 + ms(11));
+        assert_eq!(
+            acked.len(),
+            1,
+            "only the newly SACKed middle packet is released"
+        );
+        assert_eq!(space.send_wnd.start(), sq(u64::MAX - 2));
+        assert_eq!(space.num_in_flight_pkts(), 1);
+        assert!(!space.liveness.ever_progressed);
+
+        // Only the in-order ack of the head advances the front (pop_none
+        // count is nonzero) and records progress.
+        let acked = ack_one(&mut space, u64::MAX - 2, t0 + ms(12));
+        assert_eq!(acked, 1, "the head is the last in-flight packet");
+        assert!(space.no_pkts_in_flight());
+        assert!(
+            space.liveness.ever_progressed,
+            "an in-order cumulative ack must record progress"
+        );
     }
 }

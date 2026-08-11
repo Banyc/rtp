@@ -132,11 +132,18 @@ impl ReadHalf {
                     .data
                     .as_ref()
                     .is_some_and(|data| data.buf_range.is_empty() && data.frame_len.is_none());
+                let ack_next = data.ack_next;
                 let (disposition, recv_eof) = {
                     let mut reliable_layer = shared.reliable_layer.lock().unwrap();
-                    reliable_layer.recv_ack_pkt(AckBlocks::new(&bufs.ack_from_peer), now);
-                    if FEC_DEBUG {
-                        eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
+                    // An ACK event exists only when the datagram carried an
+                    // ACK command (ack_next is Some); a data-only packet must
+                    // not fabricate one.
+                    if let Some(ack_next) = ack_next {
+                        reliable_layer
+                            .recv_ack_pkt(AckBlocks::new(ack_next, &bufs.ack_from_peer), now);
+                        if FEC_DEBUG {
+                            eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
+                        }
                     }
                     let disposition = match &data.data {
                         None => None,
@@ -169,8 +176,8 @@ impl ReadHalf {
                 }
                 received_batch.record_eof(recv_eof);
                 recv_pkts.num_ack_segments += 1;
-                shared.signals.sent_pkt_acked.notify_waiters();
-                if data.data.is_none() {
+                if ack_next.is_some() {
+                    shared.signals.sent_pkt_acked.notify_waiters();
                     shared.signals.session_outbound_progress.notify_one();
                 }
                 let Some(data) = data.data else {

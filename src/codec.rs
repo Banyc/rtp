@@ -5,8 +5,9 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tap::Pipe;
 use thiserror::Error;
 
-use crate::ack::{AckInterval, EncodeAck};
+use crate::ack::{AckInterval, EncodeAck, MAX_ACK_BLOCKS};
 use crate::delivery::frame::wire::{FRAME_DATA_TS_CMD, decode_frame_data_ts, encode_frame_data_ts};
+use crate::sequence::SequenceNumber;
 
 const ACK_CMD: u8 = 0;
 const DATA_CMD: u8 = 1;
@@ -63,9 +64,16 @@ pub fn encode_ack_data(
         write_tag(&mut wtr, tag)?;
     }
     if let Some(ack) = ack {
-        for block in ack.blocks() {
-            wtr.write_u8(ACK_CMD)
-                .pipe(wrap_insufficient_buffer_size_err)?;
+        // Latest-only ACK layout: one ACK_CMD, then cumulative next, a
+        // one-byte bounded count, then that many (start, size) ranges.
+        wtr.write_u8(ACK_CMD)
+            .pipe(wrap_insufficient_buffer_size_err)?;
+        wtr.write_u64::<BigEndian>(ack.next().to_wire())
+            .pipe(wrap_insufficient_buffer_size_err)?;
+        let count = ack.block_count().min(MAX_ACK_BLOCKS);
+        wtr.write_u8(count as u8)
+            .pipe(wrap_insufficient_buffer_size_err)?;
+        for block in ack.blocks().take(count) {
             encode_ack(&mut wtr, block)?;
         }
     }
@@ -112,7 +120,7 @@ pub fn encode_ack_data(
 
 #[derive(Debug, Clone)]
 pub struct EncodeData<'a> {
-    pub seq: u64,
+    pub seq: SequenceNumber,
     pub send_ts: Option<u32>,
     /// Total application frame length in bytes.  `Some` only for the first
     /// packet of a frame in frame-delivery mode; `None` for all stock packets
@@ -124,6 +132,10 @@ pub struct EncodeData<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Decoded {
+    /// The peer's cumulative ACK next: one past the last sequence it has
+    /// received in order.  `Some` only when the datagram carried an ACK
+    /// command; a data-only packet must not fabricate an ACK event.
+    pub ack_next: Option<SequenceNumber>,
     pub data: Option<DecodedDataPkt>,
     pub echo_ts: Option<u32>,
     /// broken pipe
@@ -131,7 +143,7 @@ pub struct Decoded {
 }
 #[derive(Debug, Clone)]
 pub struct DecodedDataPkt {
-    pub seq: u64,
+    pub seq: SequenceNumber,
     pub send_ts: Option<u32>,
     /// Total application frame length in bytes.  `Some` only for the first
     /// packet of a frame in frame-delivery mode (cmd `FRAME_DATA_TS`); `None`
@@ -154,7 +166,9 @@ pub fn decode(
 ) -> Result<Decoded, DecodeError> {
     let mut killed = false;
     let mut echo_ts = None;
+    let mut ack_next = None;
     let mut tag_seen = false;
+    let mut ack_cmd_seen = false;
     let mut rdr = io::Cursor::new(buf);
     while let Ok(cmd) = rdr.read_u8() {
         match cmd {
@@ -167,12 +181,26 @@ pub fn decode(
             }
             ACK_CMD => {
                 require_tag(session_tag, tag_seen)?;
-                let a = decode_ack(&mut rdr)?;
-                ack.push(a);
+                // Latest-only framing: at most one ACK_CMD per datagram.
+                if ack_cmd_seen {
+                    return Err(DecodeError::Corrupted);
+                }
+                ack_cmd_seen = true;
+                let next = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
+                let count = rdr.read_u8().pipe(wrap_corrupted_err)?;
+                if MAX_ACK_BLOCKS < count as usize {
+                    return Err(DecodeError::Corrupted);
+                }
+                for _ in 0..count {
+                    let a = decode_ack(&mut rdr)?;
+                    ack.push(a);
+                }
+                ack_next = Some(SequenceNumber::from_wire(next));
             }
             DATA_CMD => {
                 let data = decode_data(&mut rdr)?;
                 return Ok(Decoded {
+                    ack_next,
                     data: Some(data),
                     echo_ts,
                     killed,
@@ -181,6 +209,7 @@ pub fn decode(
             DATA_TS_CMD => {
                 let data = decode_data_ts(&mut rdr)?;
                 return Ok(Decoded {
+                    ack_next,
                     data: Some(data),
                     echo_ts,
                     killed,
@@ -189,6 +218,7 @@ pub fn decode(
             FRAME_DATA_TS_CMD => {
                 let data = decode_frame_data_ts(&mut rdr)?;
                 return Ok(Decoded {
+                    ack_next,
                     data: Some(data),
                     echo_ts,
                     killed,
@@ -207,6 +237,7 @@ pub fn decode(
         }
     }
     Ok(Decoded {
+        ack_next,
         data: None,
         echo_ts,
         killed,
@@ -214,7 +245,7 @@ pub fn decode(
 }
 
 fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: AckInterval) -> Result<(), EncodeError> {
-    wtr.write_u64::<BigEndian>(ack.start)
+    wtr.write_u64::<BigEndian>(ack.start.to_wire())
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u64::<BigEndian>(ack.size.get())
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -224,8 +255,13 @@ fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: AckInterval) -> Result<(), E
 fn decode_ack(rdr: &mut io::Cursor<&[u8]>) -> Result<AckInterval, DecodeError> {
     let start = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
     let size = rdr.read_u64::<BigEndian>().pipe(wrap_corrupted_err)?;
+    // A zero-size interval is invalid on the wire (and meaningless across
+    // wrap): it is not a valid selective range.
     let size = NonZeroU64::new(size).ok_or(DecodeError::Corrupted)?;
-    Ok(AckInterval { start, size })
+    Ok(AckInterval {
+        start: SequenceNumber::from_wire(start),
+        size,
+    })
 }
 
 pub const fn data_overhead() -> usize {
@@ -236,8 +272,12 @@ pub const fn data_overhead() -> usize {
     cmd + seq + send_ts + len
 }
 
-fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result<(), EncodeError> {
-    wtr.write_u64::<BigEndian>(seq)
+fn encode_data(
+    wtr: &mut io::Cursor<&mut [u8]>,
+    seq: SequenceNumber,
+    data: &[u8],
+) -> Result<(), EncodeError> {
+    wtr.write_u64::<BigEndian>(seq.to_wire())
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u16::<BigEndian>(data.len().try_into().unwrap())
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -248,11 +288,11 @@ fn encode_data(wtr: &mut io::Cursor<&mut [u8]>, seq: u64, data: &[u8]) -> Result
 
 fn encode_data_ts(
     wtr: &mut io::Cursor<&mut [u8]>,
-    seq: u64,
+    seq: SequenceNumber,
     send_ts: u32,
     data: &[u8],
 ) -> Result<(), EncodeError> {
-    wtr.write_u64::<BigEndian>(seq)
+    wtr.write_u64::<BigEndian>(seq.to_wire())
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u32::<BigEndian>(send_ts)
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -272,7 +312,7 @@ fn decode_data(rdr: &mut io::Cursor<&[u8]>) -> Result<DecodedDataPkt, DecodeErro
     }
     let start = rdr.position() as usize;
     Ok(DecodedDataPkt {
-        seq,
+        seq: SequenceNumber::from_wire(seq),
         send_ts: None,
         frame_len: None,
         buf_range: start..end,
@@ -289,7 +329,7 @@ fn decode_data_ts(rdr: &mut io::Cursor<&[u8]>) -> Result<DecodedDataPkt, DecodeE
     }
     let start = rdr.position() as usize;
     Ok(DecodedDataPkt {
-        seq,
+        seq: SequenceNumber::from_wire(seq),
         send_ts: Some(send_ts),
         frame_len: None,
         buf_range: start..end,
@@ -309,7 +349,8 @@ pub(crate) fn wrap_corrupted_err<T>(res: std::io::Result<T>) -> Result<T, Decode
 /// Control commands in a handshaked connection must be preceded by a valid
 /// session tag.  Without this, a datagram forged at the peer's source
 /// address could kill the session (`KILL_CMD`) or release the entire send
-/// window (a `{start:0, size:u64::MAX}` ACK block) with no retransmission.
+/// window (a cumulative next past the sent span, or a `{start:0,
+/// size:u64::MAX}` selective block) with no retransmission.
 fn require_tag(session_tag: Option<u64>, tag_seen: bool) -> Result<(), DecodeError> {
     if session_tag.is_some() && !tag_seen {
         return Err(DecodeError::Unauthenticated);
@@ -335,12 +376,17 @@ pub enum DecodeError {
 mod tests {
     use super::{DecodeError, EncodeData, decode, encode_ack_data, encode_kill};
     use crate::ack::{AckHistory, EncodeAck};
+    use crate::sequence::SequenceNumber;
+
+    fn seq(n: u64) -> SequenceNumber {
+        SequenceNumber::from_wire(n)
+    }
 
     #[test]
     fn roundtrip_ack_echo_data() {
         let mut queue = AckHistory::new();
-        for seq in 10..15 {
-            queue.insert(seq);
+        for s in 10..15 {
+            queue.insert(seq(s));
         }
         let ack = EncodeAck {
             queue: &queue,
@@ -348,7 +394,7 @@ mod tests {
             max_blocks: 64,
         };
         let data = EncodeData {
-            seq: 42,
+            seq: seq(42),
             send_ts: Some(12_345),
             frame_len: None,
             data: b"hello",
@@ -357,14 +403,85 @@ mod tests {
         let n = encode_ack_data(None, Some(ack), Some(0xdead_beef), Some(data), &mut buf).unwrap();
         let mut acks = Vec::new();
         let decoded = decode(&buf[..n], &mut acks, None).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(0)));
         assert_eq!(acks.len(), 1);
-        assert_eq!(acks[0].start, 10);
+        assert_eq!(acks[0].start, seq(10));
         assert_eq!(acks[0].size.get(), 5);
         assert_eq!(decoded.echo_ts, Some(0xdead_beef));
         let data = decoded.data.unwrap();
-        assert_eq!(data.seq, 42);
+        assert_eq!(data.seq, seq(42));
         assert_eq!(data.send_ts, Some(12_345));
         assert_eq!(&buf[data.buf_range], b"hello");
+    }
+
+    #[test]
+    fn ack_wire_preserves_cumulative_and_selective_ranges_across_wrap() {
+        let mut queue = AckHistory::new_at(seq(u64::MAX - 1));
+        for s in [u64::MAX - 1, u64::MAX, 0, 1, 3] {
+            queue.insert(seq(s));
+        }
+        // Cumulative front advanced through u64::MAX, 0, 1; the hole at 2
+        // leaves [3, 4) selective.
+        assert_eq!(queue.next(), seq(2));
+        let ack = EncodeAck {
+            queue: &queue,
+            first_block_index: 0,
+            max_blocks: 64,
+        };
+        let mut buf = vec![0u8; 256];
+        let n = encode_ack_data(None, Some(ack), None, None, &mut buf).unwrap();
+        let mut acks = Vec::new();
+        let decoded = decode(&buf[..n], &mut acks, None).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(2)));
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].start, seq(3));
+        assert_eq!(acks[0].size.get(), 1);
+    }
+
+    #[test]
+    fn ack_wire_rejects_more_than_the_protocol_block_bound() {
+        // Hand-craft an ACK with a count above MAX_ACK_BLOCKS.
+        let mut buf = vec![0u8]; // ACK_CMD
+        buf.extend_from_slice(&7u64.to_be_bytes()); // cumulative next
+        buf.push(crate::ack::MAX_ACK_BLOCKS as u8 + 1); // count above the bound
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+        // A second ACK_CMD in one datagram is rejected.
+        let mut buf2 = vec![0u8];
+        buf2.extend_from_slice(&7u64.to_be_bytes());
+        buf2.push(0);
+        buf2.push(0); // second ACK_CMD
+        buf2.extend_from_slice(&8u64.to_be_bytes());
+        buf2.push(0);
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf2, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+        // A zero-size interval is rejected.
+        let mut buf3 = vec![0u8];
+        buf3.extend_from_slice(&7u64.to_be_bytes());
+        buf3.push(1);
+        buf3.extend_from_slice(&9u64.to_be_bytes()); // start
+        buf3.extend_from_slice(&0u64.to_be_bytes()); // size 0
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf3, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+        // A truncated interval is rejected.
+        let mut buf4 = vec![0u8];
+        buf4.extend_from_slice(&7u64.to_be_bytes());
+        buf4.push(1);
+        buf4.extend_from_slice(&9u64.to_be_bytes()); // start only, no size
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf4, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
     }
 
     #[test]
@@ -378,9 +495,10 @@ mod tests {
         let mut acks = Vec::new();
         let decoded = decode(&buf, &mut acks, None).unwrap();
         assert!(acks.is_empty());
+        assert_eq!(decoded.ack_next, None, "a data-only packet has no ACK next");
         assert_eq!(decoded.echo_ts, None);
         let data = decoded.data.unwrap();
-        assert_eq!(data.seq, 42);
+        assert_eq!(data.seq, seq(42));
         assert_eq!(data.send_ts, None);
         assert_eq!(&buf[data.buf_range], b"hello");
     }
@@ -397,8 +515,8 @@ mod tests {
     fn handshaked_control_requires_a_valid_session_tag() {
         let tag = 0x1234_5678_9abc_def0;
         let mut queue = AckHistory::new();
-        for seq in 10..15 {
-            queue.insert(seq);
+        for s in 10..15 {
+            queue.insert(seq(s));
         }
         let ack = EncodeAck {
             queue: &queue,
@@ -411,8 +529,9 @@ mod tests {
         let n = encode_ack_data(Some(tag), Some(ack), None, None, &mut buf).unwrap();
         let mut acks = Vec::new();
         let decoded = decode(&buf[..n], &mut acks, Some(tag)).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(0)));
         assert_eq!(acks.len(), 1);
-        assert_eq!(acks[0].start, 10);
+        assert_eq!(acks[0].start, seq(10));
         assert!(decoded.data.is_none());
         assert!(!decoded.killed);
 
@@ -432,6 +551,7 @@ mod tests {
         // precedes the first control command.
         let mut acks = Vec::new();
         let decoded = decode(&buf[..n], &mut acks, Some(tag)).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(0)));
         assert_eq!(acks.len(), 1);
         assert!(!decoded.killed);
     }
@@ -440,7 +560,7 @@ mod tests {
     fn data_only_datagrams_need_no_tag_but_a_wrong_tag_is_rejected() {
         let tag = 0x1234_5678_9abc_def0;
         let data = EncodeData {
-            seq: 7,
+            seq: seq(7),
             send_ts: None,
             frame_len: None,
             data: b"payload",
@@ -451,6 +571,7 @@ mod tests {
         let mut acks = Vec::new();
         let decoded = decode(&buf[..n], &mut acks, Some(tag)).unwrap();
         assert!(acks.is_empty());
+        assert_eq!(decoded.ack_next, None);
         assert_eq!(&buf[decoded.data.unwrap().buf_range], b"payload");
         // A forged tag on a data-only datagram is still rejected.  (The
         // encoder only emits a tag for control-bearing datagrams, so craft

@@ -154,14 +154,14 @@ impl WriteHalf {
                 let mut hdr = [0u8; 19];
                 let hdr_len = if let Some(frame_len) = data.frame_len {
                     hdr[0] = cmd;
-                    hdr[1..9].copy_from_slice(&data.seq.to_be_bytes());
+                    hdr[1..9].copy_from_slice(&data.seq.to_wire().to_be_bytes());
                     hdr[9..13].copy_from_slice(&ts.to_be_bytes());
                     hdr[13..17].copy_from_slice(&frame_len.to_be_bytes());
                     hdr[17..19].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
                     19
                 } else {
                     hdr[0] = cmd;
-                    hdr[1..9].copy_from_slice(&data.seq.to_be_bytes());
+                    hdr[1..9].copy_from_slice(&data.seq.to_wire().to_be_bytes());
                     hdr[9..13].copy_from_slice(&ts.to_be_bytes());
                     hdr[13..15].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
                     15

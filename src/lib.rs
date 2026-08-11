@@ -17,6 +17,7 @@ mod pacer;
 mod recv_queue;
 mod reliable;
 mod send_queue;
+mod sequence;
 mod transmission;
 
 pub use delivery::frame::{FrameMode, frame_delivery_from_env};

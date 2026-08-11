@@ -1,8 +1,8 @@
-//! Receiver-side out-of-order frame reassembly.
-
-use std::collections::BTreeMap;
+//! Receiver-side out-of-order frame reassembly, in wrapping sequence space.
 
 use primitive::arena::obj_pool::ObjPool;
+
+use crate::sequence::{SequenceMap, SequenceNumber};
 
 /// A slot in the receive queue.
 #[derive(Debug, PartialEq, Eq)]
@@ -18,20 +18,22 @@ pub(crate) struct RecvPkt {
 }
 
 fn find_complete_frame(
-    slots: &BTreeMap<u64, RecvSlot>,
-    scan_start: &mut u64,
-) -> Option<(Vec<u64>, u32)> {
-    for (&seq, slot) in slots.range(*scan_start..) {
+    slots: &SequenceMap<RecvSlot>,
+    scan_start: &mut SequenceNumber,
+) -> Option<(Vec<SequenceNumber>, u32)> {
+    // Scan in logical (wrapping) order: walk past the leading tombstones so
+    // the frame scan starts at the first live slot at/after the cursor.
+    for (seq, slot) in slots.iter_from(*scan_start) {
         if !matches!(slot, RecvSlot::Tombstone) {
             *scan_start = seq;
             break;
         }
-        *scan_start = seq + 1;
+        *scan_start = seq.advance(1);
     }
-    let mut collected_seqs: Vec<u64> = Vec::new();
+    let mut collected_seqs: Vec<SequenceNumber> = Vec::new();
     let mut target_len: u32 = 0;
     let mut collected: usize = 0;
-    for (&seq, slot) in slots.range(*scan_start..) {
+    for (seq, slot) in slots.iter_from(*scan_start) {
         match slot {
             RecvSlot::Data(pkt) => {
                 if collected_seqs.is_empty() || pkt.frame_len.is_some() {
@@ -43,7 +45,9 @@ fn find_complete_frame(
                     target_len = fl;
                     collected = pkt.data.len();
                 } else {
-                    let expected = *collected_seqs.last().unwrap() + 1;
+                    // Each continuation must equal the previous sequence
+                    // advanced by one (wrapping arithmetic).
+                    let expected = collected_seqs.last().unwrap().advance(1);
                     if seq != expected {
                         collected_seqs.clear();
                         collected = 0;
@@ -66,9 +70,9 @@ fn find_complete_frame(
 }
 
 pub(crate) fn pop_complete_frame(
-    slots: &mut BTreeMap<u64, RecvSlot>,
+    slots: &mut SequenceMap<RecvSlot>,
     reused_buf: &mut ObjPool<Vec<u8>>,
-    scan_start: &mut u64,
+    scan_start: &mut SequenceNumber,
 ) -> Option<Vec<u8>> {
     let (seqs, frame_len) = find_complete_frame(slots, scan_start)?;
     let mut frame_bytes = Vec::new();
@@ -82,7 +86,7 @@ pub(crate) fn pop_complete_frame(
     Some(frame_bytes)
 }
 
-pub(crate) fn fin_at_head(next: Option<u64>, slots: &BTreeMap<u64, RecvSlot>) -> bool {
+pub(crate) fn fin_at_head(next: Option<SequenceNumber>, slots: &SequenceMap<RecvSlot>) -> bool {
     let Some(next) = next else {
         return false;
     };

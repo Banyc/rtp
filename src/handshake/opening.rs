@@ -6,23 +6,45 @@ use rand::TryRng;
 
 use super::post_open::PostOpenHandshake;
 use super::wire::{Kind, PACKET_LEN, Packet, SEND_RETRY_INTERVAL};
+use crate::sequence::{InitialSequences, SequenceNumber};
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
 const OPENING_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SEND_RETRY_BUDGET: Duration = Duration::from_millis(500);
 
-/// Derive the per-connection session tag that authenticates codec
+/// Domain-separated splitmix64 finalizer over the handshake nonce.  Each
+/// derivation domain yields an independent value from the same nonce.
+fn mix(nonce: u64, domain: u64) -> u64 {
+    let mut z = nonce ^ domain;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Domain for the per-connection session tag that authenticates codec
 /// control-plane datagrams after open.  Derived from the handshake nonce
 /// (splitmix64 finalizer, domain-separated) rather than used raw, so
 /// data-plane traffic does not reveal the recovery-handshake nonce.  Both
 /// peers compute the same value from the same nonce; an off-path attacker
 /// never sees the nonce and therefore cannot forge a tag.
+const SESSION_TAG_DOMAIN: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Domain for the client-to-server directional sequence start (`rtp-c2s!`).
+const CLIENT_TO_SERVER_DOMAIN: u64 = 0x7274_702d_6332_7321;
+/// Domain for the server-to-client directional sequence start (`rtp-s2c!`).
+const SERVER_TO_CLIENT_DOMAIN: u64 = 0x7274_702d_7332_6321;
+
 fn session_tag(nonce: u64) -> u64 {
-    let mut z = nonce ^ 0x9e37_79b9_7f4a_7c15;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
+    mix(nonce, SESSION_TAG_DOMAIN)
+}
+
+/// Directional initial sequences derived from the handshake nonce: the
+/// client sends `client_to_server` and receives `server_to_client`; the
+/// server's view is role-inverted.
+fn directional_initial_sequences(nonce: u64) -> (SequenceNumber, SequenceNumber) {
+    let client_to_server = SequenceNumber::from_wire(mix(nonce, CLIENT_TO_SERVER_DOMAIN));
+    let server_to_client = SequenceNumber::from_wire(mix(nonce, SERVER_TO_CLIENT_DOMAIN));
+    (client_to_server, server_to_client)
 }
 
 enum Received {
@@ -42,6 +64,8 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     client_phase(unreliable, nonce, Kind::Confirm, Kind::ConfirmAck, deadline).await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::client(nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(nonce));
+    let (client_to_server, server_to_client) = directional_initial_sequences(nonce);
+    unreliable.initial_sequences = InitialSequences::client(client_to_server, server_to_client);
     Ok(())
 }
 
@@ -58,6 +82,8 @@ pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     server_confirm(unreliable, hello.nonce, deadline).await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(hello.nonce));
+    let (client_to_server, server_to_client) = directional_initial_sequences(hello.nonce);
+    unreliable.initial_sequences = InitialSequences::server(client_to_server, server_to_client);
     Ok(())
 }
 
@@ -205,6 +231,7 @@ mod tests {
         codec,
         handshake::{PostOpenVerdict, post_open::POST_OPEN_LIFETIME},
         io_err::IoErr,
+        sequence::InitialSequences,
         socket::socket,
         transmission::{
             fec::{FecConfig, FecState},
@@ -225,6 +252,37 @@ mod tests {
         }
         buf[..datagram.len()].copy_from_slice(datagram);
         Ok(datagram.len())
+    }
+
+    #[test]
+    fn nonce_derives_distinct_role_inverted_directional_sequences() {
+        let nonce = 0x0123_4567_89ab_cdef;
+        let (client_to_server, server_to_client) = directional_initial_sequences(nonce);
+        assert_ne!(
+            client_to_server, server_to_client,
+            "the two directional starts must be distinct"
+        );
+        assert_ne!(client_to_server, SequenceNumber::ZERO);
+        assert_ne!(server_to_client, SequenceNumber::ZERO);
+        let client = InitialSequences::client(client_to_server, server_to_client);
+        let server = InitialSequences::server(client_to_server, server_to_client);
+        assert_eq!(client.send, client_to_server, "client sends c2s");
+        assert_eq!(client.recv, server_to_client, "client receives s2c");
+        assert_eq!(
+            server.send, server_to_client,
+            "server sends s2c (role-inverted)"
+        );
+        assert_eq!(
+            server.recv, client_to_server,
+            "server receives c2s (role-inverted)"
+        );
+        // A different nonce derives different starts.
+        let (c2s_2, s2c_2) = directional_initial_sequences(nonce ^ 1);
+        assert_ne!(client_to_server, c2s_2);
+        assert_ne!(server_to_client, s2c_2);
+        // The session tag differs from both directional starts.
+        assert_ne!(session_tag(nonce), client_to_server.to_wire());
+        assert_ne!(session_tag(nonce), server_to_client.to_wire());
     }
 
     #[test]

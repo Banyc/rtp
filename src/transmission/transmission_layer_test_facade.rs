@@ -96,7 +96,7 @@ mod tests {
         }
     }
 
-    fn send_one_packet(tl: &TransmissionLayer, now: Instant) -> u64 {
+    fn send_one_packet(tl: &TransmissionLayer, now: Instant) -> crate::sequence::SequenceNumber {
         let rl = tl.reliable_layer();
         let mut rl = rl.lock().unwrap();
         let payload = vec![0u8; 100];
@@ -147,7 +147,7 @@ mod tests {
         }
         let mut datagram = vec![0; 64];
         let fin = crate::codec::EncodeData {
-            seq: 1,
+            seq: crate::sequence::SequenceNumber::from_wire(1),
             send_ts: None,
             frame_len: None,
             data: &[],
@@ -203,7 +203,7 @@ mod tests {
                 Ok(buf.len())
             }
         }
-        let encode = |seq, data: &[u8]| {
+        let encode = |seq: crate::sequence::SequenceNumber, data: &[u8]| {
             let mut datagram = vec![0; 64];
             let data = crate::codec::EncodeData {
                 seq,
@@ -216,7 +216,10 @@ mod tests {
             datagram.truncate(len);
             datagram
         };
-        let datagrams = std::collections::VecDeque::from([encode(0, b"payload"), encode(0, b"")]);
+        let datagrams = std::collections::VecDeque::from([
+            encode(crate::sequence::SequenceNumber::from_wire(0), b"payload"),
+            encode(crate::sequence::SequenceNumber::from_wire(0), b""),
+        ]);
         let layer = crate::udp::wrap_fec(
             Box::new(DatagramQueue(datagrams)),
             Box::new(ImmediateWrite),
@@ -250,7 +253,7 @@ mod tests {
         }
         let mut fin = vec![0; 64];
         let fin_data = crate::codec::EncodeData {
-            seq: 0,
+            seq: crate::sequence::SequenceNumber::from_wire(0),
             send_ts: None,
             frame_len: None,
             data: &[],
@@ -812,7 +815,7 @@ mod tests {
                 }
                 let payload = [call as u8];
                 let data = crate::codec::EncodeData {
-                    seq: call as u64,
+                    seq: crate::sequence::SequenceNumber::from_wire(call as u64),
                     send_ts: Some(100 + call as u32),
                     frame_len: None,
                     data: &payload,
@@ -887,8 +890,10 @@ mod tests {
         let (mut transmission, recorder) = harness(false, false);
         {
             let mut reliable = transmission.shared.reliable_layer.lock().unwrap();
-            for seq in (0..128).step_by(2) {
-                reliable.recv_data_pkt(seq, None, b"x");
+            // (seq 0 would fold into the cumulative front, so start at 2 to
+            // keep exactly one full page of selective blocks.)
+            for seq in (2..=128).step_by(2) {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
             }
             assert_eq!(
                 reliable.pkt_recv_space().ack_history().blocks().count(),

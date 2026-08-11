@@ -1,10 +1,9 @@
-use std::collections::BTreeMap;
-
 use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
 use crate::{
     ack::AckHistory,
     delivery::frame::recv::{RecvPkt, RecvSlot},
+    sequence::{SequenceMap, SequenceNumber, SequencePosition, min},
 };
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
@@ -28,21 +27,29 @@ impl RecvDisposition {
 
 #[derive(Debug)]
 pub struct PktRecvSpace {
-    next: Option<u64>,
-    slots: BTreeMap<u64, RecvSlot>,
-    scan_start: u64,
+    next: Option<SequenceNumber>,
+    slots: SequenceMap<RecvSlot>,
+    scan_start: SequenceNumber,
     reused_buf: ObjPool<Vec<u8>>,
     ack_history: AckHistory,
 }
 
 impl PktRecvSpace {
+    /// Zero-seeded receive space (connections opened without the handshake).
     pub fn new() -> Self {
+        Self::new_at(SequenceNumber::ZERO)
+    }
+
+    /// Receive space seeded at `initial_seq` (handshake-derived directional
+    /// start): the in-order cursor, the slot window, and the ACK history all
+    /// derive from the same initial value.
+    pub fn new_at(initial_seq: SequenceNumber) -> Self {
         Self {
-            next: Some(0),
-            slots: BTreeMap::new(),
-            scan_start: 0,
+            next: Some(initial_seq),
+            slots: SequenceMap::new(initial_seq, MAX_NUM_RECVING_PKTS as u64),
+            scan_start: initial_seq,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
-            ack_history: AckHistory::new(),
+            ack_history: AckHistory::new_at(initial_seq),
         }
     }
 
@@ -50,7 +57,7 @@ impl PktRecvSpace {
         &self.ack_history
     }
 
-    pub fn next_seq(&self) -> Option<u64> {
+    pub fn next_seq(&self) -> Option<SequenceNumber> {
         self.next
     }
 
@@ -64,12 +71,13 @@ impl PktRecvSpace {
 
     #[cfg(test)]
     pub fn recv(&mut self, seq: u64, data: Vec<u8>, frame_len: Option<u32>) -> bool {
-        self.recv_disposition(seq, data, frame_len).should_ack()
+        self.recv_disposition(SequenceNumber::from_wire(seq), data, frame_len)
+            .should_ack()
     }
 
     pub(crate) fn recv_disposition(
         &mut self,
-        seq: u64,
+        seq: SequenceNumber,
         data: Vec<u8>,
         frame_len: Option<u32>,
     ) -> RecvDisposition {
@@ -79,17 +87,22 @@ impl PktRecvSpace {
             self.reused_buf.put(data);
             return RecvDisposition::Rejected;
         }
-        let Some(next) = self.next else {
+        if self.next.is_none() {
             self.reused_buf.put(data);
             return RecvDisposition::Rejected;
-        };
-        if seq < next {
-            self.reused_buf.put(data);
-            return RecvDisposition::Duplicate;
         }
-        if seq - next >= MAX_NUM_RECVING_PKTS as u64 {
-            self.reused_buf.put(data);
-            return RecvDisposition::Rejected;
+        // Classify through the slot window: live inserts, stale returns
+        // Duplicate (ACKable without reinsertion), too-far/ambiguous rejects.
+        match self.slots.window().classify(seq) {
+            SequencePosition::Stale => {
+                self.reused_buf.put(data);
+                return RecvDisposition::Duplicate;
+            }
+            SequencePosition::TooFarAhead | SequencePosition::Ambiguous => {
+                self.reused_buf.put(data);
+                return RecvDisposition::Rejected;
+            }
+            SequencePosition::InWindow(_) => {}
         }
         if self.slots.contains_key(&seq) {
             self.reused_buf.put(data);
@@ -97,7 +110,7 @@ impl PktRecvSpace {
         }
         self.slots
             .insert(seq, RecvSlot::Data(RecvPkt { data, frame_len }));
-        self.scan_start = self.scan_start.min(seq);
+        self.scan_start = min(self.scan_start, seq);
         self.ack_history.insert(seq);
         RecvDisposition::Inserted
     }
@@ -114,16 +127,22 @@ impl PktRecvSpace {
 
     /// Advance `next` past contiguous tombstone(s) at the head of the slot
     /// map, removing them.  This is what bounds memory: tombstones count
-    /// toward the window until collapsed.
+    /// toward the window until collapsed.  The slot window anchor moves with
+    /// `next`, and `scan_start` is reset when it leaves the window.
     fn collapse_tombstone_prefix(&mut self) {
         let Some(mut next) = self.next else {
             return;
         };
         while let Some(RecvSlot::Tombstone) = self.slots.get(&next) {
             self.slots.remove(&next);
-            next += 1;
+            next = next.advance(1);
         }
         self.next = Some(next);
+        self.slots.move_anchor(next);
+        if next.forward_distance_to(self.scan_start) > crate::sequence::HALF_SEQUENCE_SPACE {
+            // The scan cursor fell behind the advanced in-order cursor.
+            self.scan_start = next;
+        }
     }
 
     pub fn peek(&self) -> Option<&Vec<u8>> {
@@ -154,12 +173,12 @@ impl PktRecvSpace {
             let next = self.next?;
             match self.slots.remove(&next) {
                 Some(RecvSlot::Data(pkt)) => {
-                    self.next = Some(next + 1);
+                    self.next = Some(next.advance(1));
                     self.collapse_tombstone_prefix();
                     return Some(pkt.data);
                 }
                 Some(RecvSlot::Tombstone) => {
-                    self.next = Some(next + 1);
+                    self.next = Some(next.advance(1));
                     continue;
                 }
                 None => {
@@ -179,6 +198,10 @@ impl Default for PktRecvSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seq(n: u64) -> SequenceNumber {
+        SequenceNumber::from_wire(n)
+    }
 
     #[test]
     fn stock_recv_pop_in_order() {
@@ -207,10 +230,10 @@ mod tests {
         let ack_count_after = space.ack_history().blocks().count();
         space.pop();
         assert_eq!(
-            space.recv_disposition(0, b"stale".to_vec(), None),
+            space.recv_disposition(seq(0), b"stale".to_vec(), None),
             RecvDisposition::Duplicate
         );
-        assert!(!space.slots.contains_key(&0));
+        assert!(!space.slots.contains_key(&seq(0)));
         assert_eq!(space.ack_history().blocks().count(), ack_count_after);
     }
 
@@ -226,10 +249,10 @@ mod tests {
         let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"a".to_vec(), None));
         assert_eq!(
-            space.recv_disposition(0, b"b".to_vec(), None),
+            space.recv_disposition(seq(0), b"b".to_vec(), None),
             RecvDisposition::Duplicate
         );
-        let pkt = space.slots.get(&0).unwrap();
+        let pkt = space.slots.get(&seq(0)).unwrap();
         match pkt {
             RecvSlot::Data(p) => assert_eq!(p.data, b"a"),
             _ => panic!("expected data"),
@@ -250,36 +273,36 @@ mod tests {
     fn tombstone_prefix_collapses() {
         let mut space = PktRecvSpace::new();
         // Insert tombstones ahead of the cursor.
-        space.slots.insert(0, RecvSlot::Tombstone);
-        space.slots.insert(1, RecvSlot::Tombstone);
+        space.slots.insert(seq(0), RecvSlot::Tombstone);
+        space.slots.insert(seq(1), RecvSlot::Tombstone);
         space.slots.insert(
-            2,
+            seq(2),
             RecvSlot::Data(RecvPkt {
                 data: b"hello".to_vec(),
                 frame_len: None,
             }),
         );
-        space.next = Some(0);
+        space.next = Some(seq(0));
         space.collapse_tombstone_prefix();
-        assert_eq!(space.next, Some(2));
+        assert_eq!(space.next, Some(seq(2)));
         assert_eq!(space.pop().unwrap(), b"hello");
     }
 
     #[test]
     fn pop_skips_head_tombstones() {
         let mut space = PktRecvSpace::new();
-        space.slots.insert(0, RecvSlot::Tombstone);
+        space.slots.insert(seq(0), RecvSlot::Tombstone);
         space.slots.insert(
-            1,
+            seq(1),
             RecvSlot::Data(RecvPkt {
                 data: b"world".to_vec(),
                 frame_len: None,
             }),
         );
-        space.next = Some(0);
+        space.next = Some(seq(0));
         // First pop skips tombstone at 0.
         assert_eq!(space.pop().unwrap(), b"world");
-        assert_eq!(space.next, Some(2));
+        assert_eq!(space.next, Some(seq(2)));
     }
 
     // Frame delivery tests — enabled mode.
@@ -292,7 +315,10 @@ mod tests {
         let frame = space.pop_complete_frame().unwrap();
         assert_eq!(frame, b"frame1");
         // Frame was delivered; seq 1 is now a tombstone.
-        assert!(matches!(space.slots.get(&1), Some(RecvSlot::Tombstone)));
+        assert!(matches!(
+            space.slots.get(&seq(1)),
+            Some(RecvSlot::Tombstone)
+        ));
         // Now fill the hole at seq 0 to verify the window still works.
         assert!(space.recv(0, b"late".to_vec(), None));
         assert_eq!(space.pop().unwrap(), b"late");
@@ -334,8 +360,8 @@ mod tests {
 
         // All tombstones were collapsed by pop_complete_frame's internal
         // collapse_tombstone_prefix.  The in-order cursor should be at 4.
-        assert_eq!(space.next, Some(4));
-        assert!(space.slots.is_empty());
+        assert_eq!(space.next, Some(seq(4)));
+        assert_eq!(space.slots.len(), 0);
     }
 
     #[test]
@@ -363,18 +389,15 @@ mod tests {
         assert!(space.recv(0, b"a".to_vec(), None));
         assert!(space.recv(1, b"b".to_vec(), None));
 
-        // ack_history should contain all three (merged into one ball 0..3).
-        let balls: Vec<_> = space.ack_history().blocks().collect();
-        assert_eq!(balls.len(), 1);
-        assert_eq!(balls[0].start, 0);
-        assert_eq!(balls[0].size.get(), 3);
+        // ack_history should have folded the in-order run into the
+        // cumulative front (no selective ranges remain).
+        assert_eq!(space.ack_history().next(), seq(3));
+        assert_eq!(space.ack_history().blocks().count(), 0);
 
         // After pop_complete_frame or pop, ack_history is NOT touched.
         space.pop();
-        let balls_after: Vec<_> = space.ack_history().blocks().collect();
-        assert_eq!(balls_after.len(), 1);
-        assert_eq!(balls_after[0].start, 0);
-        assert_eq!(balls_after[0].size.get(), 3);
+        assert_eq!(space.ack_history().next(), seq(3));
+        assert_eq!(space.ack_history().blocks().count(), 0);
     }
 
     #[test]
@@ -384,8 +407,11 @@ mod tests {
         assert!(space.recv(1, b"x".to_vec(), Some(1)));
         space.pop_complete_frame();
         // seq 1 is now a tombstone; seq 0 is a hole.
-        assert!(matches!(space.slots.get(&1), Some(RecvSlot::Tombstone)));
-        assert!(!space.slots.contains_key(&0));
+        assert!(matches!(
+            space.slots.get(&seq(1)),
+            Some(RecvSlot::Tombstone)
+        ));
+        assert!(!space.slots.contains_key(&seq(0)));
         // The tombstone at seq 1 keeps `next` pinned at 0 (hole at 0 prevents
         // collapse), so the window is [0, 8191].  seq 8192 is out of window.
         let out_of_window = MAX_NUM_RECVING_PKTS as u64;
@@ -454,23 +480,23 @@ mod tests {
     fn oversize_frame_len_cannot_pin_the_in_order_cursor() {
         let mut space = PktRecvSpace::new();
         assert_eq!(
-            space.recv_disposition(0, b"poison".to_vec(), Some(u32::MAX)),
+            space.recv_disposition(seq(0), b"poison".to_vec(), Some(u32::MAX)),
             RecvDisposition::Rejected
         );
         assert!(space.recv(0, b"real".to_vec(), Some(4)));
         assert_eq!(space.pop_complete_frame().unwrap(), b"real");
-        assert_eq!(space.next, Some(1));
-        assert!(space.slots.is_empty());
+        assert_eq!(space.next, Some(seq(1)));
+        assert_eq!(space.slots.len(), 0);
     }
 
     #[test]
     fn zero_frame_len_is_rejected() {
         let mut space = PktRecvSpace::new();
         assert_eq!(
-            space.recv_disposition(0, vec![], Some(0)),
+            space.recv_disposition(seq(0), vec![], Some(0)),
             RecvDisposition::Rejected
         );
-        assert!(space.slots.is_empty());
+        assert_eq!(space.slots.len(), 0);
         assert!(space.pop_complete_frame().is_none());
     }
 
@@ -479,7 +505,7 @@ mod tests {
         let mut space = PktRecvSpace::new();
         let max = crate::delivery::frame::send::MAX_FRAME_LEN;
         assert_eq!(
-            space.recv_disposition(0, vec![0u8; 1], Some(max as u32)),
+            space.recv_disposition(seq(0), vec![0u8; 1], Some(max as u32)),
             RecvDisposition::Inserted
         );
     }
@@ -515,8 +541,8 @@ mod tests {
     #[test]
     fn a_late_packet_below_the_scan_cursor_still_completes_its_frame() {
         let mut space = PktRecvSpace::new();
-        for seq in 2..64 {
-            assert!(space.recv(seq, b"x".to_vec(), Some(1)));
+        for s in 2..64 {
+            assert!(space.recv(s, b"x".to_vec(), Some(1)));
         }
         assert!(space.recv(1, b"lo".to_vec(), None));
         for _ in 2..64 {
@@ -532,17 +558,69 @@ mod tests {
         space.collapse_tombstone_prefix();
         assert_eq!(
             space.next_seq(),
-            Some(64),
+            Some(seq(64)),
             "the in-order cursor did not advance past the filled hole"
         );
+    }
+
+    #[test]
+    fn receive_and_cumulative_ack_advance_across_u64_wrap() {
+        // A receive space seeded just before the wrap: in-order receipts
+        // advance both the in-order cursor and the ACK cumulative front
+        // across u64::MAX → 0 without raw-order comparisons.
+        let mut space = PktRecvSpace::new_at(seq(u64::MAX - 1));
+        assert_eq!(space.next_seq(), Some(seq(u64::MAX - 1)));
+        assert_eq!(space.ack_history().next(), seq(u64::MAX - 1));
+        assert!(space.recv(u64::MAX - 1, b"a".to_vec(), None));
+        assert!(space.recv(u64::MAX, b"b".to_vec(), None));
+        assert!(space.recv(0, b"c".to_vec(), None));
+        assert_eq!(
+            space.ack_history().next(),
+            seq(1),
+            "the cumulative ACK front must fold the in-order run across the wrap"
+        );
+        assert_eq!(
+            space.next_seq(),
+            Some(seq(u64::MAX - 1)),
+            "the in-order cursor advances on pop"
+        );
+        assert_eq!(space.pop().unwrap(), b"a");
+        assert_eq!(space.pop().unwrap(), b"b");
+        assert_eq!(space.pop().unwrap(), b"c");
+        assert_eq!(
+            space.next_seq(),
+            Some(seq(1)),
+            "the in-order cursor advanced across the wrap"
+        );
+        // Stale (pre-wrap) duplicates are still ACKable as Duplicate.
+        assert_eq!(
+            space.recv_disposition(seq(u64::MAX), b"dup".to_vec(), None),
+            RecvDisposition::Duplicate
+        );
+    }
+
+    #[test]
+    fn frame_reassembly_crosses_u64_wrap_in_logical_order() {
+        let mut space = PktRecvSpace::new_at(seq(u64::MAX - 1));
+        // A two-packet frame straddling u64::MAX → 0: continuation must
+        // follow the wrapped sequence, not raw order.
+        assert!(space.recv(u64::MAX - 1, b"A1".to_vec(), Some(4)));
+        assert!(space.recv(u64::MAX, b"A2".to_vec(), None));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"A1A2");
+        // A frame wrapping the boundary itself.
+        assert!(space.recv(1, b"B2".to_vec(), None));
+        assert!(space.recv(0, b"B1".to_vec(), Some(4)));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"B1B2");
+        assert_eq!(space.next, Some(seq(2)));
+        assert_eq!(space.slots.len(), 0);
     }
 
     fn ooo_pop_cost(outstanding: u64) -> f64 {
         let mut best = f64::MAX;
         for _ in 0..3 {
             let mut space = PktRecvSpace::new();
-            for seq in 1..=outstanding {
-                assert!(space.recv(seq, b"x".to_vec(), Some(1)));
+            for s in 1..=outstanding {
+                assert!(space.recv(s, b"x".to_vec(), Some(1)));
             }
             let start = std::time::Instant::now();
             for _ in 0..outstanding {

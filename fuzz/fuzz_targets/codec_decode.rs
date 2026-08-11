@@ -37,6 +37,6 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     for ack in &acks {
-        assert!(ack.end() >= ack.start, "{ack:?} wrapped");
+        assert!(ack.size.get() != 0, "{ack:?} has zero size");
     }
 });

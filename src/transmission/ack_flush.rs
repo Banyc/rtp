@@ -3,11 +3,13 @@ use std::time::{Duration, Instant};
 use super::transmission_layer::SendBufs;
 use super::ts_echo::TsEcho;
 use super::write_half::WriteHalf;
-use crate::ack::{EncodeAck, next_page_cursor};
+use crate::ack::{EncodeAck, MAX_ACK_BLOCKS, next_page_cursor};
 use crate::codec::encode_ack_data;
 use crate::io_err::IoErr;
 
-pub(crate) const MAX_NUM_ACK: usize = 64;
+/// The wire bound on selective ACK blocks per datagram; page size for the
+/// ACK-flush paging scheme.
+pub(crate) const MAX_NUM_ACK: usize = MAX_ACK_BLOCKS;
 pub(crate) const ACK_FLUSH_COUNT: usize = 8;
 pub(crate) const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 

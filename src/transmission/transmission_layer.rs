@@ -8,6 +8,7 @@ use super::{fec::FecState, fec_tuning::FecTuning};
 use crate::ack::AckInterval;
 use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
+use crate::sequence::InitialSequences;
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
@@ -99,7 +100,7 @@ impl Default for SendBufs {
 pub struct RecvBufs {
     pub codec_pkt: Vec<u8>,
     pub ack_from_peer: Vec<AckInterval>,
-    pub ack_to_peer: Vec<u64>,
+    pub ack_to_peer: Vec<crate::sequence::SequenceNumber>,
     pub codec_pkts: Vec<Vec<u8>>,
 }
 
@@ -130,6 +131,11 @@ pub struct UnreliableLayer {
     /// without a handshake (no secret exists; the control plane stays
     /// unauthenticated).  Seeded from here into the shared [`Connection`].
     pub(crate) session_tag: Option<u64>,
+    /// Handshake-derived directional initial sequences (`ZERO` for
+    /// connections opened without the handshake).  Seeded from here into the
+    /// shared [`Connection`] and from there into both `ReliableLayer`
+    /// constructors.
+    pub(crate) initial_sequences: InitialSequences,
     pub(crate) mss: NonZeroUsize,
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
