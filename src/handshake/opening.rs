@@ -12,6 +12,19 @@ const OPENING_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SEND_RETRY_BUDGET: Duration = Duration::from_millis(500);
 
+/// Derive the per-connection session tag that authenticates codec
+/// control-plane datagrams after open.  Derived from the handshake nonce
+/// (splitmix64 finalizer, domain-separated) rather than used raw, so
+/// data-plane traffic does not reveal the recovery-handshake nonce.  Both
+/// peers compute the same value from the same nonce; an off-path attacker
+/// never sees the nonce and therefore cannot forge a tag.
+fn session_tag(nonce: u64) -> u64 {
+    let mut z = nonce ^ 0x9e37_79b9_7f4a_7c15;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 enum Received {
     Handshake(Packet),
     NextProtocol,
@@ -28,6 +41,7 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     client_phase(unreliable, nonce, Kind::Hello, Kind::HelloAck, deadline).await?;
     client_phase(unreliable, nonce, Kind::Confirm, Kind::ConfirmAck, deadline).await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::client(nonce, Instant::now()));
+    unreliable.session_tag = Some(session_tag(nonce));
     Ok(())
 }
 
@@ -43,6 +57,7 @@ pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     server_wait_for_confirm(unreliable, hello.nonce, deadline).await?;
     server_confirm(unreliable, hello.nonce, deadline).await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, Instant::now()));
+    unreliable.session_tag = Some(session_tag(hello.nonce));
     Ok(())
 }
 
@@ -231,7 +246,7 @@ mod tests {
             overlong.push(0);
             assert_eq!(Packet::decode(&overlong), None);
             assert!(!codec::in_cmd_space(encoded[0]));
-            assert!(codec::decode(&encoded, &mut Vec::new()).is_err());
+            assert!(codec::decode(&encoded, &mut Vec::new(), None).is_err());
 
             let mut fec = FecState::new(FecConfig {
                 symbol_size: 1_424,
@@ -666,6 +681,86 @@ mod tests {
         .expect("stale RTP traffic retired opening recovery")
         .expect("nonce-bound recovery failed after stale RTP traffic");
         drop(server_socket);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forged_control_datagrams_are_ignored_after_open() {
+        let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
+        let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+        let forged_tx = client_to_server_tx.clone();
+        let mut client = wrap_fec(
+            Box::new(ChannelRead(server_to_client_rx)),
+            Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
+            false,
+        );
+        let mut server = wrap_fec(
+            Box::new(ChannelRead(client_to_server_rx)),
+            Box::new(ChannelWrite::new(server_to_client_tx, None, false)),
+            false,
+        );
+        let (
+            (mut client_read, mut client_write, _client_supervisor),
+            (mut server_read, mut server_write, _server_supervisor),
+        ) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(
+                async {
+                    client_opening_handshake(&mut client).await?;
+                    Ok::<_, io::Error>(socket(client, None))
+                },
+                async {
+                    server_opening_handshake(&mut server).await?;
+                    Ok::<_, io::Error>(socket(server, None))
+                },
+            )
+        })
+        .await
+        .expect("opening handshake hung")
+        .expect("opening handshake failed");
+
+        // Legit tagged traffic flows in both directions after open.
+        let mut buf = [0; 64];
+        client_write.send(b"hello").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), server_read.recv(&mut buf))
+            .await
+            .expect("tagged request timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        server_write.send(b"ack").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), client_read.recv(&mut buf))
+            .await
+            .expect("tagged response timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ack");
+
+        // Forged control datagrams delivered from the peer address: an
+        // untagged KILL_CMD (2), a KILL_CMD behind a wrong session tag
+        // (TAG_CMD 6 + 8-byte tag + KILL_CMD), and an untagged ACK block
+        // claiming {start:0, size:u64::MAX} that would release the peer's
+        // entire send window.  All three must be dropped by the session-tag
+        // check, not honoured.
+        forged_tx.send(vec![0x02]).await.unwrap();
+        let mut wrong_tag_kill = vec![6u8];
+        wrong_tag_kill.extend_from_slice(&0x1111_2222_3333_4444u64.to_be_bytes());
+        wrong_tag_kill.push(0x02);
+        forged_tx.send(wrong_tag_kill).await.unwrap();
+        let mut forged_ack = vec![0u8]; // ACK_CMD
+        forged_ack.extend_from_slice(&0u64.to_be_bytes()); // start 0
+        forged_ack.extend_from_slice(&u64::MAX.to_be_bytes()); // size u64::MAX
+        forged_tx.send(forged_ack).await.unwrap();
+
+        // The session must survive: traffic still flows both ways.
+        client_write.send(b"still-alive").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), server_read.recv(&mut buf))
+            .await
+            .expect("forged control killed the session")
+            .unwrap();
+        assert_eq!(&buf[..n], b"still-alive");
+        server_write.send(b"still-alive-2").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), client_read.recv(&mut buf))
+            .await
+            .expect("forged control killed the session")
+            .unwrap();
+        assert_eq!(&buf[..n], b"still-alive-2");
     }
 
     #[tokio::test]

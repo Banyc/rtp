@@ -20,7 +20,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut acks = Vec::new();
-    let Ok(decoded) = rtp::testing::decode(data, &mut acks) else {
+    let Ok(decoded) = rtp::testing::decode(data, &mut acks, None) else {
         return;
     };
     if let Some(pkt) = decoded.data {

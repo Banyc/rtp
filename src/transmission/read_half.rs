@@ -106,7 +106,7 @@ impl ReadHalf {
             let mut end_of_acks = false;
             for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
                 bufs.ack_from_peer.clear();
-                let data = match decode(pkt, &mut bufs.ack_from_peer) {
+                let data = match decode(pkt, &mut bufs.ack_from_peer, shared.session_tag) {
                     Ok(x) => x,
                     Err(e) => {
                         if FEC_DEBUG {

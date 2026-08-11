@@ -124,7 +124,14 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
                 max_blocks: MAX_NUM_ACK,
             };
             let this_echo = echo_ts.take();
-            encode_ack_data(Some(ack), this_echo, None, codec_pkt).unwrap()
+            encode_ack_data(
+                write_half.session_tag(),
+                Some(ack),
+                this_echo,
+                None,
+                codec_pkt,
+            )
+            .unwrap()
         };
         let res = write_half
             .send_with_fec(&codec_pkt[..written_bytes], wire_pkt)

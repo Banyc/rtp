@@ -86,9 +86,9 @@ mod tests {
             data: b"frame-body",
         };
         let mut buf = vec![0u8; 256];
-        let n = encode_ack_data(None, None, Some(data), &mut buf).unwrap();
+        let n = encode_ack_data(None, None, None, Some(data), &mut buf).unwrap();
         let mut acks = Vec::new();
-        let decoded = decode(&buf[..n], &mut acks).unwrap();
+        let decoded = decode(&buf[..n], &mut acks, None).unwrap();
         assert!(acks.is_empty());
         let data = decoded.data.unwrap();
         assert_eq!(data.seq, 7);

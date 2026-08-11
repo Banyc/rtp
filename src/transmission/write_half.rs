@@ -173,14 +173,14 @@ impl WriteHalf {
                 ];
                 let res = self.utp_write.send_vectored(&iov).await;
                 let dup_buf = if wants_dup {
-                    let n = encode_ack_data(None, None, Some(data), codec_pkt).unwrap();
+                    let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
                     Some(&codec_pkt[..n])
                 } else {
                     None
                 };
                 (res, dup_buf)
             } else {
-                let n = encode_ack_data(None, None, Some(data), codec_pkt).unwrap();
+                let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
                 let utp_pkt = &codec_pkt[..n];
                 let send_buf: &[u8] = match self.fec.as_ref() {
                     Some(fec) => {
@@ -350,10 +350,11 @@ impl WriteHalf {
     }
 
     async fn send_kill_data_pkt(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
-        let mut buf = [0; 1];
-        encode_kill(&mut buf).unwrap();
+        // Session tag prefix (9 bytes) + KILL_CMD byte, when a tag exists.
+        let mut buf = [0; 1 + 1 + 8];
+        let n = encode_kill(self.session_tag(), &mut buf).unwrap();
         let fec_enabled = self.fec.is_some();
-        let res = self.send_with_fec(&buf, bufs.wire_pkt_mut()).await;
+        let res = self.send_with_fec(&buf[..n], bufs.wire_pkt_mut()).await;
         if res.is_err() && fec_enabled {
             self.skip_open_fec_group();
         }

@@ -152,7 +152,8 @@ mod tests {
             frame_len: None,
             data: &[],
         };
-        let len = crate::codec::encode_ack_data(None, None, Some(fin), &mut datagram).unwrap();
+        let len =
+            crate::codec::encode_ack_data(None, None, None, Some(fin), &mut datagram).unwrap();
         datagram.truncate(len);
         let layer = crate::udp::wrap_fec(
             Box::new(OneDatagramRead(Some(datagram))),
@@ -210,7 +211,8 @@ mod tests {
                 frame_len: None,
                 data,
             };
-            let len = crate::codec::encode_ack_data(None, None, Some(data), &mut datagram).unwrap();
+            let len =
+                crate::codec::encode_ack_data(None, None, None, Some(data), &mut datagram).unwrap();
             datagram.truncate(len);
             datagram
         };
@@ -253,7 +255,8 @@ mod tests {
             frame_len: None,
             data: &[],
         };
-        let len = crate::codec::encode_ack_data(None, None, Some(fin_data), &mut fin).unwrap();
+        let len =
+            crate::codec::encode_ack_data(None, None, None, Some(fin_data), &mut fin).unwrap();
         fin.truncate(len);
         let send_started = Arc::new(tokio::sync::Notify::new());
         let release_send = Arc::new(tokio::sync::Notify::new());
@@ -814,7 +817,7 @@ mod tests {
                     frame_len: None,
                     data: &payload,
                 };
-                let n = crate::codec::encode_ack_data(None, None, Some(data), buf).unwrap();
+                let n = crate::codec::encode_ack_data(None, None, None, Some(data), buf).unwrap();
                 if let Some(probe) = probe.as_mut() {
                     probe.completed = true;
                 }

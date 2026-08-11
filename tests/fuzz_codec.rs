@@ -65,7 +65,7 @@ fn a_hostile_datagram_never_yields_a_range_outside_it() {
         let pkt = packet(&mut rng);
         acks.clear();
         decode_attempts += 1;
-        let Ok(decoded) = decode(&pkt, &mut acks) else {
+        let Ok(decoded) = decode(&pkt, &mut acks, None) else {
             continue;
         };
         decoded_count += 1;

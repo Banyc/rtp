@@ -54,6 +54,9 @@ pub struct Connection {
     pub(crate) ack_flush: Mutex<AckFlushState>,
     post_open_handshake: Option<Mutex<PostOpenHandshake>>,
     post_open_handshake_active: AtomicBool,
+    /// Session tag authenticating codec control-plane datagrams; `None` on
+    /// connections opened without the handshake.
+    pub(crate) session_tag: Option<u64>,
     pub(crate) fec: Option<Mutex<FecState>>,
     pub(crate) send_rate_limiter: Arc<Mutex<SendPacer>>,
     pub(crate) termination: TerminationPresser,
@@ -89,6 +92,7 @@ pub fn new_connection(
         ack_flush: Mutex::new(AckFlushState::new()),
         post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
         post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
+        session_tag: unreliable_layer.session_tag,
         fec: unreliable_layer.fec.map(Mutex::new),
         send_rate_limiter,
         termination,
@@ -139,6 +143,7 @@ pub fn new_connection_with_watchdog_tuning(
         ack_flush: Mutex::new(AckFlushState::new()),
         post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
         post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
+        session_tag: unreliable_layer.session_tag,
         fec: unreliable_layer.fec.map(Mutex::new),
         send_rate_limiter,
         termination,
@@ -278,6 +283,10 @@ impl Connection {
     #[cfg(test)]
     pub fn recv_eof(&self) -> &tokio_util::sync::CancellationToken {
         &self.signals.recv_eof
+    }
+
+    pub(crate) fn session_tag(&self) -> Option<u64> {
+        self.session_tag
     }
 
     pub(crate) fn observe_post_open_handshake(
@@ -555,6 +564,7 @@ mod tests {
             utp_read: Box::new(PendingRead),
             utp_write: Box::new(BlockingWrite::new()),
             post_open_handshake: None,
+            session_tag: None,
             mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
             fec_tuning: FecTuning::default(),

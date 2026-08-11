@@ -125,6 +125,11 @@ pub struct UnreliableLayer {
     pub(crate) utp_write: Box<dyn UnreliableWrite>,
     #[doc(hidden)]
     pub(crate) post_open_handshake: Option<crate::handshake::PostOpenHandshake>,
+    /// Per-connection session tag that authenticates codec control-plane
+    /// datagrams after the opening handshake.  `None` for connections opened
+    /// without a handshake (no secret exists; the control plane stays
+    /// unauthenticated).  Seeded from here into the shared [`Connection`].
+    pub(crate) session_tag: Option<u64>,
     pub(crate) mss: NonZeroUsize,
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
