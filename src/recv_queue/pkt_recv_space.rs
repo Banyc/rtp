@@ -138,9 +138,11 @@ impl PktRecvSpace {
             next = next.advance(1);
         }
         self.next = Some(next);
-        self.slots.move_anchor(next);
+        if self.slots.window().anchor() == next {
+            return;
+        }
+        self.slots.advance_anchor(next);
         if next.forward_distance_to(self.scan_start) > crate::sequence::HALF_SEQUENCE_SPACE {
-            // The scan cursor fell behind the advanced in-order cursor.
             self.scan_start = next;
         }
     }
@@ -631,14 +633,47 @@ mod tests {
         best
     }
 
+    fn in_order_pop_cost(outstanding: u64) -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut space = PktRecvSpace::new();
+            for s in 0..outstanding {
+                assert!(space.recv(s, b"x".to_vec(), None));
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..outstanding {
+                assert!(space.pop().is_some());
+            }
+            best = best.min(start.elapsed().as_secs_f64() / outstanding as f64 * 1e9);
+        }
+        best
+    }
+
     #[test]
     #[ignore = "perf lane: wall-clock ns/frame ratio; run with cargo test --release -- --ignored"]
     fn delivering_past_a_hole_costs_no_more_per_frame() {
         let few = ooo_pop_cost(64);
         let many = ooo_pop_cost(4096);
+        eprintln!(
+            "out-of-order frame delivery: {few:.1} ns/frame at 64 outstanding, {many:.1} ns/frame at 4096"
+        );
         assert!(
             many < few * 8.0,
             "{many:.1} ns/frame at 4096 outstanding against {few:.1} ns at 64: the per-frame cost grows with the number of frames delivered past the hole"
+        );
+    }
+
+    #[test]
+    #[ignore = "perf lane: wall-clock ns/packet ratio; run with cargo test --release -- --ignored"]
+    fn advancing_the_receive_window_costs_no_more_per_packet() {
+        let few = in_order_pop_cost(64);
+        let many = in_order_pop_cost(4096);
+        eprintln!(
+            "in-order receive-window advance: {few:.1} ns/packet at 64 outstanding, {many:.1} ns/packet at 4096"
+        );
+        assert!(
+            many < few * 8.0,
+            "{many:.1} ns/packet at 4096 outstanding against {few:.1} ns at 64: advancing the receive window scans the outstanding map"
         );
     }
 }

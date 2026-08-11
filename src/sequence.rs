@@ -8,8 +8,8 @@
 //!
 //! This module is the only place allowed to inspect sequence integers:
 //! [`SequenceNumber`] exposes no `Ord`, and every other module of the crate
-//! compares sequences through the helpers here (`lt`/`le`/`gt`/`ge`,
-//! `max`/`min`) or through [`SequenceWindow::classify`].
+//! compares sequences through the helpers here (`lt`/`le`/`min`) or through
+//! [`SequenceWindow::classify`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -291,12 +291,14 @@ impl<V> SequenceMap<V> {
         Some((SequenceNumber(found.0.0), found.1))
     }
 
-    /// Move the window anchor, retaining only keys that stay inside the new
-    /// live window.
-    pub(crate) fn move_anchor(&mut self, new_anchor: SequenceNumber) {
+    pub(crate) fn advance_anchor(&mut self, new_anchor: SequenceNumber) {
         let new_window = SequenceWindow::new(new_anchor, self.window.limit());
-        self.inner
-            .retain(|k, _| new_window.contains(SequenceNumber::from_wire(k.0)));
+        debug_assert!(
+            self.inner
+                .keys()
+                .all(|key| new_window.contains(SequenceNumber::from_wire(key.0))),
+            "sequence map advanced before its stale prefix was removed"
+        );
         self.window = new_window;
     }
 }
@@ -551,12 +553,15 @@ mod tests {
     }
 
     #[test]
-    fn move_anchor_retains_only_in_window_keys() {
+    fn advance_anchor_after_removing_the_stale_prefix() {
         let mut map: SequenceMap<u32> = SequenceMap::new(seq(10), 100);
         for s in 20..30 {
             map.insert(seq(s), s as u32);
         }
-        map.move_anchor(seq(25));
+        for s in 20..25 {
+            map.remove(&seq(s));
+        }
+        map.advance_anchor(seq(25));
         let keys: Vec<u64> = map.iter().map(|(k, _)| k.to_wire()).collect();
         assert_eq!(keys, (25..30).collect::<Vec<_>>());
         assert_eq!(map.window().anchor(), seq(25));

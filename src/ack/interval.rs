@@ -132,7 +132,7 @@ impl AckHistory {
         if interval.start == self.next {
             self.start_to_size.remove(&interval.start);
             self.next = interval.end();
-            self.start_to_size.move_anchor(self.next);
+            self.start_to_size.advance_anchor(self.next);
         }
     }
 

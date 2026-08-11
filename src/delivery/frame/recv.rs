@@ -20,48 +20,55 @@ pub(crate) struct RecvPkt {
 fn find_complete_frame(
     slots: &SequenceMap<RecvSlot>,
     scan_start: &mut SequenceNumber,
-) -> Option<(Vec<SequenceNumber>, u32)> {
-    // Scan in logical (wrapping) order: walk past the leading tombstones so
-    // the frame scan starts at the first live slot at/after the cursor.
-    for (seq, slot) in slots.iter_from(*scan_start) {
-        if !matches!(slot, RecvSlot::Tombstone) {
-            *scan_start = seq;
-            break;
-        }
-        *scan_start = seq.advance(1);
-    }
-    let mut collected_seqs: Vec<SequenceNumber> = Vec::new();
+) -> Option<(SequenceNumber, u64, u32)> {
+    let mut scanning_front = true;
+    let mut frame_start: Option<SequenceNumber> = None;
+    let mut frame_end: Option<SequenceNumber> = None;
+    let mut packet_count: u64 = 0;
     let mut target_len: u32 = 0;
     let mut collected: usize = 0;
     for (seq, slot) in slots.iter_from(*scan_start) {
+        if scanning_front {
+            match slot {
+                RecvSlot::Tombstone => *scan_start = seq.advance(1),
+                RecvSlot::Data(_) => {
+                    *scan_start = seq;
+                    scanning_front = false;
+                }
+            }
+        }
         match slot {
             RecvSlot::Data(pkt) => {
-                if collected_seqs.is_empty() || pkt.frame_len.is_some() {
+                if frame_start.is_none() || pkt.frame_len.is_some() {
                     let Some(fl) = pkt.frame_len else {
                         continue;
                     };
-                    collected_seqs.clear();
-                    collected_seqs.push(seq);
+                    frame_start = Some(seq);
+                    frame_end = Some(seq);
+                    packet_count = 1;
                     target_len = fl;
                     collected = pkt.data.len();
                 } else {
-                    // Each continuation must equal the previous sequence
-                    // advanced by one (wrapping arithmetic).
-                    let expected = collected_seqs.last().unwrap().advance(1);
+                    let expected = frame_end.unwrap().advance(1);
                     if seq != expected {
-                        collected_seqs.clear();
+                        frame_start = None;
+                        frame_end = None;
+                        packet_count = 0;
                         collected = 0;
                         continue;
                     }
-                    collected_seqs.push(seq);
+                    frame_end = Some(seq);
+                    packet_count += 1;
                     collected += pkt.data.len();
                 }
                 if collected >= target_len as usize {
-                    return Some((collected_seqs, target_len));
+                    return Some((frame_start.unwrap(), packet_count, target_len));
                 }
             }
             RecvSlot::Tombstone => {
-                collected_seqs.clear();
+                frame_start = None;
+                frame_end = None;
+                packet_count = 0;
                 collected = 0;
             }
         }
@@ -74,9 +81,10 @@ pub(crate) fn pop_complete_frame(
     reused_buf: &mut ObjPool<Vec<u8>>,
     scan_start: &mut SequenceNumber,
 ) -> Option<Vec<u8>> {
-    let (seqs, frame_len) = find_complete_frame(slots, scan_start)?;
-    let mut frame_bytes = Vec::new();
-    for &seq in &seqs {
+    let (frame_start, packet_count, frame_len) = find_complete_frame(slots, scan_start)?;
+    let mut frame_bytes = Vec::with_capacity(frame_len as usize);
+    for offset in 0..packet_count {
+        let seq = frame_start.advance(offset);
         if let Some(RecvSlot::Data(pkt)) = slots.insert(seq, RecvSlot::Tombstone) {
             frame_bytes.extend_from_slice(&pkt.data);
             reused_buf.put(pkt.data);
