@@ -11,7 +11,7 @@
 //! compares sequences through the helpers here (`lt`/`le`/`min`) or through
 //! [`SequenceWindow::classify`].
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 use std::fmt;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
@@ -210,6 +210,22 @@ impl<V> SequenceMap<V> {
         self.inner.insert(RawSequenceKey(seq.to_wire()), value)
     }
 
+    /// Insert `value` at `seq` only when the key is vacant and in-window;
+    /// `Err(value)` (map untouched) when the key is occupied or outside the
+    /// live window.
+    pub(crate) fn insert_vacant(&mut self, seq: SequenceNumber, value: V) -> Result<(), V> {
+        if !self.window.contains(seq) {
+            return Err(value);
+        }
+        match self.inner.entry(RawSequenceKey(seq.to_wire())) {
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(value),
+        }
+    }
+
     pub(crate) fn remove(&mut self, seq: &SequenceNumber) -> Option<V> {
         self.inner.remove(&RawSequenceKey(seq.to_wire()))
     }
@@ -218,6 +234,7 @@ impl<V> SequenceMap<V> {
         self.inner.get(&RawSequenceKey(seq.to_wire()))
     }
 
+    #[cfg(test)]
     pub(crate) fn contains_key(&self, seq: &SequenceNumber) -> bool {
         self.inner.contains_key(&RawSequenceKey(seq.to_wire()))
     }
@@ -255,20 +272,18 @@ impl<V> SequenceMap<V> {
             .map(|(k, v)| (SequenceNumber::from_wire(k.0), v))
     }
 
-    /// Greatest retained key logically before `seq`, crossing the physical
-    /// zero boundary when required.
-    pub(crate) fn predecessor(&self, seq: SequenceNumber) -> Option<(SequenceNumber, &V)> {
+    /// Greatest retained key logically at or before `seq`, crossing the
+    /// physical zero boundary when required.
+    pub(crate) fn floor(&self, seq: SequenceNumber) -> Option<(SequenceNumber, &V)> {
         let anchor = RawSequenceKey(self.window.anchor().0);
         let seq = RawSequenceKey(seq.0);
         let found = if seq >= anchor {
-            // Keys before `seq` are the high keys in `[anchor, seq)`; the
-            // wrapped low segment `[..anchor)` is logically *after* `seq`.
             self.inner
-                .range((Included(anchor), Excluded(seq)))
+                .range((Included(anchor), Included(seq)))
                 .next_back()
         } else {
             self.inner
-                .range((Unbounded, Excluded(seq)))
+                .range((Unbounded, Included(seq)))
                 .next_back()
                 .or_else(|| self.inner.range((Included(anchor), Unbounded)).next_back())
         }?;
@@ -507,22 +522,25 @@ mod tests {
         assert_eq!(
             logical,
             vec![u64::MAX - 2, u64::MAX - 1, u64::MAX, 0, 1],
-            "logical iteration must chain [anchor..] then [..anchor) exactly once"
+            "Logical iteration must chain [anchor..] then [..anchor) exactly once"
         );
-        // Predecessor/successor cross the physical zero boundary.
         assert_eq!(
-            map.predecessor(seq(0)).map(|(sequence, _)| sequence),
+            map.floor(seq(0)).map(|(sequence, _)| sequence),
+            Some(seq(0))
+        );
+        map.remove(&seq(0));
+        assert_eq!(
+            map.floor(seq(0)).map(|(sequence, _)| sequence),
             Some(seq(u64::MAX))
         );
         assert_eq!(
-            map.predecessor(seq(1)).map(|(sequence, _)| sequence),
-            Some(seq(0))
+            map.successor(seq(u64::MAX)).map(|(sequence, _)| sequence),
+            Some(seq(1))
         );
         assert_eq!(
-            map.successor(seq(u64::MAX)).map(|(sequence, _)| sequence),
-            Some(seq(0))
+            map.floor(seq(u64::MAX - 2)).map(|(sequence, _)| sequence),
+            Some(seq(u64::MAX - 2))
         );
-        assert_eq!(map.predecessor(seq(u64::MAX - 2)), None);
         assert_eq!(map.successor(seq(1)), None);
     }
 

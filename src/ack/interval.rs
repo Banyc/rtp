@@ -93,47 +93,54 @@ impl AckHistory {
         if self.next.forward_distance_to(seq) >= MAX_NUM_RECVING_PKTS as u64 {
             return;
         }
-
-        if self.start_to_size.contains_key(&seq) {
+        if seq == self.next {
+            let mut interval = AckInterval {
+                start: seq,
+                size: NonZeroU64::new(1).unwrap(),
+            };
+            if self.start_to_size.len() != 0
+                && let Some(following) = self
+                    .start_to_size
+                    .successor(seq)
+                    .map(|(start, &size)| AckInterval { start, size })
+                && let Some(merged) = interval.merge_forward(following)
+            {
+                self.start_to_size.remove(&following.start);
+                interval = merged;
+            }
+            self.next = interval.end();
+            self.start_to_size.advance_anchor(self.next);
             return;
         }
-
         let previous = self
             .start_to_size
-            .predecessor(seq)
+            .floor(seq)
             .map(|(start, &size)| AckInterval { start, size });
-
         let following = self
             .start_to_size
             .successor(seq)
             .map(|(start, &size)| AckInterval { start, size });
-
         let mut interval = AckInterval {
             start: seq,
             size: NonZeroU64::new(1).unwrap(),
         };
-
-        if let Some(previous) = previous
-            && let Some(merged) = previous.merge_forward(interval)
-        {
-            self.start_to_size.remove(&previous.start);
-            interval = merged;
+        if let Some(previous) = previous {
+            if previous.start.forward_distance_to(seq) < previous.size.get() {
+                return;
+            }
+            if let Some(merged) = previous.merge_forward(interval) {
+                self.start_to_size.remove(&previous.start);
+                interval = merged;
+            }
         }
-
         if let Some(following) = following
             && let Some(merged) = interval.merge_forward(following)
         {
             self.start_to_size.remove(&following.start);
             interval = merged;
         }
-
+        debug_assert_ne!(interval.start, self.next);
         self.start_to_size.insert(interval.start, interval.size);
-
-        if interval.start == self.next {
-            self.start_to_size.remove(&interval.start);
-            self.next = interval.end();
-            self.start_to_size.advance_anchor(self.next);
-        }
     }
 
     /// The selective ranges, in increasing logical order (the cumulative

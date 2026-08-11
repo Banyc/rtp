@@ -104,12 +104,17 @@ impl PktRecvSpace {
             }
             SequencePosition::InWindow(_) => {}
         }
-        if self.slots.contains_key(&seq) {
-            self.reused_buf.put(data);
-            return RecvDisposition::Duplicate;
+        match self
+            .slots
+            .insert_vacant(seq, RecvSlot::Data(RecvPkt { data, frame_len }))
+        {
+            Ok(()) => {}
+            Err(RecvSlot::Data(pkt)) => {
+                self.reused_buf.put(pkt.data);
+                return RecvDisposition::Duplicate;
+            }
+            Err(RecvSlot::Tombstone) => unreachable!("the attempted slot was data"),
         }
-        self.slots
-            .insert(seq, RecvSlot::Data(RecvPkt { data, frame_len }));
         self.scan_start = min(self.scan_start, seq);
         self.ack_history.insert(seq);
         RecvDisposition::Inserted
