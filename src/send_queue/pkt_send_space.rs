@@ -706,14 +706,21 @@ impl PktSendSpace {
     }
 
     pub fn huge_data_loss(&self, tolerant_loss_rate: UnitR<f64>, now: Instant) -> bool {
-        let Some(data_loss_rate) = self.data_loss_rate(now) else {
+        let Some((samples, data_loss_rate)) = self.data_loss_stats(now) else {
             return false;
         };
-        let enough_samples_for_stats = LOSS_RATE_MIN_SAMPLES < self.pkts_in_pipe().count();
+        let enough_samples_for_stats = LOSS_RATE_MIN_SAMPLES < samples;
         enough_samples_for_stats && tolerant_loss_rate.get() < data_loss_rate
     }
 
     pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
+        self.data_loss_stats(now).map(|(_, rate)| rate)
+    }
+
+    /// One send-window traversal computing both the sample count and the loss
+    /// ratio, so `huge_data_loss` no longer walks `pkts_in_pipe` a second
+    /// time for its sample count.
+    fn data_loss_stats(&self, now: Instant) -> Option<(usize, f64)> {
         let mut lost = 0;
         let mut len = 0;
         for (_, p) in self.pkts_in_pipe() {
@@ -726,7 +733,7 @@ impl PktSendSpace {
         if len == 0 {
             return None;
         }
-        Some(lost as f64 / len as f64)
+        Some((len, lost as f64 / len as f64))
     }
 
     pub fn loss_event_rate(&mut self, now: Instant) -> Option<f64> {
