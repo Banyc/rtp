@@ -963,17 +963,23 @@ impl ReliableLayer {
     }
 
     fn detect_application_limited_phases(&mut self, now: Instant) {
-        let cwnd_stats = self.pkt_send_space.cwnd_stats(now);
+        // DRE's application-limited predicate is conjunctive: if staged data
+        // already fills a packet or the congestion window cannot accept a
+        // packet, the outcome cannot change, so skip the send-window scan.
         let staged_bytes = if self.frame_delivery.enabled {
             self.pending_frame_bytes()
         } else {
             self.send_data_buf.len()
         };
+        if staged_bytes >= self.max_data_size_per_pkt() || !self.pkt_send_space.accepts_new_pkt() {
+            return;
+        }
+        let cwnd_stats = self.pkt_send_space.cwnd_stats(now);
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
-                few_data_to_send: staged_bytes < self.max_data_size_per_pkt(),
+                few_data_to_send: true,
                 not_transmitting_a_packet: true,
-                cwnd_not_full: self.pkt_send_space.accepts_new_pkt(),
+                cwnd_not_full: true,
                 all_lost_packets_retransmitted: cwnd_stats.all_lost_pkts_rtxed,
                 pipe: cwnd_stats.num_not_lost_in_flight_pkts as u64,
             },

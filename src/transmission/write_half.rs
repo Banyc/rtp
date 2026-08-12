@@ -132,7 +132,6 @@ impl WriteHalf {
                 }
             };
             let is_recovery = p.is_recovery;
-            let queue_building = self.reliable_layer.lock().unwrap().queue_building();
             let data = EncodeData {
                 seq: p.seq,
                 send_ts: Some(self.wire_ts(now)),
@@ -144,7 +143,11 @@ impl WriteHalf {
             }
             let instream = self.instream_group_fec_enabled();
             let has_fec = self.fec.is_some() || instream;
-            let wants_dup = self.rtx_dup() && is_recovery && !queue_building;
+            // The mutex-backed queue_building read is kept cold behind the
+            // rtx_dup/is_recovery short-circuit: it is needed only when
+            // retransmission duplication is enabled for a recovery packet.
+            #[rustfmt::skip]
+            let wants_dup = self.rtx_dup() && is_recovery && !self.reliable_layer.lock().unwrap().queue_building();
             let (primary_res, send_buf): (_, Option<&[u8]>) = if !has_fec {
                 let ts = data.send_ts.unwrap_or(0);
                 let cmd: u8 = match data.frame_len {
