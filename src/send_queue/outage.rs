@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 /// When forward progress stalls for at least one RTO (with a loss event, or
 /// two RTOs without), a new epoch starts.  During the epoch:
 ///  - pre-outage RTT/rate samples are censored,
-///  - cwnd is clamped to INIT_CWND,
+///  - cwnd is clamped to OUTAGE_RECOVERY_CWND,
 ///  - pre-outage packets are immediately eligible for retransmission without
 ///    counting as loss events.
 ///

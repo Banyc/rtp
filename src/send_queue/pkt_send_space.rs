@@ -21,7 +21,9 @@ use crate::{
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
-pub const INIT_CWND: usize = 16;
+pub const INIT_CWND: usize = 32;
+pub(crate) const OUTAGE_RECOVERY_CWND: usize = 16;
+pub(super) const LOSS_RATE_MIN_SAMPLES: usize = 16;
 pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
 
 /// Number of newer in-flight packets that must be SACKed past an unacked
@@ -605,11 +607,11 @@ impl PktSendSpace {
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * CWND_SEND_RATE_SCALE;
         let cwnd = 1.max(cwnd);
-        // While an outage-recovery epoch is open, clamp cwnd to INIT_CWND so a
-        // just-restored path is not flooded before fresh RTT samples can seed
-        // the congestion state.
+        // While an outage-recovery epoch is open, clamp cwnd to
+        // OUTAGE_RECOVERY_CWND so a just-restored path is not flooded before
+        // fresh RTT samples can seed the congestion state.
         let cwnd = if self.outage.in_outage_recovery() {
-            cwnd.min(INIT_CWND)
+            cwnd.min(OUTAGE_RECOVERY_CWND)
         } else {
             cwnd
         };
@@ -707,7 +709,7 @@ impl PktSendSpace {
         let Some(data_loss_rate) = self.data_loss_rate(now) else {
             return false;
         };
-        let enough_samples_for_stats = INIT_CWND < self.pkts_in_pipe().count();
+        let enough_samples_for_stats = LOSS_RATE_MIN_SAMPLES < self.pkts_in_pipe().count();
         enough_samples_for_stats && tolerant_loss_rate.get() < data_loss_rate
     }
 
@@ -909,7 +911,7 @@ pub struct Pkt<'a> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CWND_SEND_RATE_SCALE, INIT_CWND, MAX_ACK_BLOCKS, PktSendSpace};
+    use super::{CWND_SEND_RATE_SCALE, MAX_ACK_BLOCKS, OUTAGE_RECOVERY_CWND, PktSendSpace};
     use crate::sequence::SequenceNumber;
     use primitive::ops::float::PosR;
 
@@ -1155,10 +1157,10 @@ mod tests {
         let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
         assert!(space.detect_outage_recovery(detect_at));
         assert!(space.in_outage_recovery());
-        // Recovery starts by clamping cwnd to INIT_CWND once set_send_rate is
-        // recomputed with the epoch active.
+        // Recovery starts by clamping cwnd to OUTAGE_RECOVERY_CWND once
+        // set_send_rate is recomputed with the epoch active.
         space.set_send_rate(PosR::new(crate::reliable::reliable_layer::INIT_SEND_RATE).unwrap());
-        assert_eq!(space.cwnd().get(), INIT_CWND);
+        assert_eq!(space.cwnd().get(), OUTAGE_RECOVERY_CWND);
         // RTO is reset to the prior RTO value (acts as the seed).
         let seed_rto = space.rto_duration();
 
@@ -1201,9 +1203,13 @@ mod tests {
             "late pre-outage echo must be censored"
         );
 
-        // CWND is no longer forced to INIT_CWND; set_send_rate recomputes it.
+        // CWND is no longer forced to OUTAGE_RECOVERY_CWND; set_send_rate
+        // recomputes it.
         space.set_send_rate(PosR::new(128.0).unwrap());
-        assert!(space.cwnd().get() >= INIT_CWND);
+        assert!(
+            space.cwnd().get() > OUTAGE_RECOVERY_CWND,
+            "fresh RTT must release the outage-recovery CWND clamp"
+        );
     }
 
     #[test]
@@ -1215,7 +1221,7 @@ mod tests {
         // Establish a large cwnd by setting a high send rate.
         space.set_send_rate(PosR::new(1_000_000.0).unwrap());
         let large_cwnd = space.cwnd().get();
-        assert!(large_cwnd > INIT_CWND, "cwnd={large_cwnd}");
+        assert!(large_cwnd > OUTAGE_RECOVERY_CWND, "cwnd={large_cwnd}");
 
         // Trigger outage recovery: make progress, send a second packet, then
         // mark that second packet as lost so a loss event exists while the
@@ -1234,8 +1240,8 @@ mod tests {
         space.set_send_rate(PosR::new(crate::reliable::reliable_layer::INIT_SEND_RATE).unwrap());
         assert_eq!(
             space.cwnd().get(),
-            INIT_CWND,
-            "cwnd should clamp to INIT_CWND"
+            OUTAGE_RECOVERY_CWND,
+            "cwnd should clamp to OUTAGE_RECOVERY_CWND"
         );
 
         // After a fresh sample, cwnd returns to the rate-based formula using the

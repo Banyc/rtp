@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::pkt_send_space::INIT_CWND;
+use super::pkt_send_space::LOSS_RATE_MIN_SAMPLES;
 
 #[derive(Debug, Clone)]
 struct LossEventBucket {
@@ -86,7 +86,7 @@ impl LossEventWindow {
     pub(crate) fn rate(&mut self, now: Instant, smooth_rtt: Duration) -> Option<f64> {
         self.rotate(now, smooth_rtt);
         let total = self.curr.lost + self.curr.delivered + self.prev.lost + self.prev.delivered;
-        if total < INIT_CWND {
+        if total < LOSS_RATE_MIN_SAMPLES {
             return None;
         }
         let lost = self.curr.lost + self.prev.lost;
