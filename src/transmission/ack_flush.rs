@@ -96,19 +96,20 @@ impl AckFlushState {
 /// local to this function so the ACK-flush feature stays co-located.
 pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Result<(), IoErr> {
     let now = Instant::now();
-    let (cursor, history_count) = {
+    let (cursor, history_count, mut echo_ts, claimed_acks, claimed_fin) = {
         let reliable_layer = write_half.reliable_layer.lock().unwrap();
         let queue = reliable_layer.pkt_recv_space().ack_history();
         let count = queue.len();
-        let s = write_half.ack_flush.lock().unwrap();
-        (s.ack_page_cursor.max(MAX_NUM_ACK).min(count), count)
+        let mut s = write_half.ack_flush.lock().unwrap();
+        (
+            s.ack_page_cursor.max(MAX_NUM_ACK).min(count),
+            count,
+            s.ts_echo.take(),
+            s.pending_acks,
+            s.fin_pending,
+        )
     };
-    let mut echo_ts = write_half.ack_flush.lock().unwrap().ts_echo.take();
     let echo_backup = echo_ts;
-    let (claimed_acks, claimed_fin) = {
-        let s = write_half.ack_flush.lock().unwrap();
-        (s.pending_acks, s.fin_pending)
-    };
     let mut page_0 = true;
     let mut skip = 0;
     let fec_enabled = write_half.fec.is_some();
