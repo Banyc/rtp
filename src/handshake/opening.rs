@@ -61,7 +61,11 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     let nonce = u64::from_be_bytes(nonce_bytes);
     let deadline = Instant::now() + OPENING_TIMEOUT;
     client_phase(unreliable, nonce, Kind::Hello, Kind::HelloAck, deadline).await?;
-    client_phase(unreliable, nonce, Kind::Confirm, Kind::ConfirmAck, deadline).await?;
+    // Confirm→ConfirmAck is the final unambiguous leg that directly precedes
+    // RTP traffic; the Hello→HelloAck leg is deliberately not sampled.
+    let initial_rtt =
+        client_phase(unreliable, nonce, Kind::Confirm, Kind::ConfirmAck, deadline).await?;
+    unreliable.initial_rtt = initial_rtt;
     unreliable.post_open_handshake = Some(PostOpenHandshake::client(nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(nonce));
     let (client_to_server, server_to_client) = directional_initial_sequences(nonce);
@@ -78,7 +82,8 @@ pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
             Received::Handshake(_) | Received::NextProtocol => {}
         }
     };
-    server_wait_for_confirm(unreliable, hello.nonce, deadline).await?;
+    let initial_rtt = server_wait_for_confirm(unreliable, hello.nonce, deadline).await?;
+    unreliable.initial_rtt = initial_rtt;
     server_confirm(unreliable, hello.nonce, deadline).await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(hello.nonce));
@@ -93,22 +98,28 @@ async fn client_phase(
     request: Kind,
     response: Kind,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<Option<Duration>> {
     let request = Packet {
         kind: request,
         nonce,
     }
     .encode();
+    let mut attempts = 0usize;
     loop {
         if Instant::now() >= deadline {
             return Err(timeout());
         }
         send(&mut unreliable.utp_write, &request, deadline).await?;
+        attempts += 1;
+        let sent_at = Instant::now();
         let retry_at = retry_at(deadline);
         loop {
             match receive_until(&mut unreliable.utp_read, retry_at).await? {
                 Received::Handshake(packet) if packet.nonce == nonce && packet.kind == response => {
-                    return Ok(());
+                    // A sample is valid only when the request succeeded on its
+                    // first transmission; after a retry the response is
+                    // ambiguous, so report `None`.
+                    return Ok((attempts == 1).then(|| Instant::now().duration_since(sent_at)));
                 }
                 Received::Deadline => break,
                 Received::Handshake(_) | Received::NextProtocol => {}
@@ -121,24 +132,30 @@ async fn server_wait_for_confirm(
     unreliable: &mut UnreliableLayer,
     nonce: u64,
     deadline: Instant,
-) -> io::Result<()> {
+) -> io::Result<Option<Duration>> {
     let hello_ack = Packet {
         kind: Kind::HelloAck,
         nonce,
     }
     .encode();
+    let mut attempts = 0usize;
     loop {
         if Instant::now() >= deadline {
             return Err(timeout());
         }
         send(&mut unreliable.utp_write, &hello_ack, deadline).await?;
+        attempts += 1;
+        let sent_at = Instant::now();
         let retry_at = retry_at(deadline);
         loop {
             match receive_until(&mut unreliable.utp_read, retry_at).await? {
                 Received::Handshake(packet)
                     if packet.nonce == nonce && packet.kind == Kind::Confirm =>
                 {
-                    return Ok(());
+                    // A sample is valid only when the HelloAck succeeded on
+                    // its first transmission; after a retry the Confirm is
+                    // ambiguous, so report `None`.
+                    return Ok((attempts == 1).then(|| Instant::now().duration_since(sent_at)));
                 }
                 Received::Handshake(packet)
                     if packet.nonce == nonce && packet.kind == Kind::Hello =>
@@ -502,6 +519,10 @@ mod tests {
                 .await
                 .expect("post-open confirmation recovery hung")
                 .expect("post-open confirmation recovery failed");
+            assert!(
+                client.initial_rtt.is_none(),
+                "client must not sample after retransmitting Confirm because ConfirmAck was lost"
+            );
             drop(server_socket);
             return;
         }
@@ -524,6 +545,49 @@ mod tests {
         .await
         .expect("opening handshake hung")
         .expect("opening handshake failed");
+
+        // The opening-RTT sample must be unambiguous: both peers get `Some`
+        // on an unlost first attempt, and the peer whose measured leg was
+        // dropped gets `None` (a sample is never assigned after a
+        // retransmission, even if the response later arrives quickly).
+        if !duplicate {
+            match dropped {
+                None | Some(Kind::Hello) => {
+                    assert!(
+                        client.initial_rtt.is_some(),
+                        "client must sample Confirm→ConfirmAck on an unlost first attempt"
+                    );
+                    assert!(
+                        server.initial_rtt.is_some(),
+                        "server must sample HelloAck→Confirm on an unlost first attempt"
+                    );
+                }
+                Some(Kind::HelloAck) => {
+                    assert!(
+                        client.initial_rtt.is_some(),
+                        "client's Confirm→ConfirmAck leg stays clean when only HelloAck is dropped"
+                    );
+                    assert!(
+                        server.initial_rtt.is_none(),
+                        "server must not sample after a HelloAck retransmission"
+                    );
+                }
+                Some(Kind::Confirm) => {
+                    // The client measures Confirm→ConfirmAck; its first
+                    // Confirm was dropped, so it must not sample.  The server
+                    // measures HelloAck→Confirm and legitimately sees a clean
+                    // leg (its HelloAck succeeded first-try), so no server
+                    // assertion here.
+                    assert!(
+                        client.initial_rtt.is_none(),
+                        "client must not sample after a Confirm retransmission"
+                    );
+                }
+                Some(Kind::ConfirmAck) | Some(Kind::Ready) => {
+                    unreachable!("ConfirmAck-dropped path returns above; Ready is never dropped")
+                }
+            }
+        }
 
         let mut received = [0; 64];
         loop {

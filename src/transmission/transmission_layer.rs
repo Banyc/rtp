@@ -1,5 +1,5 @@
 use core::num::NonZeroUsize;
-use std::{io::IoSlice, path::PathBuf, sync::Mutex};
+use std::{io::IoSlice, path::PathBuf, sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -136,6 +136,12 @@ pub struct UnreliableLayer {
     /// shared [`Connection`] and from there into both `ReliableLayer`
     /// constructors.
     pub(crate) initial_sequences: InitialSequences,
+    /// Opening-handshake RTT sample, measured only when the measured request
+    /// succeeded on its first transmission (`None` after a retransmission or
+    /// when the connection was opened without the handshake).  Seeds the
+    /// reliable sender's recovery timing via `ReliableLayer::sample_rtt` at
+    /// connection construction.
+    pub(crate) initial_rtt: Option<Duration>,
     pub(crate) mss: NonZeroUsize,
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,

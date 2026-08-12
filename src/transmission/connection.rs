@@ -74,12 +74,15 @@ pub fn new_connection(
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
-    let (reliable_layer, send_rate_limiter) = ReliableLayer::new_at(
+    let (mut reliable_layer, send_rate_limiter) = ReliableLayer::new_at(
         unreliable_layer.mss,
         frame_delivery,
         now,
         unreliable_layer.initial_sequences,
     );
+    if let Some(initial_rtt) = unreliable_layer.initial_rtt {
+        reliable_layer.sample_rtt(initial_rtt, now);
+    }
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -129,13 +132,16 @@ pub fn new_connection_with_watchdog_tuning(
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
-    let (reliable_layer, send_rate_limiter) = ReliableLayer::new_with_watchdog_tuning_at(
+    let (mut reliable_layer, send_rate_limiter) = ReliableLayer::new_with_watchdog_tuning_at(
         unreliable_layer.mss,
         frame_delivery,
         now,
         unreliable_layer.initial_sequences,
         tuning,
     );
+    if let Some(initial_rtt) = unreliable_layer.initial_rtt {
+        reliable_layer.sample_rtt(initial_rtt, now);
+    }
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -575,6 +581,7 @@ mod tests {
             post_open_handshake: None,
             session_tag: None,
             initial_sequences: crate::sequence::InitialSequences::ZERO,
+            initial_rtt: None,
             mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
             fec_tuning: FecTuning::default(),
@@ -582,6 +589,23 @@ mod tests {
             rtx_dup: false,
             instream_group_fec: false,
         }
+    }
+
+    #[test]
+    fn opening_rtt_seeds_reliable_recovery() {
+        let mut layer = pending_layer(FrameMode::default());
+        layer.initial_rtt = Some(std::time::Duration::from_millis(42));
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        assert_eq!(
+            shared
+                .reliable_layer
+                .lock()
+                .unwrap()
+                .pkt_send_space()
+                .smooth_rtt(),
+            std::time::Duration::from_millis(42),
+            "an opening-handshake RTT sample must seed the sender's recovery timing"
+        );
     }
 
     #[tokio::test]
