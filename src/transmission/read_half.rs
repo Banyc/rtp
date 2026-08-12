@@ -49,16 +49,22 @@ impl ReadHalf {
             num_fin_segments: 0,
         };
         let mut received_batch = ReceivedBatch::default();
-        bufs.ack_to_peer.clear();
+        // ACK work for this receive batch is tracked as a boolean: ACK
+        // content already lives in `AckHistory`, so storing the sequence
+        // numbers themselves is dead weight.  The flag drives the awaited
+        // recv → try_recv switch and the resume/notify control flow below.
+        let mut has_ack_to_peer = false;
         for _ in 0..MAX_NUM_ACK {
             shared
                 .termination
                 .check_error()
                 .map_err(|e| (e, SendKillPkt::No))?;
             let res = {
-                match bufs.ack_to_peer.is_empty() {
-                    true => utp_read.recv(&mut bufs.codec_pkt).await,
-                    false => {
+                match has_ack_to_peer {
+                    // No ACKable packet seen yet: block on the next datagram.
+                    false => utp_read.recv(&mut bufs.codec_pkt).await,
+                    // The batch already has ACK work: drain without blocking.
+                    true => {
                         let res = utp_read.try_recv(&mut bufs.codec_pkt);
                         if let Err(e) = &res
                             && *e == std::io::ErrorKind::WouldBlock
@@ -190,7 +196,7 @@ impl ReadHalf {
                     recv_pkts.num_payload_segments += 1;
                 }
                 if disposition.is_some_and(|result| result.should_ack()) {
-                    bufs.ack_to_peer.push(data.seq);
+                    has_ack_to_peer = true;
                     received_batch.record_ack(is_fin, data.send_ts);
                 } else {
                     end_of_acks = true;
@@ -202,7 +208,7 @@ impl ReadHalf {
             }
         }
         shared.commit_received_batch(received_batch);
-        if bufs.ack_to_peer.is_empty() {
+        if !has_ack_to_peer {
             let should_resume_send = {
                 let reliable_layer = shared.reliable_layer.lock().unwrap();
                 !reliable_layer.is_send_buf_empty()
@@ -213,7 +219,7 @@ impl ReadHalf {
             }
             return Ok(recv_pkts);
         }
-        if !bufs.ack_to_peer.is_empty() {
+        if has_ack_to_peer {
             shared.signals.recv_data_pkt.notify_waiters();
         }
         Ok(recv_pkts)

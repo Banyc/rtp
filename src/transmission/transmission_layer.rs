@@ -100,7 +100,6 @@ impl Default for SendBufs {
 pub struct RecvBufs {
     pub codec_pkt: Vec<u8>,
     pub ack_from_peer: Vec<AckInterval>,
-    pub ack_to_peer: Vec<crate::sequence::SequenceNumber>,
     pub codec_pkts: Vec<Vec<u8>>,
 }
 
@@ -109,7 +108,6 @@ impl RecvBufs {
         Self {
             codec_pkt: vec![0; BUF_SIZE],
             ack_from_peer: vec![],
-            ack_to_peer: vec![],
             codec_pkts: vec![],
         }
     }
