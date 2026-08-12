@@ -122,6 +122,12 @@ pub struct ReliableLayer {
     pub(crate) gentle: GentleMode,
     queue_building: bool,
     drain_floor_binding_since: Option<Instant>,
+    last_congestion_loss_ratio: Option<f64>,
+    last_congestion_action: Option<crate::metrics::MetricsCongestionAction>,
+    /// Set when `PktSendSpace::sample_rtt` closes an outage epoch; consumed by
+    /// the next `recv_ack_pkt` so the same datagram's fresh retransmit sample
+    /// is not mistaken for the start of a new outage epoch.
+    outage_epoch_closed_at: Option<Instant>,
     frame_delivery: FrameMode,
     frame_send_stage: FrameSendStage,
     pkt_stats_buf: Vec<PacketState>,
@@ -171,6 +177,9 @@ impl ReliableLayer {
             gentle: GentleMode::new(),
             queue_building: false,
             drain_floor_binding_since: None,
+            last_congestion_loss_ratio: None,
+            last_congestion_action: None,
+            outage_epoch_closed_at: None,
             frame_delivery,
             frame_send_stage: FrameSendStage::new(),
             pkt_stats_buf: Vec::new(),
@@ -210,6 +219,9 @@ impl ReliableLayer {
             gentle: GentleMode::new(),
             queue_building: false,
             drain_floor_binding_since: None,
+            last_congestion_loss_ratio: None,
+            last_congestion_action: None,
+            outage_epoch_closed_at: None,
             frame_delivery,
             frame_send_stage: FrameSendStage::new(),
             pkt_stats_buf: Vec::new(),
@@ -328,7 +340,9 @@ impl ReliableLayer {
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
-        self.pkt_send_space.sample_rtt(rtt, now);
+        if self.pkt_send_space.sample_rtt(rtt, now) {
+            self.outage_epoch_closed_at = Some(now);
+        }
     }
 
     pub fn send_fin_buf(&mut self) {
@@ -426,7 +440,11 @@ impl ReliableLayer {
             return None;
         }
 
-        if let Some(p) = self.pkt_send_space.rtx(now) {
+        let no_packets_in_flight = self.pkt_send_space.no_pkts_in_flight();
+        if let Some(p) = self.pkt_send_space.rtx_with_state(now, || {
+            self.connection_stats
+                .send_packet_2(now, no_packets_in_flight)
+        }) {
             pkt[..p.data.len()].copy_from_slice(p.data);
 
             let data_written = NonZeroUsize::new(p.data.len())
@@ -444,7 +462,12 @@ impl ReliableLayer {
         // regular retransmits, they resend an already-in-flight packet and
         // must fire during tail silence to avoid waiting the full RTO.
         if self.is_send_buf_empty()
-            && let Some(p) = self.pkt_send_space.tail_probe(now)
+            && let Some(p) = self
+                .pkt_send_space
+                .tail_probe_with_state(now, || {
+                    self.connection_stats
+                        .send_packet_2(now, no_packets_in_flight)
+                })
         {
             pkt[..p.data.len()].copy_from_slice(p.data);
 
@@ -602,10 +625,14 @@ impl ReliableLayer {
     pub fn recv_ack_pkt(&mut self, recved: AckBlocks<'_>, now: Instant) -> Option<dre::RateSample> {
         self.detect_application_limited_phases(now);
 
-        // An ACK means the link has delivered something.  Try to open an outage-
-        // recovery epoch first; if one starts, reset the congestion state and send
-        // rate to the initial values so the post-outage path restarts cleanly.
-        let entered_recovery = self.pkt_send_space.detect_outage_recovery(now);
+        // An ACK datagram can both close a freshly-closed outage epoch (its
+        // RTT sample already ran) and open a new one.  The epoch-close
+        // bookkeeping is consumed here so the fresh retransmit sample from
+        // this same datagram is not mistaken for the start of a new outage
+        // epoch.
+        let closed_epoch_on_this_datagram = self.outage_epoch_closed_at.take() == Some(now);
+        let entered_recovery =
+            !closed_epoch_on_this_datagram && self.pkt_send_space.detect_outage_recovery(now);
 
         self.pkt_send_space
             .ack(recved, &mut self.pkt_stats_buf, now);
@@ -623,7 +650,10 @@ impl ReliableLayer {
             self.gentle.reset();
             self.queue_building = false;
             self.drain_floor_binding_since = None;
+            self.last_congestion_loss_ratio = None;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
+            self.last_congestion_action =
+                Some(crate::metrics::MetricsCongestionAction::OutageReset);
         }
 
         // ACK-clocked slow start must count *every* ACK, including those that
@@ -635,6 +665,8 @@ impl ReliableLayer {
             let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
             let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
             self.set_send_rate(ss_rate, now);
+            self.last_congestion_action =
+                Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
         }
 
         // Per-episode accumulator: once the pipe drains, reset for the next
@@ -679,6 +711,8 @@ impl ReliableLayer {
             .pkt_send_space
             .should_censor_rate_sample(sr.prior_time())
         {
+            self.last_congestion_action =
+                Some(crate::metrics::MetricsCongestionAction::CensoredOutageSample);
             return;
         }
 
@@ -703,6 +737,7 @@ impl ReliableLayer {
 
         // ----- Gentle-mode entry/exit and gate hysteresis --------------------
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
+        self.last_congestion_loss_ratio = loss_event_rate;
         self.gentle.update_mode(
             smooth,
             floor,
@@ -745,10 +780,14 @@ impl ReliableLayer {
                 smooth,
                 now,
             ) {
+                self.last_congestion_action =
+                    Some(crate::metrics::MetricsCongestionAction::GentleProbe);
                 self.set_smooth_send_rate(target, now);
                 return;
             }
 
+            self.last_congestion_action =
+                Some(crate::metrics::MetricsCongestionAction::BandwidthProbe);
             let probed = probe_send_rate_exponential(self.send_rate.get(), sr.delivery_rate());
             let target_send_rate = probed.unwrap_or(self.send_rate.get());
             self.set_smooth_send_rate(target_send_rate, now);
@@ -757,6 +796,7 @@ impl ReliableLayer {
 
         // ----- Drain branch --------------------------------------------------
         if queue_building && little_data_loss != Some(false) {
+            self.last_congestion_action = Some(crate::metrics::MetricsCongestionAction::DelayDrain);
             let control_rtt = self.control_rtt();
             let current = self.send_rate.get();
             let drain_frac = self.gentle.drain_frac();
@@ -811,6 +851,8 @@ impl ReliableLayer {
         }
 
         if LINEAR_BACKOFF {
+            self.last_congestion_action =
+                Some(crate::metrics::MetricsCongestionAction::LossBackoff);
             self.backoff_on_high_loss_ack_linear(sr, now);
         } else {
             self.slow_start = false;
@@ -1026,24 +1068,85 @@ impl ReliableLayer {
         self.mss.get().checked_sub(data_overhead()).unwrap()
     }
 
+    pub(crate) fn metrics_at(&self, now: Instant) -> crate::metrics::MetricsSnapshot {
+        let stall_reason = self
+            .pkt_send_space
+            .stall_reason(now)
+            .map(|reason| match reason {
+                crate::send_queue::liveness::PeerStall::NoResponse => {
+                    crate::metrics::MetricsStallReason::NoResponse
+                }
+                crate::send_queue::liveness::PeerStall::NoProgress => {
+                    crate::metrics::MetricsStallReason::NoProgress
+                }
+            });
+        crate::metrics::MetricsSnapshot {
+            pacer_tokens_packets: self.send_rate_limiter.lock().unwrap().outdated_tokens(),
+            send_rate_packets_per_second: self.send_rate.get(),
+            loss_ratio: self.pkt_send_space.data_loss_rate(now),
+            congestion_loss_ratio: self.last_congestion_loss_ratio,
+            congestion_action: self.last_congestion_action,
+            in_flight_packets: self.pkt_send_space.num_in_flight_pkts(),
+            packets_in_pipe: self.pkt_send_space.num_pkts_in_pipe(),
+            retransmitted_packets: self.pkt_send_space.num_rtxed_pkts(),
+            next_send_sequence: self.pkt_send_space.next_seq().to_wire(),
+            minimum_rtt: self.pkt_send_space.min_rtt(),
+            smoothed_rtt: self.pkt_send_space.smooth_rtt(),
+            congestion_window_packets: self.pkt_send_space.cwnd().get(),
+            received_packets: self.pkt_recv_space.num_recved_pkts(),
+            next_receive_sequence: self.pkt_recv_space.next_seq().map(|s| s.to_wire()),
+            delivery_rate_packets_per_second: self
+                .prev_sample_rate
+                .as_ref()
+                .map(|sr| sr.delivery_rate()),
+            delivery_sample_app_limited: self
+                .prev_sample_rate
+                .as_ref()
+                .map(|sample| sample.is_app_limited()),
+            pending_send_bytes: if self.frame_delivery.enabled {
+                self.pending_frame_bytes()
+            } else {
+                self.send_data_buf.len()
+            },
+            send_stage_capacity_bytes: self.write_unit_capacity(),
+            accepts_new_packet: self.pkt_send_space.accepts_new_pkt(),
+            slow_start: self.slow_start,
+            gentle_mode: self.gentle.gentle_mode(),
+            gentle_draining: self.gentle.draining(),
+            queue_building: self.queue_building,
+            drain_floor_binding: self.drain_floor_binding_since.is_some(),
+            outage_recovery: self.pkt_send_space.in_outage_recovery(),
+            no_response_for: self.pkt_send_space.no_resp_for(now),
+            no_progress_for: self.pkt_send_space.no_progress_for(now),
+            stall_reason,
+        }
+    }
+
     pub fn log(&self) -> MetricsRow {
         let now = Instant::now();
-        let min_rtt = self.pkt_send_space.min_rtt();
+        let metrics = self.metrics_at(now);
         MetricsRow {
-            tokens: self.send_rate_limiter.lock().unwrap().outdated_tokens(),
-            send_rate: self.send_rate.get(),
-            loss_rate: self.pkt_send_space.data_loss_rate(now),
-            num_in_flight_pkts: self.pkt_send_space.num_in_flight_pkts(),
-            num_pkts_in_pipe: self.pkt_send_space.num_pkts_in_pipe(),
-            num_rtx_pkts: self.pkt_send_space.num_rtxed_pkts(),
-            send_seq: self.pkt_send_space.next_seq().to_wire(),
-            min_rtt: min_rtt.map(|t| t.as_millis()),
-            rtt: self.pkt_send_space.smooth_rtt().as_millis(),
-            cwnd: self.pkt_send_space.cwnd().get(),
-            num_rx_pkts: self.pkt_recv_space.num_recved_pkts(),
-            recv_seq: self.pkt_recv_space.next_seq().map(|s| s.to_wire()),
-            delivery_rate: self.prev_sample_rate.as_ref().map(|sr| sr.delivery_rate()),
-            app_limited: self.prev_sample_rate.as_ref().map(|sr| sr.is_app_limited()),
+            tokens: metrics.pacer_tokens_packets,
+            send_rate: metrics.send_rate_packets_per_second,
+            loss_rate: metrics.loss_ratio,
+            congestion_loss_rate: metrics.congestion_loss_ratio,
+            congestion_action: metrics
+                .congestion_action
+                .map(|action| action.as_str().to_owned()),
+            num_in_flight_pkts: metrics.in_flight_packets,
+            num_pkts_in_pipe: metrics.packets_in_pipe,
+            num_rtx_pkts: metrics.retransmitted_packets,
+            send_seq: metrics.next_send_sequence,
+            min_rtt: metrics.minimum_rtt.map(|t| t.as_millis()),
+            rtt: metrics.smoothed_rtt.as_millis(),
+            cwnd: metrics.congestion_window_packets,
+            num_rx_pkts: metrics.received_packets,
+            recv_seq: metrics.next_receive_sequence,
+            delivery_rate: metrics.delivery_rate_packets_per_second,
+            delivery_sample_app_limited: metrics.delivery_sample_app_limited,
+            pending_send_bytes: metrics.pending_send_bytes,
+            send_stage_capacity_bytes: metrics.send_stage_capacity_bytes,
+            accepts_new_packet: metrics.accepts_new_packet,
         }
     }
 }
@@ -1502,6 +1605,87 @@ mod tests {
             (final_rate - INIT_SEND_RATE).abs() < 1e-9,
             "outage restore should restart at exactly INIT_SEND_RATE, got {final_rate}"
         );
+    }
+
+    #[test]
+    fn post_outage_retransmit_refreshes_delivery_rate_state() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        feed_rtt(&mut rl, 20, Duration::from_millis(100), t0);
+        send_burst(&mut rl, 3, t0 + Duration::from_millis(10));
+        ack_seq(
+            &mut rl,
+            0,
+            Duration::from_millis(100),
+            t0 + Duration::from_millis(110),
+        );
+        let outage_at = t0 + Duration::from_secs(3);
+        rl.sample_rtt(Duration::from_millis(100), outage_at);
+        let selective = [AckInterval {
+            start: crate::sequence::SequenceNumber::from_wire(2),
+            size: NonZeroU64::new(1).unwrap(),
+        }];
+        rl.recv_ack_pkt(
+            AckBlocks::new(crate::sequence::SequenceNumber::from_wire(1), &selective),
+            outage_at,
+        );
+        assert_eq!(
+            rl.last_congestion_action,
+            Some(crate::metrics::MetricsCongestionAction::OutageReset)
+        );
+        let retransmit_at = outage_at + Duration::from_millis(20);
+        let mut packet = vec![0u8; TEST_MSS];
+        let retransmit = rl
+            .send_data_pkt(&mut packet, retransmit_at)
+            .expect("pre-outage packet must retransmit immediately");
+        assert!(retransmit.is_recovery);
+        assert_eq!(retransmit.seq.to_wire(), 1);
+        ack_seq(
+            &mut rl,
+            1,
+            Duration::from_millis(100),
+            retransmit_at + Duration::from_millis(100),
+        );
+        assert!(!rl.pkt_send_space.in_outage_recovery());
+        assert_eq!(
+            rl.last_congestion_action,
+            Some(crate::metrics::MetricsCongestionAction::BandwidthProbe),
+            "the fresh retransmit sample must reach congestion control"
+        );
+    }
+
+    #[test]
+    fn tail_probe_refreshes_delivery_rate_state() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        feed_rtt(&mut rl, 20, Duration::from_millis(100), t0);
+        send_burst(&mut rl, 2, t0 + Duration::from_millis(10));
+        ack_seq(
+            &mut rl,
+            0,
+            Duration::from_millis(100),
+            t0 + Duration::from_millis(110),
+        );
+        let probe_at = t0 + Duration::from_millis(260);
+        let mut packet = vec![0u8; TEST_MSS];
+        let probe = rl
+            .send_data_pkt(&mut packet, probe_at)
+            .expect("tail-loss probe must fire before the full RTO");
+        assert!(probe.is_recovery);
+        assert_eq!(probe.seq.to_wire(), 1);
+        let ack_at = probe_at + Duration::from_millis(100);
+        rl.sample_rtt(Duration::from_millis(100), ack_at);
+        let selective = [AckInterval {
+            start: crate::sequence::SequenceNumber::from_wire(1),
+            size: NonZeroU64::new(1).unwrap(),
+        }];
+        let sample = rl
+            .recv_ack_pkt(
+                AckBlocks::new(crate::sequence::SequenceNumber::from_wire(2), &selective),
+                ack_at,
+            )
+            .expect("fresh tail-probe state must yield a delivery-rate sample");
+        assert_eq!(sample.prior_time(), t0 + Duration::from_millis(110));
     }
 
     #[test]
@@ -2001,6 +2185,8 @@ pub struct MetricsRow {
     pub send_rate: f64,
     pub delivery_rate: Option<f64>,
     pub loss_rate: Option<f64>,
+    pub congestion_loss_rate: Option<f64>,
+    pub congestion_action: Option<String>,
     pub num_in_flight_pkts: usize,
     pub num_pkts_in_pipe: usize,
     pub num_rtx_pkts: usize,
@@ -2010,5 +2196,8 @@ pub struct MetricsRow {
     pub cwnd: usize,
     pub num_rx_pkts: usize,
     pub recv_seq: Option<u64>,
-    pub app_limited: Option<bool>,
+    pub delivery_sample_app_limited: Option<bool>,
+    pub pending_send_bytes: usize,
+    pub send_stage_capacity_bytes: usize,
+    pub accepts_new_packet: bool,
 }

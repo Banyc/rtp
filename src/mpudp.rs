@@ -37,7 +37,14 @@ impl Listener {
     }
     pub async fn accept_with(&mut self, config: AcceptConfig) -> io::Result<Conn> {
         let conn = self.listener.accept().await?;
-        convert_conn(conn, None, config.fec_tuning, config.frame_delivery).await
+        convert_conn(
+            conn,
+            None,
+            config.metrics_observer,
+            config.fec_tuning,
+            config.frame_delivery,
+        )
+        .await
     }
 }
 #[derive(Debug)]
@@ -55,6 +62,7 @@ impl Conn {
         convert_conn(
             conn,
             config.log_config,
+            config.metrics_observer,
             config.fec_tuning,
             config.frame_delivery,
         )
@@ -64,6 +72,7 @@ impl Conn {
 async fn convert_conn(
     conn: MpUdpConn,
     log_config: Option<LogConfig<'_>>,
+    metrics_observer: Option<crate::metrics::MetricsObserver>,
     tuning: FecTuning,
     frame_delivery: FrameMode,
 ) -> io::Result<Conn> {
@@ -78,7 +87,7 @@ async fn convert_conn(
         None => None,
     };
     let (r, w) = conn.into_split();
-    let unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+    let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         Box::new(r),
         Box::new(w),
         false,
@@ -86,6 +95,7 @@ async fn convert_conn(
         tuning,
         frame_delivery,
     )?;
+    unreliable_layer.metrics_observer = metrics_observer;
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,

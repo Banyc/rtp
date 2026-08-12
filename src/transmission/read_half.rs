@@ -126,7 +126,7 @@ impl ReadHalf {
                     if recent_echoes.should_sample(echo_ts, now)
                         && let Some(rtt) = TsEcho::rtt_from_echo(local_ts, echo_ts)
                     {
-                        shared.reliable_layer.lock().unwrap().sample_rtt(rtt, now);
+                        shared.sample_rtt(rtt, now);
                     }
                 }
                 if data.killed {
@@ -187,7 +187,7 @@ impl ReadHalf {
                     shared.signals.session_outbound_progress.notify_one();
                 }
                 let Some(data) = data.data else {
-                    shared.log("recv_ack_pkt");
+                    shared.log(crate::metrics::MetricsEvent::ReceiveAckPacket);
                     continue;
                 };
                 if is_fin {
@@ -201,7 +201,7 @@ impl ReadHalf {
                 } else {
                     end_of_acks = true;
                 }
-                shared.log("recv_data_pkt");
+                shared.log(crate::metrics::MetricsEvent::ReceiveDataPacket);
             }
             if end_of_acks {
                 break;

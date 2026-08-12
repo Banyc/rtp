@@ -87,6 +87,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         session_tag: None,
         initial_sequences: crate::sequence::InitialSequences::ZERO,
         initial_rtt: None,
+        metrics_observer: None,
         mss,
         fec: fec_state,
         fec_tuning: tuning,

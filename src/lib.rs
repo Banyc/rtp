@@ -2,6 +2,7 @@
 
 pub mod io_err;
 pub mod keyed_udp;
+pub mod metrics;
 pub mod mpudp;
 pub mod path_probe;
 pub mod socket;

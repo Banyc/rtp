@@ -140,6 +140,8 @@ pub struct UnreliableLayer {
     /// reliable sender's recovery timing via `ReliableLayer::sample_rtt` at
     /// connection construction.
     pub(crate) initial_rtt: Option<Duration>,
+    /// Optional typed transport-observation callback installed by the caller.
+    pub(crate) metrics_observer: Option<crate::metrics::MetricsObserver>,
     pub(crate) mss: NonZeroUsize,
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
@@ -218,12 +220,18 @@ pub struct LogConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsRow<'a> {
+    pub schema_version: u16,
+    pub event_index: u64,
     pub time: u128,
+    pub elapsed_micros: u128,
     pub op: &'a str,
+    pub raw_rtt_micros: Option<u128>,
 
     pub tokens: f64,
     pub send_rate: f64,
     pub loss_rate: Option<f64>,
+    pub congestion_loss_rate: Option<f64>,
+    pub congestion_action: Option<&'a str>,
     pub num_in_flight_pkts: usize,
     pub num_pkts_in_pipe: usize,
     pub num_rtx_pkts: usize,
@@ -234,5 +242,17 @@ pub struct MetricsRow<'a> {
     pub num_rx_pkts: usize,
     pub recv_seq: Option<u64>,
     pub delivery_rate: Option<f64>,
-    pub app_limited: Option<bool>,
+    pub delivery_sample_app_limited: Option<bool>,
+    pub pending_send_bytes: usize,
+    pub send_stage_capacity_bytes: usize,
+    pub accepts_new_packet: bool,
+    pub slow_start: bool,
+    pub gentle_mode: bool,
+    pub gentle_draining: bool,
+    pub queue_building: bool,
+    pub drain_floor_binding: bool,
+    pub outage_recovery: bool,
+    pub no_response_for_micros: Option<u128>,
+    pub no_progress_for_micros: Option<u128>,
+    pub stall_reason: Option<&'a str>,
 }

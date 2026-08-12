@@ -85,7 +85,7 @@ impl<K: DispatchKey> Listener<K> {
             let peer = write.peer_addr();
             KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
         };
-        let unreliable_layer = wrap_keyed::<K>(
+        let mut unreliable_layer = wrap_keyed::<K>(
             read,
             write,
             config.fec,
@@ -93,6 +93,7 @@ impl<K: DispatchKey> Listener<K> {
             config.fec_tuning,
             config.frame_delivery,
         );
+        unreliable_layer.metrics_observer = config.metrics_observer;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -148,7 +149,7 @@ impl<K: DispatchKey> Connector<K> {
         let accepted = self.listener.register_conn(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
-        let unreliable_layer = wrap_keyed::<K>(
+        let mut unreliable_layer = wrap_keyed::<K>(
             read,
             write,
             config.fec,
@@ -156,6 +157,7 @@ impl<K: DispatchKey> Connector<K> {
             config.fec_tuning,
             config.frame_delivery,
         );
+        unreliable_layer.metrics_observer = config.metrics_observer;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
             read,

@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,9 @@ use super::write_half::WriteHalf;
 
 use crate::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
 use crate::io_err::IoErr;
+use crate::metrics::{
+    MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver, SCHEMA_VERSION,
+};
 use crate::pacer::{SendPacer, SendWake};
 use crate::reliable::reliable_layer::ReliableLayer;
 
@@ -66,6 +69,8 @@ pub struct Connection {
     pub(crate) instream_group_fec_enabled: std::sync::atomic::AtomicBool,
     pub(crate) clock_epoch: Instant,
     pub(crate) reliable_layer_logger: Option<ReliableLayerLogger>,
+    metrics_observer: Option<MetricsObserver>,
+    metrics_event_index: AtomicU64,
 }
 
 pub fn new_connection(
@@ -74,6 +79,7 @@ pub fn new_connection(
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
+    let metrics_observer = unreliable_layer.metrics_observer.clone();
     let (mut reliable_layer, send_rate_limiter) = ReliableLayer::new_at(
         unreliable_layer.mss,
         frame_delivery,
@@ -111,6 +117,8 @@ pub fn new_connection(
         ),
         clock_epoch: now,
         reliable_layer_logger,
+        metrics_observer,
+        metrics_event_index: AtomicU64::new(0),
     });
     let write_half = WriteHalf {
         utp_write: unreliable_layer.utp_write,
@@ -132,6 +140,7 @@ pub fn new_connection_with_watchdog_tuning(
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
     let frame_delivery = unreliable_layer.frame_delivery;
+    let metrics_observer = unreliable_layer.metrics_observer.clone();
     let (mut reliable_layer, send_rate_limiter) = ReliableLayer::new_with_watchdog_tuning_at(
         unreliable_layer.mss,
         frame_delivery,
@@ -170,6 +179,8 @@ pub fn new_connection_with_watchdog_tuning(
         ),
         clock_epoch: now,
         reliable_layer_logger,
+        metrics_observer,
+        metrics_event_index: AtomicU64::new(0),
     });
     let write_half = WriteHalf {
         utp_write: unreliable_layer.utp_write,
@@ -241,7 +252,7 @@ impl Connection {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_buf(data, now)
             }?;
-            self.log("send_data_buf");
+            self.log(MetricsEvent::SendDataBuffer);
             if 0 < written_bytes {
                 self.signals.resume_send.notify_one();
                 return Ok(written_bytes);
@@ -268,7 +279,7 @@ impl Connection {
             };
             match result {
                 Ok(()) => {
-                    self.log("send_frame_buf");
+                    self.log(MetricsEvent::SendFrameBuffer);
                     self.signals.resume_send.notify_one();
                     return Ok(frame_len);
                 }
@@ -476,7 +487,7 @@ impl Connection {
                 (read_bytes, reliable_layer.recv_eof_ready())
             };
             self.publish_recv_eof(recv_eof);
-            self.log("recv_data_buf");
+            self.log(MetricsEvent::ReceiveDataBuffer);
             if PRINT_DEBUG_MSGS {
                 println!("recv: data: {read_bytes}");
             }
@@ -507,7 +518,7 @@ impl Connection {
             self.publish_recv_eof(recv_eof);
             match res {
                 Ok(Some(frame)) => {
-                    self.log("recv_frame_buf");
+                    self.log(MetricsEvent::ReceiveFrameBuffer);
                     return Ok(Some(frame));
                 }
                 Ok(None) => {
@@ -526,31 +537,137 @@ impl Connection {
         }
     }
 
-    pub(crate) fn log(&self, op: &str) {
+    pub(crate) fn sample_rtt(&self, rtt: std::time::Duration, now: Instant) {
+        let observer_interest = self
+            .metrics_observer
+            .as_ref()
+            .map(|observer| {
+                observer.interest(
+                    MetricsEvent::RttSample,
+                    now.saturating_duration_since(self.clock_epoch),
+                )
+            })
+            .unwrap_or(MetricsInterest::Skip);
+        let enabled =
+            observer_interest != MetricsInterest::Skip || self.reliable_layer_logger.is_some();
+        let captured = {
+            let mut reliable_layer = self.reliable_layer.lock().unwrap();
+            reliable_layer.sample_rtt(rtt, now);
+            enabled.then(|| {
+                let snapshot = (observer_interest == MetricsInterest::Snapshot
+                    || self.reliable_layer_logger.is_some())
+                .then(|| reliable_layer.metrics_at(now));
+                let event_index = self.metrics_event_index.fetch_add(1, Ordering::Relaxed);
+                (event_index, snapshot)
+            })
+        };
+        if let Some((event_index, snapshot)) = captured {
+            self.publish_metrics(
+                event_index,
+                MetricsEvent::RttSample,
+                Some(rtt),
+                now,
+                snapshot,
+                observer_interest,
+            );
+        }
+    }
+
+    pub(crate) fn log(&self, event: MetricsEvent) {
+        if self.metrics_observer.is_none() && self.reliable_layer_logger.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.clock_epoch);
+        let observer_interest = self
+            .metrics_observer
+            .as_ref()
+            .map(|observer| observer.interest(event, elapsed))
+            .unwrap_or(MetricsInterest::Skip);
+        if observer_interest == MetricsInterest::Skip && self.reliable_layer_logger.is_none() {
+            return;
+        }
+        let capture_snapshot =
+            observer_interest == MetricsInterest::Snapshot || self.reliable_layer_logger.is_some();
+        let (event_index, snapshot) = if capture_snapshot {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let snapshot = reliable_layer.metrics_at(now);
+            let event_index = self.metrics_event_index.fetch_add(1, Ordering::Relaxed);
+            (event_index, Some(snapshot))
+        } else {
+            (
+                self.metrics_event_index.fetch_add(1, Ordering::Relaxed),
+                None,
+            )
+        };
+        self.publish_metrics(event_index, event, None, now, snapshot, observer_interest);
+    }
+
+    fn publish_metrics(
+        &self,
+        event_index: u64,
+        event: MetricsEvent,
+        raw_rtt_sample: Option<std::time::Duration>,
+        now: Instant,
+        snapshot: Option<crate::metrics::MetricsSnapshot>,
+        observer_interest: MetricsInterest,
+    ) {
+        let elapsed = now.saturating_duration_since(self.clock_epoch);
+        let observation = MetricsObservation {
+            schema_version: SCHEMA_VERSION,
+            event_index,
+            elapsed,
+            event,
+            raw_rtt_sample,
+            snapshot,
+        };
+        if observer_interest != MetricsInterest::Skip
+            && let Some(observer) = &self.metrics_observer
+        {
+            observer.observe(observation);
+        }
         let Some(logger) = &self.reliable_layer_logger else {
             return;
         };
+        let snapshot = snapshot.expect("logger capture includes a snapshot");
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        let log = self.reliable_layer.lock().unwrap().log();
         let log = MetricsRow {
-            op,
+            schema_version: SCHEMA_VERSION,
+            event_index,
+            op: event.as_str(),
             time: time.as_micros(),
-            tokens: log.tokens,
-            send_rate: log.send_rate,
-            loss_rate: log.loss_rate,
-            num_in_flight_pkts: log.num_in_flight_pkts,
-            num_pkts_in_pipe: log.num_pkts_in_pipe,
-            num_rtx_pkts: log.num_rtx_pkts,
-            send_seq: log.send_seq,
-            min_rtt: log.min_rtt,
-            rtt: log.rtt,
-            cwnd: log.cwnd,
-            num_rx_pkts: log.num_rx_pkts,
-            recv_seq: log.recv_seq,
-            delivery_rate: log.delivery_rate,
-            app_limited: log.app_limited,
+            elapsed_micros: elapsed.as_micros(),
+            raw_rtt_micros: raw_rtt_sample.map(|sample| sample.as_micros()),
+            tokens: snapshot.pacer_tokens_packets,
+            send_rate: snapshot.send_rate_packets_per_second,
+            loss_rate: snapshot.loss_ratio,
+            congestion_loss_rate: snapshot.congestion_loss_ratio,
+            congestion_action: snapshot.congestion_action.map(|action| action.as_str()),
+            num_in_flight_pkts: snapshot.in_flight_packets,
+            num_pkts_in_pipe: snapshot.packets_in_pipe,
+            num_rtx_pkts: snapshot.retransmitted_packets,
+            send_seq: snapshot.next_send_sequence,
+            min_rtt: snapshot.minimum_rtt.map(|rtt| rtt.as_millis()),
+            rtt: snapshot.smoothed_rtt.as_millis(),
+            cwnd: snapshot.congestion_window_packets,
+            num_rx_pkts: snapshot.received_packets,
+            recv_seq: snapshot.next_receive_sequence,
+            delivery_rate: snapshot.delivery_rate_packets_per_second,
+            delivery_sample_app_limited: snapshot.delivery_sample_app_limited,
+            pending_send_bytes: snapshot.pending_send_bytes,
+            send_stage_capacity_bytes: snapshot.send_stage_capacity_bytes,
+            accepts_new_packet: snapshot.accepts_new_packet,
+            slow_start: snapshot.slow_start,
+            gentle_mode: snapshot.gentle_mode,
+            gentle_draining: snapshot.gentle_draining,
+            queue_building: snapshot.queue_building,
+            drain_floor_binding: snapshot.drain_floor_binding,
+            outage_recovery: snapshot.outage_recovery,
+            no_response_for_micros: snapshot.no_response_for.map(|value| value.as_micros()),
+            no_progress_for_micros: snapshot.no_progress_for.map(|value| value.as_micros()),
+            stall_reason: snapshot.stall_reason.map(|reason| reason.as_str()),
         };
         logger
             .lock()
@@ -563,10 +680,12 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use crate::delivery::frame::FrameMode;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
+    use crate::metrics::{MetricsEvent, MetricsInterest, MetricsObserver, SCHEMA_VERSION};
     use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
@@ -582,6 +701,7 @@ mod tests {
             session_tag: None,
             initial_sequences: crate::sequence::InitialSequences::ZERO,
             initial_rtt: None,
+            metrics_observer: None,
             mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
             fec_tuning: FecTuning::default(),
@@ -606,6 +726,91 @@ mod tests {
             std::time::Duration::from_millis(42),
             "an opening-handshake RTT sample must seed the sender's recovery timing"
         );
+    }
+
+    #[test]
+    fn metrics_observer_gets_ordered_state_and_raw_rtt() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        let raw_rtt = std::time::Duration::from_millis(42);
+        shared.sample_rtt(raw_rtt, Instant::now());
+        shared.log(MetricsEvent::SendDataBuffer);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].schema_version, SCHEMA_VERSION);
+        assert_eq!(observations[0].event_index, 0);
+        assert_eq!(observations[0].event, MetricsEvent::RttSample);
+        assert_eq!(observations[0].raw_rtt_sample, Some(raw_rtt));
+        let snapshot = observations[0].snapshot.unwrap();
+        assert_eq!(snapshot.smoothed_rtt, raw_rtt);
+        assert_eq!(snapshot.congestion_loss_ratio, None);
+        assert_eq!(snapshot.congestion_action, None);
+        assert!(snapshot.slow_start);
+        assert!(!snapshot.gentle_mode);
+        assert!(!snapshot.gentle_draining);
+        assert!(!snapshot.queue_building);
+        assert!(!snapshot.drain_floor_binding);
+        assert!(!snapshot.outage_recovery);
+        assert_eq!(snapshot.stall_reason, None);
+        assert_eq!(observations[1].event_index, 1);
+        assert_eq!(observations[1].event, MetricsEvent::SendDataBuffer);
+        assert_eq!(observations[1].raw_rtt_sample, None);
+    }
+
+    #[test]
+    fn filtered_metrics_observer_skips_snapshot_and_callback() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::filtered(
+                |event, _| event == MetricsEvent::RttSample,
+                move |observation| observations.lock().unwrap().push(observation),
+            )
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        shared.log(MetricsEvent::SendDataBuffer);
+        shared.sample_rtt(std::time::Duration::from_millis(20), Instant::now());
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].event_index, 0);
+        assert_eq!(observations[0].event, MetricsEvent::RttSample);
+    }
+
+    #[test]
+    fn event_only_observation_avoids_a_state_snapshot() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::selective(
+                |event, _| {
+                    if event == MetricsEvent::RttSample {
+                        MetricsInterest::EventOnly
+                    } else {
+                        MetricsInterest::Skip
+                    }
+                },
+                move |observation| observations.lock().unwrap().push(observation),
+            )
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        let raw_rtt = std::time::Duration::from_millis(20);
+        shared.sample_rtt(raw_rtt, Instant::now());
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].raw_rtt_sample, Some(raw_rtt));
+        assert_eq!(observations[0].snapshot, None);
     }
 
     #[tokio::test]

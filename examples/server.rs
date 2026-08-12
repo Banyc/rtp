@@ -132,7 +132,7 @@ async fn run_udp_accept_driver(
     let mut handshakes = JoinSet::new();
     loop {
         tokio::select! {
-            next = listener.accept_with(config) => {
+            next = listener.accept_with(config.clone()) => {
                 match next {
                     Ok(task) => {
                         handshakes.spawn(task);
@@ -154,7 +154,7 @@ async fn run_udp_accept_driver(
                         None => drop(accepted),
                     },
                     Err(error) => {
-                        eprintln!("RTP handshake rejected: {}", error);
+                        eprintln!("RTP handshake rejected: {error:?}");
                     }
                 }
             }
@@ -171,7 +171,7 @@ async fn run_mpudp_accept_driver(
     let mut first_tx = Some(first_tx);
     loop {
         tokio::select! {
-            next = listener.accept_with(config) => {
+            next = listener.accept_with(config.clone()) => {
                 match next {
                     Ok(accepted) => match first_tx.take() {
                         Some(tx) => {

@@ -282,7 +282,7 @@ pub type FrameDeliveryAccept =
 /// `frame_delivery` come from `RTP_FEC_TUNING` / `RTP_FRAME_DELIVERY`,
 /// `rtx_dup` from `RTP_RTX_DUP`, and `instream_group_fec` from
 /// `RTP_INSTREAM_GROUP_FEC`.  Override the fields explicitly to opt out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AcceptConfig {
     pub fec: bool,
     pub mss: MssConfig,
@@ -290,6 +290,7 @@ pub struct AcceptConfig {
     pub frame_delivery: FrameMode,
     pub rtx_dup: bool,
     pub instream_group_fec: bool,
+    pub metrics_observer: Option<crate::metrics::MetricsObserver>,
 }
 
 impl Default for AcceptConfig {
@@ -301,6 +302,7 @@ impl Default for AcceptConfig {
             frame_delivery: frame_delivery_from_env(),
             rtx_dup: rtx_dup_from_env(),
             instream_group_fec: instream_group_fec_from_env(),
+            metrics_observer: None,
         }
     }
 }
@@ -312,6 +314,7 @@ impl Default for AcceptConfig {
 #[derive(Debug, Clone)]
 pub struct ConnectConfig<'a> {
     pub log_config: Option<LogConfig<'a>>,
+    pub metrics_observer: Option<crate::metrics::MetricsObserver>,
     pub handshake: bool,
     pub fec: bool,
     pub mss: MssConfig,
@@ -326,6 +329,7 @@ impl<'a> Default for ConnectConfig<'a> {
     fn default() -> Self {
         Self {
             log_config: None,
+            metrics_observer: None,
             handshake: true,
             fec: false,
             mss: MssConfig::Default,
@@ -342,7 +346,7 @@ impl<'a> Default for ConnectConfig<'a> {
 /// out of a public [`AcceptConfig`] (plus the `handshake` flag and the
 /// already-resolved [`ValidMss`]) so the accept path takes a single config
 /// argument in the `(data, …, config)` shape used across the crate.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AcceptSetup {
     handshake: bool,
     fec: bool,
@@ -351,6 +355,7 @@ struct AcceptSetup {
     frame_delivery: FrameMode,
     rtx_dup: bool,
     instream_group_fec: bool,
+    metrics_observer: Option<crate::metrics::MetricsObserver>,
 }
 
 impl AcceptSetup {
@@ -367,6 +372,7 @@ impl AcceptSetup {
             frame_delivery: config.frame_delivery,
             rtx_dup: config.rtx_dup,
             instream_group_fec: config.instream_group_fec,
+            metrics_observer: config.metrics_observer,
         })
     }
 
@@ -391,6 +397,7 @@ async fn accept(
         frame_delivery,
         rtx_dup,
         instream_group_fec,
+        metrics_observer,
     } = setup;
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
@@ -409,6 +416,7 @@ async fn accept(
     )?;
     unreliable_layer.rtx_dup = rtx_dup;
     unreliable_layer.instream_group_fec = instream_group_fec;
+    unreliable_layer.metrics_observer = metrics_observer;
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -690,6 +698,7 @@ async fn connect_bound(
 ) -> std::io::Result<Connected> {
     let ConnectConfig {
         log_config,
+        metrics_observer,
         handshake,
         fec,
         mss,
@@ -720,6 +729,7 @@ async fn connect_bound(
     )?;
     unreliable_layer.rtx_dup = rtx_dup;
     unreliable_layer.instream_group_fec = instream_group_fec;
+    unreliable_layer.metrics_observer = metrics_observer;
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }

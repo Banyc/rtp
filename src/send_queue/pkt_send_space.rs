@@ -326,16 +326,17 @@ impl PktSendSpace {
         self.liveness.refresh_waits(now, rto);
     }
 
-    pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
+    pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) -> bool {
         if self.outage.should_censor_rtt_sample(rtt, now) {
-            return;
+            return false;
         }
         if self.outage.try_close_epoch_with_fresh_sample() {
             self.rtt_stats.record_min_and_reseed_rto(rtt);
-            return;
+            return true;
         }
 
         self.rtt_stats.record_rtt(rtt);
+        false
     }
 
     pub fn accepts_new_pkt(&self) -> bool {
@@ -371,8 +372,15 @@ impl PktSendSpace {
 
     /// Produce a tail-loss probe if it is time for one. The probe retransmits
     /// the current tail packet with a fresh timestamp and RTO without marking
-    /// it as a loss event or clearing its congestion state.
-    pub fn tail_probe(&mut self, now: Instant) -> Option<Pkt<'_>> {
+    /// it as a loss event or clearing its congestion state. `packet_state`
+    /// refreshes the DRE packet state on the probe so recovered delivery-rate
+    /// samples inherit fresh prior_delivered/prior_time instead of stale
+    /// censored state.
+    pub fn tail_probe_with_state(
+        &mut self,
+        now: Instant,
+        packet_state: impl FnOnce() -> PacketState,
+    ) -> Option<Pkt<'_>> {
         if !self.has_tail_probe(now) {
             return None;
         }
@@ -380,6 +388,7 @@ impl PktSendSpace {
         self.tlp.sent();
         let rto = self.tlp.rto(&self.rtt_stats);
         let p = self.send_wnd.get_mut(&seq)?.as_mut()?;
+        p.stats = packet_state();
 
         // Refresh the timestamp/RTO so the probe is tracked as a fresh packet
         // for RTO calculation (the RTO fallback covers a lost probe).
@@ -402,6 +411,15 @@ impl PktSendSpace {
             seq,
             data: &p.data,
             frame_len: p.frame_len,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn tail_probe(&mut self, now: Instant) -> Option<Pkt<'_>> {
+        let no_packets_in_flight = self.no_pkts_in_flight();
+        let mut connection_state = dre::ConnectionState::new(now);
+        self.tail_probe_with_state(now, || {
+            connection_state.send_packet_2(now, no_packets_in_flight)
         })
     }
 
@@ -466,7 +484,11 @@ impl PktSendSpace {
             })
     }
 
-    pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
+    pub fn rtx_with_state(
+        &mut self,
+        now: Instant,
+        packet_state: impl FnOnce() -> PacketState,
+    ) -> Option<Pkt<'_>> {
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let stock_window = self.rtt_stats.reorder_window();
         let jcap = self.jitter_cap;
@@ -523,6 +545,11 @@ impl PktSendSpace {
                 None
             };
 
+            // Refresh the DRE packet state on this retransmit so recovered
+            // delivery-rate samples inherit fresh prior_delivered/prior_time
+            // instead of the stale pre-outage censored state.
+            p.stats = packet_state();
+
             // fresh pkt for this cwnd
             let considered_new_in_cwnd = if self.max_pipe_seq.is_some_and(|m| lt(m, s)) {
                 self.max_pipe_seq = Some(s);
@@ -563,6 +590,15 @@ impl PktSendSpace {
             return Some(p);
         }
         None
+    }
+
+    #[cfg(test)]
+    pub fn rtx(&mut self, now: Instant) -> Option<Pkt<'_>> {
+        let no_packets_in_flight = self.no_pkts_in_flight();
+        let mut connection_state = dre::ConnectionState::new(now);
+        self.rtx_with_state(now, || {
+            connection_state.send_packet_2(now, no_packets_in_flight)
+        })
     }
 
     /// Record any deferred CC loss-events whose stock reorder-window deadline

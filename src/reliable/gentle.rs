@@ -243,9 +243,12 @@ impl GentleMode {
 
     // ----- Test-visible accessors -------------------------------------------
 
-    #[cfg(test)]
     pub(crate) fn gentle_mode(&self) -> bool {
         self.gentle_mode
+    }
+
+    pub(crate) fn draining(&self) -> bool {
+        self.draining
     }
 
     #[cfg(test)]

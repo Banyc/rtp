@@ -77,8 +77,12 @@ impl WriteHalf {
         if self.termination.has_error() {
             return;
         }
-        self.termination
-            .press_broken_pipe(KillPolicy::SendKill, Some(context));
+        if self
+            .termination
+            .press_broken_pipe(KillPolicy::SendKill, Some(context))
+        {
+            self.log(crate::metrics::MetricsEvent::ProactiveTermination);
+        }
     }
 
     #[cfg(test)]
@@ -117,7 +121,7 @@ impl WriteHalf {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_pkt(payload, now)
             };
-            self.log("send_data_pkt");
+            self.log(crate::metrics::MetricsEvent::SendDataPacketAttempt);
             let Some(p) = res else {
                 if FEC_DEBUG {
                     eprintln!("send_data_pkt: no pkt to send (rtx=None, cwnd full or no tokens)");
@@ -425,7 +429,16 @@ impl WriteHalf {
 
 #[cfg(test)]
 mod tests {
+    use crate::delivery::frame::FrameMode;
+    use crate::metrics::{MetricsEvent, MetricsObserver};
     use crate::send_queue::liveness::PeerLiveness;
+    use crate::transmission::connection::new_connection_with_watchdog_tuning;
+    use crate::transmission::fec_tuning::FecTuning;
+    use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
+    use crate::transmission::transmission_layer::UnreliableLayer;
+    use crate::transmission::watchdog_tuning::WatchdogTuning;
+    use std::num::NonZeroUsize;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn term(l: &PeerLiveness, now: Instant, has_in_flight: bool) -> bool {
@@ -502,5 +515,50 @@ mod tests {
         l.on_send(now, rto);
         let dl = l.next_deadline(false).unwrap();
         assert!(dl > now, "deadline must be in the future");
+    }
+
+    #[test]
+    fn proactive_termination_emits_a_snapshot_event() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let layer = UnreliableLayer {
+            utp_read: Box::new(PendingRead),
+            utp_write: Box::new(BlockingWrite::new()),
+            post_open_handshake: None,
+            session_tag: None,
+            initial_sequences: crate::sequence::InitialSequences::ZERO,
+            initial_rtt: None,
+            metrics_observer: Some(observer),
+            mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
+            fec: None,
+            fec_tuning: FecTuning::default(),
+            frame_delivery: FrameMode::default(),
+            rtx_dup: false,
+            instream_group_fec: false,
+        };
+        let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (shared, write_half, _read_half, _reaper) =
+            new_connection_with_watchdog_tuning(layer, None, watchdog);
+        let now = Instant::now();
+        let mut reliable = shared.reliable_layer.lock().unwrap();
+        reliable.send_data_buf(b"x", now).unwrap();
+        let mut packet = vec![0; crate::udp::NO_FEC_MSS];
+        assert!(reliable.send_data_pkt(&mut packet, now).is_some());
+        drop(reliable);
+        write_half.proactively_terminate_stalled_session();
+        let observations = observations.lock().unwrap();
+        let event = observations
+            .iter()
+            .find(|observation| observation.event == MetricsEvent::ProactiveTermination)
+            .expect("watchdog termination must be observable");
+        assert_eq!(
+            event.snapshot.unwrap().stall_reason,
+            Some(crate::metrics::MetricsStallReason::NoResponse)
+        );
     }
 }
