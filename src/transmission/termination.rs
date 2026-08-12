@@ -1,6 +1,9 @@
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -41,6 +44,8 @@ struct State {
 #[derive(Debug)]
 struct Inner {
     state: Mutex<State>,
+    error_present: AtomicBool,
+    kill_pending: AtomicBool,
     terminal: CancellationToken,
     kill_requested: CancellationToken,
     kill_finished: CancellationToken,
@@ -73,6 +78,8 @@ pub(crate) fn new_termination() -> (TerminationPresser, TerminationWriter, Termi
             kill: KillState::NotRequested,
             writer_alive: true,
         }),
+        error_present: AtomicBool::new(false),
+        kill_pending: AtomicBool::new(false),
         terminal: CancellationToken::new(),
         kill_requested: CancellationToken::new(),
         kill_finished: CancellationToken::new(),
@@ -113,9 +120,13 @@ impl TerminationPresser {
                 false
             } else {
                 state.first_error = Some(FirstErrorValue { error, context });
+                // The atomics are monotonic fast-path hints, not replacement
+                // state machines: stores happen while the state mutex is held.
+                self.inner.error_present.store(true, Ordering::Release);
                 if peer_reset == KillPolicy::SendKill {
                     if state.writer_alive {
                         state.kill = KillState::Requested;
+                        self.inner.kill_pending.store(true, Ordering::Release);
                         request_kill = true;
                     } else {
                         state.kill = KillState::Finished;
@@ -135,13 +146,16 @@ impl TerminationPresser {
         inserted
     }
     pub(crate) fn check_error(&self) -> Result<(), IoErr> {
+        if !self.inner.error_present.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match &self.inner.state.lock().unwrap().first_error {
             Some(first) => Err(first.error),
             None => Ok(()),
         }
     }
     pub(crate) fn has_error(&self) -> bool {
-        self.inner.state.lock().unwrap().first_error.is_some()
+        self.inner.error_present.load(Ordering::Acquire)
     }
     pub(crate) fn io_error(&self, error: IoErr) -> std::io::Error {
         let context = self
@@ -168,11 +182,15 @@ impl TerminationWriter {
         &self.inner.kill_requested
     }
     pub(crate) fn take_kill_attempt(&self) -> Option<KillAttempt> {
+        if !self.inner.kill_pending.load(Ordering::Acquire) {
+            return None;
+        }
         let mut state = self.inner.state.lock().unwrap();
         if state.kill != KillState::Requested {
             return None;
         }
         state.kill = KillState::InProgress;
+        self.inner.kill_pending.store(false, Ordering::Release);
         Some(KillAttempt {
             inner: Arc::clone(&self.inner),
         })
@@ -186,6 +204,7 @@ impl Drop for TerminationWriter {
             state.writer_alive = false;
             if matches!(state.kill, KillState::Requested | KillState::InProgress) {
                 state.kill = KillState::Finished;
+                self.inner.kill_pending.store(false, Ordering::Release);
                 true
             } else {
                 false
