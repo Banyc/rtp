@@ -102,6 +102,9 @@ impl WriteHalf {
         self.proactively_terminate_stalled_session();
         self.check_error_after_requested_kill(bufs).await?;
         self.send_due_post_open_response().await?;
+        // `now` is already fixed for one send pass: compute the wire timestamp
+        // once and reuse it for every packet encoded by this pass.
+        let wire_ts = self.wire_ts(now);
         let mut written_bytes = 0;
         let mut written_fin = false;
         loop {
@@ -134,7 +137,7 @@ impl WriteHalf {
             let is_recovery = p.is_recovery;
             let data = EncodeData {
                 seq: p.seq,
-                send_ts: Some(self.wire_ts(now)),
+                send_ts: Some(wire_ts),
                 frame_len: p.frame_len,
                 data: &payload[..data_written],
             };
