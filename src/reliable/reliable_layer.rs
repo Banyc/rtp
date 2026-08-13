@@ -462,12 +462,10 @@ impl ReliableLayer {
         // regular retransmits, they resend an already-in-flight packet and
         // must fire during tail silence to avoid waiting the full RTO.
         if self.is_send_buf_empty()
-            && let Some(p) = self
-                .pkt_send_space
-                .tail_probe_with_state(now, || {
-                    self.connection_stats
-                        .send_packet_2(now, no_packets_in_flight)
-                })
+            && let Some(p) = self.pkt_send_space.tail_probe_with_state(now, || {
+                self.connection_stats
+                    .send_packet_2(now, no_packets_in_flight)
+            })
         {
             pkt[..p.data.len()].copy_from_slice(p.data);
 

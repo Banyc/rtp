@@ -6,6 +6,7 @@ use super::write_half::WriteHalf;
 use crate::ack::{EncodeAck, MAX_ACK_BLOCKS, next_page_cursor};
 use crate::codec::encode_ack_data;
 use crate::io_err::IoErr;
+use crate::metrics::MetricsTerminationCause;
 
 /// The wire bound on selective ACK blocks per datagram; page size for the
 /// ACK-flush paging scheme.
@@ -166,7 +167,7 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
                 break 'ack_pages;
             }
             Err(e) => {
-                write_half.termination.press_error(e);
+                write_half.press_error(e, MetricsTerminationCause::AckWrite);
                 if let Some(ts) = echo_ts.take().or(echo_backup) {
                     write_half.ack_flush.lock().unwrap().ts_echo.restore(ts);
                 }

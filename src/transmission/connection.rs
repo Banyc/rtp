@@ -19,7 +19,8 @@ use super::write_half::WriteHalf;
 use crate::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
 use crate::io_err::IoErr;
 use crate::metrics::{
-    MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver, SCHEMA_VERSION,
+    MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver, MetricsTermination,
+    MetricsTerminationCause, SCHEMA_VERSION,
 };
 use crate::pacer::{SendPacer, SendWake};
 use crate::reliable::reliable_layer::ReliableLayer;
@@ -223,9 +224,37 @@ impl Connection {
         self.termination.check_error()
     }
 
-    pub fn request_kill_and_abort(&self) {
-        self.termination
-            .press_broken_pipe(KillPolicy::SendKill, None);
+    pub(crate) fn request_kill_and_abort(&self, cause: MetricsTerminationCause) {
+        self.press_broken_pipe(KillPolicy::SendKill, None, cause);
+    }
+
+    pub(crate) fn press_error(&self, error: IoErr, cause: MetricsTerminationCause) -> bool {
+        let inserted = self.termination.press_error(error);
+        if inserted {
+            self.log(MetricsEvent::SessionTermination(MetricsTermination {
+                cause,
+                error_kind: error.kind(),
+                raw_os_error: error.raw_os_error(),
+            }));
+        }
+        inserted
+    }
+
+    pub(crate) fn press_broken_pipe(
+        &self,
+        policy: KillPolicy,
+        context: Option<super::transmission_layer::ProactiveTerminationContext>,
+        cause: MetricsTerminationCause,
+    ) -> bool {
+        let inserted = self.termination.press_broken_pipe(policy, context);
+        if inserted {
+            self.log(MetricsEvent::SessionTermination(MetricsTermination {
+                cause,
+                error_kind: std::io::ErrorKind::BrokenPipe,
+                raw_os_error: None,
+            }));
+        }
+        inserted
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<usize, IoErr> {
@@ -685,7 +714,9 @@ mod tests {
 
     use crate::delivery::frame::FrameMode;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
-    use crate::metrics::{MetricsEvent, MetricsInterest, MetricsObserver, SCHEMA_VERSION};
+    use crate::metrics::{
+        MetricsEvent, MetricsInterest, MetricsObserver, MetricsTerminationCause, SCHEMA_VERSION,
+    };
     use crate::pacer::SendWake;
     use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
@@ -811,6 +842,37 @@ mod tests {
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].raw_rtt_sample, Some(raw_rtt));
         assert_eq!(observations[0].snapshot, None);
+    }
+
+    #[test]
+    fn first_terminal_path_is_observed_once_with_its_owner() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        assert!(shared.press_error(
+            crate::io_err::IoErr::new(std::io::ErrorKind::ConnectionReset, Some(54)),
+            MetricsTerminationCause::DataWrite,
+        ));
+        assert!(!shared.press_error(
+            std::io::ErrorKind::BrokenPipe.into(),
+            MetricsTerminationCause::PeerKill,
+        ));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        let MetricsEvent::SessionTermination(termination) = observations[0].event else {
+            panic!("the first terminal path must emit a termination event");
+        };
+        assert_eq!(termination.cause, MetricsTerminationCause::DataWrite);
+        assert_eq!(termination.error_kind, std::io::ErrorKind::ConnectionReset);
+        assert_eq!(termination.raw_os_error, Some(54));
+        assert!(observations[0].snapshot.is_some());
     }
 
     #[tokio::test]

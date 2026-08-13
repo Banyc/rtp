@@ -8,6 +8,7 @@ use super::transmission_layer::{
 };
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
+use crate::metrics::MetricsTerminationCause;
 use crate::pacer::SendWake;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,12 +78,11 @@ impl WriteHalf {
         if self.termination.has_error() {
             return;
         }
-        if self
-            .termination
-            .press_broken_pipe(KillPolicy::SendKill, Some(context))
-        {
-            self.log(crate::metrics::MetricsEvent::ProactiveTermination);
-        }
+        self.press_broken_pipe(
+            KillPolicy::SendKill,
+            Some(context),
+            MetricsTerminationCause::ProactiveStall,
+        );
     }
 
     #[cfg(test)]
@@ -222,7 +222,7 @@ impl WriteHalf {
                                     }
                                 }
                                 Err(e) => {
-                                    self.termination.press_error(e);
+                                    self.press_error(e, MetricsTerminationCause::DataWrite);
                                     return Err(e);
                                 }
                             }
@@ -237,7 +237,7 @@ impl WriteHalf {
                     continue;
                 }
                 Err(e) => {
-                    self.termination.press_error(e);
+                    self.press_error(e, MetricsTerminationCause::DataWrite);
                     return Err(e);
                 }
             }
@@ -322,7 +322,7 @@ impl WriteHalf {
                     return Ok(());
                 }
                 Err(e) => {
-                    self.termination.press_error(e);
+                    self.press_error(e, MetricsTerminationCause::FecParityWrite);
                     return Err(e);
                 }
             }
@@ -345,7 +345,7 @@ impl WriteHalf {
                 Ok(())
             }
             Err(error) => {
-                self.termination.press_error(error);
+                self.press_error(error, MetricsTerminationCause::HandshakeWrite);
                 Err(error)
             }
         }
@@ -380,8 +380,11 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub async fn send_kill_and_abort(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        self.termination
-            .press_broken_pipe(KillPolicy::SendKill, None);
+        self.press_broken_pipe(
+            KillPolicy::SendKill,
+            None,
+            MetricsTerminationCause::LocalAbort,
+        );
         match self.try_send_requested_kill(bufs).await {
             Some(result) => result,
             None => self.termination.check_error(),
@@ -430,7 +433,7 @@ impl WriteHalf {
 #[cfg(test)]
 mod tests {
     use crate::delivery::frame::FrameMode;
-    use crate::metrics::{MetricsEvent, MetricsObserver};
+    use crate::metrics::{MetricsEvent, MetricsObserver, MetricsTerminationCause};
     use crate::send_queue::liveness::PeerLiveness;
     use crate::transmission::connection::new_connection_with_watchdog_tuning;
     use crate::transmission::fec_tuning::FecTuning;
@@ -554,7 +557,13 @@ mod tests {
         let observations = observations.lock().unwrap();
         let event = observations
             .iter()
-            .find(|observation| observation.event == MetricsEvent::ProactiveTermination)
+            .find(|observation| {
+                matches!(
+                    observation.event,
+                    MetricsEvent::SessionTermination(termination)
+                        if termination.cause == MetricsTerminationCause::ProactiveStall
+                )
+            })
             .expect("watchdog termination must be observable");
         assert_eq!(
             event.snapshot.unwrap().stall_reason,

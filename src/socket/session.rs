@@ -5,6 +5,8 @@ use tokio::task::{JoinError, JoinSet};
 
 use super::stream::{ConnReader, ConnWriter};
 
+use crate::metrics::MetricsTerminationCause;
+
 use crate::transmission::{
     connection::{Connection, new_connection, new_connection_with_watchdog_tuning},
     read_half::ReadHalf,
@@ -192,7 +194,9 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
                     }
                 };
                 if read_closed && 0 < recv_pkts.num_payload_segments {
-                    shared.request_kill_and_abort();
+                    shared.request_kill_and_abort(
+                        MetricsTerminationCause::UnreadPayloadAfterReadClose,
+                    );
                     return;
                 }
             }

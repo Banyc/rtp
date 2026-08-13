@@ -7,6 +7,7 @@ use super::transmission_layer::{
 };
 use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
+use crate::metrics::MetricsTerminationCause;
 use crate::{
     ack::AckBlocks,
     codec::decode,
@@ -38,9 +39,8 @@ impl ReadHalf {
             shared,
         } = self;
         let shared: &Connection = shared.as_ref();
-        let termination = &shared.termination;
-        let record_error = |e: IoErr| {
-            termination.press_error(e);
+        let record_error = |e: IoErr, cause: MetricsTerminationCause| {
+            shared.press_error(e, cause);
             e
         };
         let mut recv_pkts = RecvPkts {
@@ -78,7 +78,10 @@ impl ReadHalf {
             let read_bytes = match res {
                 Ok(x) => x,
                 Err(e) => {
-                    return Err((record_error(e), SendKillPkt::No));
+                    return Err((
+                        record_error(e, MetricsTerminationCause::UnreliableRead),
+                        SendKillPkt::No,
+                    ));
                 }
             };
             let now = Instant::now();
@@ -131,7 +134,7 @@ impl ReadHalf {
                 }
                 if data.killed {
                     let e = IoErr::from(std::io::ErrorKind::BrokenPipe);
-                    record_error(e);
+                    record_error(e, MetricsTerminationCause::PeerKill);
                     return Err((e, SendKillPkt::No));
                 }
                 let is_fin = data

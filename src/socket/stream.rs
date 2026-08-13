@@ -8,6 +8,7 @@ use async_async_io::{
 use super::session::SessionHandle;
 
 use crate::io_err::IoErr;
+use crate::metrics::MetricsTerminationCause;
 use crate::transmission::connection::Connection;
 
 pub type AsyncReadAdapter = PollRead<ConnReader>;
@@ -33,7 +34,8 @@ impl AsyncWriteAdapter {
     }
 
     pub async fn send_kill_and_abort(&mut self) {
-        self.abort_session.request_kill_and_abort();
+        self.abort_session
+            .request_kill_and_abort(MetricsTerminationCause::LocalAbort);
     }
 }
 
@@ -296,7 +298,8 @@ impl ConnWriter {
     }
 
     pub async fn send_kill_and_abort(&mut self) {
-        self.transmission_layer.request_kill_and_abort();
+        self.transmission_layer
+            .request_kill_and_abort(MetricsTerminationCause::LocalAbort);
     }
 
     pub fn into_async_write(self) -> AsyncWriteAdapter {

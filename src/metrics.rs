@@ -9,7 +9,62 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 7;
+pub const SCHEMA_VERSION: u16 = 8;
+
+/// Why the session reached its first terminal error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsTerminationCause {
+    LocalAbort,
+    UnreadPayloadAfterReadClose,
+    PeerKill,
+    UnreliableRead,
+    DataWrite,
+    AckWrite,
+    FecParityWrite,
+    HandshakeWrite,
+    ProactiveStall,
+}
+
+impl MetricsTerminationCause {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalAbort => "local_abort",
+            Self::UnreadPayloadAfterReadClose => "unread_payload_after_read_close",
+            Self::PeerKill => "peer_kill",
+            Self::UnreliableRead => "unreliable_read",
+            Self::DataWrite => "data_write",
+            Self::AckWrite => "ack_write",
+            Self::FecParityWrite => "fec_parity_write",
+            Self::HandshakeWrite => "handshake_write",
+            Self::ProactiveStall => "proactive_stall",
+        }
+    }
+}
+
+/// The typed first terminal error recorded for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsTermination {
+    pub cause: MetricsTerminationCause,
+    pub error_kind: std::io::ErrorKind,
+    pub raw_os_error: Option<i32>,
+}
+
+impl MetricsTermination {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn error_kind_str(self) -> &'static str {
+        match self.error_kind {
+            std::io::ErrorKind::BrokenPipe => "broken_pipe",
+            std::io::ErrorKind::ConnectionReset => "connection_reset",
+            std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+            std::io::ErrorKind::NotConnected => "not_connected",
+            std::io::ErrorKind::TimedOut => "timed_out",
+            std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+            std::io::ErrorKind::WouldBlock => "would_block",
+            _ => "other",
+        }
+    }
+}
 
 /// Most recent congestion-controller branch evaluated for the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,8 +137,8 @@ pub enum MetricsEvent {
     SendDataPacketAttempt,
     /// A raw timestamp-echo RTT sample was accepted by the estimator.
     RttSample,
-    /// The peer-liveness watchdog committed proactive session termination.
-    ProactiveTermination,
+    /// The first terminal error that owns the session failure.
+    SessionTermination(MetricsTermination),
 }
 
 impl MetricsEvent {
@@ -98,7 +153,7 @@ impl MetricsEvent {
             Self::ReceiveDataPacket => "recv_data_pkt",
             Self::SendDataPacketAttempt => "send_data_pkt",
             Self::RttSample => "rtt_sample",
-            Self::ProactiveTermination => "proactive_termination",
+            Self::SessionTermination(_) => "session_termination",
         }
     }
 }
