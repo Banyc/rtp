@@ -130,20 +130,20 @@ async fn run_udp_accept_driver(
 ) -> TransportTaskExit {
     let mut first_tx = Some(first_tx);
     let mut handshakes = JoinSet::new();
-    loop {
+    let exit = loop {
         tokio::select! {
             next = listener.accept_with(config.clone()) => {
                 match next {
                     Ok(task) => {
                         handshakes.spawn(task);
                     }
-                    Err(error) => return TransportTaskExit::DriverFailed {
+                    Err(error) => break TransportTaskExit::DriverFailed {
                         driver: "rtp_accept",
                         detail: error.to_string(),
                     },
                 }
             }
-            _ = stop.changed() => return TransportTaskExit::Stopped,
+            _ = stop.changed() => break TransportTaskExit::Stopped,
             joined = handshakes.join_next(), if !handshakes.is_empty() => {
                 let result = joined.expect("guarded non-empty").unwrap();
                 match result {
@@ -158,6 +158,24 @@ async fn run_udp_accept_driver(
                     }
                 }
             }
+        }
+    };
+    abort_and_reap_handshakes(&mut handshakes).await;
+    exit
+}
+
+async fn abort_and_reap_handshakes(handshakes: &mut JoinSet<std::io::Result<rtp::udp::Accepted>>) {
+    handshakes.abort_all();
+    while let Some(joined) = handshakes.join_next().await {
+        if joined
+            .as_ref()
+            .is_err_and(tokio::task::JoinError::is_cancelled)
+        {
+            continue;
+        }
+        match joined.unwrap() {
+            Ok(accepted) => drop(accepted),
+            Err(error) => eprintln!("RTP handshake rejected during shutdown: {error:?}"),
         }
     }
 }
@@ -189,5 +207,22 @@ async fn run_mpudp_accept_driver(
             }
             _ = stop.changed() => return TransportTaskExit::Stopped,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abort_and_reap_handshakes;
+    use tokio::task::JoinSet;
+
+    #[tokio::test]
+    #[should_panic(expected = "handshake child panic")]
+    async fn udp_accept_epilog_cascades_a_completed_handshake_panic() {
+        let mut handshakes = JoinSet::new();
+        let abort_handle = handshakes.spawn(async { panic!("handshake child panic") });
+        while !abort_handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        abort_and_reap_handshakes(&mut handshakes).await;
     }
 }
