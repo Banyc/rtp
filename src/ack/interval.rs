@@ -98,7 +98,7 @@ impl AckHistory {
                 start: seq,
                 size: NonZeroU64::new(1).unwrap(),
             };
-            if self.start_to_size.len() != 0
+            if !self.start_to_size.is_empty()
                 && let Some(following) = self
                     .start_to_size
                     .successor(seq)

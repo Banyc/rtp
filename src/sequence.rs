@@ -200,6 +200,10 @@ impl<V> SequenceMap<V> {
         self.inner.len()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     /// Insert `value` at `seq`.  Returns the previous value when the key was
     /// already present; `None` when the key is outside the live window (the
     /// insertion is rejected) or when the key was absent.
@@ -234,9 +238,32 @@ impl<V> SequenceMap<V> {
         self.inner.get(&RawSequenceKey(seq.to_wire()))
     }
 
-    #[cfg(test)]
     pub(crate) fn contains_key(&self, seq: &SequenceNumber) -> bool {
         self.inner.contains_key(&RawSequenceKey(seq.to_wire()))
+    }
+
+    /// The logically-first retained entry, wrap-aware: the smallest key at or
+    /// after the anchor, or the smallest wrapped key when the anchor segment
+    /// is empty.
+    pub(crate) fn first(&self) -> Option<(SequenceNumber, &V)> {
+        let anchor = RawSequenceKey(self.window.anchor().to_wire());
+        self.inner
+            .range(anchor..)
+            .next()
+            .or_else(|| self.inner.range(..anchor).next())
+            .map(|(k, v)| (SequenceNumber::from_wire(k.0), v))
+    }
+
+    /// The logically-last retained entry, wrap-aware: the largest key below
+    /// the anchor (the wrapped low segment is the logical tail), or the
+    /// largest key at/after the anchor when the wrapped segment is empty.
+    pub(crate) fn last(&self) -> Option<(SequenceNumber, &V)> {
+        let anchor = RawSequenceKey(self.window.anchor().to_wire());
+        self.inner
+            .range(..anchor)
+            .next_back()
+            .or_else(|| self.inner.range(anchor..).next_back())
+            .map(|(k, v)| (SequenceNumber::from_wire(k.0), v))
     }
 
     /// Logical iteration: chain `[anchor..]` then `[..anchor)` exactly once.
@@ -417,6 +444,71 @@ impl<V> SendWindow<Option<V>> {
     }
 }
 
+/// A contiguous sequence queue (like [`SendWindow`]) whose iteration from an
+/// interior point skips the forward offset from the queue start and never
+/// circles back around the wrapping space.
+///
+/// Unlike [`SequenceMap::iter_from`], which chains the wrapped low segment
+/// back onto the logical tail, a queue has a single physical backing array:
+/// `iter_from(start)` maps `start` to its local index via the forward
+/// distance from the queue start and yields only the suffix `[start..)`.
+#[derive(Debug, Clone)]
+pub(crate) struct SequenceQueue<V> {
+    start: SequenceNumber,
+    next: SequenceNumber,
+    queue: VecDeque<V>,
+}
+
+impl<V> SequenceQueue<V> {
+    pub(crate) fn new(start: SequenceNumber) -> Self {
+        Self {
+            start,
+            next: start,
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// The queue's logical start (the sequence of the front entry).
+    pub(crate) fn start(&self) -> SequenceNumber {
+        self.start
+    }
+
+    /// The next sequence a push will occupy.
+    pub(crate) fn next(&self) -> SequenceNumber {
+        self.next
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Enqueue a value at the next sequence (wrapping arithmetic).
+    pub(crate) fn push(&mut self, value: V) {
+        self.queue.push_back(value);
+        self.next = self.next.advance(1);
+    }
+
+    /// Iterate the logical suffix starting at `start`: skip the forward
+    /// offset from the queue start and stop at the physical end — never
+    /// circling back around the wrap.  Sequences outside the queue (stale or
+    /// too far ahead) yield an empty iterator.
+    pub(crate) fn iter_from(
+        &self,
+        start: SequenceNumber,
+    ) -> impl Iterator<Item = (SequenceNumber, &V)> + '_ {
+        let offset = self.start.forward_distance_to(start);
+        self.queue
+            .iter()
+            .enumerate()
+            .skip(offset as usize)
+            .map(|(i, v)| (self.start.advance(i as u64), v))
+    }
+}
+
 /// Strictly-less-than within a live window (all compared values within
 /// `HALF_SEQUENCE_SPACE` of one another).
 pub(crate) fn lt(a: SequenceNumber, b: SequenceNumber) -> bool {
@@ -568,6 +660,53 @@ mod tests {
             .map(|(k, _)| k.to_wire())
             .collect();
         assert_eq!(from_anchor.len(), 5);
+    }
+
+    #[test]
+    fn sequence_map_first_last_are_wrap_aware() {
+        let mut map: SequenceMap<u32> = SequenceMap::new(seq(u64::MAX - 2), 8);
+        assert!(map.is_empty());
+        assert!(map.first().is_none());
+        assert!(map.last().is_none());
+        for (s, v) in [(u64::MAX - 2, 1), (u64::MAX, 3), (0, 4)] {
+            assert!(map.insert(seq(s), v).is_none());
+        }
+        // Logical order: [MAX-2, ..., MAX, 0, ...]; first is the anchor,
+        // last is the wrapped low segment's tail.
+        assert_eq!(map.first().map(|(k, _)| k.to_wire()), Some(u64::MAX - 2));
+        assert_eq!(map.last().map(|(k, _)| k.to_wire()), Some(0));
+        assert!(!map.is_empty());
+        // After removing the anchor segment the wrapped segment leads.
+        map.remove(&seq(u64::MAX - 2));
+        map.remove(&seq(u64::MAX));
+        assert_eq!(map.first().map(|(k, _)| k.to_wire()), Some(0));
+        assert_eq!(map.last().map(|(k, _)| k.to_wire()), Some(0));
+        // Production contains_key sees retained keys only.
+        assert!(map.contains_key(&seq(0)));
+        assert!(!map.contains_key(&seq(u64::MAX - 2)));
+    }
+
+    #[test]
+    fn sequence_queue_iter_from_skips_the_forward_offset_without_circling() {
+        let mut queue: SequenceQueue<u32> = SequenceQueue::new(seq(u64::MAX - 1));
+        for v in 1..=5 {
+            queue.push(v);
+        }
+        // Entries sit at MAX-1, MAX, 0, 1, 2 (straddling the wrap).
+        assert_eq!(queue.start().to_wire(), u64::MAX - 1);
+        assert_eq!(queue.len(), 5);
+        let from_wrapped: Vec<(u64, u32)> = queue
+            .iter_from(seq(0))
+            .map(|(k, v)| (k.to_wire(), *v))
+            .collect();
+        assert_eq!(
+            from_wrapped,
+            vec![(0, 3), (1, 4), (2, 5)],
+            "iter_from must skip the forward offset and never circle back"
+        );
+        // The queue start yields the whole suffix; a stale start yields none.
+        assert_eq!(queue.iter_from(queue.start()).count(), 5);
+        assert_eq!(queue.iter_from(seq(3)).count(), 0, "past the physical end");
     }
 
     #[test]
