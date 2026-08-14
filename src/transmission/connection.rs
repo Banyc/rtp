@@ -4,9 +4,7 @@ use std::sync::{
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::ack_flush::AckFlushState;
 use super::coordination::Signals;
-use super::fec::FecState;
 use super::read_half::ReadHalf;
 use super::termination::{KillPolicy, TerminationPresser, TerminationReaper, new_termination};
 use super::transmission_layer::{
@@ -16,14 +14,16 @@ use super::ts_echo::RecentEchoes;
 use super::watchdog_tuning::WatchdogTuning;
 use super::write_half::WriteHalf;
 
-use crate::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
 use crate::io_err::IoErr;
 use crate::metrics::{
     MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver, MetricsTermination,
     MetricsTerminationCause, SCHEMA_VERSION,
 };
-use crate::pacer::{SendPacer, SendWake};
 use crate::reliable::reliable_layer::ReliableLayer;
+use crate::traffic_shaping::control::ack_flush::AckFlushState;
+use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
+use crate::traffic_shaping::core::{SendPacer, SendWake};
+use crate::traffic_shaping::redundancy::fec::FecState;
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceivedBatch {
@@ -717,8 +717,8 @@ mod tests {
     use crate::metrics::{
         MetricsEvent, MetricsInterest, MetricsObserver, MetricsTerminationCause, SCHEMA_VERSION,
     };
-    use crate::pacer::SendWake;
-    use crate::transmission::fec_tuning::FecTuning;
+    use crate::traffic_shaping::core::SendWake;
+    use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
 

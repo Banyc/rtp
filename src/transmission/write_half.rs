@@ -9,7 +9,7 @@ use super::transmission_layer::{
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::MetricsTerminationCause;
-use crate::pacer::SendWake;
+use crate::traffic_shaping::core::SendWake;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendLoopResult {
@@ -63,8 +63,12 @@ impl WriteHalf {
             };
             ProactiveTerminationContext {
                 reason: match reason {
-                    crate::send_queue::liveness::PeerStall::NoResponse => "no_response",
-                    crate::send_queue::liveness::PeerStall::NoProgress => "no_progress",
+                    crate::traffic_shaping::recovery::liveness::PeerStall::NoResponse => {
+                        "no_response"
+                    }
+                    crate::traffic_shaping::recovery::liveness::PeerStall::NoProgress => {
+                        "no_progress"
+                    }
                 },
                 no_response_for_ms: send_space
                     .no_resp_for(now)
@@ -408,7 +412,7 @@ impl WriteHalf {
                 return Ok(());
             }
         }
-        super::ack_flush::flush(self, bufs).await
+        crate::traffic_shaping::control::ack_flush::flush(self, bufs).await
     }
 
     pub(crate) async fn send_with_fec(
@@ -434,9 +438,9 @@ impl WriteHalf {
 mod tests {
     use crate::delivery::frame::FrameMode;
     use crate::metrics::{MetricsEvent, MetricsObserver, MetricsTerminationCause};
-    use crate::send_queue::liveness::PeerLiveness;
+    use crate::traffic_shaping::recovery::liveness::PeerLiveness;
+    use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
     use crate::transmission::connection::new_connection_with_watchdog_tuning;
-    use crate::transmission::fec_tuning::FecTuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
     use crate::transmission::watchdog_tuning::WatchdogTuning;

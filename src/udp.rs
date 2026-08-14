@@ -13,16 +13,19 @@ use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::UnreliableLayer;
 use crate::{
     delivery::frame::{FrameMode, frame_delivery_from_env},
-    handshake::{client_opening_handshake, server_opening_handshake},
     socket::{
         ConnReader, ConnWriter, FrameByteReader, FrameByteWriter, SessionHandle,
         into_frame_io_parts, socket, socket_with_watchdog_tuning,
     },
-    transmission::{
-        fec_tuning::{FecTuning, fec_tuning_from_env},
-        transmission_layer::{
-            self, UnreliableRead, UnreliableWrite, instream_group_fec_from_env, rtx_dup_from_env,
+    traffic_shaping::{
+        control::handshake::{client_opening_handshake, server_opening_handshake},
+        redundancy::{
+            fec_tuning::{FecTuning, fec_tuning_from_env},
+            instream_group_fec_from_env, rtx_dup_from_env,
         },
+    },
+    transmission::{
+        transmission_layer::{self, UnreliableRead, UnreliableWrite},
         watchdog_tuning::WatchdogTuning,
     },
 };
@@ -1034,7 +1037,7 @@ mod tests {
             Box::new(Dummy),
             false,
             ValidMss::try_new(mss).unwrap(),
-            crate::transmission::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             FrameMode::enabled(),
         );
         assert!(matches!(

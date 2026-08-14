@@ -318,13 +318,13 @@ mod tests {
         harness_with_tuning(
             fec,
             enabled,
-            crate::transmission::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
         )
     }
     fn harness_with_tuning(
         fec: bool,
         enabled: bool,
-        tuning: crate::transmission::fec_tuning::FecTuning,
+        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
@@ -383,7 +383,7 @@ mod tests {
             }),
             true,
             crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::transmission::fec_tuning::FecTuning::max_diversity(),
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::max_diversity(),
             crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
@@ -541,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
-        use crate::transmission::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
         let payload = vec![0u8; 100];
         let now = Instant::now();
@@ -598,7 +598,7 @@ mod tests {
             Box::new(write),
             fec,
             crate::udp::ValidMss::try_new(mss).unwrap(),
-            crate::transmission::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[tokio::test]
     async fn proactive_watchdog_aborts_locally_before_best_effort_kill_completes() {
-        use crate::transmission::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
         use crate::transmission::watchdog_tuning::WatchdogTuning;
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         let kill_started = Arc::new(tokio::sync::Notify::new());

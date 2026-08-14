@@ -10,7 +10,8 @@ use primitive::{
 use crate::{
     ack::{AckBlocks, MAX_ACK_BLOCKS},
     recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
-    send_queue::{
+    sequence::{SendWindow, SequenceNumber, le, lt},
+    traffic_shaping::recovery::{
         liveness::PeerLiveness,
         loss_event_window::LossEventWindow,
         outage::{OutageDetection, OutageEpoch},
@@ -18,7 +19,6 @@ use crate::{
         rtx_index::{ReadyReason, RetransmissionIndex},
         tlp::TailLossProber,
     },
-    sequence::{SendWindow, SequenceNumber, le, lt},
     transmission::watchdog_tuning::WatchdogTuning,
 };
 

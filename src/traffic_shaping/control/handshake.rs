@@ -1,5 +1,8 @@
+#[path = "opening.rs"]
 pub(crate) mod opening;
+#[path = "post_open.rs"]
 pub(crate) mod post_open;
+#[path = "wire.rs"]
 pub(crate) mod wire;
 
 pub(crate) use opening::{client_opening_handshake, server_opening_handshake};

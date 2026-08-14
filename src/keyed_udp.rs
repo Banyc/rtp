@@ -10,10 +10,8 @@ use udp_listener::{Classified, ConnWrite, DispatchPolicy, Packet, UtpListener};
 use crate::delivery::frame::FrameMode;
 use crate::{
     socket::{ConnReader, ConnWriter, SessionHandle, socket},
-    transmission::{
-        fec_tuning::FecTuning,
-        transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
-    },
+    traffic_shaping::redundancy::fec_tuning::FecTuning,
+    transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::{
         self, AcceptConfig, MaybeRawFd, ValidMss, maybe_raw_fd, should_wait_after_try_send,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
@@ -367,7 +365,7 @@ mod tests {
     use super::*;
 
     use crate::delivery::frame::FrameMode;
-    use crate::transmission::fec_tuning::FecTuning;
+    use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
     use crate::transmission::transmission_layer::UnreliableRead;
 
     #[derive(Debug)]

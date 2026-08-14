@@ -11,7 +11,7 @@ use crate::metrics::MetricsTerminationCause;
 use crate::{
     ack::AckBlocks,
     codec::decode,
-    handshake::{PostOpenVerdict, is_post_open_candidate},
+    traffic_shaping::control::handshake::{PostOpenVerdict, is_post_open_candidate},
 };
 
 pub struct ReadHalf {

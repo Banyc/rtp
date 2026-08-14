@@ -26,9 +26,9 @@ use crate::{
             send::{FrameSendStage, MAX_FRAME_LEN},
         },
     },
-    pacer::SendPacer,
     recv_queue::pkt_recv_space::PktRecvSpace,
-    send_queue::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
+    traffic_shaping::core::SendPacer,
+    traffic_shaping::recovery::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
@@ -85,13 +85,13 @@ const DRAIN_FLOOR_PEAK_FRACTION: f64 = 0.25;
 /// stale windowed peak.
 const DRAIN_FLOOR_GRACE_RTTS: f64 = 3.0;
 
-// Gentle-mode parameters are defined in super::gentle and re-exported here
-// so the test imports via `super::` continue to work.
-pub(crate) use super::gentle::*;
+// Gentle-mode parameters are defined in crate::traffic_shaping::core and
+// re-exported here so the test imports via `super::` continue to work.
+pub(crate) use crate::traffic_shaping::core::*;
 
 #[cfg(test)]
-use super::rate_window::{RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE};
-use super::rate_window::{WindowedDeliveryMax, WindowedRttMin};
+use crate::traffic_shaping::core::{RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE};
+use crate::traffic_shaping::core::{WindowedDeliveryMax, WindowedRttMin};
 
 #[derive(Debug, Clone)]
 enum FinState {
@@ -1071,10 +1071,10 @@ impl ReliableLayer {
             .pkt_send_space
             .stall_reason(now)
             .map(|reason| match reason {
-                crate::send_queue::liveness::PeerStall::NoResponse => {
+                crate::traffic_shaping::recovery::liveness::PeerStall::NoResponse => {
                     crate::metrics::MetricsStallReason::NoResponse
                 }
-                crate::send_queue::liveness::PeerStall::NoProgress => {
+                crate::traffic_shaping::recovery::liveness::PeerStall::NoProgress => {
                     crate::metrics::MetricsStallReason::NoProgress
                 }
             });

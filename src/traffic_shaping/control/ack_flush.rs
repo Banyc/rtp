@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
-use super::transmission_layer::SendBufs;
-use super::ts_echo::TsEcho;
-use super::write_half::WriteHalf;
 use crate::ack::{EncodeAck, MAX_ACK_BLOCKS, next_page_cursor};
 use crate::codec::encode_ack_data;
 use crate::io_err::IoErr;
 use crate::metrics::MetricsTerminationCause;
+use crate::transmission::transmission_layer::SendBufs;
+use crate::transmission::ts_echo::TsEcho;
+use crate::transmission::write_half::WriteHalf;
 
 /// The wire bound on selective ACK blocks per datagram; page size for the
 /// ACK-flush paging scheme.

@@ -7,10 +7,8 @@ use crate::io_err::IoErr;
 use crate::{
     delivery::frame::FrameMode,
     socket::{ConnReader, ConnWriter, SessionHandle, socket},
-    transmission::{
-        fec_tuning::FecTuning,
-        transmission_layer::{UnreliableRead, UnreliableWrite},
-    },
+    traffic_shaping::redundancy::fec_tuning::FecTuning,
+    transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
         AcceptConfig, ConnectConfig, LogConfig, ValidMss,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,

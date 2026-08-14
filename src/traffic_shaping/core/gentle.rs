@@ -94,8 +94,8 @@ impl GentleMode {
         } = config;
         let enter_tol = rttvar
             .mul_f64(enter_coefficient)
-            .max(floor.mul_f64(super::reliable_layer::QUEUE_TOL_RTT_FRACTION))
-            .max(super::reliable_layer::QUEUE_RTT_FLOOR);
+            .max(floor.mul_f64(crate::reliable::reliable_layer::QUEUE_TOL_RTT_FRACTION))
+            .max(crate::reliable::reliable_layer::QUEUE_RTT_FLOOR);
 
         let entering = smooth > floor + enter_tol;
         if entering {
@@ -170,8 +170,11 @@ impl GentleMode {
 
         let open_since = self.gentle_gate_open_since.get_or_insert(now);
         let open_for = now.saturating_duration_since(*open_since);
-        let open_threshold = crate::reliable::rate_window::RTT_MIN_BUCKET
-            .max(smooth_rtt.saturating_mul(crate::reliable::rate_window::RTT_MIN_BUCKET_RTT_SCALE));
+        let open_threshold = crate::traffic_shaping::core::rate_window::RTT_MIN_BUCKET.max(
+            smooth_rtt.saturating_mul(
+                crate::traffic_shaping::core::rate_window::RTT_MIN_BUCKET_RTT_SCALE,
+            ),
+        );
         if open_for >= open_threshold {
             // The gate has been open long enough on a clean link: leave gentle
             // mode and let normal probing take over.

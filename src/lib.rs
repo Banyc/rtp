@@ -1,25 +1,22 @@
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
-pub mod io_err;
-pub mod keyed_udp;
-pub mod metrics;
-pub mod mpudp;
-pub mod path_probe;
-pub mod socket;
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
-pub mod udp;
-
 mod ack;
 mod codec;
 mod delivery;
-mod handshake;
-mod pacer;
+pub mod io_err;
+pub mod keyed_udp;
+pub mod mpudp;
 mod recv_queue;
 mod reliable;
-mod send_queue;
 mod sequence;
+pub mod socket;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+pub mod traffic_shaping;
 mod transmission;
+pub mod udp;
+pub use traffic_shaping::adjacent::metrics;
+pub use traffic_shaping::control::path_probe;
 
 pub use delivery::frame::{FrameMode, frame_delivery_from_env};
 pub use io_err::IoErr;
@@ -33,7 +30,7 @@ pub use socket::{
     AsyncReadAdapter, AsyncWriteAdapter, ConnReader, ConnWriter, FrameByteReader, FrameByteWriter,
     IoStream, SessionHandle, socket_with_watchdog_tuning, unsplit,
 };
-pub use transmission::fec_tuning::{FecTuning, fec_tuning_from_env};
+pub use traffic_shaping::redundancy::{FecTuning, fec_tuning_from_env};
 pub use transmission::transmission_layer::{
     LogConfig as LayerLogConfig, UnreliableLayer, UnreliableRead, UnreliableWrite,
 };

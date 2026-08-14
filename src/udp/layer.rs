@@ -7,11 +7,11 @@ use super::MAX_MSS;
 #[cfg(test)]
 use super::NO_FEC_MSS;
 use crate::delivery::frame::FrameMode;
-use crate::transmission::{
+use crate::traffic_shaping::redundancy::{
     fec::{FecConfig, FecState},
     fec_tuning::FecTuning,
-    transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
 };
+use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
 /// A maximum segment size that has been validated against the datagram
 /// ceiling and the codec payload overhead.  Construction is fallible; every

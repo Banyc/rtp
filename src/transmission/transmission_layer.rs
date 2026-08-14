@@ -4,60 +4,17 @@ use std::{io::IoSlice, path::PathBuf, sync::Mutex, time::Duration};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{fec::FecState, fec_tuning::FecTuning};
 use crate::ack::AckInterval;
 use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
 use crate::sequence::InitialSequences;
+use crate::traffic_shaping::redundancy::{fec::FecState, fec_tuning::FecTuning};
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
 pub(crate) const BUF_SIZE: usize = 1024 * 64;
 
-pub(crate) use super::ack_flush::MAX_NUM_ACK;
-
-/// Whether retransmission armor (`RTP_RTX_DUP`) is enabled at process
-/// startup.  Reads `RTP_RTX_DUP` once; `1`/`true` enables it, anything
-/// else preserves stock single-datagram behaviour byte-for-byte.
-///
-/// When enabled, the transmission layer emits a second identical copy of
-/// every retransmit and tail-loss-probe datagram — reusing the exact
-/// already-encoded symbol bytes (encode once, send twice).  The primary
-/// repair datagram always sends (it bypasses the pacing token bucket as
-/// today); the duplicate is skipped when the token bucket lacks tokens and
-/// is charged to the bucket when sent, and is suppressed whenever the
-/// delivery-rate congestion controller reports the bottleneck queue is
-/// building.  Duplicating ordinary data packets is never done — the win is
-/// specific to rare recovery packets.
-pub(crate) fn rtx_dup_from_env() -> bool {
-    match std::env::var("RTP_RTX_DUP") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
-
-/// Whether in-stream group FEC (`RTP_INSTREAM_GROUP_FEC`) is enabled at
-/// process startup.  Reads the env var once; `1`/`true` enables it, anything
-/// else preserves stock behaviour byte-for-byte (parity is tail-only and
-/// force-skipped at `PARITY_DATA_THRESHOLD`).
-///
-/// When enabled, the transmission layer suppresses the
-/// `PARITY_DATA_THRESHOLD` force-skip in `encode_data` (passing
-/// `instream = true`), so a data group may accumulate up to
-/// `INSTREAM_DATA_PER_GROUP` (8) data symbols.  Right after each successful
-/// data send, `maybe_flush_full_fec_group` emits
-/// `INSTREAM_PARITY_PER_GROUP` (4) parity symbols inline mid-burst when the
-/// group is full, gated on the spare-token budget.  At the data-path burst
-/// close, a partial DATA group is force-flushed (regardless of the stock
-/// `can_send_tail_fec` gate) so a burst ending mid-group still emits its
-/// stock 1:4 parity.  ACK/kill bursts keep the stock tail gate untouched
-/// (force-flushing ACK bursts tripled reverse-path packets for zero gain).
-pub(crate) fn instream_group_fec_from_env() -> bool {
-    match std::env::var("RTP_INSTREAM_GROUP_FEC") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
-}
+pub(crate) use crate::traffic_shaping::control::ack_flush::MAX_NUM_ACK;
 
 pub(crate) type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
@@ -123,7 +80,8 @@ pub struct UnreliableLayer {
     pub(crate) utp_read: Box<dyn UnreliableRead>,
     pub(crate) utp_write: Box<dyn UnreliableWrite>,
     #[doc(hidden)]
-    pub(crate) post_open_handshake: Option<crate::handshake::PostOpenHandshake>,
+    pub(crate) post_open_handshake:
+        Option<crate::traffic_shaping::control::handshake::PostOpenHandshake>,
     /// Per-connection session tag that authenticates codec control-plane
     /// datagrams after the opening handshake.  `None` for connections opened
     /// without a handshake (no secret exists; the control plane stays

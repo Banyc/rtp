@@ -104,7 +104,7 @@ impl Default for TailLossProber {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::send_queue::rtt_stats::RttStats;
+    use crate::traffic_shaping::recovery::rtt_stats::RttStats;
 
     use super::TailLossProber;
 

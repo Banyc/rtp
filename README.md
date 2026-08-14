@@ -11,7 +11,7 @@ Treat RTP like TCP for behavior common to reliable stream transports. In particu
 - an async-free reliable layer
   - a piece of pure algorithm
   - main entry: [[src/reliable/reliable_layer.rs]]
-  - send window: [[src/send_queue/pkt_send_space.rs]]
+  - send window: [[src/traffic_shaping/recovery/pkt_send_space.rs]]
   - recv window: [[src/recv_queue/pkt_recv_space.rs]]
   - ACK calculation: [[src/ack/]] (intervals, wire selection, sender interpretation)
 - a dead simple codec for packet encoding/decoding
@@ -31,6 +31,12 @@ Treat RTP like TCP for behavior common to reliable stream transports. In particu
 - a user-facing keyed-streams over-single-UDP-connection implementation
   - exposing listening, accepting, and connecting APIs
   - main entry: [[src/keyed_udp.rs]]
+- traffic-shaping policy, organized by concern:
+  - adjacent observations/configuration: [[src/traffic_shaping/adjacent/]]
+  - reverse/control traffic: [[src/traffic_shaping/control/]]
+  - core forward shaping: [[src/traffic_shaping/core/]]
+  - recovery shaping: [[src/traffic_shaping/recovery/]]
+  - redundancy shaping: [[src/traffic_shaping/redundancy/]]
 
 ## How to use
 

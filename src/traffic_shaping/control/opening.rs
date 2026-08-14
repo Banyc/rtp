@@ -246,14 +246,14 @@ mod tests {
     use super::*;
     use crate::{
         codec,
-        handshake::{PostOpenVerdict, post_open::POST_OPEN_LIFETIME},
         io_err::IoErr,
         sequence::InitialSequences,
         socket::socket,
-        transmission::{
-            fec::{FecConfig, FecState},
-            test_doubles::PendingWrite,
+        traffic_shaping::{
+            control::handshake::{PostOpenVerdict, post_open::POST_OPEN_LIFETIME},
+            redundancy::fec::{FecConfig, FecState},
         },
+        transmission::test_doubles::PendingWrite,
         udp::wrap_fec,
     };
     use async_trait::async_trait;
