@@ -103,6 +103,9 @@ enum FinState {
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
+    /// Cached `mss - data_overhead()`: the maximum payload bytes per data
+    /// packet, computed once at construction instead of on every packetize.
+    max_data_size_per_pkt: usize,
     send_data_buf: StockSendStage,
     send_fin_buf: FinState,
     recv_data_buf: StockRecvStage,
@@ -156,8 +159,10 @@ impl ReliableLayer {
     ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
+        let max_data_size_per_pkt = mss.get().checked_sub(data_overhead()).unwrap();
         let this = Self {
             mss,
+            max_data_size_per_pkt,
             send_data_buf: StockSendStage::new(mss),
             send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
@@ -197,8 +202,10 @@ impl ReliableLayer {
     ) -> (Self, Arc<Mutex<SendPacer>>) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
+        let max_data_size_per_pkt = mss.get().checked_sub(data_overhead()).unwrap();
         let this = Self {
             mss,
+            max_data_size_per_pkt,
             send_data_buf: StockSendStage::new(mss),
             send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
@@ -491,7 +498,7 @@ impl ReliableLayer {
         }
 
         if self.frame_delivery.enabled {
-            return self.send_data_pkt_frame(pkt, now);
+            return self.send_data_pkt_frame(pkt, now, no_packets_in_flight);
         }
 
         let pkt_bytes = pkt
@@ -551,8 +558,15 @@ impl ReliableLayer {
     /// first packet of a frame carries `Some(frame_len)`; the continuation
     /// packets carry `None`.  The `pkt` scratch buffer receives the payload
     /// bytes; the returned `DataPkt.frame_len` tells the transmission layer
-    /// which codec command to emit.
-    fn send_data_pkt_frame(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
+    /// which codec command to emit.  `no_packets_in_flight` is the pre-send
+    /// in-flight snapshot taken once by [`Self::send_data_pkt`] and reused
+    /// for the DRE packet stats instead of re-scanning the send window.
+    fn send_data_pkt_frame(
+        &mut self,
+        pkt: &mut [u8],
+        now: Instant,
+        no_packets_in_flight: bool,
+    ) -> Option<DataPkt> {
         let normal_max_payload = self.max_data_size_per_pkt();
         let first_pkt_max_payload = self
             .mss
@@ -586,7 +600,7 @@ impl ReliableLayer {
             self.send_fin_buf = FinState::PendingBlocked;
             let stats = self
                 .connection_stats
-                .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
+                .send_packet_2(now, no_packets_in_flight);
             let buf = self.pkt_send_space.reused_buf().take();
             let p = self.pkt_send_space.send(buf, stats, None, now);
             return Some(DataPkt {
@@ -599,7 +613,7 @@ impl ReliableLayer {
 
         let stats = self
             .connection_stats
-            .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
+            .send_packet_2(now, no_packets_in_flight);
 
         let mut buf = self.pkt_send_space.reused_buf().take();
         let take_bytes = chunk.take_bytes;
@@ -1063,7 +1077,7 @@ impl ReliableLayer {
     }
 
     fn max_data_size_per_pkt(&self) -> usize {
-        self.mss.get().checked_sub(data_overhead()).unwrap()
+        self.max_data_size_per_pkt
     }
 
     pub(crate) fn metrics_at(&self, now: Instant) -> crate::metrics::MetricsSnapshot {

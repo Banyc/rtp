@@ -1251,4 +1251,78 @@ mod tests {
             .smooth_rtt();
         let _ = rtt;
     }
+
+    #[tokio::test]
+    async fn ack_only_datagram_wakes_writer_before_receive_waits_again() {
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+        #[derive(Debug)]
+        struct AckThenWait {
+            datagram: Vec<u8>,
+            sent: Mutex<bool>,
+        }
+        #[async_trait]
+        impl UnreliableRead for AckThenWait {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+                let already_sent = *self.sent.lock().unwrap();
+                if already_sent {
+                    std::future::pending().await
+                }
+                *self.sent.lock().unwrap() = true;
+                let n = self.datagram.len();
+                buf[..n].copy_from_slice(&self.datagram);
+                Ok(n)
+            }
+        }
+        #[derive(Debug)]
+        struct ImmediateWrite;
+        #[async_trait]
+        impl UnreliableWrite for ImmediateWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+                Ok(buf.len())
+            }
+        }
+        // The peer received the first packet (seq 0): cumulative next 1 with
+        // no selective blocks — an ACK-only datagram.
+        let history = crate::ack::AckHistory::new_at(crate::sequence::SequenceNumber::from_wire(1));
+        let ack = crate::ack::EncodeAck {
+            queue: &history,
+            first_block_index: 0,
+            max_blocks: crate::ack::MAX_ACK_BLOCKS,
+        };
+        let mut datagram = vec![0u8; 64];
+        let len =
+            crate::codec::encode_ack_data(None, Some(ack), None, None, &mut datagram).unwrap();
+        datagram.truncate(len);
+        let layer = crate::udp::wrap_fec(
+            Box::new(AckThenWait {
+                datagram,
+                sent: Mutex::new(false),
+            }),
+            Box::new(ImmediateWrite),
+            false,
+        );
+        let mut transmission = TransmissionLayer::new(layer, None);
+        let mut send_bufs = SendBufs::new();
+        let mut recv_bufs = RecvBufs::new();
+        // Put one packet in flight so the ACK genuinely updates the send
+        // window when it lands.
+        stage_small_message(&transmission);
+        assert!(transmission.send_pkts(&mut send_bufs).await.unwrap());
+        let shared = Arc::clone(&transmission.shared);
+        let mut recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
+        tokio::select! {
+            result = &mut recv => panic!("receive returned before the ACK-only wake: {result:?}"),
+            () = shared.resume_send().notified() => (),
+        }
+        // recv_pkts must now be parked waiting for the next datagram again;
+        // the writer was woken by the ACK, not by the receive loop exiting.
+        tokio::select! {
+            result = &mut recv => panic!("receive returned while the writer was being woken: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => (),
+        }
+    }
 }

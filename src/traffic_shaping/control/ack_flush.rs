@@ -11,7 +11,7 @@ use crate::transmission::write_half::WriteHalf;
 /// The wire bound on selective ACK blocks per datagram; page size for the
 /// ACK-flush paging scheme.
 pub(crate) const MAX_NUM_ACK: usize = MAX_ACK_BLOCKS;
-pub(crate) const ACK_FLUSH_COUNT: usize = 8;
+pub(crate) const ACK_FLUSH_COUNT: usize = 16;
 pub(crate) const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 
 /// Shared ACK-flush state, accessed from both the recv path (records ACK
@@ -68,6 +68,13 @@ impl AckFlushState {
         } else {
             None
         }
+    }
+
+    /// Single-lock query combining the due-ness decision with the wake
+    /// deadline, so the send pass can carry one `AckFlushState` result into
+    /// the next-wake computation instead of locking twice.
+    pub(crate) fn check(&self, now: Instant) -> (bool, Option<Instant>) {
+        (self.is_due(now), self.next_deadline(now))
     }
 
     /// Record ACK work produced by the recv path: one pending ack (or FIN) per
@@ -206,4 +213,44 @@ pub(crate) async fn flush(write_half: &mut WriteHalf, bufs: &mut SendBufs) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_ack_flush_uses_the_count_threshold_without_changing_the_age_cap() {
+        let now = Instant::now();
+        let mut s = AckFlushState::new();
+        // The count threshold drives a busy flow whose acks arrive faster
+        // than the age cap: 16 pending acks flush immediately even though
+        // the last flush was instant ago.
+        assert_eq!(ACK_FLUSH_COUNT, 16);
+        s.pending_acks = ACK_FLUSH_COUNT - 1;
+        s.last_ack_flush = Some(now);
+        assert!(
+            !s.is_due(now),
+            "below the count threshold and inside the age cap, no flush is due"
+        );
+        let (due, deadline) = s.check(now);
+        assert!(!due);
+        assert_eq!(deadline, s.next_deadline(now));
+        s.pending_acks = ACK_FLUSH_COUNT;
+        assert!(
+            s.is_due(now),
+            "at the count threshold the flush is due regardless of the age cap"
+        );
+        // The age cap is unchanged: 1 ms after the last flush even a single
+        // pending ack is due.
+        assert_eq!(ACK_FLUSH_AGE, Duration::from_millis(1));
+        let mut s = AckFlushState::new();
+        s.pending_acks = 1;
+        s.last_ack_flush = Some(now);
+        assert!(!s.is_due(now));
+        assert!(
+            s.is_due(now + ACK_FLUSH_AGE),
+            "the 1 ms age cap must still fire for a sparse ack flow"
+        );
+    }
 }

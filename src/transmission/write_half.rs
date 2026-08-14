@@ -97,13 +97,21 @@ impl WriteHalf {
     pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendLoopResult, IoErr> {
         let now = Instant::now();
         let made_progress = self.send_pkts_inner(bufs, now).await?;
+        // The pass may have awaited blocking underlay sends; refresh the
+        // clock before recomputing the next wake so deadlines are not stale.
+        let now = Instant::now();
+        let (_, ack_deadline) = self.ack_flush.lock().unwrap().check(now);
         Ok(SendLoopResult {
             made_progress,
-            wake: self.next_send_wake(now),
+            wake: self.next_send_wake_after_ack_check(now, ack_deadline),
         })
     }
 
-    async fn send_pkts_inner(&mut self, bufs: &mut SendBufs, now: Instant) -> Result<bool, IoErr> {
+    async fn send_pkts_inner(
+        &mut self,
+        bufs: &mut SendBufs,
+        mut now: Instant,
+    ) -> Result<bool, IoErr> {
         if self.try_send_requested_kill(bufs).await.is_some() {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
@@ -111,14 +119,15 @@ impl WriteHalf {
         self.check_error_after_requested_kill(bufs).await?;
         self.send_due_post_open_response().await?;
         // `now` is already fixed for one send pass: compute the wire timestamp
-        // once and reuse it for every packet encoded by this pass.
+        // once and reuse it for every packet encoded by this pass.  A blocked
+        // underlay send refreshes the clock for deadline/token math, but the
+        // wire timestamp stays stable for the whole pass.
         let wire_ts = self.wire_ts(now);
         let mut written_bytes = 0;
         let mut written_fin = false;
         loop {
-            if self.try_send_requested_kill(bufs).await.is_some() {
-                return Err(std::io::ErrorKind::BrokenPipe.into());
-            }
+            // A requested kill is delivered by `check_error_after_requested_kill`
+            // on the error path; no separate poll is needed here.
             self.check_error_after_requested_kill(bufs).await?;
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
             let res = {
@@ -238,6 +247,10 @@ impl WriteHalf {
                     if FEC_DEBUG {
                         eprintln!("send_pkts: WouldBlock on data send (transient)");
                     }
+                    // A blocked underlay send may have consumed real time:
+                    // refresh the clock so the next pacing/token decision is
+                    // computed against the fresh instant.
+                    now = Instant::now();
                     continue;
                 }
                 Err(e) => {

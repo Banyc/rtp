@@ -188,6 +188,10 @@ impl ReadHalf {
                 if ack_next.is_some() {
                     shared.signals.sent_pkt_acked.notify_waiters();
                     shared.signals.session_outbound_progress.notify_one();
+                    // ACK processing may have freed send-window capacity, so
+                    // wake the writer directly instead of letting it wait for
+                    // a timer or the next application push.
+                    shared.signals.resume_send.notify_one();
                 }
                 let Some(data) = data.data else {
                     shared.log(crate::metrics::MetricsEvent::ReceiveAckPacket);

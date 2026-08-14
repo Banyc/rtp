@@ -274,9 +274,13 @@ impl Connection {
 
     async fn send_bytes(&self, data: &[u8]) -> Result<usize, IoErr> {
         let now = Instant::now();
-        let mut sent_data_pkt = self.signals.sent_data_pkt.notified();
+        let sent_data_pkt = self.signals.sent_data_pkt.notified();
+        tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
+            // Arm the notification before inspecting capacity so a wake
+            // between the check and the await is never lost.
+            sent_data_pkt.as_mut().enable();
             let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_buf(data, now)
@@ -288,20 +292,24 @@ impl Connection {
             }
             self.termination.check_error()?;
             tokio::select! {
-                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
+                () = &mut sent_data_pkt => (),
                 () = self.termination.terminal().cancelled() => (),
             }
             self.termination.check_error()?;
-            sent_data_pkt = self.signals.sent_data_pkt.notified();
+            sent_data_pkt.set(self.signals.sent_data_pkt.notified());
         }
     }
 
     pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, IoErr> {
         let now = Instant::now();
         let frame_len = frame.len();
-        let mut sent_data_pkt = self.signals.sent_data_pkt.notified();
+        let sent_data_pkt = self.signals.sent_data_pkt.notified();
+        tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
+            // Arm the notification before inspecting capacity so a wake
+            // between the check and the await is never lost.
+            sent_data_pkt.as_mut().enable();
             let result = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_frame_buf(frame, now)
@@ -315,11 +323,11 @@ impl Connection {
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     self.termination.check_error()?;
                     tokio::select! {
-                        _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
+                        () = &mut sent_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
                     self.termination.check_error()?;
-                    sent_data_pkt = self.signals.sent_data_pkt.notified();
+                    sent_data_pkt.set(self.signals.sent_data_pkt.notified());
                 }
                 Err(error) => return Err(error),
             }
@@ -386,17 +394,17 @@ impl Connection {
         }
     }
 
-    pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
+    pub(crate) fn next_send_wake_with_ack_deadline(
+        &self,
+        now: Instant,
+        ack_deadline: Option<Instant>,
+    ) -> SendWake {
         let (mut protocol_deadline, pacing_deadline) = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             (
                 reliable_layer.pkt_send_space().next_poll_time(),
                 reliable_layer.next_pacing_deadline(now),
             )
-        };
-        let ack_deadline = {
-            let ack = self.ack_flush.lock().unwrap();
-            ack.next_deadline(now)
         };
         if let Some(ack_deadline) = ack_deadline {
             protocol_deadline =
@@ -416,6 +424,22 @@ impl Connection {
             }
         }
         SendWake::after_send_pass(now, pacing_deadline, protocol_deadline)
+    }
+
+    /// The next-send wake with the ACK deadline supplied by the caller's
+    /// single `AckFlushState::check` (one lock in the send pass, not two).
+    pub(crate) fn next_send_wake_after_ack_check(
+        &self,
+        now: Instant,
+        ack_deadline: Option<Instant>,
+    ) -> SendWake {
+        self.next_send_wake_with_ack_deadline(now, ack_deadline)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
+        let ack_deadline = self.ack_flush.lock().unwrap().next_deadline(now);
+        self.next_send_wake_with_ack_deadline(now, ack_deadline)
     }
 
     pub(crate) fn wire_ts(&self, now: Instant) -> u32 {
@@ -458,17 +482,21 @@ impl Connection {
     }
 
     pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
-        let mut sent_data_pkt = self.signals.sent_data_pkt.notified();
+        let sent_data_pkt = self.signals.sent_data_pkt.notified();
+        tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
+            // Arm the notification before inspecting the buffer so a wake
+            // between the check and the await is never lost.
+            sent_data_pkt.as_mut().enable();
             if self.reliable_layer.lock().unwrap().is_send_buf_empty() {
                 return Ok(());
             }
             tokio::select! {
-                _ = tokio::time::timeout(std::time::Duration::from_millis(10), sent_data_pkt) => (),
+                () = &mut sent_data_pkt => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            sent_data_pkt = self.signals.sent_data_pkt.notified();
+            sent_data_pkt.set(self.signals.sent_data_pkt.notified());
         }
     }
 

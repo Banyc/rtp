@@ -3,7 +3,7 @@ use primitive::arena::obj_pool::{ObjPool, buf_pool};
 use crate::{
     ack::AckHistory,
     delivery::frame::recv::{RecvPkt, RecvSlot},
-    sequence::{SequenceMap, SequenceNumber, SequencePosition, min},
+    sequence::{SequenceMap, SequenceNumber, SequencePosition, SequenceVacancyError, min},
 };
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
@@ -91,29 +91,37 @@ impl PktRecvSpace {
             self.reused_buf.put(data);
             return RecvDisposition::Rejected;
         }
-        // Classify through the slot window: live inserts, stale returns
-        // Duplicate (ACKable without reinsertion), too-far/ambiguous rejects.
-        match self.slots.window().classify(seq) {
-            SequencePosition::Stale => {
-                self.reused_buf.put(data);
-                return RecvDisposition::Duplicate;
-            }
-            SequencePosition::TooFarAhead | SequencePosition::Ambiguous => {
-                self.reused_buf.put(data);
-                return RecvDisposition::Rejected;
-            }
-            SequencePosition::InWindow(_) => {}
-        }
-        match self
-            .slots
-            .insert_vacant(seq, RecvSlot::Data(RecvPkt { data, frame_len }))
-        {
+        // Classify once through `insert_vacant_with`: the slot window decides
+        // vacant/in-window/stale/too-far in a single pass and the payload is
+        // constructed only inside the successful insertion closure, so stale
+        // and duplicate packets are ACKable without ever building or
+        // reinserting their payload.
+        let mut data = Some(data);
+        match self.slots.insert_vacant_with(seq, || {
+            RecvSlot::Data(RecvPkt {
+                data: data.take().expect("payload is present until inserted"),
+                frame_len,
+            })
+        }) {
             Ok(()) => {}
-            Err(RecvSlot::Data(pkt)) => {
-                self.reused_buf.put(pkt.data);
+            Err(SequenceVacancyError::Occupied) => {
+                self.reused_buf
+                    .put(data.take().expect("payload was not inserted"));
                 return RecvDisposition::Duplicate;
             }
-            Err(RecvSlot::Tombstone) => unreachable!("the attempted slot was data"),
+            Err(SequenceVacancyError::Outside(position)) => {
+                self.reused_buf
+                    .put(data.take().expect("payload was not inserted"));
+                return match position {
+                    SequencePosition::Stale => RecvDisposition::Duplicate,
+                    SequencePosition::TooFarAhead | SequencePosition::Ambiguous => {
+                        RecvDisposition::Rejected
+                    }
+                    SequencePosition::InWindow(_) => {
+                        unreachable!("insert_vacant_with only rejects outside the window")
+                    }
+                };
+            }
         }
         self.scan_start = min(self.scan_start, seq);
         self.ack_history.insert(seq);

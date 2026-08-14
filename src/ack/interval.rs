@@ -278,24 +278,32 @@ impl<'a> AckBlocks<'a> {
     ) -> Option<SequenceNumber> {
         block_offsets.clear();
         block_offsets.extend(self.valid_block_offsets(send_start, sent_span));
-        if !block_offsets.is_sorted_by_key(|&(start, _)| start) {
-            block_offsets.sort_unstable_by_key(|&(start, _)| start);
-        }
-        let highest_sacked = block_offsets
-            .last()
-            .map(|&(start, _)| send_start.advance(start));
-        let mut merged_len = 0;
-        for read in 0..block_offsets.len() {
-            let (start, end) = block_offsets[read];
-            if merged_len > 0 && start < block_offsets[merged_len - 1].1 {
-                block_offsets[merged_len - 1].1 = block_offsets[merged_len - 1].1.max(end);
-            } else {
-                block_offsets[merged_len] = (start, end);
-                merged_len += 1;
+        if block_offsets.len() > 1 {
+            if !block_offsets.is_sorted_by_key(|&(start, _)| start) {
+                block_offsets.sort_unstable_by_key(|&(start, _)| start);
             }
+            let highest_sacked = block_offsets
+                .last()
+                .map(|&(start, _)| send_start.advance(start));
+            let mut merged_len = 0;
+            for read in 0..block_offsets.len() {
+                let (start, end) = block_offsets[read];
+                if merged_len > 0 && start < block_offsets[merged_len - 1].1 {
+                    block_offsets[merged_len - 1].1 = block_offsets[merged_len - 1].1.max(end);
+                } else {
+                    block_offsets[merged_len] = (start, end);
+                    merged_len += 1;
+                }
+            }
+            block_offsets.truncate(merged_len);
+            highest_sacked
+        } else {
+            // Zero or one clipped block: nothing to sort or merge; a single
+            // block is already in order and cannot overlap anything.
+            block_offsets
+                .last()
+                .map(|&(start, _)| send_start.advance(start))
         }
-        block_offsets.truncate(merged_len);
-        highest_sacked
     }
 
     /// The exclusive forward offset (from `send_start`) of the last unacked
