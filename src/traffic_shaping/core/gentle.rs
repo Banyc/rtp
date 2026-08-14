@@ -106,7 +106,7 @@ impl GentleMode {
         }
 
         // Loss exit: high loss must leave gentle mode immediately.
-        if self.gentle_mode && loss_event_rate.is_some_and(|lr| lr > GENTLE_EXIT_LOSS) {
+        if self.gentle_mode && loss_event_rate.is_some_and(|lr| lr >= GENTLE_EXIT_LOSS) {
             self.gentle_mode = false;
             self.queue_since = None;
             self.gentle_gate_open_since = None;

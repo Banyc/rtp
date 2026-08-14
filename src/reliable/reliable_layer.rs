@@ -964,9 +964,10 @@ impl ReliableLayer {
     /// Shared gate for huge-data-loss backoff. Returns the elapsed time the
     /// loss has persisted once the `2 * RTO` threshold is reached.
     fn huge_data_loss_gate(&mut self, now: Instant) -> Option<Duration> {
-        // Pace healthy scans: a negative result is cached for the check
-        // interval, while a positive result must be recomputed on every call
-        // because an ACK can repair the window between asynchronous sends.
+        // Pace scans: a negative result is cached for the check interval,
+        // and a positive result is also gated by the interval so the scan
+        // cannot re-fire on every processing pass (an ACK can repair the
+        // window by the next scan).
         if now < self.huge_data_loss_check_after {
             return None;
         }
@@ -978,7 +979,7 @@ impl ReliableLayer {
             self.huge_data_loss_check_after = now + HUGE_DATA_LOSS_CHECK_INTERVAL;
             return None;
         }
-        self.huge_data_loss_check_after = now;
+        self.huge_data_loss_check_after = now + HUGE_DATA_LOSS_CHECK_INTERVAL;
         let at_least_for = self.pkt_send_space.rto_duration().mul_f64(2.);
         let (set_off, elapsed) = self
             .huge_data_loss_timer
@@ -1546,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_huge_loss_checks_are_paced_but_positive_results_revalidate() {
+    fn huge_loss_checks_are_paced_including_positive_results() {
         let now = Instant::now();
         let mut layer = test_layer(now);
         assert!(layer.huge_data_loss_gate(now).is_none());
@@ -1562,10 +1563,16 @@ mod tests {
         send_burst(&mut layer, 20, now);
         let lost_at = now + Duration::from_secs(2);
         assert!(layer.huge_data_loss_gate(lost_at).is_none());
-        assert_eq!(layer.huge_data_loss_check_after, lost_at);
+        assert_eq!(
+            layer.huge_data_loss_check_after,
+            lost_at + HUGE_DATA_LOSS_CHECK_INTERVAL
+        );
         let recheck_at = lost_at + Duration::from_millis(1);
         assert!(layer.huge_data_loss_gate(recheck_at).is_none());
-        assert_eq!(layer.huge_data_loss_check_after, recheck_at);
+        assert_eq!(
+            layer.huge_data_loss_check_after,
+            lost_at + HUGE_DATA_LOSS_CHECK_INTERVAL
+        );
     }
 
     fn send_burst(rl: &mut super::ReliableLayer, n: usize, now: Instant) {

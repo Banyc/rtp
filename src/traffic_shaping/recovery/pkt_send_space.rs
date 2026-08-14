@@ -904,12 +904,13 @@ impl PktSendSpace {
         let mut lost = 0;
         let mut pipe_len = 0;
         let mut retransmitted = 0;
+        let live_rto = self.rtt_stats.rto_duration();
         for (seq, p) in Self::unacked(&self.send_wnd) {
             let in_pipe = self.max_pipe_seq.is_some_and(|m| le(seq, m));
             if in_pipe {
                 pipe_len += 1;
                 let rtxed = !p.considered_new_in_cwnd && p.rtxed;
-                if rtxed || p.hits_rto(now) {
+                if rtxed || p.hits_rto(now, live_rto) {
                     lost += 1;
                 }
             }
@@ -993,11 +994,12 @@ impl PktSendSpace {
     pub fn cwnd_stats(&self, now: Instant) -> CwndStats {
         let mut not_lost = 0;
         let mut all_lost_pkts_rtxed = true;
+        let live_rto = self.rtt_stats.rto_duration();
         for p in Self::unacked(&self.send_wnd)
             .map(|(_, v)| v)
             .take(self.cwnd.get())
         {
-            if p.hits_rto(now) {
+            if p.hits_rto(now, live_rto) {
                 all_lost_pkts_rtxed = false;
             } else {
                 not_lost += 1;
@@ -1033,10 +1035,11 @@ impl PktSendSpace {
     fn data_loss_stats(&self, now: Instant) -> Option<(usize, f64)> {
         let mut lost = 0;
         let mut len = 0;
+        let live_rto = self.rtt_stats.rto_duration();
         for (_, p) in self.pkts_in_pipe() {
             len += 1;
             let rtxed = !p.considered_new_in_cwnd && p.rtxed;
-            if rtxed || p.hits_rto(now) {
+            if rtxed || p.hits_rto(now, live_rto) {
                 lost += 1;
             }
         }
@@ -1156,9 +1159,14 @@ struct InFlightPkt {
     pub deferred_loss_baseline_deadline: Option<Instant>,
 }
 impl InFlightPkt {
-    pub fn hits_rto(&self, now: Instant) -> bool {
+    pub fn hits_rto(&self, now: Instant, live_rto: Duration) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
-        self.rto <= sent_elapsed
+        let effective_rto = if self.rto_from_tail_probe {
+            self.rto
+        } else {
+            self.rto.max(live_rto)
+        };
+        effective_rto <= sent_elapsed
     }
 
     #[allow(dead_code)]
