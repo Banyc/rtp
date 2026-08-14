@@ -7,6 +7,13 @@ use primitive::ops::float::NonNegR;
 pub struct RtxTimer {
     smooth_rtt: NonNegR<f64>,
     smooth_rtt_var: NonNegR<f64>,
+    smooth_rtt_duration: Duration,
+    smooth_rtt_var_duration: Duration,
+    raw_rto: Duration,
+    rto: Duration,
+    reorder_window: Duration,
+    fast_reorder_window: Duration,
+    fast_loss_armed: bool,
     first_measured: bool,
 }
 impl RtxTimer {
@@ -16,28 +23,39 @@ impl RtxTimer {
     const ALPHA: f64 = 1. / 8.;
 
     pub fn new() -> Self {
-        Self {
+        let mut timer = Self {
             smooth_rtt: NonNegR::new(Self::MIN_RTO.as_secs_f64()).unwrap(),
             smooth_rtt_var: NonNegR::new(0.0).unwrap(),
+            smooth_rtt_duration: Duration::ZERO,
+            smooth_rtt_var_duration: Duration::ZERO,
+            raw_rto: Duration::ZERO,
+            rto: Duration::ZERO,
+            reorder_window: Duration::ZERO,
+            fast_reorder_window: Duration::ZERO,
+            fast_loss_armed: false,
             first_measured: false,
-        }
+        };
+        timer.recompute_derived();
+        timer
     }
 
     pub fn set(&mut self, rtt: Duration) {
+        let rtt_secs = rtt.as_secs_f64();
         if !self.first_measured {
             self.first_measured = true;
-            self.smooth_rtt = NonNegR::new(rtt.as_secs_f64()).unwrap();
-            self.smooth_rtt_var = NonNegR::new(rtt.as_secs_f64() / 2.).unwrap();
+            self.smooth_rtt = NonNegR::new(rtt_secs).unwrap();
+            self.smooth_rtt_var = NonNegR::new(rtt_secs / 2.).unwrap();
+            self.recompute_derived();
             return;
         }
 
-        let rtt_var = (self.smooth_rtt.get() - rtt.as_secs_f64()).abs();
+        let rtt_var = (self.smooth_rtt.get() - rtt_secs).abs();
         let smooth_rtt_var = (1. - Self::BETA) * self.smooth_rtt_var.get() + Self::BETA * rtt_var;
         self.smooth_rtt_var = NonNegR::new(smooth_rtt_var).unwrap();
 
-        let smooth_rtt =
-            (1. - Self::ALPHA) * self.smooth_rtt.get() + Self::ALPHA * rtt.as_secs_f64();
+        let smooth_rtt = (1. - Self::ALPHA) * self.smooth_rtt.get() + Self::ALPHA * rtt_secs;
         self.smooth_rtt = NonNegR::new(smooth_rtt).unwrap();
+        self.recompute_derived();
     }
 
     // pub fn rto(&self, granularity: Duration) -> Duration {
@@ -46,14 +64,12 @@ impl RtxTimer {
     //     Duration::from_secs_f64(rto).max(Self::MIN_RTO)
     // }
     pub fn rto(&self) -> Duration {
-        self.raw_rto().max(Self::MIN_RTO)
+        self.rto
     }
 
     /// RTO formula value without any floor applied.
     pub(crate) fn raw_rto(&self) -> Duration {
-        let tol = Self::K * self.smooth_rtt_var.get();
-        let rto = self.smooth_rtt.get() + tol;
-        Duration::from_secs_f64(rto)
+        self.raw_rto
     }
 
     /// Reset the SRTT filter to a fixed value, keeping the same RTO calculation.
@@ -70,12 +86,7 @@ impl RtxTimer {
     /// RACK-style: `srtt + max(K * rttvar, srtt / 4)`, capped at the full RTO.
     /// No `MIN_RTO` floor so that on stable low-RTT links the window stays tight.
     pub fn reorder_window(&self) -> Duration {
-        let srtt = self.smooth_rtt();
-        let rttvar = Duration::from_secs_f64(self.smooth_rtt_var.get());
-        let tol = rttvar.mul_f64(Self::K);
-        let quarter = srtt / 4;
-        let extra = tol.max(quarter);
-        (srtt + extra).min(self.rto())
+        self.reorder_window
     }
 
     /// Fast reorder window used only to schedule retransmission of
@@ -86,11 +97,7 @@ impl RtxTimer {
     /// `srtt/4` floor dominates both windows, so `fast_reorder_window ==
     /// reorder_window` and the toggle is a no-op there.
     pub fn fast_reorder_window(&self) -> Duration {
-        let srtt = self.smooth_rtt();
-        let rttvar = Duration::from_secs_f64(self.smooth_rtt_var.get());
-        let quarter = srtt / 4;
-        let extra = rttvar.max(quarter);
-        (srtt + extra).min(self.rto())
+        self.fast_reorder_window
     }
 
     /// Whether the structural low-jitter gate is armed: `K * rttvar <
@@ -99,17 +106,32 @@ impl RtxTimer {
     /// gate for evidence-gated fast loss declaration — under high jitter
     /// reordering mimics loss, so the fast path must stay off.
     pub fn fast_loss_armed(&self) -> bool {
-        let srtt = self.smooth_rtt.get();
-        let rttvar = self.smooth_rtt_var.get();
-        rttvar * Self::K < srtt / 4.
+        self.fast_loss_armed
     }
 
     pub fn smooth_rtt(&self) -> Duration {
-        Duration::from_secs_f64(self.smooth_rtt.get())
+        self.smooth_rtt_duration
     }
 
     pub fn smooth_rtt_var(&self) -> Duration {
-        Duration::from_secs_f64(self.smooth_rtt_var.get())
+        self.smooth_rtt_var_duration
+    }
+
+    fn recompute_derived(&mut self) {
+        let smooth_rtt = self.smooth_rtt.get();
+        let smooth_rtt_var = self.smooth_rtt_var.get();
+        let srtt = Duration::from_secs_f64(smooth_rtt);
+        let rttvar = Duration::from_secs_f64(smooth_rtt_var);
+        let raw_rto = Duration::from_secs_f64(smooth_rtt + Self::K * smooth_rtt_var);
+        let rto = raw_rto.max(Self::MIN_RTO);
+        let quarter = srtt / 4;
+        self.smooth_rtt_duration = srtt;
+        self.smooth_rtt_var_duration = rttvar;
+        self.raw_rto = raw_rto;
+        self.rto = rto;
+        self.reorder_window = (srtt + rttvar.mul_f64(Self::K).max(quarter)).min(rto);
+        self.fast_reorder_window = (srtt + rttvar.max(quarter)).min(rto);
+        self.fast_loss_armed = smooth_rtt_var * Self::K < smooth_rtt / 4.;
     }
 }
 

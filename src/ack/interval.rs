@@ -93,6 +93,10 @@ impl AckHistory {
         if self.next.forward_distance_to(seq) >= MAX_NUM_RECVING_PKTS as u64 {
             return;
         }
+        self.insert_in_window(seq);
+    }
+
+    pub(crate) fn insert_in_window(&mut self, seq: SequenceNumber) {
         if seq == self.next {
             let mut interval = AckInterval {
                 start: seq,
@@ -374,6 +378,9 @@ impl<'a> AckBlocks<'a> {
             has_sack_evidence: !block_offsets.is_empty(),
         };
         sacked_above.clear();
+        if self.blocks.is_empty() {
+            return analysis;
+        }
         sacked_above.resize(unacked.len(), 0);
         if block_offsets.is_empty() {
             return analysis;

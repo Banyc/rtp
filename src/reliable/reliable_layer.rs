@@ -121,6 +121,22 @@ struct CongestionMetrics {
     delay_drains: u64,
 }
 
+impl CongestionMetrics {
+    fn clear_decision_gauges(&mut self) {
+        self.control_rtt = None;
+        self.rtt_floor = None;
+        self.queue_tolerance = None;
+        self.delivery_peak_packets_per_second = None;
+        self.drain_floor_packets_per_second = None;
+        self.drain_target_packets_per_second = None;
+    }
+    fn start_congestion_epoch(&mut self) {
+        self.clear_decision_gauges();
+        self.last_bandwidth_probe_increase_at = None;
+        self.last_bandwidth_probe_interval = None;
+    }
+}
+
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
@@ -300,7 +316,11 @@ impl ReliableLayer {
                     .cwnd()
                     .get()
                     .saturating_sub(self.pkt_send_space.num_in_flight_pkts());
-                self.pending_new_packets().min(cwnd_headroom)
+                if cwnd_headroom == 0 {
+                    0
+                } else {
+                    self.pending_new_packets().min(cwnd_headroom)
+                }
             };
         if max_sendable_packets == 0 {
             return None;
@@ -564,7 +584,7 @@ impl ReliableLayer {
 
         let stats = self
             .connection_stats
-            .send_packet_2(now, self.pkt_send_space.no_pkts_in_flight());
+            .send_packet_2(now, no_packets_in_flight);
 
         let mut buf = self.pkt_send_space.reused_buf().take();
         self.send_data_buf.dequeue_extend(pkt_bytes, &mut buf);
@@ -680,6 +700,7 @@ impl ReliableLayer {
 
         self.pkt_send_space
             .ack(recved, &mut self.pkt_stats_buf, now);
+        self.huge_data_loss_check_after = now;
 
         // Reconcile deferred CC loss-events after the ack: any whose seq was
         // just acked has been cancelled, and any whose stock deadline has
@@ -702,7 +723,7 @@ impl ReliableLayer {
             // so the post-outage path starts fresh (rate samples, probe
             // timing, and drain counters all restart at zero).
             if self.congestion_metrics_enabled {
-                self.congestion_metrics = CongestionMetrics::default();
+                self.congestion_metrics.start_congestion_epoch();
             }
         }
 
@@ -711,6 +732,9 @@ impl ReliableLayer {
         // bursts). The per-burst accumulator lives here, before the rate sample
         // is computed and cleared.
         if self.slow_start {
+            if self.congestion_metrics_enabled {
+                self.congestion_metrics.clear_decision_gauges();
+            }
             self.slow_start_acked_pkts += self.pkt_stats_buf.len();
             let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
             let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
@@ -753,6 +777,10 @@ impl ReliableLayer {
     }
 
     fn on_rate_sample(&mut self, sr: &dre::RateSample, now: Instant) {
+        if self.congestion_metrics_enabled {
+            self.congestion_metrics.rate_samples =
+                self.congestion_metrics.rate_samples.saturating_add(1);
+        }
         // While an outage-recovery epoch is open, ignore rate samples whose prior
         // time predates the outage cut.  A blackout-spanning sample can report a
         // bogus delivery rate (~acked/outage-length) that would collapse the just-
@@ -761,6 +789,9 @@ impl ReliableLayer {
             .pkt_send_space
             .should_censor_rate_sample(sr.prior_time())
         {
+            if self.congestion_metrics_enabled {
+                self.congestion_metrics.clear_decision_gauges();
+            }
             self.last_congestion_action =
                 Some(crate::metrics::MetricsCongestionAction::CensoredOutageSample);
             return;
@@ -784,7 +815,6 @@ impl ReliableLayer {
             .mul_f64(QUEUE_RTT_FACTOR)
             .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
             .max(QUEUE_RTT_FLOOR);
-        self.record_congestion_interval_state(floor, tol, peak_delivery);
 
         // ----- Gentle-mode entry/exit and gate hysteresis --------------------
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
@@ -803,6 +833,7 @@ impl ReliableLayer {
 
         // Gate hysteresis: while actively draining in gentle mode, use tol/2.
         let gate_tol = self.gentle.gate_tol(tol);
+        self.record_congestion_interval_state(floor, gate_tol, peak_delivery);
         let queue_building = smooth > floor + gate_tol;
         self.queue_building = queue_building;
 
@@ -1027,9 +1058,7 @@ impl ReliableLayer {
         frame_len: Option<u32>,
         pkt: &[u8],
     ) -> crate::recv_queue::pkt_recv_space::RecvDisposition {
-        let mut buf = self.pkt_recv_space.reused_buf().take();
-        buf.extend(pkt);
-        let disposition = self.pkt_recv_space.recv_disposition(seq, buf, frame_len);
+        let disposition = self.pkt_recv_space.recv_bytes(seq, pkt, frame_len);
         if !disposition.should_ack() {
             return disposition;
         }
@@ -1154,7 +1183,8 @@ impl ReliableLayer {
         metrics.rtt_floor = Some(floor);
         metrics.queue_tolerance = Some(tol);
         metrics.delivery_peak_packets_per_second = Some(peak_delivery);
-        metrics.rate_samples = metrics.rate_samples.saturating_add(1);
+        metrics.drain_floor_packets_per_second = None;
+        metrics.drain_target_packets_per_second = None;
     }
 
     /// Account a bandwidth-probe decision, saturating every counter.  An
@@ -1311,9 +1341,13 @@ impl ReliableLayer {
             num_rx_pkts: metrics.received_packets,
             recv_seq: metrics.next_receive_sequence,
             delivery_sample_app_limited: metrics.delivery_sample_app_limited,
-            congestion_control_rtt: metrics.congestion_control_rtt.map(|t| t.as_millis()),
-            congestion_rtt_floor: metrics.congestion_rtt_floor.map(|t| t.as_millis()),
-            congestion_queue_tolerance: metrics.congestion_queue_tolerance.map(|t| t.as_millis()),
+            congestion_control_rtt: metrics
+                .congestion_control_rtt
+                .map(|value| value.as_micros()),
+            congestion_rtt_floor: metrics.congestion_rtt_floor.map(|value| value.as_micros()),
+            congestion_queue_tolerance: metrics
+                .congestion_queue_tolerance
+                .map(|value| value.as_micros()),
             congestion_delivery_peak_packets_per_second: metrics
                 .congestion_delivery_peak_packets_per_second,
             congestion_drain_floor_packets_per_second: metrics
@@ -1327,7 +1361,7 @@ impl ReliableLayer {
                 .congestion_bandwidth_probe_before_feedback,
             congestion_last_bandwidth_probe_interval: metrics
                 .congestion_last_bandwidth_probe_interval
-                .map(|t| t.as_millis()),
+                .map(|value| value.as_micros()),
             congestion_delay_drains: metrics.congestion_delay_drains,
             pending_send_bytes: metrics.pending_send_bytes,
             send_stage_capacity_bytes: metrics.send_stage_capacity_bytes,
