@@ -360,6 +360,11 @@ impl RetransmissionIndex {
         self.active.iter().map(|(seq, _)| seq)
     }
 
+    /// Number of packets currently retransmission-ready (any reason armed).
+    pub(super) fn ready_count(&self) -> usize {
+        self.ready.len()
+    }
+
     /// Advance the anchor of every wrapped map to the new send-window front.
     /// The caller must have removed (deactivated) every entry the advance
     /// would leave stale.

@@ -8,6 +8,7 @@ pub(crate) const GENTLE_BW_PROBE_GAIN: f64 = 0.25;
 pub(crate) const GENTLE_DRAIN_FRAC: f64 = 0.7;
 pub(crate) const GENTLE_ADD_PKTS: f64 = 4.0;
 pub(crate) const GENTLE_ENTER_RTTS: f64 = 3.0;
+pub(crate) const GENTLE_ENTER_MIN: Duration = Duration::from_secs(1);
 pub(crate) const GENTLE_ENTER_MAX_LOSS: f64 = 0.05;
 pub(crate) const GENTLE_EXIT_LOSS: f64 = 0.1;
 pub(crate) const GENTLE_DRAIN_CHECK_RTTS: f64 = 12.0;
@@ -105,13 +106,16 @@ impl GentleMode {
         }
 
         // Loss exit: high loss must leave gentle mode immediately.
-        if self.gentle_mode && loss_event_rate.is_some_and(|lr| lr >= GENTLE_EXIT_LOSS) {
+        if self.gentle_mode && loss_event_rate.is_some_and(|lr| lr > GENTLE_EXIT_LOSS) {
             self.gentle_mode = false;
             self.queue_since = None;
             self.gentle_gate_open_since = None;
         }
 
         // Enter gentle mode after a sustained low-loss queue-building stretch.
+        // The sustained stretch is the larger of three control RTTs and the
+        // one-second entry floor, so a low-RTT path cannot enter on a sub-
+        // second queue blip.
         let stretch = self
             .queue_since
             .map(|start| now.saturating_duration_since(start));
@@ -120,9 +124,10 @@ impl GentleMode {
             .gentle_block_until
             .map(|until| now >= until)
             .unwrap_or(true);
+        let enter_after = control_rtt.mul_f64(GENTLE_ENTER_RTTS).max(GENTLE_ENTER_MIN);
         if let Some(stretch) = stretch
             && !self.gentle_mode
-            && stretch >= control_rtt.mul_f64(GENTLE_ENTER_RTTS)
+            && stretch >= enter_after
             && low_loss != Some(false)
             && block_cleared
         {
@@ -267,5 +272,115 @@ impl GentleMode {
     #[cfg(test)]
     pub(crate) fn gentle_gate_open_since(&self) -> Option<Instant> {
         self.gentle_gate_open_since
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{GENTLE_ENTER_MIN, GentleMode, GentlePreambleConfig};
+
+    #[test]
+    fn low_rtt_queue_must_persist_for_the_entry_floor() {
+        let t0 = Instant::now();
+        let mut gentle = GentleMode::new();
+        let config = GentlePreambleConfig {
+            enter_coefficient: 2.0,
+            control_rtt: Duration::from_millis(50),
+        };
+        // A 60 ms smooth RTT against a 40 ms floor: the three-control-RTT
+        // condition (150 ms) elapses long before the one-second entry floor.
+        // The standing queue must persist past GENTLE_ENTER_MIN regardless.
+        for i in 0..9 {
+            gentle.update_mode(
+                Duration::from_millis(60),
+                Duration::from_millis(40),
+                Duration::from_millis(5),
+                Some(0.0),
+                t0 + Duration::from_millis(100) * i,
+                config,
+            );
+            assert!(
+                !gentle.gentle_mode(),
+                "gentle mode must not enter before GENTLE_ENTER_MIN at step {i}"
+            );
+        }
+        gentle.update_mode(
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            Some(0.0),
+            t0 + Duration::from_millis(950),
+            config,
+        );
+        assert!(
+            !gentle.gentle_mode(),
+            "950 ms of standing queue must not enter on a 50 ms control RTT"
+        );
+        gentle.update_mode(
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            Some(0.0),
+            t0 + GENTLE_ENTER_MIN,
+            config,
+        );
+        assert!(
+            gentle.gentle_mode(),
+            "one second of standing queue must enter gentle mode"
+        );
+    }
+
+    #[test]
+    fn long_rtt_path_still_waits_for_three_control_rtts() {
+        let t0 = Instant::now();
+        let mut gentle = GentleMode::new();
+        let config = GentlePreambleConfig {
+            enter_coefficient: 2.0,
+            control_rtt: Duration::from_millis(600),
+        };
+        // 3 * 600 ms = 1800 ms dominates the one-second entry floor, so a
+        // 1 s standing queue is not enough on this path.
+        gentle.update_mode(
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            Some(0.0),
+            t0,
+            config,
+        );
+        gentle.update_mode(
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            Some(0.0),
+            t0 + Duration::from_millis(500),
+            config,
+        );
+        gentle.update_mode(
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            Some(0.0),
+            t0 + Duration::from_secs(1),
+            config,
+        );
+        assert!(
+            !gentle.gentle_mode(),
+            "one second of queue must not enter when 3 control RTTs exceed it"
+        );
+        gentle.update_mode(
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            Some(0.0),
+            t0 + Duration::from_millis(1800),
+            config,
+        );
+        assert!(
+            gentle.gentle_mode(),
+            "three control RTTs of standing queue must enter gentle mode"
+        );
     }
 }

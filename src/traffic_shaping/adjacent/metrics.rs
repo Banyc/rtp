@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 8;
+pub const SCHEMA_VERSION: u16 = 14;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +75,7 @@ pub enum MetricsCongestionAction {
     SlowStartAck,
     GentleProbe,
     DelayDrain,
+    HugeLossBackoff,
     LossBackoff,
 }
 
@@ -88,6 +89,7 @@ impl MetricsCongestionAction {
             Self::BandwidthProbe => "bandwidth_probe",
             Self::GentleProbe => "gentle_probe",
             Self::DelayDrain => "delay_drain",
+            Self::HugeLossBackoff => "huge_loss_backoff",
             Self::LossBackoff => "loss_backoff",
         }
     }
@@ -173,10 +175,22 @@ pub struct MetricsSnapshot {
     pub congestion_action: Option<MetricsCongestionAction>,
     pub in_flight_packets: usize,
     pub packets_in_pipe: usize,
+    /// Packets currently tracked by the retransmission scheduler.
+    pub retransmission_active_packets: usize,
+    /// Packets currently retransmission-ready (due or evidence-armed).
+    pub retransmission_ready_packets: usize,
     pub retransmitted_packets: usize,
     pub next_send_sequence: u64,
     pub minimum_rtt: Option<Duration>,
     pub smoothed_rtt: Duration,
+    /// Current retransmission timeout estimate.
+    pub retransmission_timeout: Duration,
+    /// Age of the oldest packet still in the pipe.
+    pub oldest_pipe_packet_age: Option<Duration>,
+    /// How far past its RTO deadline the most overdue pipe packet is.
+    pub maximum_packet_rto_overdue: Option<Duration>,
+    /// RTO deadlines postponed by the lazy live-estimator floor.
+    pub rto_deadline_postponements: u64,
     pub congestion_window_packets: usize,
     pub received_packets: usize,
     pub next_receive_sequence: Option<u64>,
@@ -185,6 +199,30 @@ pub struct MetricsSnapshot {
     /// Whether the packet behind the most recent delivery-rate sample was
     /// transmitted while DRE considered the connection application-limited.
     pub delivery_sample_app_limited: Option<bool>,
+    /// Control RTT last used by the congestion controller.
+    pub congestion_control_rtt: Option<Duration>,
+    /// RTT floor last used by the congestion controller's queue gate.
+    pub congestion_rtt_floor: Option<Duration>,
+    /// Queue-gate tolerance last computed by the congestion controller.
+    pub congestion_queue_tolerance: Option<Duration>,
+    /// Recent delivery peak feeding the drain floor.
+    pub congestion_delivery_peak_packets_per_second: Option<f64>,
+    /// Drain floor last applied by the congestion controller.
+    pub congestion_drain_floor_packets_per_second: Option<f64>,
+    /// Drain target last applied by the congestion controller.
+    pub congestion_drain_target_packets_per_second: Option<f64>,
+    /// Delivery-rate samples evaluated by the congestion controller.
+    pub congestion_rate_samples: u64,
+    /// Bandwidth-probe decisions taken by the congestion controller.
+    pub congestion_bandwidth_probe_decisions: u64,
+    /// Probe decisions that increased the send rate.
+    pub congestion_bandwidth_probe_increases: u64,
+    /// Increases applied before the previous one got feedback.
+    pub congestion_bandwidth_probe_before_feedback: u64,
+    /// Interval between the last two applied probe increases.
+    pub congestion_last_bandwidth_probe_interval: Option<Duration>,
+    /// Delay-drain decisions taken by the congestion controller.
+    pub congestion_delay_drains: u64,
     /// Application bytes staged inside RTP but not yet packetized.
     pub pending_send_bytes: usize,
     /// Maximum application bytes the current send stage can retain.

@@ -90,6 +90,10 @@ pub fn new_connection(
     if let Some(initial_rtt) = unreliable_layer.initial_rtt {
         reliable_layer.sample_rtt(initial_rtt, now);
     }
+    // Controller interval accounting is opt-in: it runs only when a metrics
+    // observer or a reliable-layer logger exists, so a bare connection pays
+    // exactly one predictable branch per controller decision point.
+    reliable_layer.congestion_metrics_enabled = metrics_observer.is_some() || log_config.is_some();
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -152,6 +156,10 @@ pub fn new_connection_with_watchdog_tuning(
     if let Some(initial_rtt) = unreliable_layer.initial_rtt {
         reliable_layer.sample_rtt(initial_rtt, now);
     }
+    // Controller interval accounting is opt-in: it runs only when a metrics
+    // observer or a reliable-layer logger exists, so a bare connection pays
+    // exactly one predictable branch per controller decision point.
+    reliable_layer.congestion_metrics_enabled = metrics_observer.is_some() || log_config.is_some();
     let reliable_layer_logger = log_config.as_ref().map(|c| {
         let file = std::fs::File::options()
             .write(true)
@@ -704,15 +712,49 @@ impl Connection {
             congestion_action: snapshot.congestion_action.map(|action| action.as_str()),
             num_in_flight_pkts: snapshot.in_flight_packets,
             num_pkts_in_pipe: snapshot.packets_in_pipe,
+            num_rtx_active_pkts: snapshot.retransmission_active_packets,
+            num_rtx_ready_pkts: snapshot.retransmission_ready_packets,
             num_rtx_pkts: snapshot.retransmitted_packets,
             send_seq: snapshot.next_send_sequence,
             min_rtt: snapshot.minimum_rtt.map(|rtt| rtt.as_millis()),
             rtt: snapshot.smoothed_rtt.as_millis(),
+            retransmission_timeout_micros: snapshot.retransmission_timeout.as_micros(),
+            oldest_pipe_packet_age_micros: snapshot
+                .oldest_pipe_packet_age
+                .map(|value| value.as_micros()),
+            maximum_packet_rto_overdue_micros: snapshot
+                .maximum_packet_rto_overdue
+                .map(|value| value.as_micros()),
+            rto_deadline_postponements: snapshot.rto_deadline_postponements,
             cwnd: snapshot.congestion_window_packets,
             num_rx_pkts: snapshot.received_packets,
             recv_seq: snapshot.next_receive_sequence,
             delivery_rate: snapshot.delivery_rate_packets_per_second,
             delivery_sample_app_limited: snapshot.delivery_sample_app_limited,
+            congestion_control_rtt_micros: snapshot
+                .congestion_control_rtt
+                .map(|value| value.as_micros()),
+            congestion_rtt_floor_micros: snapshot
+                .congestion_rtt_floor
+                .map(|value| value.as_micros()),
+            congestion_queue_tolerance_micros: snapshot
+                .congestion_queue_tolerance
+                .map(|value| value.as_micros()),
+            congestion_delivery_peak_packets_per_second: snapshot
+                .congestion_delivery_peak_packets_per_second,
+            congestion_drain_floor_packets_per_second: snapshot
+                .congestion_drain_floor_packets_per_second,
+            congestion_drain_target_packets_per_second: snapshot
+                .congestion_drain_target_packets_per_second,
+            congestion_rate_samples: snapshot.congestion_rate_samples,
+            congestion_bandwidth_probe_decisions: snapshot.congestion_bandwidth_probe_decisions,
+            congestion_bandwidth_probe_increases: snapshot.congestion_bandwidth_probe_increases,
+            congestion_bandwidth_probe_before_feedback: snapshot
+                .congestion_bandwidth_probe_before_feedback,
+            congestion_last_bandwidth_probe_interval_micros: snapshot
+                .congestion_last_bandwidth_probe_interval
+                .map(|value| value.as_micros()),
+            congestion_delay_drains: snapshot.congestion_delay_drains,
             pending_send_bytes: snapshot.pending_send_bytes,
             send_stage_capacity_bytes: snapshot.send_stage_capacity_bytes,
             accepts_new_packet: snapshot.accepts_new_packet,
@@ -812,6 +854,30 @@ mod tests {
         assert_eq!(snapshot.smoothed_rtt, raw_rtt);
         assert_eq!(snapshot.congestion_loss_ratio, None);
         assert_eq!(snapshot.congestion_action, None);
+        assert!(
+            snapshot.retransmission_timeout >= raw_rtt,
+            "the RTO must cover the raw RTT sample"
+        );
+        assert_eq!(
+            snapshot.oldest_pipe_packet_age, None,
+            "no pipe packet timing on an idle connection"
+        );
+        assert_eq!(snapshot.maximum_packet_rto_overdue, None);
+        assert_eq!(snapshot.rto_deadline_postponements, 0);
+        assert_eq!(snapshot.retransmission_active_packets, 0);
+        assert_eq!(snapshot.retransmission_ready_packets, 0);
+        assert_eq!(
+            snapshot.congestion_rtt_floor, None,
+            "no controller RTT floor before the first rate sample"
+        );
+        assert_eq!(
+            snapshot.congestion_queue_tolerance, None,
+            "no controller queue gate before the first rate sample"
+        );
+        assert_eq!(
+            snapshot.congestion_delivery_peak_packets_per_second, None,
+            "no delivery peak before the first rate sample"
+        );
         assert!(snapshot.slow_start);
         assert!(!snapshot.gentle_mode);
         assert!(!snapshot.gentle_draining);

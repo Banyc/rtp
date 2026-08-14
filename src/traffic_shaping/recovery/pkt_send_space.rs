@@ -200,21 +200,25 @@ impl PktSendSpace {
     }
 
     /// Reconcile the retransmission index with the send window's exact
-    /// `min(num_in_flight, cwnd)` in-flight prefix.  Centralizes, in one
-    /// place, active-prefix updates, anchor advancement, reorder-boundary
+    /// `min(num_in_flight, cwnd)` in-flight prefix — or, while an
+    /// outage-recovery epoch is open, the whole pre-outage window.  Centralizes,
+    /// in one place, active-prefix updates, anchor advancement, reorder-boundary
     /// synchronization, fast-loss gate synchronization, and outage
     /// readiness.  Runs only on state transitions (send/ack/cwnd change/
     /// outage detection/tail probe), never on the per-poll paths
     /// (`has_rtx`/`next_poll_time`), which read the index directly.
     fn sync_rtx_index(&mut self, _now: Instant) {
-        let cwnd = self.cwnd.get();
+        let active_target = self.active_target();
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let fast_loss_armed = self.fast_loss_armed();
 
-        // Snapshot the exact in-flight cwnd prefix.
+        // Snapshot the exact in-flight active prefix.
         self.unacked_buf.clear();
-        self.unacked_buf
-            .extend(Self::unacked(&self.send_wnd).take(cwnd).map(|(seq, _)| seq));
+        self.unacked_buf.extend(
+            Self::unacked(&self.send_wnd)
+                .take(active_target)
+                .map(|(seq, _)| seq),
+        );
 
         // Deactivate entries that left the prefix.
         let stale: Vec<SequenceNumber> = self
@@ -321,6 +325,9 @@ impl PktSendSpace {
         self.send_wnd.next()
     }
 
+    /// Single-accessor form of [`Self::send_window_metrics`]; retained as
+    /// public API for external consumers of the send window.
+    #[allow(dead_code)]
     pub fn num_rtxed_pkts(&self) -> usize {
         let mut n = 0;
         for (_, p) in Self::unacked(&self.send_wnd) {
@@ -627,9 +634,10 @@ impl PktSendSpace {
         self.num_in_flight += 1;
         self.tlp.reset();
 
-        // The new packet is indexed iff it lands inside the exact
-        // `min(num_in_flight, cwnd)` prefix of the send window.
-        if self.num_in_flight <= self.cwnd.get() {
+        // The new packet is indexed iff it lands inside the exact active
+        // prefix of the send window: the `min(num_in_flight, cwnd)` prefix in
+        // ordinary mode, the whole pre-outage window during outage recovery.
+        if self.num_in_flight <= self.active_target() {
             let out_of_order = self.out_of_order_seq_end.is_some_and(|end| lt(s, end));
             self.rtx_index.activate(RetransmissionActivation {
                 seq: s,
@@ -864,6 +872,75 @@ impl PktSendSpace {
         self.send_wnd.is_empty()
     }
 
+    /// Number of in-flight packets eligible for the retransmission index:
+    /// the whole pre-outage window while an outage-recovery epoch is open
+    /// (every in-flight packet may be retransmitted without waiting for ack
+    /// rounds), otherwise the exact `min(num_in_flight, cwnd)` prefix.
+    pub fn active_target(&self) -> usize {
+        if self.outage.in_outage_recovery() {
+            self.num_in_flight
+        } else {
+            self.num_in_flight.min(self.cwnd.get())
+        }
+    }
+
+    pub fn num_rtx_active_pkts(&self) -> usize {
+        self.rtx_index.active_entries().count()
+    }
+
+    pub fn num_rtx_ready_pkts(&self) -> usize {
+        self.rtx_index.ready_count()
+    }
+
+    pub fn rto_deadline_postponements(&self) -> u64 {
+        self.rto_deadline_postponements
+    }
+
+    /// One send-window traversal computing the loss ratio, the pipe depth,
+    /// and the retransmission count for the metrics snapshot.  Mirrors the
+    /// semantics of `data_loss_rate` / `num_pkts_in_pipe` / `num_rtxed_pkts`
+    /// without walking the window three times.
+    pub fn send_window_metrics(&self, now: Instant) -> (Option<f64>, usize, usize) {
+        let mut lost = 0;
+        let mut pipe_len = 0;
+        let mut retransmitted = 0;
+        for (seq, p) in Self::unacked(&self.send_wnd) {
+            let in_pipe = self.max_pipe_seq.is_some_and(|m| le(seq, m));
+            if in_pipe {
+                pipe_len += 1;
+                let rtxed = !p.considered_new_in_cwnd && p.rtxed;
+                if rtxed || p.hits_rto(now) {
+                    lost += 1;
+                }
+            }
+            if p.rtxed {
+                retransmitted += 1;
+            }
+        }
+        let loss_ratio = (pipe_len > 0).then_some(lost as f64 / pipe_len as f64);
+        (loss_ratio, pipe_len, retransmitted)
+    }
+
+    /// Pipe timing for the metrics snapshot: the age of the oldest pipe
+    /// packet and how far past its RTO deadline the most overdue pipe packet
+    /// is.  Both are `None` when the pipe is empty (or nothing is overdue).
+    pub fn pipe_rto_timing(&self, now: Instant) -> (Option<Duration>, Option<Duration>) {
+        let mut oldest_sent: Option<Instant> = None;
+        let mut max_overdue: Option<Duration> = None;
+        for (_, p) in self.pkts_in_pipe() {
+            oldest_sent = Some(oldest_sent.map_or(p.sent_time, |oldest| oldest.min(p.sent_time)));
+            let deadline = p.sent_time + p.rto;
+            if now >= deadline {
+                let overdue = now.duration_since(deadline);
+                max_overdue = Some(max_overdue.map_or(overdue, |max| max.max(overdue)));
+            }
+        }
+        (
+            oldest_sent.map(|sent| now.duration_since(sent)),
+            max_overdue,
+        )
+    }
+
     pub fn in_outage_recovery(&self) -> bool {
         self.outage.in_outage_recovery()
     }
@@ -943,6 +1020,9 @@ impl PktSendSpace {
         enough_samples_for_stats && tolerant_loss_rate.get() < data_loss_rate
     }
 
+    /// Single-accessor form of [`Self::send_window_metrics`]; retained as
+    /// public API for external consumers of the send window.
+    #[allow(dead_code)]
     pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
         self.data_loss_stats(now).map(|(_, rate)| rate)
     }
@@ -980,6 +1060,9 @@ impl PktSendSpace {
             .record_lost(1, now, self.smooth_rtt());
     }
 
+    /// Single-accessor form of [`Self::send_window_metrics`]; retained as
+    /// public API for external consumers of the send window.
+    #[allow(dead_code)]
     pub fn num_pkts_in_pipe(&self) -> usize {
         self.pkts_in_pipe().count()
     }
@@ -1078,6 +1161,7 @@ impl InFlightPkt {
         self.rto <= sent_elapsed
     }
 
+    #[allow(dead_code)]
     pub fn next_rto_time(&self) -> Instant {
         self.sent_time + self.rto
     }
@@ -2698,6 +2782,67 @@ mod tests {
         assert!(space.no_pkts_in_flight());
         assert_eq!(space.send_wnd.start(), space.send_wnd.next());
         assert_eq!(space.newest_unacked, None);
+    }
+
+    #[test]
+    fn outage_recovery_schedules_the_whole_pre_outage_window_without_ack_rounds() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Raise cwnd so a flight larger than OUTAGE_RECOVERY_CWND can be in
+        // flight before the outage clamps it: 0.1 s * 80 pkt/s * scale = 64.
+        space.set_send_rate(PosR::new(80.0).unwrap());
+        let pre_outage_flight = space.cwnd().get();
+        assert!(
+            pre_outage_flight > OUTAGE_RECOVERY_CWND,
+            "cwnd={pre_outage_flight}"
+        );
+        for i in 0..pre_outage_flight {
+            send_packet(&mut space, t0 + ms(i as u64));
+        }
+        assert_eq!(space.num_in_flight_pkts(), pre_outage_flight);
+
+        // Make forward progress, arm a loss event, then wait one RTO so the
+        // epoch can be detected.
+        ack_one(&mut space, 0, t0 + ms(pre_outage_flight as u64));
+        lose_packet(&mut space, 1, t0 + ms(pre_outage_flight as u64 + 40));
+        let detect_at = t0 + ms(pre_outage_flight as u64) + space.rto_duration() + ms(1);
+        assert!(space.detect_outage_recovery(detect_at));
+        assert!(space.in_outage_recovery());
+        space.set_send_rate(PosR::new(crate::reliable::reliable_layer::INIT_SEND_RATE).unwrap());
+        assert!(
+            space.cwnd().get() < pre_outage_flight,
+            "recovery cwnd must clamp below the pre-outage flight"
+        );
+
+        // The whole pre-outage window is now active — even beyond the clamped
+        // recovery cwnd — and every packet is ready without any ack round.
+        assert_eq!(
+            space.active_rtx_seqs().len(),
+            space.num_in_flight_pkts(),
+            "the whole pre-outage window must be indexed, not the cwnd prefix"
+        );
+        assert!(
+            space.has_rtx(detect_at),
+            "pre-outage packets must be immediately retransmission-ready"
+        );
+
+        // Retransmit everything in one sweep.  Production paces these through
+        // the token bucket, but the scheduler itself must offer the whole
+        // pre-outage window without any ack rounds in between.
+        let mut t = detect_at;
+        let mut retransmitted = 0;
+        while let Some(p) = space.rtx(t) {
+            retransmitted += 1;
+            t += ms(1);
+        }
+        assert_eq!(
+            retransmitted,
+            pre_outage_flight - 1,
+            "every pre-outage in-flight packet must be scheduled without ack rounds"
+        );
+        assert!(!space.has_rtx(t), "the window is exhausted after one sweep");
     }
 
     #[test]
