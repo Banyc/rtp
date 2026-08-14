@@ -298,12 +298,37 @@ impl<'a> AckBlocks<'a> {
         highest_sacked
     }
 
+    /// The exclusive forward offset (from `send_start`) of the last unacked
+    /// sequence this ACK can possibly deliver: the maximum of the cumulative
+    /// front (when current) and the end of the highest clipped selective
+    /// block.  Unacked sequences at or beyond this offset are never acked by
+    /// this ACK and never carry selective evidence, so sender-side analysis
+    /// can stop there without scanning the whole send window.
+    pub(crate) fn relevant_unacked_end_offset(
+        &self,
+        send_start: SequenceNumber,
+        sent_span: u64,
+    ) -> u64 {
+        let cumulative_end = match self.cumulative_position(send_start, sent_span) {
+            CumulativePosition::Current(offset) => offset,
+            CumulativePosition::Stale | CumulativePosition::Future => 0,
+        };
+        let selective_end = self
+            .valid_block_offsets(send_start, sent_span)
+            .map(|(_, end)| end)
+            .max()
+            .unwrap_or(0);
+        cumulative_end.max(selective_end)
+    }
+
     /// One bounded wrapping-safe linear analysis of this ACK against the
     /// sender's in-flight window: computes, in a single pass per direction,
     /// which `unacked` sequences are delivered (cumulative prefix plus
     /// normalized selective blocks) and the dup-ACK-pass evidence above each
     /// one, plus the analysis summary.  `unacked` must be in increasing
-    /// logical offset order (as produced by `SendWindow::iter`).
+    /// logical offset order (as produced by `SendWindow::iter`).  It may be
+    /// truncated at [`Self::relevant_unacked_end_offset`]: sequences at or
+    /// beyond the bound are never acked and never contribute evidence.
     /// `block_offsets`, `acked`, and `sacked_above` are caller-owned reusable
     /// buffers; `sacked_above` is always resized to `unacked.len()` and
     /// zero-filled even for a cumulative-only ACK.
@@ -697,6 +722,69 @@ mod tests {
             .collect();
         assert_eq!(delivered, vec![0, 1, 3, 4, 6]);
         assert_eq!(evidence, vec![3, 3, 3, 2, 1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn relevant_unacked_end_uses_clipped_cumulative_and_selective_bounds() {
+        let send_start = seq(100);
+        let sent_span = 8u64;
+        let unacked: Vec<SequenceNumber> = (0..sent_span).map(|o| send_start.advance(o)).collect();
+
+        // Cumulative-only: the exclusive bound is the cumulative front.
+        let recved = AckBlocks::new(seq(104), &[]);
+        assert_eq!(recved.relevant_unacked_end_offset(send_start, sent_span), 4);
+
+        // Selective blocks extend the bound to the highest clipped end.
+        let blocks = [iv(102, 2), iv(105, 1)];
+        let recved = AckBlocks::new(seq(101), &blocks);
+        assert_eq!(recved.relevant_unacked_end_offset(send_start, sent_span), 6);
+
+        // A block clipped at the sent span bounds at sent_span.
+        let blocks = [iv(105, 100)];
+        let recved = AckBlocks::new(seq(101), &blocks);
+        assert_eq!(recved.relevant_unacked_end_offset(send_start, sent_span), 8);
+
+        // A stale/future cumulative next contributes nothing; only the
+        // clipped selective bound counts.
+        let blocks = [iv(102, 2)];
+        let recved = AckBlocks::new(seq(99), &blocks);
+        assert_eq!(recved.relevant_unacked_end_offset(send_start, sent_span), 4);
+
+        // Analyzing over the bounded prefix agrees with the full-window
+        // analysis for both acked sequences and evidence: sequences at or
+        // beyond the bound are never delivered and never earn evidence.
+        let blocks = [iv(102, 2), iv(105, 1)];
+        let recved = AckBlocks::new(seq(101), &blocks);
+        let end = recved.relevant_unacked_end_offset(send_start, sent_span);
+        let bounded: Vec<SequenceNumber> = unacked
+            .iter()
+            .copied()
+            .take_while(|s| send_start.forward_distance_to(*s) < end)
+            .collect();
+        assert_eq!(bounded.len(), 6);
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut evidence = Vec::new();
+        let mut bounded_acked = Vec::new();
+        let mut bounded_evidence = Vec::new();
+        recved.analyze(
+            send_start,
+            sent_span,
+            &unacked,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
+        recved.analyze(
+            send_start,
+            sent_span,
+            &bounded,
+            &mut block_offsets,
+            &mut bounded_acked,
+            &mut bounded_evidence,
+        );
+        assert_eq!(bounded_acked, acked);
+        assert_eq!(bounded_evidence, evidence[..bounded.len()]);
     }
 
     #[test]

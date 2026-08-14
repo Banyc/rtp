@@ -47,11 +47,6 @@ impl SequenceNumber {
         Self(self.0.wrapping_add(n))
     }
 
-    /// Retreat by `n` with wrapping arithmetic.
-    pub(crate) fn retreat(self, n: u64) -> Self {
-        Self(self.0.wrapping_sub(n))
-    }
-
     /// Forward distance from `self` to `later`, computed with wrapping
     /// arithmetic.  The result is a raw offset, meaningful only relative to
     /// a live window anchor.
@@ -117,6 +112,15 @@ pub(crate) enum SequencePosition {
     Ambiguous,
     /// Ahead of the live window but within the forward half space.
     TooFarAhead,
+}
+
+/// Why a vacant-only insertion was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceVacancyError {
+    /// The key is already present in the map.
+    Occupied,
+    /// The key is outside the live window; carries its classification.
+    Outside(SequencePosition),
 }
 
 /// A bounded live window over the wrapping sequence space: `[anchor,
@@ -230,12 +234,38 @@ impl<V> SequenceMap<V> {
         }
     }
 
+    /// Build `value` and insert it at `seq` only when the key is vacant and
+    /// in-window.  The closure runs only for a successful insertion, so
+    /// callers can construct expensive payloads lazily without building
+    /// rejected values.
+    pub(crate) fn insert_vacant_with(
+        &mut self,
+        seq: SequenceNumber,
+        value: impl FnOnce() -> V,
+    ) -> Result<(), SequenceVacancyError> {
+        let position = self.window.classify(seq);
+        if !matches!(position, SequencePosition::InWindow(_)) {
+            return Err(SequenceVacancyError::Outside(position));
+        }
+        match self.inner.entry(RawSequenceKey(seq.to_wire())) {
+            Entry::Vacant(entry) => {
+                entry.insert(value());
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(SequenceVacancyError::Occupied),
+        }
+    }
+
     pub(crate) fn remove(&mut self, seq: &SequenceNumber) -> Option<V> {
         self.inner.remove(&RawSequenceKey(seq.to_wire()))
     }
 
     pub(crate) fn get(&self, seq: &SequenceNumber) -> Option<&V> {
         self.inner.get(&RawSequenceKey(seq.to_wire()))
+    }
+
+    pub(crate) fn get_mut(&mut self, seq: &SequenceNumber) -> Option<&mut V> {
+        self.inner.get_mut(&RawSequenceKey(seq.to_wire()))
     }
 
     pub(crate) fn contains_key(&self, seq: &SequenceNumber) -> bool {
@@ -247,11 +277,16 @@ impl<V> SequenceMap<V> {
     /// is empty.
     pub(crate) fn first(&self) -> Option<(SequenceNumber, &V)> {
         let anchor = RawSequenceKey(self.window.anchor().to_wire());
-        self.inner
-            .range(anchor..)
-            .next()
-            .or_else(|| self.inner.range(..anchor).next())
-            .map(|(k, v)| (SequenceNumber::from_wire(k.0), v))
+        let (first_key, first_value) = self.inner.first_key_value()?;
+        let (key, value) = if *first_key >= anchor {
+            (first_key, first_value)
+        } else {
+            self.inner
+                .range(anchor..)
+                .next()
+                .unwrap_or((first_key, first_value))
+        };
+        Some((SequenceNumber::from_wire(key.0), value))
     }
 
     /// The logically-last retained entry, wrap-aware: the largest key below
@@ -422,6 +457,22 @@ impl<V> SendWindow<V> {
             .map(|(i, v)| (self.start.advance(i as u64), v))
     }
 
+    /// Iterate the logical suffix starting at `start`: skip the forward
+    /// offset from the window start and stop at the physical end — never
+    /// circling back around the wrap.
+    pub(crate) fn iter_from(
+        &self,
+        start: SequenceNumber,
+    ) -> impl Iterator<Item = (SequenceNumber, &V)> + '_ {
+        let offset = self.start.forward_distance_to(start);
+        let offset = offset.min(self.queue.len() as u64) as usize;
+        self.queue
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .map(|(i, value)| (self.start.advance(i as u64), value))
+    }
+
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (SequenceNumber, &mut V)> + '_ {
         self.queue
             .iter_mut()
@@ -431,6 +482,21 @@ impl<V> SendWindow<V> {
 }
 
 impl<V> SendWindow<Option<V>> {
+    /// The newest entry still holding a value (the logical tail of the
+    /// window's occupied suffix), scanning from the physical end so the
+    /// common case (tail unacked) is a single probe.
+    pub(crate) fn last_present(&self) -> Option<(SequenceNumber, &V)> {
+        self.queue
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, value)| {
+                value
+                    .as_ref()
+                    .map(|value| (self.start.advance(index as u64), value))
+            })
+    }
+
     /// Remove the acknowledged empty prefix (`None` entries at the head) and
     /// return the number of entries removed.  Liveness accounting must use
     /// this count rather than comparing wrapped numeric values.
@@ -542,10 +608,9 @@ mod tests {
     }
 
     #[test]
-    fn advance_and_retreat_wrap() {
+    fn advance_wraps() {
         let a = seq(u64::MAX);
         assert_eq!(a.advance(1), seq(0));
-        assert_eq!(seq(0).retreat(1), seq(u64::MAX));
         assert_eq!(a.advance(2), seq(1));
     }
 
@@ -763,5 +828,71 @@ mod tests {
         assert_eq!(w.pop_none(), 2, "both None entries must be removed");
         assert_eq!(w.start(), seq(u64::MAX - 1).advance(3));
         assert_eq!(*w.get(&seq(u64::MAX - 1).advance(3)).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn lazy_vacant_insert_distinguishes_occupied_stale_and_future_without_building_rejections() {
+        let mut map: SequenceMap<u32> = SequenceMap::new(seq(10), 5);
+        let builds = std::cell::Cell::new(0u32);
+        let build = || {
+            builds.set(builds.get() + 1);
+            7u32
+        };
+        // An in-window vacant insertion builds and inserts exactly once.
+        assert!(map.insert_vacant_with(seq(12), build).is_ok());
+        assert_eq!(builds.get(), 1);
+        assert_eq!(map.get(&seq(12)), Some(&7));
+        // An occupied insertion is rejected without building a value.
+        assert_eq!(
+            map.insert_vacant_with(seq(12), build),
+            Err(SequenceVacancyError::Occupied)
+        );
+        assert_eq!(builds.get(), 1, "occupied rejection must not build a value");
+        // Stale and future insertions are rejected with their classification
+        // and never build a value either.
+        assert_eq!(
+            map.insert_vacant_with(seq(5), build),
+            Err(SequenceVacancyError::Outside(SequencePosition::Stale))
+        );
+        assert_eq!(
+            map.insert_vacant_with(seq(16), build),
+            Err(SequenceVacancyError::Outside(SequencePosition::TooFarAhead))
+        );
+        assert_eq!(
+            builds.get(),
+            1,
+            "rejected insertions must not build a value"
+        );
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn sequence_map_first_preserves_logical_order_with_and_without_wrap() {
+        // No wrap: the physically-first key is also the logical first.
+        let mut map: SequenceMap<u32> = SequenceMap::new(seq(10), 8);
+        for s in [12, 10, 14] {
+            map.insert(seq(s), s as u32);
+        }
+        assert_eq!(map.first().map(|(k, _)| k.to_wire()), Some(10));
+        // Wrap: keys straddle the physical zero; the logical first is the
+        // anchor even though the physically-first key lives in the wrapped
+        // low segment.
+        let mut wrapped: SequenceMap<u32> = SequenceMap::new(seq(u64::MAX - 2), 8);
+        for (s, v) in [(0, 1), (u64::MAX - 1, 2), (u64::MAX - 2, 3)] {
+            wrapped.insert(seq(s), v);
+        }
+        assert_eq!(
+            wrapped.first().map(|(k, _)| k.to_wire()),
+            Some(u64::MAX - 2),
+            "the anchor segment leads after the wrap"
+        );
+        // Removing the anchor segment moves the logical first into the
+        // wrapped low segment (the physically-first key is now correct).
+        wrapped.remove(&seq(u64::MAX - 2));
+        wrapped.remove(&seq(u64::MAX - 1));
+        assert_eq!(wrapped.first().map(|(k, _)| k.to_wire()), Some(0));
+        // An empty map has no first.
+        let empty: SequenceMap<u32> = SequenceMap::new(seq(0), 8);
+        assert!(empty.first().is_none());
     }
 }
