@@ -11,7 +11,7 @@ use crate::transmission::write_half::WriteHalf;
 /// The wire bound on selective ACK blocks per datagram; page size for the
 /// ACK-flush paging scheme.
 pub(crate) const MAX_NUM_ACK: usize = MAX_ACK_BLOCKS;
-pub(crate) const ACK_FLUSH_COUNT: usize = 16;
+pub(crate) const ACK_FLUSH_COUNT: usize = 8;
 pub(crate) const ACK_FLUSH_AGE: Duration = Duration::from_millis(1);
 
 /// Shared ACK-flush state, accessed from both the recv path (records ACK
@@ -224,9 +224,9 @@ mod tests {
         let now = Instant::now();
         let mut s = AckFlushState::new();
         // The count threshold drives a busy flow whose acks arrive faster
-        // than the age cap: 16 pending acks flush immediately even though
+        // than the age cap: 8 pending acks flush immediately even though
         // the last flush was instant ago.
-        assert_eq!(ACK_FLUSH_COUNT, 16);
+        assert_eq!(ACK_FLUSH_COUNT, 8);
         s.pending_acks = ACK_FLUSH_COUNT - 1;
         s.last_ack_flush = Some(now);
         assert!(

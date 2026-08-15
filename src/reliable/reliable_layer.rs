@@ -1,6 +1,9 @@
 use core::num::NonZeroUsize;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -106,6 +109,8 @@ enum FinState {
 /// decisions — no extra timers or scans are run to produce it.
 #[derive(Debug, Clone, Copy, Default)]
 struct CongestionMetrics {
+    application_limited_detections: u64,
+    application_limited_detections_suppressed_by_waiting_writer: u64,
     control_rtt: Option<Duration>,
     rtt_floor: Option<Duration>,
     queue_tolerance: Option<Duration>,
@@ -137,6 +142,23 @@ impl CongestionMetrics {
     }
 }
 
+/// A drop-scoped registration of one application writer blocked on send
+/// capacity.  Holding one of these raises the exported
+/// `application_write_waiters` counter; dropping it decrements the counter
+/// (cancellation-safe: no writer ever suppresses application-limited
+/// classification while waiting).
+#[derive(Debug)]
+pub(crate) struct ApplicationWriteWaiter {
+    waiters: Arc<AtomicUsize>,
+}
+
+impl Drop for ApplicationWriteWaiter {
+    fn drop(&mut self) {
+        let previous = self.waiters.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "application write waiter counter underflow");
+    }
+}
+
 #[derive(Debug)]
 pub struct ReliableLayer {
     mss: NonZeroUsize,
@@ -148,6 +170,10 @@ pub struct ReliableLayer {
     recv_data_buf: StockRecvStage,
     recv_fin_buf: bool,
     send_rate_limiter: Arc<Mutex<SendPacer>>,
+    /// Number of application writers currently blocked waiting for send
+    /// capacity.  Registration is drop-scoped (`ApplicationWriteWaiter`), so
+    /// a cancelled writer always releases its slot.
+    application_write_waiters: Arc<AtomicUsize>,
     connection_stats: ConnectionState,
     pkt_send_space: PktSendSpace,
     pkt_recv_space: PktRecvSpace,
@@ -212,6 +238,7 @@ impl ReliableLayer {
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
+            application_write_waiters: Arc::new(AtomicUsize::new(0)),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new_at(initial_sequences.send),
             pkt_recv_space: PktRecvSpace::new_at(initial_sequences.recv),
@@ -257,6 +284,7 @@ impl ReliableLayer {
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
             send_rate_limiter: send_rate_limiter.clone(),
+            application_write_waiters: Arc::new(AtomicUsize::new(0)),
             connection_stats: ConnectionState::new(now),
             pkt_send_space: PktSendSpace::new_at(initial_sequences.send)
                 .with_watchdog_tuning(tuning),
@@ -283,6 +311,18 @@ impl ReliableLayer {
             pkt_buf: Vec::new(),
         };
         (this, send_rate_limiter)
+    }
+
+    /// Register one blocked application writer: raises the exported
+    /// `application_write_waiters` counter for as long as the returned guard
+    /// is alive.  The guard is drop-scoped, so a cancelled writer always
+    /// releases its slot (see [`ApplicationWriteWaiter`]).
+    pub(crate) fn application_write_waiter(&self) -> ApplicationWriteWaiter {
+        self.application_write_waiters
+            .fetch_add(1, Ordering::Relaxed);
+        ApplicationWriteWaiter {
+            waiters: Arc::clone(&self.application_write_waiters),
+        }
     }
 
     /// Whether frame-delivery mode is enabled on this connection.
@@ -700,7 +740,6 @@ impl ReliableLayer {
 
         self.pkt_send_space
             .ack(recved, &mut self.pkt_stats_buf, now);
-        self.huge_data_loss_check_after = now;
 
         // Reconcile deferred CC loss-events after the ack: any whose seq was
         // just acked has been cancelled, and any whose stock deadline has
@@ -1119,6 +1158,12 @@ impl ReliableLayer {
             return;
         }
         let cwnd_stats = self.pkt_send_space.cwnd_stats(now);
+        if self.congestion_metrics_enabled {
+            self.congestion_metrics.application_limited_detections = self
+                .congestion_metrics
+                .application_limited_detections
+                .saturating_add(1);
+        }
         self.connection_stats.detect_application_limited_phases_2(
             dre::DetectAppLimitedPhaseParams {
                 few_data_to_send: true,
@@ -1228,10 +1273,7 @@ impl ReliableLayer {
     }
 
     pub(crate) fn metrics_at(&self, now: Instant) -> crate::metrics::MetricsSnapshot {
-        let (loss_ratio, packets_in_pipe, retransmitted_packets) =
-            self.pkt_send_space.send_window_metrics(now);
-        let (oldest_pipe_packet_age, maximum_packet_rto_overdue) =
-            self.pkt_send_space.pipe_rto_timing(now);
+        let send_window = self.pkt_send_space.send_window_observation(now);
         let stall_reason = self
             .pkt_send_space
             .stall_reason(now)
@@ -1246,20 +1288,20 @@ impl ReliableLayer {
         crate::metrics::MetricsSnapshot {
             pacer_tokens_packets: self.send_rate_limiter.lock().unwrap().outdated_tokens(),
             send_rate_packets_per_second: self.send_rate.get(),
-            loss_ratio,
+            loss_ratio: send_window.loss_ratio,
             congestion_loss_ratio: self.last_congestion_loss_ratio,
             congestion_action: self.last_congestion_action,
             in_flight_packets: self.pkt_send_space.num_in_flight_pkts(),
-            packets_in_pipe,
+            packets_in_pipe: send_window.packets_in_pipe,
             retransmission_active_packets: self.pkt_send_space.num_rtx_active_pkts(),
             retransmission_ready_packets: self.pkt_send_space.num_rtx_ready_pkts(),
-            retransmitted_packets,
+            retransmitted_packets: send_window.retransmitted_packets,
             next_send_sequence: self.pkt_send_space.next_seq().to_wire(),
             minimum_rtt: self.pkt_send_space.min_rtt(),
             smoothed_rtt: self.pkt_send_space.smooth_rtt(),
             retransmission_timeout: self.pkt_send_space.rto_duration(),
-            oldest_pipe_packet_age,
-            maximum_packet_rto_overdue,
+            oldest_pipe_packet_age: send_window.oldest_pipe_packet_age,
+            maximum_packet_rto_overdue: send_window.maximum_packet_rto_overdue,
             rto_deadline_postponements: self.pkt_send_space.rto_deadline_postponements(),
             congestion_window_packets: self.pkt_send_space.cwnd().get(),
             received_packets: self.pkt_recv_space.num_recved_pkts(),
@@ -1272,6 +1314,11 @@ impl ReliableLayer {
                 .prev_sample_rate
                 .as_ref()
                 .map(|sample| sample.is_app_limited()),
+            application_write_waiters: self.application_write_waiters.load(Ordering::Relaxed),
+            application_limited_detections: self.congestion_metrics.application_limited_detections,
+            application_limited_detections_suppressed_by_waiting_writer: self
+                .congestion_metrics
+                .application_limited_detections_suppressed_by_waiting_writer,
             congestion_control_rtt: self.congestion_metrics.control_rtt,
             congestion_rtt_floor: self.congestion_metrics.rtt_floor,
             congestion_queue_tolerance: self.congestion_metrics.queue_tolerance,
@@ -1341,6 +1388,10 @@ impl ReliableLayer {
             num_rx_pkts: metrics.received_packets,
             recv_seq: metrics.next_receive_sequence,
             delivery_sample_app_limited: metrics.delivery_sample_app_limited,
+            application_write_waiters: metrics.application_write_waiters,
+            application_limited_detections: metrics.application_limited_detections,
+            application_limited_detections_suppressed_by_waiting_writer: metrics
+                .application_limited_detections_suppressed_by_waiting_writer,
             congestion_control_rtt: metrics
                 .congestion_control_rtt
                 .map(|value| value.as_micros()),
@@ -1581,6 +1632,23 @@ mod tests {
     }
 
     #[test]
+    fn application_write_waiter_registration_is_drop_scoped() {
+        let now = Instant::now();
+        let layer = test_layer(now);
+        assert_eq!(layer.metrics_at(now).application_write_waiters, 0);
+        {
+            let _first = layer.application_write_waiter();
+            assert_eq!(layer.metrics_at(now).application_write_waiters, 1);
+            {
+                let _second = layer.application_write_waiter();
+                assert_eq!(layer.metrics_at(now).application_write_waiters, 2);
+            }
+            assert_eq!(layer.metrics_at(now).application_write_waiters, 1);
+        }
+        assert_eq!(layer.metrics_at(now).application_write_waiters, 0);
+    }
+
+    #[test]
     fn huge_loss_checks_are_paced_including_positive_results() {
         let now = Instant::now();
         let mut layer = test_layer(now);
@@ -1588,6 +1656,15 @@ mod tests {
         assert_eq!(
             layer.huge_data_loss_check_after,
             now + HUGE_DATA_LOSS_CHECK_INTERVAL
+        );
+        layer.recv_ack_pkt(
+            AckBlocks::new(crate::sequence::SequenceNumber::ZERO, &[]),
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(
+            layer.huge_data_loss_check_after,
+            now + HUGE_DATA_LOSS_CHECK_INTERVAL,
+            "an ACK must not bypass the bounded huge-loss scan cadence"
         );
         assert!(
             layer
@@ -2614,6 +2691,9 @@ pub struct MetricsRow {
     pub num_rx_pkts: usize,
     pub recv_seq: Option<u64>,
     pub delivery_sample_app_limited: Option<bool>,
+    pub application_write_waiters: usize,
+    pub application_limited_detections: u64,
+    pub application_limited_detections_suppressed_by_waiting_writer: u64,
     pub congestion_control_rtt: Option<u128>,
     pub congestion_rtt_floor: Option<u128>,
     pub congestion_queue_tolerance: Option<u128>,

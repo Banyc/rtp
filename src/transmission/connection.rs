@@ -299,9 +299,21 @@ impl Connection {
                 return Ok(written_bytes);
             }
             self.termination.check_error()?;
-            tokio::select! {
-                () = &mut sent_data_pkt => (),
-                () = self.termination.terminal().cancelled() => (),
+            {
+                // Register the blocked writer for the duration of the wait:
+                // the counter is drop-scoped, so a cancelled writer always
+                // releases its slot.  Waiting never suppresses
+                // application-limited classification (the exported
+                // suppression counter stays zero).
+                let _waiter = self
+                    .reliable_layer
+                    .lock()
+                    .unwrap()
+                    .application_write_waiter();
+                tokio::select! {
+                    () = &mut sent_data_pkt => (),
+                    () = self.termination.terminal().cancelled() => (),
+                }
             }
             self.termination.check_error()?;
             sent_data_pkt.set(self.signals.sent_data_pkt.notified());
@@ -330,9 +342,18 @@ impl Connection {
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     self.termination.check_error()?;
-                    tokio::select! {
-                        () = &mut sent_data_pkt => (),
-                        () = self.termination.terminal().cancelled() => (),
+                    {
+                        // Register the blocked writer for the duration of the
+                        // wait (drop-scoped; see `send_bytes`).
+                        let _waiter = self
+                            .reliable_layer
+                            .lock()
+                            .unwrap()
+                            .application_write_waiter();
+                        tokio::select! {
+                            () = &mut sent_data_pkt => (),
+                            () = self.termination.terminal().cancelled() => (),
+                        }
                     }
                     self.termination.check_error()?;
                     sent_data_pkt.set(self.signals.sent_data_pkt.notified());
@@ -410,7 +431,7 @@ impl Connection {
         let (mut protocol_deadline, pacing_deadline) = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             (
-                reliable_layer.pkt_send_space().next_poll_time(),
+                reliable_layer.pkt_send_space().next_poll_time(now),
                 reliable_layer.next_pacing_deadline(now),
             )
         };
@@ -642,7 +663,21 @@ impl Connection {
         if self.metrics_observer.is_none() && self.reliable_layer_logger.is_none() {
             return;
         }
-        let now = Instant::now();
+        self.log_enabled_at(event, Instant::now());
+    }
+
+    /// Log an event against a caller-supplied decision time: the clock is
+    /// never re-sampled for a decision already made at the pass time, so
+    /// `elapsed` (and every deadline derived from it) matches the moment the
+    /// decision was made, not the moment the metrics call happened to run.
+    pub(crate) fn log_at(&self, event: MetricsEvent, now: Instant) {
+        if self.metrics_observer.is_none() && self.reliable_layer_logger.is_none() {
+            return;
+        }
+        self.log_enabled_at(event, now);
+    }
+
+    fn log_enabled_at(&self, event: MetricsEvent, now: Instant) {
         let elapsed = now.saturating_duration_since(self.clock_epoch);
         let observer_interest = self
             .metrics_observer
@@ -731,6 +766,10 @@ impl Connection {
             recv_seq: snapshot.next_receive_sequence,
             delivery_rate: snapshot.delivery_rate_packets_per_second,
             delivery_sample_app_limited: snapshot.delivery_sample_app_limited,
+            application_write_waiters: snapshot.application_write_waiters,
+            application_limited_detections: snapshot.application_limited_detections,
+            application_limited_detections_suppressed_by_waiting_writer: snapshot
+                .application_limited_detections_suppressed_by_waiting_writer,
             congestion_control_rtt_micros: snapshot
                 .congestion_control_rtt
                 .map(|value| value.as_micros()),
@@ -935,6 +974,28 @@ mod tests {
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].raw_rtt_sample, Some(raw_rtt));
+        assert_eq!(observations[0].snapshot, None);
+    }
+
+    #[test]
+    fn log_at_preserves_the_transport_decision_time() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::selective(
+                |_, _| MetricsInterest::EventOnly,
+                move |observation| observations.lock().unwrap().push(observation),
+            )
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        let decision_time = shared.clock_epoch + std::time::Duration::from_millis(7);
+        shared.log_at(MetricsEvent::SendDataPacketAttempt, decision_time);
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].elapsed, std::time::Duration::from_millis(7));
+        assert_eq!(observations[0].event, MetricsEvent::SendDataPacketAttempt);
         assert_eq!(observations[0].snapshot, None);
     }
 

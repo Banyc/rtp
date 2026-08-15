@@ -43,18 +43,23 @@ impl WriteHalf {
         Some(result)
     }
 
-    async fn check_error_after_requested_kill(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        match self.termination.check_error() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = self.try_send_requested_kill(bufs).await;
-                Err(error)
-            }
-        }
+    async fn return_error_after_requested_kill(
+        &mut self,
+        bufs: &mut SendBufs,
+    ) -> Result<(), IoErr> {
+        let error = self
+            .termination
+            .check_error()
+            .expect_err("error-present flag must publish the first terminal error");
+        let _ = self.try_send_requested_kill(bufs).await;
+        Err(error)
     }
 
-    pub(crate) fn proactively_terminate_stalled_session(&self) {
-        let now = Instant::now();
+    /// Proactively terminate the session when the peer-liveness watchdog
+    /// considers it stalled, evaluated at the caller-supplied decision time
+    /// (the send pass's fixed `now`, never a fresh clock sampled after the
+    /// stall was observed).  Emits the termination snapshot event exactly once.
+    pub(crate) fn proactively_terminate_stalled_session_at(&self, now: Instant) {
         let context = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let send_space = reliable_layer.pkt_send_space();
@@ -91,19 +96,19 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
-        self.send_pkts_inner(bufs, Instant::now()).await
+        Ok(self.send_pkts_inner(bufs, Instant::now()).await?.0)
     }
 
     pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendLoopResult, IoErr> {
         let now = Instant::now();
-        let made_progress = self.send_pkts_inner(bufs, now).await?;
-        // The pass may have awaited blocking underlay sends; refresh the
-        // clock before recomputing the next wake so deadlines are not stale.
-        let now = Instant::now();
-        let (_, ack_deadline) = self.ack_flush.lock().unwrap().check(now);
+        let (made_progress, completed_at) = self.send_pkts_inner(bufs, now).await?;
+        // The pass may have awaited blocking underlay sends; the completion
+        // clock (refreshed after awaits) is the decision time for the next
+        // wake, never the pre-await `now`.
+        let (_, ack_deadline) = self.ack_flush.lock().unwrap().check(completed_at);
         Ok(SendLoopResult {
             made_progress,
-            wake: self.next_send_wake_after_ack_check(now, ack_deadline),
+            wake: self.next_send_wake_after_ack_check(completed_at, ack_deadline),
         })
     }
 
@@ -111,13 +116,15 @@ impl WriteHalf {
         &mut self,
         bufs: &mut SendBufs,
         mut now: Instant,
-    ) -> Result<bool, IoErr> {
+    ) -> Result<(bool, Instant), IoErr> {
         if self.try_send_requested_kill(bufs).await.is_some() {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
-        self.proactively_terminate_stalled_session();
-        self.check_error_after_requested_kill(bufs).await?;
-        self.send_due_post_open_response().await?;
+        self.proactively_terminate_stalled_session_at(now);
+        if self.termination.has_error() {
+            self.return_error_after_requested_kill(bufs).await?;
+        }
+        self.send_due_post_open_response(now).await?;
         // `now` is already fixed for one send pass: compute the wire timestamp
         // once and reuse it for every packet encoded by this pass.  A blocked
         // underlay send refreshes the clock for deadline/token math, but the
@@ -126,15 +133,15 @@ impl WriteHalf {
         let mut written_bytes = 0;
         let mut written_fin = false;
         loop {
-            // A requested kill is delivered by `check_error_after_requested_kill`
-            // on the error path; no separate poll is needed here.
-            self.check_error_after_requested_kill(bufs).await?;
+            if self.termination.has_error() {
+                self.return_error_after_requested_kill(bufs).await?;
+            }
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
             let res = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 reliable_layer.send_data_pkt(payload, now)
             };
-            self.log(crate::metrics::MetricsEvent::SendDataPacketAttempt);
+            self.log_at(crate::metrics::MetricsEvent::SendDataPacketAttempt, now);
             let Some(p) = res else {
                 if FEC_DEBUG {
                     eprintln!("send_data_pkt: no pkt to send (rtx=None, cwnd full or no tokens)");
@@ -274,10 +281,13 @@ impl WriteHalf {
                 || (data_path && self.instream_group_fec_enabled());
             self.close_fec_burst(now, can_send_tail_fec).await?;
         }
-        if self.ack_flush_is_due() {
+        let made_progress = 0 < written_bytes || written_fin;
+        let mut completed_at = Instant::now();
+        if self.ack_flush_is_due(completed_at) {
             self.flush_acks(bufs).await?;
+            completed_at = Instant::now();
         }
-        Ok(0 < written_bytes || written_fin)
+        Ok((made_progress, completed_at))
     }
 
     async fn maybe_flush_full_fec_group(&mut self, now: Instant) -> Result<(), IoErr> {
@@ -347,8 +357,8 @@ impl WriteHalf {
         Ok(())
     }
 
-    async fn send_due_post_open_response(&mut self) -> Result<(), IoErr> {
-        let Some(response) = self.claim_post_open_response(Instant::now()) else {
+    async fn send_due_post_open_response(&mut self, now: Instant) -> Result<(), IoErr> {
+        let Some(response) = self.claim_post_open_response(now) else {
             return Ok(());
         };
         match self.utp_write.send(&response.bytes).await {
@@ -413,8 +423,7 @@ impl WriteHalf {
         self.ack_flush.lock().unwrap().has_pending()
     }
 
-    pub fn ack_flush_is_due(&self) -> bool {
-        let now = Instant::now();
+    fn ack_flush_is_due(&self, now: Instant) -> bool {
         self.ack_flush.lock().unwrap().is_due(now)
     }
 
@@ -570,7 +579,7 @@ mod tests {
         let mut packet = vec![0; crate::udp::NO_FEC_MSS];
         assert!(reliable.send_data_pkt(&mut packet, now).is_some());
         drop(reliable);
-        write_half.proactively_terminate_stalled_session();
+        write_half.proactively_terminate_stalled_session_at(now + Duration::from_nanos(1));
         let observations = observations.lock().unwrap();
         let event = observations
             .iter()

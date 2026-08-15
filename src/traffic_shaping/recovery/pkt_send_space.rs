@@ -16,7 +16,9 @@ use crate::{
         loss_event_window::LossEventWindow,
         outage::{OutageDetection, OutageEpoch},
         rtt_stats::RttStats,
-        rtx_index::{ReadyReason, RetransmissionActivation, RetransmissionIndex},
+        rtx_index::{
+            DeferredLossIndex, ReadyReason, RetransmissionActivation, RetransmissionIndex,
+        },
         tlp::TailLossProber,
     },
     transmission::watchdog_tuning::WatchdogTuning,
@@ -45,11 +47,12 @@ pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 /// then (genuine loss).  If the original is acked before the stock deadline
 /// (it was reordering, not loss) no loss event is recorded and no later
 /// repair is double-counted.
+fn jitter_cap_enabled(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+}
+
 fn jitter_cap_from_env() -> bool {
-    match std::env::var("RTP_JITTER_CAP") {
-        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-        Err(_) => false,
-    }
+    jitter_cap_enabled(std::env::var("RTP_JITTER_CAP").ok().as_deref())
 }
 
 #[derive(Debug)]
@@ -98,8 +101,9 @@ pub struct PktSendSpace {
     /// retransmitted at the fast reorder window; its CC loss event is deferred
     /// to the stock reorder-window deadline and recorded only if the packet
     /// is still unacked then.  An ACK for the seq cancels the entry
-    /// (reordering, not loss).
-    deferred_losses: Vec<DeferredLoss>,
+    /// (reordering, not loss).  Indexed by sequence for O(1) cancellation
+    /// with a deadline-ordered set for the next-due selection.
+    deferred_losses: DeferredLossIndex,
 
     /// Snapshot of `RTP_JITTER_CAP` taken at construction.  Stored as a
     /// field rather than read from a `OnceLock` so tests can construct a
@@ -145,7 +149,7 @@ impl PktSendSpace {
             outage: OutageEpoch::new(),
             rtt_stats: RttStats::new(),
             fast_loss_disabled: false,
-            deferred_losses: vec![],
+            deferred_losses: DeferredLossIndex::new(initial_seq),
             jitter_cap: jitter_cap_from_env(),
             rtx_index: RetransmissionIndex::new(initial_seq),
             unacked_buf: vec![],
@@ -199,6 +203,84 @@ impl PktSendSpace {
         self
     }
 
+    fn sync_rtx_index(&mut self) {
+        self.sync_rtx_index_inner(true, None);
+    }
+
+    /// The ACK-path form of [`Self::sync_rtx_index`]: the ack delivery loop
+    /// already deactivated delivered entries, so no stale-entries pass runs;
+    /// `reorder_extension` is the `[start, end)` range of sequences the ack's
+    /// selective evidence newly brought below the reorder boundary, and only
+    /// those sequences get a fresh reorder deadline key.
+    fn sync_rtx_index_after_ack(
+        &mut self,
+        reorder_extension: Option<(SequenceNumber, SequenceNumber)>,
+    ) {
+        self.sync_rtx_index_inner(false, reorder_extension);
+    }
+
+    /// Resize the retransmission index to the exact
+    /// `min(num_in_flight, cwnd)` in-flight prefix: deactivate active entries
+    /// that fell outside the prefix and activate in-flight packets inside it
+    /// that are not yet active.  Ready reasons of packets that stay active
+    /// are preserved (resize never touches readiness).  Used when the cwnd
+    /// changes and after a plain cumulative-only ACK, where no evidence was
+    /// re-derived.
+    fn resize_rtx_index_to_active_target(&mut self) {
+        let active_target = self.active_target();
+        while self.rtx_index.active_count() > active_target {
+            let seq = self
+                .rtx_index
+                .last_active()
+                .expect("a non-empty retransmission prefix must have a logical tail");
+            assert!(self.rtx_index.deactivate(seq));
+        }
+
+        let missing = active_target - self.rtx_index.active_count();
+        let start = self
+            .rtx_index
+            .last_active()
+            .map_or_else(|| self.send_wnd.start(), |seq| seq.advance(1));
+        let out_of_order_seq_end = self.out_of_order_seq_end;
+        let fast_loss_armed = self.fast_loss_armed();
+        let send_wnd = &self.send_wnd;
+        let outage = &self.outage;
+        let rtx_index = &mut self.rtx_index;
+        for (seq, p) in send_wnd
+            .iter_from(start)
+            .filter_map(|(seq, p)| p.as_ref().map(|p| (seq, p)))
+            .take(missing)
+        {
+            let pre_outage = outage.is_pre_outage_loss(p.sent_time);
+            rtx_index.activate(RetransmissionActivation {
+                seq,
+                rto_at: p.sent_time + p.rto,
+                sent_at: p.sent_time,
+                apply_live_rto_floor: !p.rto_from_tail_probe,
+                reorder_eligible: out_of_order_seq_end.is_some_and(|end| lt(seq, end)),
+                fast_loss_eligible: fast_loss_armed && p.is_fast_loss(),
+                pre_outage_eligible: pre_outage,
+            });
+        }
+        debug_assert_eq!(self.rtx_index.active_count(), active_target);
+    }
+
+    /// The plain cumulative-only ACK path: resize the index to the exact
+    /// active prefix (a plain ACK carries no selective evidence and delivers
+    /// no new packets, so nothing else changed), then advance every anchor to
+    /// the send-window front so wrap safety holds even if the window slid
+    /// since the last sync.
+    fn refill_rtx_index_after_plain_ack(&mut self) {
+        self.resize_rtx_index_to_active_target();
+        let anchor = if self.send_wnd.is_empty() {
+            self.send_wnd.next()
+        } else {
+            self.send_wnd.start()
+        };
+        self.rtx_index.advance_anchor(anchor);
+        self.deferred_losses.advance_anchor(anchor);
+    }
+
     /// Reconcile the retransmission index with the send window's exact
     /// `min(num_in_flight, cwnd)` in-flight prefix — or, while an
     /// outage-recovery epoch is open, the whole pre-outage window.  Centralizes,
@@ -207,11 +289,19 @@ impl PktSendSpace {
     /// readiness.  Runs only on state transitions (send/ack/cwnd change/
     /// outage detection/tail probe), never on the per-poll paths
     /// (`has_rtx`/`next_poll_time`), which read the index directly.
-    fn sync_rtx_index(&mut self, _now: Instant) {
+    fn sync_rtx_index_inner(
+        &mut self,
+        stale_entries_may_exist: bool,
+        reorder_extension: Option<(SequenceNumber, SequenceNumber)>,
+    ) {
         let active_target = self.active_target();
         let out_of_order_seq_end = self.out_of_order_seq_end;
         let fast_loss_armed = self.fast_loss_armed();
-
+        let anchor = if self.send_wnd.is_empty() {
+            self.send_wnd.next()
+        } else {
+            self.send_wnd.start()
+        };
         // Snapshot the exact in-flight active prefix.
         self.unacked_buf.clear();
         self.unacked_buf.extend(
@@ -219,40 +309,49 @@ impl PktSendSpace {
                 .take(active_target)
                 .map(|(seq, _)| seq),
         );
-
-        // Deactivate entries that left the prefix.
-        let stale: Vec<SequenceNumber> = self
-            .rtx_index
-            .active_entries()
-            .filter(|seq| !self.unacked_buf.contains(seq))
-            .collect();
-        for seq in stale {
-            self.rtx_index.deactivate(seq);
+        // Deactivate entries that left the prefix.  The stale set is small
+        // (bounded by the index size) and only recomputed when the caller
+        // expects stale entries: the ACK delivery loop already deactivated
+        // everything it delivered.
+        if stale_entries_may_exist {
+            self.fast_loss_buf.clear();
+            {
+                let unacked = &self.unacked_buf;
+                let rtx_index = &self.rtx_index;
+                let stale = &mut self.fast_loss_buf;
+                stale.extend(rtx_index.active_entries().filter(|seq| {
+                    let offset = anchor.forward_distance_to(*seq);
+                    unacked
+                        .binary_search_by(|candidate| {
+                            anchor.forward_distance_to(*candidate).cmp(&offset)
+                        })
+                        .is_err()
+                }));
+            }
+            for index in 0..self.fast_loss_buf.len() {
+                let seq = self.fast_loss_buf[index];
+                self.rtx_index.deactivate(seq);
+            }
         }
-
         // Activate the entries that entered the prefix, sync the reorder
-        // boundary for already-active entries (the boundary only advances
-        // while a packet is in-window, so membership never needs removal
-        // here), and re-sync the independent ready reasons on every prefix
-        // sync: clear the reorder and fast-loss reasons (re-armed below only
-        // when their evidence still holds), then set pre-outage from the
-        // packet's own send time.  The RTO reason survives — a packet whose
-        // RTO already expired is re-promoted (and lazily re-floored) on the
-        // next `promote_due`.
+        // boundary for already-active entries, and re-sync the independent
+        // ready reasons on every prefix sync: clear the transient reorder and
+        // fast-loss reasons (re-armed below only when their evidence still
+        // holds), then set pre-outage from the packet's own send time.  The
+        // RTO reason survives — a packet whose RTO already expired is
+        // re-promoted (and lazily re-floored) on the next `promote_due`.
         self.fast_loss_buf.clear();
         for &seq in &self.unacked_buf {
             let Some(Some(p)) = self.send_wnd.get(&seq) else {
                 continue;
             };
             let out_of_order = out_of_order_seq_end.is_some_and(|end| lt(seq, end));
-            if fast_loss_armed && p.is_fast_loss() {
+            let preserve_fast_loss = fast_loss_armed && p.is_fast_loss();
+            if preserve_fast_loss {
                 self.fast_loss_buf.push(seq);
             }
-            if self.rtx_index.is_active(&seq) {
-                if out_of_order {
-                    self.rtx_index.add_reorder_candidate(seq, p.sent_time);
-                }
-            } else {
+            let was_active = self.rtx_index.is_active(&seq);
+            if !was_active {
                 self.rtx_index.activate(RetransmissionActivation {
                     seq,
                     rto_at: p.sent_time + p.rto,
@@ -263,30 +362,29 @@ impl PktSendSpace {
                     pre_outage_eligible: false,
                 });
             }
-            self.rtx_index.set_reason(seq, ReadyReason::Reorder, None);
-            self.rtx_index.set_reason(seq, ReadyReason::FastLoss, None);
             let pre_outage = self
                 .outage
                 .is_pre_outage_loss(p.sent_time)
                 .then_some(p.sent_time);
-            self.rtx_index
-                .set_reason(seq, ReadyReason::PreOutage, pre_outage);
+            let rearm_reorder =
+                self.rtx_index
+                    .sync_active_evidence_reasons(seq, preserve_fast_loss, pre_outage);
+            let entered_reorder_range =
+                reorder_extension.is_some_and(|(start, end)| !lt(seq, start) && lt(seq, end));
+            if was_active && out_of_order && (entered_reorder_range || rearm_reorder) {
+                self.rtx_index.add_reorder_candidate(seq, p.sent_time);
+            }
         }
         for &seq in &self.fast_loss_buf {
             let sent_time = self.send_wnd.get(&seq).unwrap().as_ref().unwrap().sent_time;
             self.rtx_index
                 .set_reason(seq, ReadyReason::FastLoss, Some(sent_time));
         }
-
         // Advance the anchor to the send-window front (or the next sequence
         // when the window is empty) so wrap safety holds as the window
         // advances.
-        let anchor = if self.send_wnd.is_empty() {
-            self.send_wnd.next()
-        } else {
-            self.send_wnd.start()
-        };
         self.rtx_index.advance_anchor(anchor);
+        self.deferred_losses.advance_anchor(anchor);
     }
 
     fn unacked(
@@ -318,7 +416,7 @@ impl PktSendSpace {
     #[cfg(test)]
     pub(crate) fn set_cwnd(&mut self, cwnd: NonZeroUsize) {
         self.cwnd = cwnd;
-        self.sync_rtx_index(Instant::now());
+        self.sync_rtx_index();
     }
 
     pub fn next_seq(&self) -> SequenceNumber {
@@ -365,6 +463,8 @@ impl PktSendSpace {
     pub fn ack(&mut self, recved: AckBlocks<'_>, acked: &mut Vec<PacketState>, now: Instant) {
         let send_start = self.send_wnd.start();
         let sent_span = self.send_wnd.len() as u64;
+        let previous_out_of_order_seq_end = self.out_of_order_seq_end;
+        let fast_loss_was_armed = self.fast_loss_armed();
         // This ACK can only deliver sequences below the relevant end offset
         // (cumulative front ∪ highest clipped SACK block): walk only the
         // occupied prefix of that bound instead of scanning the whole send
@@ -419,7 +519,11 @@ impl PktSendSpace {
             }
         }
         let mut cumulative_advance = 0;
+        let newest_unacked = self.newest_unacked;
+        let mut newest_unacked_delivered = false;
         for &s in &self.ack_buf {
+            newest_unacked_delivered |= newest_unacked == Some(s);
+            self.rtx_index.deactivate(s);
             let p = self.send_wnd.get_mut(&s).unwrap();
             let p = p.take().unwrap();
             *self.occupied_wnd.get_mut(&s).unwrap() = false;
@@ -435,9 +539,7 @@ impl PktSendSpace {
                 }
                 cumulative_advance += released;
             }
-            if !self.deferred_losses.is_empty() {
-                self.deferred_losses.retain(|dl| dl.seq != s);
-            }
+            self.deferred_losses.cancel(s);
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
@@ -446,10 +548,7 @@ impl PktSendSpace {
         }
         // The newest unacked packet was acked: rescan for the new tail.  No
         // other ACK ever moves it, so no other ACK rescans.
-        if self
-            .newest_unacked
-            .is_some_and(|newest| self.ack_buf.contains(&newest))
-        {
+        if newest_unacked_delivered {
             self.newest_unacked = self.send_wnd.last_present().map(|(seq, _)| seq);
         }
         let current_start = self.send_wnd.start();
@@ -460,15 +559,30 @@ impl PktSendSpace {
         {
             self.out_of_order_seq_end = None;
         }
+        let mut fast_loss_eligibility_changed = false;
         if analysis.has_sack_evidence {
             for (&sequence, &sacked_above) in self.unacked_buf.iter().zip(&self.sacked_above_buf) {
                 let Some(Some(packet)) = self.send_wnd.get_mut(&sequence) else {
                     continue;
                 };
+                let was_fast_loss = packet.is_fast_loss();
                 packet.sacked_above = packet.sacked_above.max(sacked_above);
+                fast_loss_eligibility_changed |= was_fast_loss != packet.is_fast_loss();
             }
         }
-        self.sync_rtx_index(now);
+        let reorder_extension = match (previous_out_of_order_seq_end, self.out_of_order_seq_end) {
+            (None, Some(end)) => Some((current_start, end)),
+            (Some(start), Some(end)) if lt(start, end) => Some((start, end)),
+            _ => None,
+        };
+        let evidence_changed = previous_out_of_order_seq_end != self.out_of_order_seq_end
+            || fast_loss_was_armed != self.fast_loss_armed()
+            || fast_loss_eligibility_changed;
+        if evidence_changed {
+            self.sync_rtx_index_after_ack(reorder_extension);
+        } else if delivered > 0 {
+            self.refill_rtx_index_after_plain_ack();
+        }
         self.loss_event_window
             .record_delivered(delivered, now, self.smooth_rtt());
         if !peer_response {
@@ -486,14 +600,17 @@ impl PktSendSpace {
         if self.outage.should_censor_rtt_sample(rtt, now) {
             return false;
         }
+        let fast_loss_was_armed = self.fast_loss_armed();
         if self.outage.try_close_epoch_with_fresh_sample() {
             self.rtt_stats.record_min_and_reseed_rto(rtt);
-            self.sync_rtx_index(now);
+            self.sync_rtx_index();
             return true;
         }
 
         self.rtt_stats.record_rtt(rtt);
-        self.sync_rtx_index(now);
+        if self.fast_loss_armed() != fast_loss_was_armed {
+            self.sync_rtx_index();
+        }
         false
     }
 
@@ -756,10 +873,8 @@ impl PktSendSpace {
             };
         }
         if defer_loss {
-            self.deferred_losses.push(DeferredLoss {
-                seq: s,
-                baseline_deadline: baseline_deadline_opt.unwrap(),
-            });
+            self.deferred_losses
+                .insert(s, baseline_deadline_opt.unwrap());
         } else if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
             let smooth_rtt = self.rtt_stats.smooth_rtt();
             self.loss_event_window.record_lost(1, now, smooth_rtt);
@@ -805,27 +920,16 @@ impl PktSendSpace {
             return;
         }
         let smooth_rtt = self.rtt_stats.smooth_rtt();
-        let mut i = 0;
-        while i < self.deferred_losses.len() {
-            let dl = &self.deferred_losses[i];
-            if now < dl.baseline_deadline {
-                i += 1;
-                continue;
-            }
+        while let Some(seq) = self.deferred_losses.pop_due(now) {
             // Deadline elapsed: is the seq still in flight (genuine loss)?
             // `send_wnd.get(&seq)` returning Some(Some(_)) means the packet is
             // still unacked; if it is None or Some(None) the packet was acked
             // and `ack` already cancelled this entry — but be defensive and
             // double-check here too.
-            let still_in_flight = self
-                .send_wnd
-                .get(&dl.seq)
-                .and_then(|o| o.as_ref())
-                .is_some();
+            let still_in_flight = self.send_wnd.get(&seq).and_then(|o| o.as_ref()).is_some();
             if still_in_flight {
                 self.loss_event_window.record_lost(1, now, smooth_rtt);
             }
-            self.deferred_losses.swap_remove(i);
         }
     }
 
@@ -834,6 +938,7 @@ impl PktSendSpace {
     }
 
     pub fn set_send_rate(&mut self, send_rate: PosR<f64>) {
+        let previous_cwnd = self.cwnd;
         let cwnd = self.rtt_stats.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
         let cwnd = cwnd * CWND_SEND_RATE_SCALE;
@@ -847,17 +952,28 @@ impl PktSendSpace {
             cwnd
         };
         self.cwnd = NonZeroUsize::new(cwnd).unwrap();
+        if self.cwnd != previous_cwnd {
+            self.resize_rtx_index_to_active_target();
+        }
 
-        let last_seq_in_cwnd = || -> Option<SequenceNumber> {
-            if let Some(s) = Self::unacked(&self.send_wnd).map(|(k, _)| k).nth(cwnd) {
-                return Some(s);
+        let last_seq_in_cwnd = if self.outage.in_outage_recovery() {
+            Self::unacked(&self.send_wnd)
+                .map(|(seq, _)| seq)
+                .take(cwnd.saturating_add(1))
+                .last()
+        } else {
+            let active_tail = self.rtx_index.last_active();
+            if self.rtx_index.active_count() == cwnd {
+                active_tail.and_then(|tail| {
+                    self.send_wnd
+                        .iter_from(tail.advance(1))
+                        .find_map(|(seq, packet)| packet.as_ref().map(|_| seq))
+                        .or(Some(tail))
+                })
+            } else {
+                active_tail
             }
-            if let Some(s) = Self::unacked(&self.send_wnd).map(|(k, _)| k).last() {
-                return Some(s);
-            }
-            None
         };
-        let last_seq_in_cwnd = last_seq_in_cwnd();
 
         // Retract max sequence in pipe
         if let Some(last) = last_seq_in_cwnd
@@ -865,7 +981,6 @@ impl PktSendSpace {
         {
             self.max_pipe_seq = Some(last);
         }
-        self.sync_rtx_index(Instant::now());
     }
 
     pub fn no_pkts_in_flight(&self) -> bool {
@@ -885,7 +1000,7 @@ impl PktSendSpace {
     }
 
     pub fn num_rtx_active_pkts(&self) -> usize {
-        self.rtx_index.active_entries().count()
+        self.rtx_index.active_count()
     }
 
     pub fn num_rtx_ready_pkts(&self) -> usize {
@@ -897,13 +1012,16 @@ impl PktSendSpace {
     }
 
     /// One send-window traversal computing the loss ratio, the pipe depth,
-    /// and the retransmission count for the metrics snapshot.  Mirrors the
-    /// semantics of `data_loss_rate` / `num_pkts_in_pipe` / `num_rtxed_pkts`
-    /// without walking the window three times.
-    pub fn send_window_metrics(&self, now: Instant) -> (Option<f64>, usize, usize) {
+    /// the retransmission count, the oldest pipe-packet age, and the maximum
+    /// RTO overdue for the metrics snapshot.  Mirrors the semantics of
+    /// `data_loss_rate` / `num_pkts_in_pipe` / `num_rtxed_pkts` and
+    /// `pipe_rto_timing` without walking the window repeatedly.
+    pub(crate) fn send_window_observation(&self, now: Instant) -> SendWindowObservation {
         let mut lost = 0;
         let mut pipe_len = 0;
         let mut retransmitted = 0;
+        let mut oldest_sent: Option<Instant> = None;
+        let mut max_overdue: Option<Duration> = None;
         let live_rto = self.rtt_stats.rto_duration();
         for (seq, p) in Self::unacked(&self.send_wnd) {
             let in_pipe = self.max_pipe_seq.is_some_and(|m| le(seq, m));
@@ -913,33 +1031,26 @@ impl PktSendSpace {
                 if rtxed || p.hits_rto(now, live_rto) {
                     lost += 1;
                 }
+                oldest_sent =
+                    Some(oldest_sent.map_or(p.sent_time, |oldest| oldest.min(p.sent_time)));
+                let deadline = p.sent_time + p.rto;
+                if now >= deadline {
+                    let overdue = now.duration_since(deadline);
+                    max_overdue = Some(max_overdue.map_or(overdue, |max| max.max(overdue)));
+                }
             }
             if p.rtxed {
                 retransmitted += 1;
             }
         }
         let loss_ratio = (pipe_len > 0).then_some(lost as f64 / pipe_len as f64);
-        (loss_ratio, pipe_len, retransmitted)
-    }
-
-    /// Pipe timing for the metrics snapshot: the age of the oldest pipe
-    /// packet and how far past its RTO deadline the most overdue pipe packet
-    /// is.  Both are `None` when the pipe is empty (or nothing is overdue).
-    pub fn pipe_rto_timing(&self, now: Instant) -> (Option<Duration>, Option<Duration>) {
-        let mut oldest_sent: Option<Instant> = None;
-        let mut max_overdue: Option<Duration> = None;
-        for (_, p) in self.pkts_in_pipe() {
-            oldest_sent = Some(oldest_sent.map_or(p.sent_time, |oldest| oldest.min(p.sent_time)));
-            let deadline = p.sent_time + p.rto;
-            if now >= deadline {
-                let overdue = now.duration_since(deadline);
-                max_overdue = Some(max_overdue.map_or(overdue, |max| max.max(overdue)));
-            }
+        SendWindowObservation {
+            loss_ratio,
+            packets_in_pipe: pipe_len,
+            retransmitted_packets: retransmitted,
+            oldest_pipe_packet_age: oldest_sent.map(|sent| now.duration_since(sent)),
+            maximum_packet_rto_overdue: max_overdue,
         }
-        (
-            oldest_sent.map(|sent| now.duration_since(sent)),
-            max_overdue,
-        )
     }
 
     pub fn in_outage_recovery(&self) -> bool {
@@ -981,7 +1092,7 @@ impl PktSendSpace {
         if detected {
             // Pre-outage packets are immediately eligible for retransmission
             // once the epoch opens (or re-arms): reflect that in the index.
-            self.sync_rtx_index(now);
+            self.sync_rtx_index();
         }
         detected
     }
@@ -995,6 +1106,12 @@ impl PktSendSpace {
         let mut not_lost = 0;
         let mut all_lost_pkts_rtxed = true;
         let live_rto = self.rtt_stats.rto_duration();
+        if !self.rtx_index.has_rto_due(now, live_rto) {
+            return CwndStats {
+                all_lost_pkts_rtxed,
+                num_not_lost_in_flight_pkts: self.num_in_flight.min(self.cwnd.get()),
+            };
+        }
         for p in Self::unacked(&self.send_wnd)
             .map(|(_, v)| v)
             .take(self.cwnd.get())
@@ -1075,9 +1192,12 @@ impl PktSendSpace {
             .take_while(|(s, _)| self.max_pipe_seq.is_some_and(|m| le(*s, m)))
     }
 
-    pub fn next_poll_time(&self) -> Option<Instant> {
+    pub(crate) fn next_poll_time(&self, now: Instant) -> Option<Instant> {
         let wd_dl = self.liveness.next_deadline(!self.no_pkts_in_flight());
         let mut min_next_poll_time: Option<Instant> = wd_dl;
+        if min_next_poll_time.is_some_and(|deadline| deadline <= now) {
+            return min_next_poll_time;
+        }
         let rtx_window = if self.jitter_cap {
             self.rtt_stats.fast_reorder_window()
         } else {
@@ -1086,18 +1206,20 @@ impl PktSendSpace {
         if let Some(t) = self.rtx_index.next_deadline(rtx_window) {
             min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
         }
+        if min_next_poll_time.is_some_and(|deadline| deadline <= now) {
+            return min_next_poll_time;
+        }
+        if let Some(deadline) = self.deferred_losses.next_deadline() {
+            min_next_poll_time = Some(min_next_poll_time.map_or(deadline, |min| min.min(deadline)));
+        }
+        if min_next_poll_time.is_some_and(|deadline| deadline <= now) {
+            return min_next_poll_time;
+        }
         if let Some(seq) = self.tail_seq()
             && let Some(Some(p)) = self.send_wnd.get(&seq)
             && let Some(t) = self.tlp.next_probe_time(p.sent_time, &self.rtt_stats)
         {
             min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
-        }
-        for dl in &self.deferred_losses {
-            min_next_poll_time = Some(
-                min_next_poll_time
-                    .map(|min| min.min(dl.baseline_deadline))
-                    .unwrap_or(dl.baseline_deadline),
-            );
         }
         min_next_poll_time
     }
@@ -1113,6 +1235,14 @@ impl Default for PktSendSpace {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct SendWindowObservation {
+    pub(crate) loss_ratio: Option<f64>,
+    pub(crate) packets_in_pipe: usize,
+    pub(crate) retransmitted_packets: usize,
+    pub(crate) oldest_pipe_packet_age: Option<Duration>,
+    pub(crate) maximum_packet_rto_overdue: Option<Duration>,
+}
+
 pub struct CwndStats {
     pub all_lost_pkts_rtxed: bool,
     pub num_not_lost_in_flight_pkts: usize,
@@ -1190,12 +1320,8 @@ impl InFlightPkt {
 /// [`PktSendSpace::poll_deferred_loss`] runs at `now >= baseline_deadline` it
 /// records one loss event iff `seq` is still in flight (genuine loss); if the
 /// seq was acked in the meantime the entry was already cancelled by `ack`.
-#[derive(Debug, Clone, Copy)]
-struct DeferredLoss {
-    seq: SequenceNumber,
-    baseline_deadline: Instant,
-}
-
+/// Stored in a [`DeferredLossIndex`] so ACK cancellation and next-deadline
+/// selection stay O(1) without rescanning the pending set.
 #[derive(Debug, Clone)]
 pub struct Pkt<'a> {
     pub seq: SequenceNumber,
@@ -1305,6 +1431,99 @@ mod tests {
             space.sample_rtt(ms(100), now + ms(i * 2));
             space.sample_rtt(ms(900), now + ms(i * 2 + 1));
         }
+    }
+
+    fn scanned_cwnd_stats(space: &PktSendSpace, now: Instant) -> (bool, usize) {
+        let live_rto = space.rtt_stats.rto_duration();
+        let mut not_lost = 0;
+        let mut all_lost_pkts_rtxed = true;
+        for packet in PktSendSpace::unacked(&space.send_wnd)
+            .map(|(_, packet)| packet)
+            .take(space.cwnd.get())
+        {
+            if packet.hits_rto(now, live_rto) {
+                all_lost_pkts_rtxed = false;
+            } else {
+                not_lost += 1;
+            }
+        }
+        (all_lost_pkts_rtxed, not_lost)
+    }
+
+    fn assert_cwnd_stats_match_scan(space: &PktSendSpace, now: Instant) {
+        let expected = scanned_cwnd_stats(space, now);
+        let actual = space.cwnd_stats(now);
+        assert_eq!(
+            (
+                actual.all_lost_pkts_rtxed,
+                actual.num_not_lost_in_flight_pkts
+            ),
+            expected
+        );
+    }
+
+    fn scanned_pipe_boundary(space: &PktSendSpace) -> Option<SequenceNumber> {
+        PktSendSpace::unacked(&space.send_wnd)
+            .map(|(seq, _)| seq)
+            .take(space.cwnd.get().saturating_add(1))
+            .last()
+    }
+
+    #[test]
+    fn indexed_rto_gate_matches_the_exact_cwnd_scan() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let sent_at = t0 + ms(1000);
+        for _ in 0..INIT_CWND + 3 {
+            send_packet(&mut space, sent_at);
+        }
+        let live_rto = space.rtt_stats.rto_duration();
+        assert!(!space.rtx_index.has_rto_due(sent_at, live_rto));
+        assert_cwnd_stats_match_scan(&space, sent_at);
+        let due = sent_at + live_rto;
+        assert!(space.rtx_index.has_rto_due(due, live_rto));
+        assert_cwnd_stats_match_scan(&space, due);
+        space
+            .rtx_index
+            .promote_due(due, space.rtt_stats.reorder_window(), live_rto);
+        assert!(space.rtx_index.has_rto_due(due, live_rto));
+        assert_cwnd_stats_match_scan(&space, due);
+    }
+
+    #[test]
+    fn indexed_pipe_boundary_matches_the_wrapping_scan_across_a_hole() {
+        let t0 = Instant::now();
+        let start = sq(u64::MAX - 32);
+        let mut space = PktSendSpace::new_at(start);
+        settle_rtt_at(&mut space, t0);
+        let rate = PosR::new(80.0).unwrap();
+        space.set_send_rate(rate);
+        let cwnd = space.cwnd.get();
+        for _ in 0..cwnd + 3 {
+            send_packet(&mut space, t0 + ms(1000));
+        }
+        let expected = scanned_pipe_boundary(&space);
+        space.set_send_rate(rate);
+        assert_eq!(space.max_pipe_seq, expected);
+        assert_eq!(space.num_pkts_in_pipe(), cwnd + 1);
+        let boundary = expected.unwrap();
+        let block = crate::ack::AckInterval {
+            start: boundary,
+            size: std::num::NonZeroU64::new(1).unwrap(),
+        };
+        let mut acked = Vec::new();
+        space.ack(
+            crate::ack::AckBlocks::new(start, &[block]),
+            &mut acked,
+            t0 + ms(1100),
+        );
+        assert_eq!(acked.len(), 1);
+        send_packet(&mut space, t0 + ms(1200));
+        let expected = scanned_pipe_boundary(&space);
+        space.set_send_rate(rate);
+        assert_eq!(space.max_pipe_seq, expected);
+        assert_eq!(space.num_pkts_in_pipe(), cwnd + 1);
     }
 
     fn lose_packet(space: &mut PktSendSpace, seq: u64, now: Instant) {
@@ -1906,6 +2125,45 @@ mod tests {
     }
 
     #[test]
+    fn rtt_gate_transition_resyncs_existing_fast_loss_evidence() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_high_jitter(&mut space, t0);
+        assert!(!space.fast_loss_armed(), "high-jitter gate starts disarmed");
+        let sent_at = t0 + ms(1_000);
+        for offset in 0..4 {
+            send_packet(&mut space, sent_at + ms(offset));
+        }
+        sack_one(&mut space, 1, sent_at + ms(10));
+        sack_one(&mut space, 2, sent_at + ms(11));
+        sack_one(&mut space, 3, sent_at + ms(12));
+        assert_eq!(sacked_above(&space, 0), 3);
+        let early = sent_at + ms(30);
+        assert!(
+            !space.has_rtx(early),
+            "fast-loss evidence must stay dormant while the structural gate is disarmed"
+        );
+        for _ in 0..256 {
+            space.sample_rtt(ms(100), early);
+            if space.fast_loss_armed() {
+                break;
+            }
+        }
+        assert!(
+            space.fast_loss_armed(),
+            "stable RTT samples must re-arm the gate"
+        );
+        assert!(
+            space.has_rtx(early),
+            "the gate transition must publish existing fast-loss evidence"
+        );
+        assert_eq!(
+            space.rtx(early).expect("fast loss becomes ready").seq,
+            sq(0)
+        );
+    }
+
+    #[test]
     fn observed_reordering_hard_disables_fast_loss() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
@@ -2035,6 +2293,16 @@ mod tests {
             Some(rtx_t),
             "fast-loss rtx must stamp fast_loss_rtx_time"
         );
+    }
+
+    #[test]
+    fn jitter_cap_defaults_on_and_accepts_an_explicit_diagnostic_disable() {
+        assert!(super::jitter_cap_enabled(None));
+        assert!(super::jitter_cap_enabled(Some("1")));
+        assert!(super::jitter_cap_enabled(Some("true")));
+        assert!(!super::jitter_cap_enabled(Some("0")));
+        assert!(!super::jitter_cap_enabled(Some("false")));
+        assert!(!super::jitter_cap_enabled(Some("FALSE")));
     }
 
     // ---- jitter-tolerant fast-retransmit (RTP_JITTER_CAP) tests ----
@@ -2180,10 +2448,9 @@ mod tests {
             1,
             "one deferred loss entry pending"
         );
-        assert_eq!(space.deferred_losses[0].seq, sq(0));
         assert_eq!(
-            space.deferred_losses[0].baseline_deadline,
-            baseline_deadline
+            space.deferred_losses.deadline(sq(0)),
+            Some(baseline_deadline)
         );
     }
 
@@ -2584,7 +2851,7 @@ mod tests {
         let mut space = PktSendSpace::new();
 
         // A full cwnd of packets: the whole window is the indexed prefix.
-        for i in 0..INIT_CWND {
+        for i in 0..INIT_CWND * 2 {
             send_packet(&mut space, t0 + ms(i as u64));
         }
         let seqs = space.active_rtx_seqs();
@@ -2596,14 +2863,89 @@ mod tests {
         // Ack the first half: the prefix must move exactly to the remainder.
         ack_up_to(&mut space, INIT_CWND as u64 / 2 - 1, t0 + ms(1000));
         let seqs = space.active_rtx_seqs();
-        assert_eq!(seqs.len(), INIT_CWND - INIT_CWND / 2);
+        assert_eq!(seqs.len(), INIT_CWND);
         for (i, seq) in seqs.iter().enumerate() {
             assert_eq!(*seq, sq((INIT_CWND / 2 + i) as u64));
         }
 
         // Acking the rest empties the index along with the window.
-        ack_up_to(&mut space, INIT_CWND as u64 - 1, t0 + ms(1000) + ms(1));
+        ack_up_to(
+            &mut space,
+            (INIT_CWND * 2) as u64 - 1,
+            t0 + ms(1000) + ms(1),
+        );
         assert!(space.active_rtx_seqs().is_empty());
+    }
+
+    #[test]
+    fn plain_ack_refill_preserves_surviving_reorder_readiness() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_high_jitter(&mut space, t0);
+        let sent_at = t0 + ms(1000);
+        for i in 0..INIT_CWND * 2 {
+            send_packet(&mut space, sent_at + ms(i as u64));
+        }
+        assert_eq!(
+            sack_one(&mut space, INIT_CWND as u64 - 1, sent_at + ms(100)),
+            1
+        );
+        let reorder_window = space.rtt_stats.reorder_window();
+        let promote_at = sent_at + ms(INIT_CWND as u64) + reorder_window;
+        space
+            .rtx_index
+            .promote_due(promote_at, reorder_window, space.rtt_stats.rto_duration());
+        assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        assert_eq!(
+            sack_one(&mut space, INIT_CWND as u64 - 2, promote_at + ms(1)),
+            1
+        );
+        assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        let active = space.active_rtx_seqs();
+        assert_eq!(active.len(), INIT_CWND);
+        assert_eq!(active[INIT_CWND - 2], sq(INIT_CWND as u64));
+        assert_eq!(active[INIT_CWND - 1], sq(INIT_CWND as u64 + 1));
+    }
+
+    #[test]
+    fn cwnd_resize_preserves_surviving_reorder_readiness() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_high_jitter(&mut space, t0);
+        let sent_at = t0 + ms(1000);
+        for i in 0..INIT_CWND * 2 {
+            send_packet(&mut space, sent_at + ms(i as u64));
+        }
+        assert_eq!(
+            sack_one(&mut space, INIT_CWND as u64 - 1, sent_at + ms(100)),
+            1
+        );
+        let reorder_window = space.rtt_stats.reorder_window();
+        let promote_at = sent_at + ms(INIT_CWND as u64) + reorder_window;
+        space
+            .rtx_index
+            .promote_due(promote_at, reorder_window, space.rtt_stats.rto_duration());
+        assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        let srtt_seconds = space.rtt_stats.smooth_rtt().as_secs_f64();
+        let rate_for_cwnd = |cwnd: usize| {
+            PosR::new(cwnd as f64 / (CWND_SEND_RATE_SCALE as f64 * srtt_seconds)).unwrap()
+        };
+        let shrunken = INIT_CWND / 2;
+        space.set_send_rate(rate_for_cwnd(shrunken));
+        assert_eq!(space.cwnd.get(), shrunken);
+        assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        assert_eq!(
+            space.active_rtx_seqs(),
+            (0..shrunken as u64).map(sq).collect::<Vec<_>>()
+        );
+        let grown = INIT_CWND - CWND_SEND_RATE_SCALE;
+        space.set_send_rate(rate_for_cwnd(grown));
+        assert_eq!(space.cwnd.get(), grown);
+        assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        assert_eq!(
+            space.active_rtx_seqs(),
+            (0..grown as u64).map(sq).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2619,7 +2961,11 @@ mod tests {
         send_packet(&mut space, t0 + ms(1));
         sack_one(&mut space, 1, t0 + ms(10));
         let reorder_deadline = t0 + stock;
-        assert_eq!(space.next_poll_time(), Some(reorder_deadline));
+        assert_eq!(space.next_poll_time(t0 + ms(10)), Some(reorder_deadline));
+        assert_eq!(
+            space.next_poll_time(reorder_deadline),
+            Some(reorder_deadline)
+        );
 
         // The reorder rtx fires at that deadline; the retransmitted copy
         // then polls at its own fresh reorder deadline.
@@ -2628,7 +2974,7 @@ mod tests {
             .rtx(first_rtx_t)
             .expect("reorder rtx fires at the tracked deadline");
         assert_eq!(rtx.seq, sq(0));
-        assert_eq!(space.next_poll_time(), Some(first_rtx_t + stock));
+        assert_eq!(space.next_poll_time(first_rtx_t), Some(first_rtx_t + stock));
 
         // With the tail-probe budget then exhausted, the next poll tracks
         // the retransmitted copy's RTO deadline instead of the reorder
@@ -2648,7 +2994,9 @@ mod tests {
             space.tail_probe(send_t + ms(630)).is_none(),
             "probe budget exhausted"
         );
-        let rto_deadline = space.next_poll_time().expect("RTO deadline tracked");
+        let rto_deadline = space
+            .next_poll_time(send_t + ms(630))
+            .expect("RTO deadline tracked");
         let rtx = space
             .rtx(rto_deadline)
             .expect("full-RTO rtx fires at the tracked deadline");
@@ -2824,8 +3172,13 @@ mod tests {
             "recovery cwnd must clamp below the pre-outage flight"
         );
 
-        // The whole pre-outage window is now active — even beyond the clamped
-        // recovery cwnd — and every packet is ready without any ack round.
+        // Outage mode retains the cwnd-bounded pipe scan even while the whole
+        // pre-outage window is indexed for retransmission.
+        assert_eq!(
+            space.max_pipe_seq,
+            scanned_pipe_boundary(&space),
+            "outage mode must retain the cwnd-bounded pipe scan"
+        );
         assert_eq!(
             space.active_rtx_seqs().len(),
             space.num_in_flight_pkts(),
@@ -2841,7 +3194,7 @@ mod tests {
         // pre-outage window without any ack rounds in between.
         let mut t = detect_at;
         let mut retransmitted = 0;
-        while let Some(p) = space.rtx(t) {
+        while let Some(_p) = space.rtx(t) {
             retransmitted += 1;
             t += ms(1);
         }

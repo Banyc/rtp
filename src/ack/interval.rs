@@ -567,6 +567,10 @@ mod tests {
             3,
             "a fully-acked window must release everything"
         );
+        assert!(
+            evidence.is_empty(),
+            "a cumulative-only ACK carries no selective-loss evidence"
+        );
 
         // Cumulative next exactly one past the first packet.
         let recved = AckBlocks::new(seq(u64::MAX - 1), &[]);
@@ -916,13 +920,20 @@ mod tests {
                 None
             };
             let mut ref_acked: Vec<u64> = Vec::new();
-            let mut ref_evidence = vec![0u32; sent_span as usize];
+            let mut ref_evidence = if wire_blocks.is_empty() {
+                Vec::new()
+            } else {
+                vec![0; sent_span as usize]
+            };
             for offset in 0..sent_span {
                 let index = offset as usize;
                 if cumulative_front.is_some_and(|front| offset < front) || covered[index] {
                     ref_acked.push(offset);
                 }
-                ref_evidence[index] = covered[index + 1..].iter().filter(|&&c| c).count() as u32;
+                if !wire_blocks.is_empty() {
+                    ref_evidence[index] =
+                        covered[index + 1..].iter().filter(|&&c| c).count() as u32;
+                }
             }
             let delivered: Vec<u64> = acked
                 .iter()

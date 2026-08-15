@@ -56,14 +56,20 @@ impl TailLossProber {
     /// Time between consecutive tail-loss probes for the current tail episode.
     ///
     /// The PTO formula: `max(2*srtt, 2*min_rtt)` with a 10 ms floor, capped at
-    /// the RTO currently in use.
+    /// the RTO currently in use.  The doubled terms use checked multiplication
+    /// so a sub-nanosecond RTT cannot round the doubling away.
     pub fn probe_window(&self, rtt_stats: &RttStats) -> Duration {
         let srtt = rtt_stats.smooth_rtt();
         let min_tol = Self::MIN_TOL;
-        let doubled_srtt = srtt.mul_f64(2.);
+        let doubled_srtt = srtt
+            .checked_mul(2)
+            .expect("smoothed RTT must fit when doubled for the probe window");
         let min_rtt_doubled = rtt_stats
             .min_rtt()
-            .map(|r| r.mul_f64(2.))
+            .map(|r| {
+                r.checked_mul(2)
+                    .expect("minimum RTT must fit when doubled for the probe window")
+            })
             .unwrap_or(doubled_srtt);
         let cap = self.rto(rtt_stats);
         doubled_srtt.max(min_rtt_doubled).max(min_tol).min(cap)
@@ -174,6 +180,15 @@ mod tests {
 
         let just_after = sent + window + ms(1);
         assert!(tlp.is_due(sent, &rtt_stats, just_after));
+    }
+
+    #[test]
+    fn probe_window_doubles_rtt_without_fractional_rounding() {
+        let mut rtt_stats = RttStats::new();
+        let rtt = Duration::from_millis(10) + Duration::from_nanos(1);
+        rtt_stats.record_rtt(rtt);
+        let tlp = TailLossProber::new();
+        assert_eq!(tlp.probe_window(&rtt_stats), rtt.checked_mul(2).unwrap());
     }
 
     #[test]

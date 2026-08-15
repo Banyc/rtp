@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 14;
+pub const SCHEMA_VERSION: u16 = 15;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +199,12 @@ pub struct MetricsSnapshot {
     /// Whether the packet behind the most recent delivery-rate sample was
     /// transmitted while DRE considered the connection application-limited.
     pub delivery_sample_app_limited: Option<bool>,
+    /// Application writers currently blocked waiting for send capacity.
+    pub application_write_waiters: usize,
+    /// Application-limited phases detected by DRE's conjunctive predicate.
+    pub application_limited_detections: u64,
+    /// Detections suppressed because an application writer was waiting.
+    pub application_limited_detections_suppressed_by_waiting_writer: u64,
     /// Control RTT last used by the congestion controller.
     pub congestion_control_rtt: Option<Duration>,
     /// RTT floor last used by the congestion controller's queue gate.
