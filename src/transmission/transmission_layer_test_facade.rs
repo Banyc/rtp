@@ -405,18 +405,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_non_fec_fast_path_copies_only_when_a_duplicate_needs_it() {
+    async fn fresh_non_fec_data_uses_the_canonical_contiguous_encoding() {
         let (mut tl, recorder) = harness(false, false);
-        stage_small_message(&tl);
         let mut bufs = SendBufs::new();
+        stage_small_message(&tl);
         assert!(
             tl.send_pkts(&mut bufs).await.unwrap(),
             "a data packet must go out"
         );
-        assert_eq!(recorder.lock().unwrap().count(), 1);
-        assert!(
-            bufs.parts_mut().1.iter().all(|&byte| byte == 0),
-            "the fast path re-encoded the packet into bufs.codec_pkt for a send with no duplicate"
+        let datagrams = recorder.lock().unwrap().datagrams();
+        assert_eq!(datagrams.len(), 1);
+        let encoded = bufs.parts_mut().1;
+        assert_eq!(
+            datagrams[0],
+            encoded[..datagrams[0].len()],
+            "fresh non-FEC data must use the canonical contiguous codec buffer"
         );
     }
 
@@ -536,6 +539,10 @@ mod tests {
             recorder.lock().unwrap().count(),
             1,
             "toggle off must send exactly one datagram (stock)"
+        );
+        assert!(
+            bufs.parts_mut().1.iter().all(|&byte| byte == 0),
+            "non-FEC recovery without duplication must keep the zero-copy vectored path"
         );
     }
 

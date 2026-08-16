@@ -170,12 +170,12 @@ impl WriteHalf {
             }
             let instream = self.instream_group_fec_enabled();
             let has_fec = self.fec.is_some() || instream;
-            // The mutex-backed queue_building read is kept cold behind the
-            // rtx_dup/is_recovery short-circuit: it is needed only when
-            // retransmission duplication is enabled for a recovery packet.
+            // Keep both shared-state reads cold behind the local recovery
+            // check: normal data packets need neither the rtx_dup atomic nor
+            // the mutex-backed queue_building observation.
             #[rustfmt::skip]
-            let wants_dup = self.rtx_dup() && is_recovery && !self.reliable_layer.lock().unwrap().queue_building();
-            let (primary_res, send_buf): (_, Option<&[u8]>) = if !has_fec {
+            let wants_dup = is_recovery && self.rtx_dup() && !self.reliable_layer.lock().unwrap().queue_building();
+            let (primary_res, send_buf): (_, Option<&[u8]>) = if !has_fec && is_recovery {
                 let ts = data.send_ts.unwrap_or(0);
                 let cmd: u8 = match data.frame_len {
                     Some(_) => crate::delivery::frame::wire::FRAME_DATA_TS_CMD,

@@ -16,8 +16,8 @@ use super::write_half::WriteHalf;
 
 use crate::io_err::IoErr;
 use crate::metrics::{
-    MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver, MetricsTermination,
-    MetricsTerminationCause, SCHEMA_VERSION,
+    MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver,
+    MetricsSendDriverResumeSource, MetricsTermination, MetricsTerminationCause, SCHEMA_VERSION,
 };
 use crate::reliable::reliable_layer::ReliableLayer;
 use crate::traffic_shaping::control::ack_flush::AckFlushState;
@@ -208,6 +208,10 @@ impl Connection {
     pub fn resume_send(&self) -> &tokio::sync::Notify {
         &self.signals.resume_send
     }
+    pub(crate) fn request_send_driver_resume(&self, source: MetricsSendDriverResumeSource) {
+        self.log(MetricsEvent::SendDriverResumeRequest(source));
+        self.signals.resume_send.notify_one();
+    }
 
     pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
         &self.reliable_layer
@@ -295,7 +299,7 @@ impl Connection {
             }?;
             self.log(MetricsEvent::SendDataBuffer);
             if 0 < written_bytes {
-                self.signals.resume_send.notify_one();
+                self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationData);
                 return Ok(written_bytes);
             }
             self.termination.check_error()?;
@@ -337,7 +341,9 @@ impl Connection {
             match result {
                 Ok(()) => {
                     self.log(MetricsEvent::SendFrameBuffer);
-                    self.signals.resume_send.notify_one();
+                    self.request_send_driver_resume(
+                        MetricsSendDriverResumeSource::ApplicationFrame,
+                    );
                     return Ok(frame_len);
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
@@ -365,7 +371,7 @@ impl Connection {
 
     pub fn send_fin_buf(&self) {
         self.reliable_layer.lock().unwrap().send_fin_buf();
-        self.signals.resume_send.notify_one();
+        self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationFinish);
     }
 
     pub fn recv_fin(&self) -> &tokio_util::sync::CancellationToken {
@@ -531,12 +537,14 @@ impl Connection {
 
     pub(crate) fn commit_received_batch(&self, batch: ReceivedBatch) {
         let ack_work_added = batch.pending_acks > 0 || batch.fin_ack;
-        if ack_work_added {
+        let should_resume_send = if ack_work_added {
             let mut ack_flush = self.ack_flush.lock().unwrap();
-            ack_flush.record(batch.pending_acks, batch.fin_ack, batch.echo_ts);
-        }
-        if ack_work_added {
-            self.signals.resume_send.notify_one();
+            ack_flush.record(batch.pending_acks, batch.fin_ack, batch.echo_ts)
+        } else {
+            false
+        };
+        if should_resume_send {
+            self.request_send_driver_resume(MetricsSendDriverResumeSource::AckFlush);
         }
         if batch.recv_fin {
             self.signals.recv_fin.cancel();
@@ -624,13 +632,15 @@ impl Connection {
     }
 
     pub(crate) fn sample_rtt(&self, rtt: std::time::Duration, now: Instant) {
+        let elapsed = (self.metrics_observer.is_some() || self.reliable_layer_logger.is_some())
+            .then(|| now.saturating_duration_since(self.clock_epoch));
         let observer_interest = self
             .metrics_observer
             .as_ref()
             .map(|observer| {
                 observer.interest(
                     MetricsEvent::RttSample,
-                    now.saturating_duration_since(self.clock_epoch),
+                    elapsed.expect("metrics observer capture includes elapsed time"),
                 )
             })
             .unwrap_or(MetricsInterest::Skip);
@@ -652,7 +662,7 @@ impl Connection {
                 event_index,
                 MetricsEvent::RttSample,
                 Some(rtt),
-                now,
+                elapsed.expect("enabled metrics capture includes elapsed time"),
                 snapshot,
                 observer_interest,
             );
@@ -700,7 +710,14 @@ impl Connection {
                 None,
             )
         };
-        self.publish_metrics(event_index, event, None, now, snapshot, observer_interest);
+        self.publish_metrics(
+            event_index,
+            event,
+            None,
+            elapsed,
+            snapshot,
+            observer_interest,
+        );
     }
 
     fn publish_metrics(
@@ -708,11 +725,10 @@ impl Connection {
         event_index: u64,
         event: MetricsEvent,
         raw_rtt_sample: Option<std::time::Duration>,
-        now: Instant,
+        elapsed: std::time::Duration,
         snapshot: Option<crate::metrics::MetricsSnapshot>,
         observer_interest: MetricsInterest,
     ) {
-        let elapsed = now.saturating_duration_since(self.clock_epoch);
         let observation = MetricsObservation {
             schema_version: SCHEMA_VERSION,
             event_index,
@@ -779,6 +795,10 @@ impl Connection {
             congestion_queue_tolerance_micros: snapshot
                 .congestion_queue_tolerance
                 .map(|value| value.as_micros()),
+            congestion_persistent_queue_for_micros: snapshot
+                .congestion_persistent_queue_for
+                .map(|value| value.as_micros()),
+            congestion_persistent_queue_resets: snapshot.congestion_persistent_queue_resets,
             congestion_delivery_peak_packets_per_second: snapshot
                 .congestion_delivery_peak_packets_per_second,
             congestion_drain_floor_packets_per_second: snapshot
@@ -913,6 +933,11 @@ mod tests {
             snapshot.congestion_queue_tolerance, None,
             "no controller queue gate before the first rate sample"
         );
+        assert_eq!(
+            snapshot.congestion_persistent_queue_for, None,
+            "no persistent-queue signal before the first rate sample"
+        );
+        assert_eq!(snapshot.congestion_persistent_queue_resets, 0);
         assert_eq!(
             snapshot.congestion_delivery_peak_packets_per_second, None,
             "no delivery peak before the first rate sample"

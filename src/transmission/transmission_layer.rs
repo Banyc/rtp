@@ -213,6 +213,8 @@ pub struct MetricsRow<'a> {
     pub congestion_control_rtt_micros: Option<u128>,
     pub congestion_rtt_floor_micros: Option<u128>,
     pub congestion_queue_tolerance_micros: Option<u128>,
+    pub congestion_persistent_queue_for_micros: Option<u128>,
+    pub congestion_persistent_queue_resets: u64,
     pub congestion_delivery_peak_packets_per_second: Option<f64>,
     pub congestion_drain_floor_packets_per_second: Option<f64>,
     pub congestion_drain_target_packets_per_second: Option<f64>,

@@ -5,7 +5,7 @@ use tokio::task::{JoinError, JoinSet};
 
 use super::stream::{ConnReader, ConnWriter};
 
-use crate::metrics::MetricsTerminationCause;
+use crate::metrics::{MetricsEvent, MetricsSendDriverWake, MetricsTerminationCause};
 
 use crate::transmission::{
     connection::{Connection, new_connection, new_connection_with_watchdog_tuning},
@@ -134,8 +134,8 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
     let mut drivers = JoinSet::new();
     drivers.spawn({
         let stop_drivers = stop_drivers.clone();
+        let mut write_half = write_half;
         async move {
-            let mut write_half = write_half;
             let mut send_bufs = SendBufs::new();
             let kill_requested = write_half.kill_requested().clone();
             loop {
@@ -144,23 +144,35 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
                     Err(_) => return,
                 };
                 let resume_send = write_half.resume_send().notified();
-                match pass.wake.deadline() {
+                let wake = match pass.wake.deadline() {
                     Some(t) => {
+                        let timer_wake = match pass.wake {
+                            crate::traffic_shaping::core::SendWake::Pacing(_) => {
+                                MetricsSendDriverWake::PacingTimer
+                            }
+                            crate::traffic_shaping::core::SendWake::Protocol(_) => {
+                                MetricsSendDriverWake::ProtocolTimer
+                            }
+                            crate::traffic_shaping::core::SendWake::Event => {
+                                unreachable!("an event wait has no deadline")
+                            }
+                        };
                         tokio::select! {
-                            () = tokio::time::sleep_until(t.into()) => (),
-                            () = resume_send => (),
-                            () = kill_requested.cancelled() => (),
+                            () = tokio::time::sleep_until(t.into()) => timer_wake,
+                            () = resume_send => MetricsSendDriverWake::ResumeSignal,
+                            () = kill_requested.cancelled() => MetricsSendDriverWake::KillRequested,
                             () = stop_drivers.cancelled() => return,
                         }
                     }
                     None => {
                         tokio::select! {
-                            () = resume_send => (),
-                            () = kill_requested.cancelled() => (),
+                            () = resume_send => MetricsSendDriverWake::ResumeSignal,
+                            () = kill_requested.cancelled() => MetricsSendDriverWake::KillRequested,
                             () = stop_drivers.cancelled() => return,
                         }
                     }
-                }
+                };
+                write_half.log(MetricsEvent::SendDriverWake(wake));
             }
         }
     });
@@ -212,7 +224,7 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
             let mut drivers = drivers;
             let first_exit = 'session: {
                 tokio::select! {
-                    () = write_shutdown.cancelled() => { shared.send_fin_buf(); shared.resume_send().notify_one(); }
+                    () = write_shutdown.cancelled() => shared.send_fin_buf(),
                     () = termination_reaper.ready() => break 'session None,
                     result = next_driver_exit(&mut drivers) => break 'session Some(result),
                 }

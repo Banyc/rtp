@@ -7,7 +7,7 @@ use super::transmission_layer::{
 };
 use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
-use crate::metrics::MetricsTerminationCause;
+use crate::metrics::{MetricsSendDriverResumeSource, MetricsTerminationCause};
 use crate::{
     ack::AckBlocks,
     codec::decode,
@@ -91,7 +91,9 @@ impl ReadHalf {
                     PostOpenVerdict::NotHandshake => {}
                     PostOpenVerdict::Consumed | PostOpenVerdict::Complete => continue,
                     PostOpenVerdict::ReplyQueued => {
-                        shared.signals.resume_send.notify_one();
+                        shared.request_send_driver_resume(
+                            MetricsSendDriverResumeSource::PostOpenHandshake,
+                        );
                         continue;
                     }
                 }
@@ -142,18 +144,21 @@ impl ReadHalf {
                     .as_ref()
                     .is_some_and(|data| data.buf_range.is_empty() && data.frame_len.is_none());
                 let ack_next = data.ack_next;
-                let (disposition, recv_eof) = {
+                let (disposition, recv_eof, gentle_mode_exit) = {
                     let mut reliable_layer = shared.reliable_layer.lock().unwrap();
                     // An ACK event exists only when the datagram carried an
                     // ACK command (ack_next is Some); a data-only packet must
                     // not fabricate one.
-                    if let Some(ack_next) = ack_next {
+                    let gentle_mode_exit = if let Some(ack_next) = ack_next {
                         reliable_layer
                             .recv_ack_pkt(AckBlocks::new(ack_next, &bufs.ack_from_peer), now);
                         if FEC_DEBUG {
                             eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
                         }
-                    }
+                        reliable_layer.take_gentle_mode_exit()
+                    } else {
+                        None
+                    };
                     let disposition = match &data.data {
                         None => None,
                         Some(data) => {
@@ -173,8 +178,15 @@ impl ReadHalf {
                             Some(disposition)
                         }
                     };
-                    (disposition, reliable_layer.recv_eof_ready())
+                    (
+                        disposition,
+                        reliable_layer.recv_eof_ready(),
+                        gentle_mode_exit,
+                    )
                 };
+                if let Some(cause) = gentle_mode_exit {
+                    shared.log_at(crate::metrics::MetricsEvent::GentleModeExit(cause), now);
+                }
                 if is_fin
                     && matches!(
                         disposition,
@@ -191,7 +203,7 @@ impl ReadHalf {
                     // ACK processing may have freed send-window capacity, so
                     // wake the writer directly instead of letting it wait for
                     // a timer or the next application push.
-                    shared.signals.resume_send.notify_one();
+                    shared.request_send_driver_resume(MetricsSendDriverResumeSource::PeerAck);
                 }
                 let Some(data) = data.data else {
                     shared.log(crate::metrics::MetricsEvent::ReceiveAckPacket);
@@ -222,7 +234,8 @@ impl ReadHalf {
                     && reliable_layer.pkt_send_space().accepts_new_pkt()
             };
             if should_resume_send {
-                shared.signals.resume_send.notify_one();
+                shared
+                    .request_send_driver_resume(MetricsSendDriverResumeSource::ReceiveOpportunity);
             }
             return Ok(recv_pkts);
         }
