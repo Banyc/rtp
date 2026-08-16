@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 15;
+pub const SCHEMA_VERSION: u16 = 21;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +78,42 @@ pub enum MetricsCongestionAction {
     HugeLossBackoff,
     LossBackoff,
 }
+/// Why one delay-gated gentle-mode episode ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsGentleExitCause {
+    Loss,
+    GateOpen,
+    DrainGuard,
+    OutageReset,
+}
+
+impl MetricsGentleExitCause {
+    pub const ALL: [Self; 4] = [
+        Self::Loss,
+        Self::GateOpen,
+        Self::DrainGuard,
+        Self::OutageReset,
+    ];
+
+    /// Stable suffix used by aggregate export labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loss => "loss",
+            Self::GateOpen => "gate_open",
+            Self::DrainGuard => "drain_guard",
+            Self::OutageReset => "outage_reset",
+        }
+    }
+
+    const fn event_str(self) -> &'static str {
+        match self {
+            Self::Loss => "gentle_mode_exit_loss",
+            Self::GateOpen => "gentle_mode_exit_gate_open",
+            Self::DrainGuard => "gentle_mode_exit_drain_guard",
+            Self::OutageReset => "gentle_mode_exit_outage_reset",
+        }
+    }
+}
 
 impl MetricsCongestionAction {
     /// Stable snake-case label used by text and CSV exporters.
@@ -114,6 +150,26 @@ pub enum MetricsStallReason {
     NoResponse,
     NoProgress,
 }
+/// What resumed the send driver after a completed send pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsSendDriverWake {
+    ResumeSignal,
+    PacingTimer,
+    ProtocolTimer,
+    KillRequested,
+}
+
+impl MetricsSendDriverWake {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResumeSignal => "send_driver_resume_signal",
+            Self::PacingTimer => "send_driver_pacing_timer",
+            Self::ProtocolTimer => "send_driver_protocol_timer",
+            Self::KillRequested => "send_driver_kill_requested",
+        }
+    }
+}
 
 impl MetricsStallReason {
     /// Stable snake-case label used by text and CSV exporters.
@@ -137,10 +193,67 @@ pub enum MetricsEvent {
     /// A send-loop packet attempt, including attempts that find no sendable
     /// packet because pacing, congestion control, or the queue blocks them.
     SendDataPacketAttempt,
+    /// The event that resumed the send driver after its previous send pass.
+    SendDriverWake(MetricsSendDriverWake),
+    /// A request to resume the send driver, before Notify coalescing.
+    SendDriverResumeRequest(MetricsSendDriverResumeSource),
+    /// An exact transition that ended a delay-gated gentle-mode episode.
+    GentleModeExit(MetricsGentleExitCause),
     /// A raw timestamp-echo RTT sample was accepted by the estimator.
     RttSample,
     /// The first terminal error that owns the session failure.
     SessionTermination(MetricsTermination),
+}
+/// Producer that requested a resume-signal wake for the RTP send driver.
+///
+/// Requests and consumed wakes are deliberately separate observations:
+/// [`tokio::sync::Notify`] may coalesce several requests into one
+/// [`MetricsSendDriverWake::ResumeSignal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsSendDriverResumeSource {
+    ApplicationData,
+    ApplicationFrame,
+    ApplicationFinish,
+    PeerAck,
+    AckFlush,
+    PostOpenHandshake,
+    ReceiveOpportunity,
+}
+
+impl MetricsSendDriverResumeSource {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplicationData => "send_driver_resume_request_application_data",
+            Self::ApplicationFrame => "send_driver_resume_request_application_frame",
+            Self::ApplicationFinish => "send_driver_resume_request_application_finish",
+            Self::PeerAck => "send_driver_resume_request_peer_ack",
+            Self::AckFlush => "send_driver_resume_request_ack_flush",
+            Self::PostOpenHandshake => "send_driver_resume_request_post_open_handshake",
+            Self::ReceiveOpportunity => "send_driver_resume_request_receive_opportunity",
+        }
+    }
+}
+
+/// Cumulative repair activity for one connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsRetransmissionCounters {
+    /// Calls that selected and emitted a retransmission-ready packet.
+    pub attempts: u64,
+    /// Retransmission attempts for packets that had not previously been repaired.
+    pub first_attempts: u64,
+    /// Retransmission attempts for packets already repaired at least once.
+    pub repeat_attempts: u64,
+    /// Attempts where an RTO reason was armed.
+    pub rto_reason: u64,
+    /// Attempts where the time-based reordering deadline was armed.
+    pub reorder_reason: u64,
+    /// Attempts where SACK-count fast-loss evidence was armed.
+    pub fast_loss_reason: u64,
+    /// Attempts where outage recovery marked the packet pre-outage.
+    pub pre_outage_reason: u64,
+    /// Tail-loss probes emitted outside the retransmission-ready path.
+    pub tail_probes: u64,
 }
 
 impl MetricsEvent {
@@ -154,6 +267,9 @@ impl MetricsEvent {
             Self::ReceiveAckPacket => "recv_ack_pkt",
             Self::ReceiveDataPacket => "recv_data_pkt",
             Self::SendDataPacketAttempt => "send_data_pkt",
+            Self::SendDriverWake(wake) => wake.as_str(),
+            Self::SendDriverResumeRequest(source) => source.as_str(),
+            Self::GentleModeExit(cause) => cause.event_str(),
             Self::RttSample => "rtt_sample",
             Self::SessionTermination(_) => "session_termination",
         }
@@ -180,6 +296,9 @@ pub struct MetricsSnapshot {
     /// Packets currently retransmission-ready (due or evidence-armed).
     pub retransmission_ready_packets: usize,
     pub retransmitted_packets: usize,
+    /// Cumulative repair activity.  Scheduler-reason counters are
+    /// non-exclusive because one attempt may have multiple reasons armed.
+    pub retransmission_counters: MetricsRetransmissionCounters,
     pub next_send_sequence: u64,
     pub minimum_rtt: Option<Duration>,
     pub smoothed_rtt: Duration,
@@ -211,6 +330,13 @@ pub struct MetricsSnapshot {
     pub congestion_rtt_floor: Option<Duration>,
     /// Queue-gate tolerance last computed by the congestion controller.
     pub congestion_queue_tolerance: Option<Duration>,
+    /// Continuous time for which the wider persistent-queue signal has been
+    /// armed.  `None` means the signal is currently clear.
+    pub congestion_persistent_queue_for: Option<Duration>,
+    /// Observed armed-to-clear transitions of the persistent-queue signal.
+    /// Congestion-epoch resets clear the private continuity latch and therefore
+    /// do not increment this cumulative diagnostic counter.
+    pub congestion_persistent_queue_resets: u64,
     /// Recent delivery peak feeding the drain floor.
     pub congestion_delivery_peak_packets_per_second: Option<f64>,
     /// Drain floor last applied by the congestion controller.
