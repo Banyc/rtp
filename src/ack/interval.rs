@@ -197,6 +197,16 @@ pub(crate) struct AckAnalysis {
     pub(crate) highest_sacked: Option<SequenceNumber>,
     pub(crate) has_sack_evidence: bool,
 }
+/// ACK facts computed while normalizing selective blocks. The sender uses
+/// 'relevant_unacked_end' to bound its occupied-window walk, then consumes the
+/// remaining facts and the same normalized block buffer during analysis.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AckPreparation {
+    cumulative: Option<u64>,
+    highest_sacked: Option<SequenceNumber>,
+    raw_blocks_present: bool,
+    pub(crate) relevant_unacked_end: u64,
+}
 
 /// Sender-side view over the ACK blocks received from the peer.  All
 /// interpretation of what an incoming ACK means is computed here, relative
@@ -269,9 +279,9 @@ impl<'a> AckBlocks<'a> {
 
     /// Normalize the hostile wire input once: clip to the sent span, sort by
     /// logical start offset, and merge overlapping ranges (but not merely
-    /// adjacent ones).  After this, SACK membership is a set and
+    /// adjacent ones). After this, SACK membership is a set and
     /// overlapping/duplicate ranges can no longer inflate loss evidence.
-    /// Returns the start of the highest *clipped* acked block — the newest
+    /// Returns the start of the highest *clipped* acked block - the newest
     /// in-span sequence the peer reported, captured before merging so it
     /// bounds how far an out-of-order ACK advances the reorder knowledge.
     fn normalize_block_offsets(
@@ -281,6 +291,9 @@ impl<'a> AckBlocks<'a> {
         block_offsets: &mut Vec<(u64, u64)>,
     ) -> Option<SequenceNumber> {
         block_offsets.clear();
+        if self.blocks.is_empty() {
+            return None;
+        }
         block_offsets.extend(self.valid_block_offsets(send_start, sent_span));
         if block_offsets.len() > 1 {
             if !block_offsets.is_sorted_by_key(|&(start, _)| start) {
@@ -316,34 +329,54 @@ impl<'a> AckBlocks<'a> {
     /// block.  Unacked sequences at or beyond this offset are never acked by
     /// this ACK and never carry selective evidence, so sender-side analysis
     /// can stop there without scanning the whole send window.
+    pub(crate) fn prepare(
+        &self,
+        send_start: SequenceNumber,
+        sent_span: u64,
+        block_offsets: &mut Vec<(u64, u64)>,
+    ) -> AckPreparation {
+        let highest_sacked = self.normalize_block_offsets(send_start, sent_span, block_offsets);
+        let cumulative = match self.cumulative_position(send_start, sent_span) {
+            CumulativePosition::Current(offset) => Some(offset),
+            CumulativePosition::Stale | CumulativePosition::Future => None,
+        };
+        let selective_end = block_offsets.last().map_or(0, |&(_, end)| end);
+        AckPreparation {
+            cumulative,
+            highest_sacked,
+            raw_blocks_present: !self.blocks.is_empty(),
+            relevant_unacked_end: cumulative.unwrap_or(0).max(selective_end),
+        }
+    }
+
+    /// The exclusive forward offset (from `send_start`) of the last unacked
+    /// sequence this ACK can possibly deliver: the maximum of the cumulative
+    /// front (when current) and the end of the highest clipped selective
+    /// block.  Unacked sequences at or beyond this offset are never acked by
+    /// this ACK and never carry selective evidence, so sender-side analysis
+    /// can stop there without scanning the whole send window.
+
+    #[cfg(test)]
     pub(crate) fn relevant_unacked_end_offset(
         &self,
         send_start: SequenceNumber,
         sent_span: u64,
     ) -> u64 {
-        let cumulative_end = match self.cumulative_position(send_start, sent_span) {
-            CumulativePosition::Current(offset) => offset,
-            CumulativePosition::Stale | CumulativePosition::Future => 0,
-        };
-        let selective_end = self
-            .valid_block_offsets(send_start, sent_span)
-            .map(|(_, end)| end)
-            .max()
-            .unwrap_or(0);
-        cumulative_end.max(selective_end)
+        self.prepare(send_start, sent_span, &mut Vec::new())
+            .relevant_unacked_end
     }
 
     /// One bounded wrapping-safe linear analysis of this ACK against the
     /// sender's in-flight window: computes, in a single pass per direction,
-    /// which `unacked` sequences are delivered (cumulative prefix plus
+    /// which 'unacked' sequences are delivered (cumulative prefix plus
     /// normalized selective blocks) and the dup-ACK-pass evidence above each
-    /// one, plus the analysis summary.  `unacked` must be in increasing
-    /// logical offset order (as produced by `SendWindow::iter`).  It may be
-    /// truncated at [`Self::relevant_unacked_end_offset`]: sequences at or
-    /// beyond the bound are never acked and never contribute evidence.
-    /// `block_offsets`, `acked`, and `sacked_above` are caller-owned reusable
-    /// buffers; `sacked_above` is always resized to `unacked.len()` and
-    /// zero-filled even for a cumulative-only ACK.
+    /// one, plus the analysis summary.
+    /// 'unacked' must be in increasing logical offset order (as produced by "SendWindow::iter"). It may be
+    /// truncated at ['Self::relevant_unacked_end_offset']: sequences at or beyond the bound are never acked and never contribute evidence.
+    /// 'block_offsets', 'acked', and 'sacked_above' are caller-owned reusable buffers. A cumulative-only ACK leaves 'sacked_above' empty because the
+    /// returned 'has_sack_evidence' is false and the caller must not inspect
+    /// per-sequence evidence; otherwise it is resized to 'unacked.len()'.
+    #[cfg(test)]
     pub(crate) fn analyze(
         &self,
         send_start: SequenceNumber,
@@ -353,18 +386,33 @@ impl<'a> AckBlocks<'a> {
         acked: &mut Vec<SequenceNumber>,
         sacked_above: &mut Vec<u32>,
     ) -> AckAnalysis {
-        let highest_sacked = self.normalize_block_offsets(send_start, sent_span, block_offsets);
-        let cumulative = match self.cumulative_position(send_start, sent_span) {
-            CumulativePosition::Current(offset) => Some(offset),
-            CumulativePosition::Stale | CumulativePosition::Future => None,
-        };
+        let prepared = self.prepare(send_start, sent_span, block_offsets);
+        self.analyze_prepared(
+            prepared,
+            send_start,
+            unacked,
+            block_offsets,
+            acked,
+            sacked_above,
+        )
+    }
+
+    pub(crate) fn analyze_prepared(
+        &self,
+        prepared: AckPreparation,
+        send_start: SequenceNumber,
+        unacked: &[SequenceNumber],
+        block_offsets: &[(u64, u64)],
+        acked: &mut Vec<SequenceNumber>,
+        sacked_above: &mut Vec<u32>,
+    ) -> AckAnalysis {
         let mut block_index = 0;
         for &seq in unacked {
             let offset = send_start.forward_distance_to(seq);
             while block_index < block_offsets.len() && block_offsets[block_index].1 <= offset {
                 block_index += 1;
             }
-            let cumulatively_acked = cumulative.is_some_and(|front| offset < front);
+            let cumulatively_acked = prepared.cumulative.is_some_and(|front| offset < front);
             let selectively_acked = block_offsets
                 .get(block_index)
                 .is_some_and(|&(start, end)| start <= offset && offset < end);
@@ -373,12 +421,12 @@ impl<'a> AckBlocks<'a> {
             }
         }
         let analysis = AckAnalysis {
-            cumulative_is_current: cumulative.is_some(),
-            highest_sacked,
+            cumulative_is_current: prepared.cumulative.is_some(),
+            highest_sacked: prepared.highest_sacked,
             has_sack_evidence: !block_offsets.is_empty(),
         };
         sacked_above.clear();
-        if self.blocks.is_empty() {
+        if !prepared.raw_blocks_present {
             return analysis;
         }
         sacked_above.resize(unacked.len(), 0);

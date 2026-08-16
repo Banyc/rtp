@@ -7,7 +7,7 @@
 //! original send time (`sent_at`).  The RTO deadline is indexed directly;
 //! the reorder-window deadline is derived at query time as
 //! `sent_at + reorder_window` from the `reorder_sent` send-time keys (the
-//! window tracks sRTT and changes over a packet's life).
+//! window tracks SRTT and changes over a packet's life).
 //!
 //! Time-based reasons (RTO, reorder) are promoted into the *ready* set once
 //! their deadlines elapse ([`RetransmissionIndex::promote_due`]);
@@ -20,14 +20,12 @@
 //! postpones it to `sent_at + live_rto` instead of promoting a stale
 //! deadline.  Deadline ties break by wrap-aware sequence serial order,
 //! which is a total order only within a live window smaller than half the
-//! sequence space — the invariant every caller maintains.
-
+//! sequence space - the invariant every caller maintains.
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use crate::sequence::{HALF_SEQUENCE_SPACE, SequenceMap, SequenceNumber, lt};
-
+use crate::sequence::{HALF_SEQUENCE_SPACE, SequenceMap, SequenceNumber, SequenceVacancyError, lt};
 /// Deadline for an active packet: the RTO retransmission deadline (send
 /// time + the packet's RTO), the original send time (used to derive the
 /// reorder-window deadline at query time), whether the packet's RTO is
@@ -195,6 +193,22 @@ impl ReadyReasons {
         self.fast_loss
     }
 
+    pub(super) fn has_pre_outage(self) -> bool {
+        self.pre_outage.is_some()
+    }
+
+    pub(super) fn has_fast_loss(self) -> bool {
+        self.fast_loss.is_some()
+    }
+
+    pub(super) fn has_reorder(self) -> bool {
+        self.reorder.is_some()
+    }
+
+    pub(super) fn has_rto(self) -> bool {
+        self.rto.is_some()
+    }
+
     /// The `since` deadline of one independent reason, if set.
     fn get(self, reason: ReadyReason) -> Option<Instant> {
         match reason {
@@ -237,7 +251,7 @@ impl RetransmissionIndex {
     }
 
     /// Activate a packet: insert it into the active set, atomically adding
-    /// its RTO deadline key and — when the packet is out-of-order-passed —
+    /// its RTO deadline key and - when the packet is out-of-order-passed -
     /// its reorder send-time key.  Evidence- and outage-based ready reasons
     /// named in the activation are set independently; time-based reasons
     /// are promoted later by [`Self::promote_due`].  A packet already
@@ -253,20 +267,20 @@ impl RetransmissionIndex {
             fast_loss_eligible,
             pre_outage_eligible,
         } = activation;
-        if self.active.contains_key(&seq) {
-            return;
+        match self.active.insert_vacant_with(seq, || ActiveEntry {
+            rto_at,
+            sent_at,
+            apply_live_rto_floor,
+            reorder_indexed: reorder_eligible,
+        }) {
+            Ok(()) => {}
+            Err(SequenceVacancyError::Occupied) => return,
+            Err(SequenceVacancyError::Outside(position)) => {
+                panic!(
+                    "active retransmission sequence must be inside the live window: {position:?}"
+                );
+            }
         }
-        self.active
-            .insert_vacant(
-                seq,
-                ActiveEntry {
-                    rto_at,
-                    sent_at,
-                    apply_live_rto_floor,
-                    reorder_indexed: reorder_eligible,
-                },
-            )
-            .expect("active retransmission sequence must be vacant and inside the live window");
         self.rto_deadlines.insert(DeadlineKey { at: rto_at, seq });
         if reorder_eligible {
             self.reorder_sent.insert(DeadlineKey { at: sent_at, seq });
@@ -302,7 +316,7 @@ impl RetransmissionIndex {
     }
 
     /// Promote active packets whose time-based deadlines have elapsed:
-    /// first every RTO deadline with `at <= now` (setting the RTO reason —
+    /// first every RTO deadline with `at <= now` (setting the RTO reason -
     /// but lazily postponing stale non-tail-probe deadlines below the live
     /// estimator floor to `sent_at + live_rto`), then every reorder send
     /// time with `sent_at + reorder_window <= now` (setting the reorder
@@ -322,16 +336,12 @@ impl RetransmissionIndex {
             }
             let entry = self
                 .active
-                .get(&deadline.seq)
-                .copied()
+                .get_mut(&deadline.seq)
                 .expect("RTO deadline must belong to an active packet");
             let live_deadline = entry.sent_at + live_rto;
             if entry.apply_live_rto_floor && deadline.at < live_deadline {
                 self.rto_deadlines.remove(&deadline);
-                self.active
-                    .get_mut(&deadline.seq)
-                    .expect("RTO deadline must belong to an active packet")
-                    .rto_at = live_deadline;
+                entry.rto_at = live_deadline;
                 self.rto_deadlines.insert(DeadlineKey {
                     at: live_deadline,
                     seq: deadline.seq,
@@ -357,7 +367,11 @@ impl RetransmissionIndex {
         rto_deadline_postponements
     }
 
-    pub(super) fn has_due(&self, now: Instant, reorder_window: std::time::Duration) -> bool {
+    pub(super) fn has_due(
+        &self,
+        now: Instant,
+        reorder_window: impl FnOnce() -> std::time::Duration,
+    ) -> bool {
         !self.ready.is_empty()
             || self
                 .rto_deadlines
@@ -366,18 +380,30 @@ impl RetransmissionIndex {
             || self
                 .reorder_sent
                 .first()
-                .is_some_and(|sent| sent.at + reorder_window <= now)
+                .is_some_and(|sent| sent.at + reorder_window() <= now)
     }
 
-    pub(super) fn next_deadline(&self, reorder_window: std::time::Duration) -> Option<Instant> {
+    /// Deadline used only to schedule the next send-loop wake. If one source
+    /// is already due, later sources cannot make that wake more immediate.
+    pub(super) fn next_deadline(
+        &self,
+        now: Instant,
+        reorder_window: impl FnOnce() -> std::time::Duration,
+    ) -> Option<Instant> {
         let mut next = self.ready_deadlines.first().map(|entry| entry.at);
+        if next.is_some_and(|deadline| deadline <= now) {
+            return next;
+        }
         if let Some(deadline) = self.rto_deadlines.first().map(|entry| entry.at) {
             next = Some(next.map_or(deadline, |current| current.min(deadline)));
+        }
+        if next.is_some_and(|deadline| deadline <= now) {
+            return next;
         }
         if let Some(deadline) = self
             .reorder_sent
             .first()
-            .map(|entry| entry.at + reorder_window)
+            .map(|entry| entry.at + reorder_window())
         {
             next = Some(next.map_or(deadline, |current| current.min(deadline)));
         }
@@ -637,7 +663,7 @@ mod tests {
             pre_outage_eligible: false,
         });
         index.set_reason(sq(0), ReadyReason::FastLoss, Some(t0 + ms(50)));
-        assert_eq!(index.next_deadline(ms(100)), Some(t0 + ms(40)));
+        assert_eq!(index.next_deadline(t0, || ms(100)), Some(t0 + ms(40)));
         index.deactivate(sq(0));
         index.activate(RetransmissionActivation {
             seq: sq(1),
@@ -649,9 +675,67 @@ mod tests {
             pre_outage_eligible: false,
         });
         index.set_reason(sq(1), ReadyReason::FastLoss, Some(t0 + ms(50)));
-        assert_eq!(index.next_deadline(ms(100)), Some(t0 + ms(50)));
+        assert_eq!(index.next_deadline(t0, || ms(100)), Some(t0 + ms(50)));
         index.set_reason(sq(1), ReadyReason::FastLoss, None);
-        assert_eq!(index.next_deadline(ms(100)), Some(t0 + ms(100)))
+        assert_eq!(index.next_deadline(t0, || ms(100)), Some(t0 + ms(100)));
+    }
+
+    #[test]
+    fn duplicate_activation_leaves_every_existing_index_untouched() {
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        index.activate(activation(sq(0), t0 + ms(100), t0));
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(1),
+            sent_at: t0 + ms(1),
+            apply_live_rto_floor: false,
+            reorder_eligible: true,
+            fast_loss_eligible: true,
+            pre_outage_eligible: true,
+        });
+
+        let active = index.active.get(&sq(0)).unwrap();
+        assert_eq!(active.rto_at, t0 + ms(100));
+        assert_eq!(active.sent_at, t0);
+        assert!(!active.apply_live_rto_floor);
+        assert!(!active.reorder_indexed);
+        assert!(index.ready.is_empty());
+        assert!(index.reorder_sent.is_empty());
+        assert_eq!(index.rto_deadlines.first().unwrap().at, t0 + ms(100));
+    }
+
+    #[test]
+    fn next_deadline_stops_after_the_first_due_wake_source() {
+        use std::cell::Cell;
+
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(40),
+            sent_at: t0,
+            apply_live_rto_floor: false,
+            reorder_eligible: true,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        index.set_reason(sq(0), ReadyReason::FastLoss, Some(t0 + ms(50)));
+        let reorder_window_read = Cell::new(false);
+        assert_eq!(
+            index.next_deadline(t0 + ms(60), || {
+                reorder_window_read.set(true);
+                ms(100)
+            }),
+            Some(t0 + ms(50))
+        );
+        assert!(!reorder_window_read.get());
+
+        assert!(index.has_due(t0 + ms(60), || {
+            reorder_window_read.set(true);
+            ms(100)
+        }));
+        assert!(!reorder_window_read.get());
     }
 
     #[test]
@@ -738,16 +822,19 @@ mod tests {
         assert!(index.has_rto_due(t0 + ms(900), ms(900)));
         assert_eq!(index.promote_due(t0 + ms(500), ms(100), ms(900)), 1);
         assert_eq!(index.rto_ready_count, 0);
-        assert!(!index.has_due(t0 + ms(500), ms(100)));
-        assert_eq!(index.next_deadline(ms(100)), Some(t0 + ms(900)));
+        assert!(!index.has_due(t0 + ms(500), || ms(100)));
+        assert_eq!(
+            index.next_deadline(t0 + ms(500), || ms(100)),
+            Some(t0 + ms(900))
+        );
         // A second promote before the floored deadline is a no-op.
         assert_eq!(index.promote_due(t0 + ms(800), ms(100), ms(900)), 0);
-        assert!(!index.has_due(t0 + ms(800), ms(100)));
+        assert!(!index.has_due(t0 + ms(800), || ms(100)));
         // At the floored deadline the packet becomes RTO-ready.
         assert_eq!(index.promote_due(t0 + ms(900), ms(100), ms(900)), 0);
         assert_eq!(index.rto_ready_count, 1);
         assert!(index.has_rto_due(t0 + ms(900), ms(900)));
-        assert!(index.has_due(t0 + ms(900), ms(100)));
+        assert!(index.has_due(t0 + ms(900), || ms(100)));
         let (seq, _) = index.first_ready().unwrap();
         assert_eq!(seq, sq(0));
 
@@ -768,7 +855,7 @@ mod tests {
         assert!(tail.has_rto_due(t0 + ms(300), ms(900)));
         assert_eq!(tail.promote_due(t0 + ms(300), ms(100), ms(900)), 0);
         assert_eq!(tail.rto_ready_count, 1);
-        assert!(tail.has_due(t0 + ms(300), ms(100)));
+        assert!(tail.has_due(t0 + ms(300), || ms(100)));
         let (seq, _) = tail.first_ready().unwrap();
         assert_eq!(seq, sq(0));
         tail.deactivate(sq(0));

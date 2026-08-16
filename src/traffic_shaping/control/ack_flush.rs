@@ -59,6 +59,7 @@ impl AckFlushState {
     }
 
     /// The next instant at which a flush must run, if pending work exists.
+    #[cfg(test)]
     pub(crate) fn next_deadline(&self, now: Instant) -> Option<Instant> {
         if self.pending_acks >= ACK_FLUSH_COUNT || self.fin_pending {
             Some(now)
@@ -71,20 +72,41 @@ impl AckFlushState {
     }
 
     /// Single-lock query combining the due-ness decision with the wake
-    /// deadline, so the send pass can carry one `AckFlushState` result into
+    /// deadline, so the send pass can carry one 'AckFlushState' result into
     /// the next-wake computation instead of locking twice.
     pub(crate) fn check(&self, now: Instant) -> (bool, Option<Instant>) {
-        (self.is_due(now), self.next_deadline(now))
+        if self.pending_acks == 0 && !self.fin_pending {
+            return (false, None);
+        }
+        if self.fin_pending || ACK_FLUSH_COUNT <= self.pending_acks {
+            return (true, Some(now));
+        }
+        match self.last_ack_flush {
+            Some(last) => (
+                ACK_FLUSH_AGE <= now.duration_since(last),
+                Some(last + ACK_FLUSH_AGE),
+            ),
+            None => (true, Some(now)),
+        }
     }
 
     /// Record ACK work produced by the recv path: one pending ack (or FIN) per
     /// accepted packet plus an optional peer echo timestamp.
-    pub(crate) fn record(&mut self, pending_acks: usize, fin_ack: bool, echo_ts: Option<u32>) {
+    pub(crate) fn record(
+        &mut self,
+        pending_acks: usize,
+        fin_ack: bool,
+        echo_ts: Option<u32>,
+    ) -> bool {
+        let had_pending = self.has_pending();
+        let was_immediately_due = self.fin_pending || ACK_FLUSH_COUNT <= self.pending_acks;
         self.pending_acks += pending_acks;
         self.fin_pending |= fin_ack;
         if let Some(echo_ts) = echo_ts {
             self.ts_echo.set(echo_ts);
         }
+        let is_immediately_due = self.fin_pending || ACK_FLUSH_COUNT <= self.pending_acks;
+        !had_pending || (!was_immediately_due && is_immediately_due)
     }
 
     /// Subtract-claimed: decrement `pending_acks` by the number actually
@@ -220,6 +242,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn combined_check_matches_the_separate_due_and_deadline_queries() {
+        let now = Instant::now();
+        let states = [
+            (0, false, None),
+            (1, false, None),
+            (1, false, Some(now)),
+            (1, false, Some(now - ACK_FLUSH_AGE)),
+            (ACK_FLUSH_COUNT, false, Some(now)),
+            (0, true, Some(now)),
+        ];
+        for (pending_acks, fin_pending, last_ack_flush) in states {
+            let mut state = AckFlushState::new();
+            state.pending_acks = pending_acks;
+            state.fin_pending = fin_pending;
+            state.last_ack_flush = last_ack_flush;
+            assert_eq!(
+                state.check(now),
+                (state.is_due(now), state.next_deadline(now))
+            );
+        }
+    }
+    #[test]
     fn busy_ack_flush_uses_the_count_threshold_without_changing_the_age_cap() {
         let now = Instant::now();
         let mut s = AckFlushState::new();
@@ -251,6 +295,37 @@ mod tests {
         assert!(
             s.is_due(now + ACK_FLUSH_AGE),
             "the 1 ms age cap must still fire for a sparse ack flow"
+        );
+    }
+
+    #[test]
+    fn record_wakes_only_when_ack_work_needs_an_earlier_schedule() {
+        let mut state = AckFlushState::new();
+        assert!(
+            state.record(1, false, None),
+            "empty to pending needs a wake"
+        );
+        assert!(
+            !state.record(ACK_FLUSH_COUNT - 2, false, None),
+            "work below the count threshold keeps the existing age deadline"
+        );
+        assert!(
+            state.record(1, false, None),
+            "crossing the count threshold makes the flush immediately due"
+        );
+        assert!(
+            !state.record(1, false, None),
+            "already-immediate work does not need another wake"
+        );
+        let mut fin = AckFlushState::new();
+        assert!(fin.record(1, false, None));
+        assert!(
+            fin.record(0, true, None),
+            "a newly pending FIN is immediate"
+        );
+        assert!(
+            !fin.record(0, true, None),
+            "an already pending FIN has already scheduled the writer"
         );
     }
 }

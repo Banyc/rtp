@@ -54,25 +54,24 @@ impl TailLossProber {
     }
 
     /// Time between consecutive tail-loss probes for the current tail episode.
-    ///
     /// The PTO formula: `max(2*srtt, 2*min_rtt)` with a 10 ms floor, capped at
     /// the RTO currently in use.  The doubled terms use checked multiplication
     /// so a sub-nanosecond RTT cannot round the doubling away.
     pub fn probe_window(&self, rtt_stats: &RttStats) -> Duration {
         let srtt = rtt_stats.smooth_rtt();
-        let min_tol = Self::MIN_TOL;
+        self.probe_window_with_srtt(rtt_stats, srtt)
+    }
+
+    fn probe_window_with_srtt(&self, rtt_stats: &RttStats, srtt: Duration) -> Duration {
+        debug_assert!(rtt_stats.min_rtt().is_none_or(|min_rtt| min_rtt <= srtt));
+        // min_rtt is the lifetime minimum of the samples feeding srtt, so
+        // 2 * min_rtt can never exceed 2 * srtt. Keep the formula's dominant
+        // term without doubling and comparing both on every poll.
         let doubled_srtt = srtt
             .checked_mul(2)
             .expect("smoothed RTT must fit when doubled for the probe window");
-        let min_rtt_doubled = rtt_stats
-            .min_rtt()
-            .map(|r| {
-                r.checked_mul(2)
-                    .expect("minimum RTT must fit when doubled for the probe window")
-            })
-            .unwrap_or(doubled_srtt);
         let cap = self.rto(rtt_stats);
-        doubled_srtt.max(min_rtt_doubled).max(min_tol).min(cap)
+        doubled_srtt.max(Self::MIN_TOL).min(cap)
     }
 
     /// Whether enough time has passed since `sent_time` for a probe to fire.
@@ -86,12 +85,30 @@ impl TailLossProber {
         self.probes_sent += 1;
     }
 
-    /// Next poll time for the next probe, if budget remains.
-    pub fn next_probe_time(&self, sent_time: Instant, rtt_stats: &RttStats) -> Option<Instant> {
+    /// Merge the next probe time into an already-known wake deadline.
+    /// A probe cannot precede `sent_time + MIN_TOL`. When another source is
+    /// already due by that lower bound, keep it without calculating the RTT-
+    /// derived probe window.
+    pub fn merge_next_probe_time(
+        &self,
+        sent_time: Instant,
+        rtt_stats: &RttStats,
+        current: Option<Instant>,
+    ) -> Option<Instant> {
         if !self.can_probe() {
-            return None;
+            return current;
         }
-        Some(sent_time + self.probe_window(rtt_stats))
+        let srtt = rtt_stats.smooth_rtt();
+        // Both RTO caps are at least sRTT, while the uncapped probe window is
+        // at least max(sRTT, MIN_TOL). Therefore no probe can precede this
+        // lower bound. If another wake already wins, avoid the doubled-sRTT
+        // and RTO-cap calculation entirely.
+        let earliest_probe = sent_time + srtt.max(Self::MIN_TOL);
+        if current.is_some_and(|deadline| deadline <= earliest_probe) {
+            return current;
+        }
+        let probe = sent_time + self.probe_window_with_srtt(rtt_stats, srtt);
+        Some(current.map_or(probe, |deadline| deadline.min(probe)))
     }
 
     #[cfg(test)]
@@ -192,6 +209,26 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_minimum_is_dominated_across_varying_rtt_samples() {
+        let mut rtt_stats = RttStats::new();
+        let tlp = TailLossProber::new();
+
+        for rtt in [ms(900), ms(100), ms(700), ms(250), ms(500)] {
+            rtt_stats.record_rtt(rtt);
+            let srtt = rtt_stats.smooth_rtt();
+            let min_rtt = rtt_stats.min_rtt().unwrap();
+            assert!(min_rtt <= srtt);
+            let old_formula = srtt
+                .checked_mul(2)
+                .unwrap()
+                .max(min_rtt.checked_mul(2).unwrap())
+                .max(TailLossProber::MIN_TOL)
+                .min(tlp.rto(&rtt_stats));
+            assert_eq!(tlp.probe_window(&rtt_stats), old_formula);
+        }
+    }
+
+    #[test]
     fn budget_exhausted_after_max_probes() {
         let mut tlp = TailLossProber::new();
         assert!(tlp.can_probe());
@@ -199,10 +236,23 @@ mod tests {
         assert!(tlp.can_probe());
         tlp.sent();
         assert!(!tlp.can_probe());
-        // next_probe_time returns None when budget exhausted
+        // The merge contributes no deadline when the budget is exhausted.
         assert!(
-            tlp.next_probe_time(Instant::now(), &settled_rtt_stats())
+            tlp.merge_next_probe_time(Instant::now(), &settled_rtt_stats(), None)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn earlier_deadline_at_probe_lower_bound_wins_without_changing_it() {
+        let tlp = TailLossProber::new();
+        let sent = Instant::now();
+        let rtt_stats = settled_rtt_stats();
+        let current = sent + rtt_stats.smooth_rtt();
+        assert!(current < sent + tlp.probe_window(&rtt_stats));
+        assert_eq!(
+            tlp.merge_next_probe_time(sent, &rtt_stats, Some(current)),
+            Some(current)
         );
     }
 
