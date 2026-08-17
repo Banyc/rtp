@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 24;
+pub const SCHEMA_VERSION: u16 = 25;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

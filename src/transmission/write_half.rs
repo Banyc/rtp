@@ -1,11 +1,14 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::ack_feedback::schedule::AckSchedule;
+use super::ack_feedback::state::AckFlushOutcome;
 use super::connection::Connection;
 use super::termination::{KillPolicy, TerminationWriter};
 use super::transmission_layer::{
     FEC_DEBUG, PRINT_DEBUG_MSGS, ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
+use crate::ack::EncodeAck;
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::MetricsTerminationCause;
@@ -102,14 +105,14 @@ impl WriteHalf {
     pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendLoopResult, IoErr> {
         let now = Instant::now();
         let (made_progress, completed_at) = self.send_pkts_inner(bufs, now).await?;
-        // The pass may have awaited blocking underlay sends; the completion
-        // clock (refreshed after awaits) is the decision time for the next
-        // wake, never the pre-await `now`.
-        let (_, ack_deadline) = self.ack_flush.lock().unwrap().check(completed_at);
         Ok(SendLoopResult {
             made_progress,
-            wake: self.next_send_wake_after_ack_check(completed_at, ack_deadline),
+            wake: self.next_send_wake(completed_at),
         })
+    }
+
+    pub(crate) fn ack_schedule(&self, now: Instant) -> AckSchedule {
+        self.ack_feedback.schedule(now)
     }
 
     async fn send_pkts_inner(
@@ -420,21 +423,98 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub fn has_pending_acks(&self) -> bool {
-        self.ack_flush.lock().unwrap().has_pending()
+        !self.ack_feedback.is_drained()
     }
 
     fn ack_flush_is_due(&self, now: Instant) -> bool {
-        self.ack_flush.lock().unwrap().is_due(now)
+        self.ack_feedback.schedule(now).is_due()
     }
 
     pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        {
-            let s = self.ack_flush.lock().unwrap();
-            if !s.has_pending() {
+        let now = Instant::now();
+        let (claim, encoded_page_lengths) = {
+            let reliable_layer = self.reliable_layer.lock().unwrap();
+            let history = reliable_layer.pkt_recv_space().ack_history();
+            let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
                 return Ok(());
+            };
+            let (payload, codec_pkt, _) = bufs.parts_mut();
+            let mut encoded_page_lengths = [None; 2];
+            for (index, page) in claim.pages().into_iter().enumerate() {
+                let Some(page) = page else {
+                    continue;
+                };
+                let output = if index == 0 {
+                    &mut codec_pkt[..]
+                } else {
+                    &mut payload[..]
+                };
+                let ack = EncodeAck {
+                    queue: history,
+                    first_block_index: page.first_block_index,
+                    max_blocks: page.max_blocks,
+                };
+                encoded_page_lengths[index] = Some(
+                    encode_ack_data(
+                        self.session_tag(),
+                        Some(ack),
+                        claim.take_echo(),
+                        None,
+                        output,
+                    )
+                    .unwrap(),
+                );
+            }
+            (claim, encoded_page_lengths)
+        };
+        let fec_enabled = self.fec.is_some();
+        let mut pages_sent = 0;
+        for (index, written_bytes) in encoded_page_lengths.into_iter().enumerate() {
+            let Some(written_bytes) = written_bytes else {
+                continue;
+            };
+            let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
+            let encoded_page = if index == 0 {
+                &codec_pkt[..written_bytes]
+            } else {
+                &payload[..written_bytes]
+            };
+            match self.send_with_fec(encoded_page, wire_pkt).await {
+                Ok(_) => {
+                    pages_sent += 1;
+                    if fec_enabled {
+                        let fec_now = Instant::now();
+                        let can_send_tail_fec = {
+                            self.reliable_layer
+                                .lock()
+                                .unwrap()
+                                .can_send_tail_fec(fec_now)
+                        };
+                        if let Err(error) = self.close_fec_burst(fec_now, can_send_tail_fec).await {
+                            self.ack_feedback
+                                .complete(claim, AckFlushOutcome::Fatal { pages_sent });
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
+                    self.ack_feedback
+                        .complete(claim, AckFlushOutcome::WouldBlock { pages_sent });
+                    self.signals.session_outbound_progress.notify_one();
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.ack_feedback
+                        .complete(claim, AckFlushOutcome::Fatal { pages_sent });
+                    self.press_error(error, MetricsTerminationCause::AckWrite);
+                    return Err(error);
+                }
             }
         }
-        crate::traffic_shaping::control::ack_flush::flush(self, bufs).await
+        self.ack_feedback
+            .complete(claim, AckFlushOutcome::Sent { pages_sent });
+        self.signals.session_outbound_progress.notify_one();
+        Ok(())
     }
 
     pub(crate) async fn send_with_fec(

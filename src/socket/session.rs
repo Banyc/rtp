@@ -1,11 +1,12 @@
 use std::sync::Arc;
-use std::{future::Future, pin::Pin, task::Poll};
+use std::{future::Future, pin::Pin, task::Poll, time::Instant};
 
 use tokio::task::{JoinError, JoinSet};
 
 use super::stream::{ConnReader, ConnWriter};
 
 use crate::metrics::{MetricsEvent, MetricsSendDriverWake, MetricsTerminationCause};
+use crate::transmission::ack_feedback::schedule::AckSchedule;
 
 use crate::transmission::{
     connection::{Connection, new_connection, new_connection_with_watchdog_tuning},
@@ -143,36 +144,67 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
                     Ok(pass) => pass,
                     Err(_) => return,
                 };
-                let resume_send = write_half.resume_send().notified();
-                let wake = match pass.wake.deadline() {
-                    Some(t) => {
-                        let timer_wake = match pass.wake {
-                            crate::traffic_shaping::core::SendWake::Pacing(_) => {
-                                MetricsSendDriverWake::PacingTimer
-                            }
-                            crate::traffic_shaping::core::SendWake::Protocol(_) => {
-                                MetricsSendDriverWake::ProtocolTimer
-                            }
-                            crate::traffic_shaping::core::SendWake::Event => {
-                                unreachable!("an event wait has no deadline")
-                            }
-                        };
-                        tokio::select! {
-                            () = tokio::time::sleep_until(t.into()) => timer_wake,
-                            () = resume_send => MetricsSendDriverWake::ResumeSignal,
-                            () = kill_requested.cancelled() => MetricsSendDriverWake::KillRequested,
-                            () = stop_drivers.cancelled() => return,
+                let next_wake = pass.wake;
+                loop {
+                    let resume_send = write_half.resume_send().notified();
+                    let ack_schedule_changed = write_half.ack_schedule_changed().notified();
+                    tokio::pin!(ack_schedule_changed);
+                    ack_schedule_changed.as_mut().enable();
+                    let ack_deadline = match write_half.ack_schedule(Instant::now()) {
+                        AckSchedule::Idle => None,
+                        AckSchedule::At(deadline) => Some(deadline),
+                        AckSchedule::Due => break,
+                    };
+                    let timed_wake = match (next_wake, ack_deadline) {
+                        (crate::traffic_shaping::core::SendWake::Event, None) => None,
+                        (crate::traffic_shaping::core::SendWake::Event, Some(ack)) => {
+                            Some((ack, MetricsSendDriverWake::ProtocolTimer))
                         }
-                    }
-                    None => {
-                        tokio::select! {
-                            () = resume_send => MetricsSendDriverWake::ResumeSignal,
-                            () = kill_requested.cancelled() => MetricsSendDriverWake::KillRequested,
-                            () = stop_drivers.cancelled() => return,
+                        (crate::traffic_shaping::core::SendWake::Pacing(pacing), None) => {
+                            Some((pacing, MetricsSendDriverWake::PacingTimer))
                         }
+                        (crate::traffic_shaping::core::SendWake::Pacing(pacing), Some(ack))
+                            if pacing <= ack =>
+                        {
+                            Some((pacing, MetricsSendDriverWake::PacingTimer))
+                        }
+                        (crate::traffic_shaping::core::SendWake::Pacing(_), Some(ack)) => {
+                            Some((ack, MetricsSendDriverWake::ProtocolTimer))
+                        }
+                        (crate::traffic_shaping::core::SendWake::Protocol(protocol), None) => {
+                            Some((protocol, MetricsSendDriverWake::ProtocolTimer))
+                        }
+                        (crate::traffic_shaping::core::SendWake::Protocol(protocol), Some(ack)) => {
+                            Some((protocol.min(ack), MetricsSendDriverWake::ProtocolTimer))
+                        }
+                    };
+                    let wake = match timed_wake {
+                        Some((deadline, timer_wake)) => {
+                            tokio::select! {
+                                () = tokio::time::sleep_until(deadline.into()) => Some(timer_wake),
+                                () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
+                                () = &mut ack_schedule_changed => None,
+                                () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
+                                () = stop_drivers.cancelled() => return,
+                            }
+                        }
+                        None => {
+                            tokio::select! {
+                                () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
+                                () = &mut ack_schedule_changed => None,
+                                () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
+                                () = stop_drivers.cancelled() => return,
+                            }
+                        }
+                    };
+                    if let Some(wake) = wake {
+                        write_half.log(MetricsEvent::SendDriverWake(wake));
+                        break;
                     }
-                };
-                write_half.log(MetricsEvent::SendDriverWake(wake));
+                    write_half.log(MetricsEvent::SendDriverWake(
+                        MetricsSendDriverWake::AckScheduleSignal,
+                    ));
+                }
             }
         }
     });

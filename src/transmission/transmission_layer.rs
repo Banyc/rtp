@@ -14,7 +14,7 @@ pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
 pub(crate) const BUF_SIZE: usize = 1024 * 64;
 
-pub(crate) use crate::traffic_shaping::control::ack_flush::MAX_NUM_ACK;
+pub(crate) use crate::transmission::ack_feedback::MAX_NUM_ACK;
 
 pub(crate) type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 

@@ -6,8 +6,7 @@
 //!   been received — a cumulative front plus merged intervals of sequence
 //!   numbers in wrapping space.
 //! - [`EncodeAck`]: the wire selection — which page of the history goes out
-//!   in the next ACK datagram, and how the deep-page resume cursor advances
-//!   ([`next_page_cursor`]).  Every ACK datagram carries the cumulative
+//!   in the next ACK datagram.  Every ACK datagram carries the cumulative
 //!   `next` even when `block_count` is zero.
 //! - [`AckBlocks`]: the sender-side interpretation of the blocks received
 //!   from the peer, relative to the sender's `(send_start, sent_span)`
@@ -32,8 +31,7 @@ use crate::sequence::SequenceNumber;
 pub(crate) const MAX_ACK_BLOCKS: usize = 64;
 
 /// The ACK blocks to emit on the wire: a page selected from the receiver's
-/// history, plus the cumulative `next` that always accompanies it.
-#[derive(Debug, Clone)]
+/// history, plus the cumulative `next` that always accompanies it.#[derive(Debug, Clone)]
 pub struct EncodeAck<'a> {
     /// The receiver-side history to select from.
     pub queue: &'a AckHistory,
@@ -66,18 +64,6 @@ impl EncodeAck<'_> {
     }
 }
 
-/// Advance the deep-page resume cursor after a flush that sent one page of
-/// `max_blocks` blocks starting at `cursor`.  Wraps back to the start of the
-/// deep pages (`max_blocks`, since the first page is always the head) when
-/// the page reached the end of the history.
-pub fn next_page_cursor(cursor: usize, history_count: usize, max_blocks: usize) -> usize {
-    if cursor + max_blocks < history_count {
-        cursor + max_blocks
-    } else {
-        max_blocks
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,17 +71,6 @@ mod tests {
 
     fn seq(n: u64) -> SequenceNumber {
         SequenceNumber::from_wire(n)
-    }
-
-    #[test]
-    fn next_page_cursor_advances_and_wraps() {
-        // The first page is the head; the deep page advances by max_blocks
-        // while more history remains.
-        assert_eq!(next_page_cursor(64, 200, 64), 128);
-        assert_eq!(next_page_cursor(64, 128, 64), 64);
-        assert_eq!(next_page_cursor(64, 127, 64), 64);
-        // A cursor already past the history wraps back to the head.
-        assert_eq!(next_page_cursor(64, 40, 64), 64);
     }
 
     #[test]

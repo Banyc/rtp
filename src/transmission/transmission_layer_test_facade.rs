@@ -618,8 +618,7 @@ mod tests {
     #[tokio::test]
     async fn full_group_flushes_four_parities_inline_mid_burst() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.instream_group_fec_enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tl.instream_group_fec_enabled = true;
         stage_n_packets(&tl, 8);
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
@@ -633,8 +632,7 @@ mod tests {
     #[tokio::test]
     async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.instream_group_fec_enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tl.instream_group_fec_enabled = true;
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -681,8 +679,7 @@ mod tests {
     #[tokio::test]
     async fn ack_burst_keeps_stock_tail_gate_when_blocked() {
         let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.instream_group_fec_enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tl.instream_group_fec_enabled = true;
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -859,16 +856,16 @@ mod tests {
         let mut recv_bufs = RecvBufs::new();
         let mut send_bufs = SendBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
-        transmission.resume_send().notified().await;
+        transmission.ack_schedule_changed().notified().await;
         transmission.flush_acks(&mut send_bufs).await.unwrap();
         assert!(!transmission.has_pending_acks());
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
         tokio::time::timeout(
             Duration::from_millis(100),
-            transmission.resume_send().notified(),
+            transmission.ack_schedule_changed().notified(),
         )
         .await
-        .expect("new ACK work must wake the send timer");
+        .expect("new ACK work must rearm the send schedule");
         assert!(transmission.has_pending_acks());
         let mut third_recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
         tokio::select! {
@@ -908,7 +905,13 @@ mod tests {
                 "the history must hold exactly one page of balls"
             );
         }
-        transmission.shared.ack_flush.lock().unwrap().pending_acks = 1;
+        transmission.shared.ack_feedback.record(
+            crate::transmission::ack_feedback::state::ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            },
+        );
         let mut send_bufs = SendBufs::new();
         transmission
             .flush_acks(&mut send_bufs)
@@ -948,30 +951,38 @@ mod tests {
         );
         let mut transmission = TransmissionLayer::new(layer, None);
         let shared = Arc::clone(&transmission.shared);
-        shared.ack_flush.lock().unwrap().pending_acks = 1;
+        shared
+            .ack_feedback
+            .record(crate::transmission::ack_feedback::state::ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
         let mut send_bufs = SendBufs::new();
         let mut flush = Box::pin(transmission.flush_acks(&mut send_bufs));
         tokio::select! {
             result = &mut flush => panic!("ACK send completed before release: {result:?}"),
             () = send_started.notified() => (),
         }
-        {
-            let mut s = shared.ack_flush.lock().unwrap();
-            s.pending_acks += 1;
-            s.fin_pending = true;
-        }
+        shared
+            .ack_feedback
+            .record(crate::transmission::ack_feedback::state::ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: true,
+                echo_ts: None,
+            });
         release_send.notify_one();
         tokio::time::timeout(Duration::from_millis(100), flush)
             .await
             .expect("released ACK send did not finish")
             .expect("ACK send failed");
-        let s = shared.ack_flush.lock().unwrap();
+        let (pending_acks, fin_pending) = shared.ack_feedback.pending_work();
         assert!(
-            s.fin_pending,
+            fin_pending,
             "a FIN that arrived mid-flush was not acked by it and must stay pending"
         );
         assert_eq!(
-            s.pending_acks, 1,
+            pending_acks, 1,
             "only the acks claimed before the send may be subtracted"
         );
     }
@@ -1323,7 +1334,7 @@ mod tests {
         let mut recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
         tokio::select! {
             result = &mut recv => panic!("receive returned before the ACK-only wake: {result:?}"),
-            () = shared.resume_send().notified() => (),
+            () = shared.ack_schedule_changed().notified() => (),
         }
         // recv_pkts must now be parked waiting for the next datagram again;
         // the writer was woken by the ACK, not by the receive loop exiting.
@@ -1331,5 +1342,105 @@ mod tests {
             result = &mut recv => panic!("receive returned while the writer was being woken: {result:?}"),
             () = tokio::time::sleep(Duration::from_millis(10)) => (),
         }
+    }
+
+    #[tokio::test]
+    async fn ack_flush_pages_share_one_history_snapshot_across_await() {
+        use crate::transmission::transmission_layer::MAX_NUM_ACK;
+        let recorder = Arc::new(Mutex::new(Vec::new()));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        #[derive(Debug)]
+        struct GatedRecordingWrite {
+            recorder: Arc<Mutex<Vec<Vec<u8>>>>,
+            first_started: Arc<tokio::sync::Notify>,
+            release_first: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl UnreliableWrite for GatedRecordingWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+                let is_first = {
+                    let mut sent = self.recorder.lock().unwrap();
+                    sent.push(buf.to_vec());
+                    sent.len() == 1
+                };
+                if is_first {
+                    self.first_started.notify_one();
+                    self.release_first.notified().await;
+                }
+                Ok(buf.len())
+            }
+        }
+        let layer = crate::udp::wrap_fec(
+            Box::new(BlackholeRead),
+            Box::new(GatedRecordingWrite {
+                recorder: Arc::clone(&recorder),
+                first_started: Arc::clone(&first_started),
+                release_first: Arc::clone(&release_first),
+            }),
+            false,
+        );
+        let mut transmission = TransmissionLayer::new(layer, None);
+        let shared = Arc::clone(&transmission.shared);
+        // Seed a history spanning two full pages (head + deep page).
+        {
+            let mut reliable = shared.reliable_layer.lock().unwrap();
+            for seq in (2..=258).step_by(2) {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
+            }
+            assert!(
+                reliable.pkt_recv_space().ack_history().len() > MAX_NUM_ACK,
+                "the history must span two pages"
+            );
+        }
+        // Snapshot the expected deep page from the pre-mutation history.
+        let expected_deep = {
+            let mut buf = vec![0u8; 8192];
+            let reliable = shared.reliable_layer.lock().unwrap();
+            let history = reliable.pkt_recv_space().ack_history();
+            let ack = crate::ack::EncodeAck {
+                queue: history,
+                first_block_index: MAX_NUM_ACK,
+                max_blocks: MAX_NUM_ACK,
+            };
+            let n = crate::codec::encode_ack_data(None, Some(ack), None, None, &mut buf).unwrap();
+            buf.truncate(n);
+            buf
+        };
+        transmission.shared.ack_feedback.record(
+            crate::transmission::ack_feedback::state::ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            },
+        );
+        let mut send_bufs = SendBufs::new();
+        let mut flush = Box::pin(transmission.flush_acks(&mut send_bufs));
+        tokio::select! {
+            result = &mut flush => panic!("page 0 send completed before release: {result:?}"),
+            () = first_started.notified() => (),
+        }
+        // Page 0 is in flight; mutate the history before page 1 is encoded.
+        {
+            let mut reliable = shared.reliable_layer.lock().unwrap();
+            for seq in (260..=300).step_by(2) {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
+            }
+        }
+        release_first.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), flush)
+            .await
+            .expect("released ACK flush did not finish")
+            .expect("ACK flush failed");
+        let sent = recorder.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the flush must send both claimed pages (head + deep)"
+        );
+        assert_eq!(
+            sent[1], expected_deep,
+            "the deep page must encode from the one pre-await history snapshot"
+        );
     }
 }

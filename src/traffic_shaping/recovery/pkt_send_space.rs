@@ -1245,7 +1245,11 @@ impl PktSendSpace {
     /// Deadline used only to choose the next send-loop wake. Once any source
     /// is already due, later sources cannot make that wake more immediate, so
     /// avoid computing them on the hot post-send path.
-    pub(crate) fn next_poll_time(&self, now: Instant) -> Option<Instant> {
+    pub(crate) fn next_poll_time(
+        &self,
+        now: Instant,
+        tail_probe_eligible: bool,
+    ) -> Option<Instant> {
         let wd_dl = self.liveness.next_deadline(!self.no_pkts_in_flight());
         let mut min_next_poll_time: Option<Instant> = wd_dl;
         if min_next_poll_time.is_some_and(|deadline| deadline <= now) {
@@ -3045,9 +3049,12 @@ mod tests {
         send_packet(&mut space, t0 + ms(1));
         sack_one(&mut space, 1, t0 + ms(10));
         let reorder_deadline = t0 + stock;
-        assert_eq!(space.next_poll_time(t0 + ms(10)), Some(reorder_deadline));
         assert_eq!(
-            space.next_poll_time(reorder_deadline),
+            space.next_poll_time(t0 + ms(10), true),
+            Some(reorder_deadline)
+        );
+        assert_eq!(
+            space.next_poll_time(reorder_deadline, true),
             Some(reorder_deadline)
         );
 
@@ -3058,7 +3065,10 @@ mod tests {
             .rtx(first_rtx_t)
             .expect("reorder rtx fires at the tracked deadline");
         assert_eq!(rtx.seq, sq(0));
-        assert_eq!(space.next_poll_time(first_rtx_t), Some(first_rtx_t + stock));
+        assert_eq!(
+            space.next_poll_time(first_rtx_t, true),
+            Some(first_rtx_t + stock)
+        );
 
         // With the tail-probe budget then exhausted, the next poll tracks
         // the retransmitted copy's RTO deadline instead of the reorder
@@ -3079,7 +3089,7 @@ mod tests {
             "probe budget exhausted"
         );
         let rto_deadline = space
-            .next_poll_time(send_t + ms(630))
+            .next_poll_time(send_t + ms(630), true)
             .expect("RTO deadline tracked");
         let rtx = space
             .rtx(rto_deadline)

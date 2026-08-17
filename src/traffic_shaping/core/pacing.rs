@@ -119,13 +119,6 @@ impl SendWake {
             (None, None) => Self::Event,
         }
     }
-
-    pub(crate) fn deadline(self) -> Option<Instant> {
-        match self {
-            Self::Event => None,
-            Self::Pacing(deadline) | Self::Protocol(deadline) => Some(deadline),
-        }
-    }
 }
 
 fn burst_capacity(rate: PosR<f64>) -> NonZeroUsize {

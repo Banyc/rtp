@@ -4,6 +4,8 @@ use std::sync::{
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use super::ack_feedback::AckFeedback;
+use super::ack_feedback::state::ReceivedAckWork;
 use super::coordination::Signals;
 use super::read_half::ReadHalf;
 use super::termination::{KillPolicy, TerminationPresser, TerminationReaper, new_termination};
@@ -20,7 +22,6 @@ use crate::metrics::{
     MetricsSendDriverResumeSource, MetricsTermination, MetricsTerminationCause, SCHEMA_VERSION,
 };
 use crate::reliable::reliable_layer::ReliableLayer;
-use crate::traffic_shaping::control::ack_flush::AckFlushState;
 use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
 use crate::traffic_shaping::core::{SendPacer, SendWake};
 use crate::traffic_shaping::redundancy::fec::FecState;
@@ -55,7 +56,7 @@ impl ReceivedBatch {
 #[derive(Debug)]
 pub struct Connection {
     pub(crate) reliable_layer: Mutex<ReliableLayer>,
-    pub(crate) ack_flush: Mutex<AckFlushState>,
+    pub(crate) ack_feedback: AckFeedback,
     post_open_handshake: Option<Mutex<PostOpenHandshake>>,
     post_open_handshake_active: AtomicBool,
     /// Session tag authenticating codec control-plane datagrams; `None` on
@@ -65,9 +66,9 @@ pub struct Connection {
     pub(crate) send_rate_limiter: Arc<Mutex<SendPacer>>,
     pub(crate) termination: TerminationPresser,
     pub(crate) signals: Signals,
-    pub(crate) rtx_dup: std::sync::atomic::AtomicBool,
+    pub(crate) rtx_dup: bool,
     pub(crate) fec_instream_flush: bool,
-    pub(crate) instream_group_fec_enabled: std::sync::atomic::AtomicBool,
+    pub(crate) instream_group_fec_enabled: bool,
     pub(crate) clock_epoch: Instant,
     pub(crate) reliable_layer_logger: Option<ReliableLayerLogger>,
     metrics_observer: Option<MetricsObserver>,
@@ -107,7 +108,7 @@ pub fn new_connection(
     let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
     let shared = Arc::new(Connection {
         reliable_layer: Mutex::new(reliable_layer),
-        ack_flush: Mutex::new(AckFlushState::new()),
+        ack_feedback: AckFeedback::new(),
         post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
         post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
         session_tag: unreliable_layer.session_tag,
@@ -115,11 +116,9 @@ pub fn new_connection(
         send_rate_limiter,
         termination,
         signals: Signals::new(),
-        rtx_dup: std::sync::atomic::AtomicBool::new(unreliable_layer.rtx_dup),
+        rtx_dup: unreliable_layer.rtx_dup,
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
-        instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
-            unreliable_layer.instream_group_fec,
-        ),
+        instream_group_fec_enabled: unreliable_layer.instream_group_fec,
         clock_epoch: now,
         reliable_layer_logger,
         metrics_observer,
@@ -173,7 +172,7 @@ pub fn new_connection_with_watchdog_tuning(
     let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
     let shared = Arc::new(Connection {
         reliable_layer: Mutex::new(reliable_layer),
-        ack_flush: Mutex::new(AckFlushState::new()),
+        ack_feedback: AckFeedback::new(),
         post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
         post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
         session_tag: unreliable_layer.session_tag,
@@ -181,11 +180,9 @@ pub fn new_connection_with_watchdog_tuning(
         send_rate_limiter,
         termination,
         signals: Signals::new(),
-        rtx_dup: std::sync::atomic::AtomicBool::new(unreliable_layer.rtx_dup),
+        rtx_dup: unreliable_layer.rtx_dup,
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
-        instream_group_fec_enabled: std::sync::atomic::AtomicBool::new(
-            unreliable_layer.instream_group_fec,
-        ),
+        instream_group_fec_enabled: unreliable_layer.instream_group_fec,
         clock_epoch: now,
         reliable_layer_logger,
         metrics_observer,
@@ -208,6 +205,9 @@ impl Connection {
     pub fn resume_send(&self) -> &tokio::sync::Notify {
         &self.signals.resume_send
     }
+    pub(crate) fn ack_schedule_changed(&self) -> &tokio::sync::Notify {
+        self.ack_feedback.schedule_changed()
+    }
     pub(crate) fn request_send_driver_resume(&self, source: MetricsSendDriverResumeSource) {
         self.log(MetricsEvent::SendDriverResumeRequest(source));
         self.signals.resume_send.notify_one();
@@ -218,12 +218,11 @@ impl Connection {
     }
 
     pub fn rtx_dup(&self) -> bool {
-        self.rtx_dup.load(std::sync::atomic::Ordering::Relaxed)
+        self.rtx_dup
     }
 
     pub fn instream_group_fec_enabled(&self) -> bool {
         self.instream_group_fec_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn fec_recovered_symbols(&self) -> Option<usize> {
@@ -429,22 +428,16 @@ impl Connection {
         }
     }
 
-    pub(crate) fn next_send_wake_with_ack_deadline(
-        &self,
-        now: Instant,
-        ack_deadline: Option<Instant>,
-    ) -> SendWake {
+    pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
         let (mut protocol_deadline, pacing_deadline) = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             (
-                reliable_layer.pkt_send_space().next_poll_time(now),
+                reliable_layer
+                    .pkt_send_space()
+                    .next_poll_time(now, reliable_layer.is_send_buf_empty()),
                 reliable_layer.next_pacing_deadline(now),
             )
         };
-        if let Some(ack_deadline) = ack_deadline {
-            protocol_deadline =
-                Some(protocol_deadline.map_or(ack_deadline, |current| current.min(ack_deadline)));
-        }
         if self.post_open_handshake_active.load(Ordering::Acquire)
             && let Some(handshake) = &self.post_open_handshake
         {
@@ -459,22 +452,6 @@ impl Connection {
             }
         }
         SendWake::after_send_pass(now, pacing_deadline, protocol_deadline)
-    }
-
-    /// The next-send wake with the ACK deadline supplied by the caller's
-    /// single `AckFlushState::check` (one lock in the send pass, not two).
-    pub(crate) fn next_send_wake_after_ack_check(
-        &self,
-        now: Instant,
-        ack_deadline: Option<Instant>,
-    ) -> SendWake {
-        self.next_send_wake_with_ack_deadline(now, ack_deadline)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
-        let ack_deadline = self.ack_flush.lock().unwrap().next_deadline(now);
-        self.next_send_wake_with_ack_deadline(now, ack_deadline)
     }
 
     pub(crate) fn wire_ts(&self, now: Instant) -> u32 {
@@ -502,10 +479,7 @@ impl Connection {
             let progress = self.signals.session_outbound_progress.notified();
             self.termination.check_error()?;
             let reliable_drained = self.reliable_layer.lock().unwrap().is_no_data_to_send();
-            let ack_drained = {
-                let ack_flush = self.ack_flush.lock().unwrap();
-                !ack_flush.has_pending()
-            };
+            let ack_drained = self.ack_feedback.is_drained();
             if reliable_drained && ack_drained {
                 return Ok(());
             }
@@ -537,14 +511,19 @@ impl Connection {
 
     pub(crate) fn commit_received_batch(&self, batch: ReceivedBatch) {
         let ack_work_added = batch.pending_acks > 0 || batch.fin_ack;
-        let should_resume_send = if ack_work_added {
-            let mut ack_flush = self.ack_flush.lock().unwrap();
-            ack_flush.record(batch.pending_acks, batch.fin_ack, batch.echo_ts)
+        let schedule_changed = if ack_work_added {
+            self.ack_feedback.record(ReceivedAckWork {
+                pending_acks: batch.pending_acks,
+                fin_ack: batch.fin_ack,
+                echo_ts: batch.echo_ts,
+            })
         } else {
             false
         };
-        if should_resume_send {
-            self.request_send_driver_resume(MetricsSendDriverResumeSource::AckFlush);
+        if schedule_changed {
+            self.log(MetricsEvent::SendDriverResumeRequest(
+                MetricsSendDriverResumeSource::AckFlush,
+            ));
         }
         if batch.recv_fin {
             self.signals.recv_fin.cancel();
