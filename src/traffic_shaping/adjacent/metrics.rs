@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 21;
+pub const SCHEMA_VERSION: u16 = 24;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,7 @@ pub enum MetricsCongestionAction {
     BandwidthProbe,
     SlowStartAck,
     GentleProbe,
+    QueueHold,
     DelayDrain,
     HugeLossBackoff,
     LossBackoff,
@@ -124,6 +125,7 @@ impl MetricsCongestionAction {
             Self::SlowStartAck => "slow_start_ack",
             Self::BandwidthProbe => "bandwidth_probe",
             Self::GentleProbe => "gentle_probe",
+            Self::QueueHold => "queue_hold",
             Self::DelayDrain => "delay_drain",
             Self::HugeLossBackoff => "huge_loss_backoff",
             Self::LossBackoff => "loss_backoff",
@@ -154,6 +156,7 @@ pub enum MetricsStallReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsSendDriverWake {
     ResumeSignal,
+    AckScheduleSignal,
     PacingTimer,
     ProtocolTimer,
     KillRequested,
@@ -164,6 +167,7 @@ impl MetricsSendDriverWake {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ResumeSignal => "send_driver_resume_signal",
+            Self::AckScheduleSignal => "send_driver_ack_schedule_signal",
             Self::PacingTimer => "send_driver_pacing_timer",
             Self::ProtocolTimer => "send_driver_protocol_timer",
             Self::KillRequested => "send_driver_kill_requested",
@@ -193,6 +197,12 @@ pub enum MetricsEvent {
     /// A send-loop packet attempt, including attempts that find no sendable
     /// packet because pacing, congestion control, or the queue blocks them.
     SendDataPacketAttempt,
+    /// The retransmission-armor duplicate copy of a recovery datagram was
+    /// emitted.  Rare event: counted, never a state row.
+    RetransmissionArmorDuplicate,
+    /// The send path returned `WouldBlock` while trying to write a datagram.
+    /// Rare event: counted, never a state row.
+    DataSendWouldBlock,
     /// The event that resumed the send driver after its previous send pass.
     SendDriverWake(MetricsSendDriverWake),
     /// A request to resume the send driver, before Notify coalescing.
@@ -267,6 +277,8 @@ impl MetricsEvent {
             Self::ReceiveAckPacket => "recv_ack_pkt",
             Self::ReceiveDataPacket => "recv_data_pkt",
             Self::SendDataPacketAttempt => "send_data_pkt",
+            Self::RetransmissionArmorDuplicate => "retransmission_armor_duplicate",
+            Self::DataSendWouldBlock => "data_send_would_block",
             Self::SendDriverWake(wake) => wake.as_str(),
             Self::SendDriverResumeRequest(source) => source.as_str(),
             Self::GentleModeExit(cause) => cause.event_str(),
@@ -279,105 +291,62 @@ impl MetricsEvent {
 /// A point-in-time snapshot of the reliable transport.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetricsSnapshot {
-    /// Currently available pacer tokens, in packets.
     pub pacer_tokens_packets: f64,
-    /// Configured sender pacing rate, in packets per second.
     pub send_rate_packets_per_second: f64,
-    /// Estimated recent packet-loss fraction in [0, 1].
     pub loss_ratio: Option<f64>,
-    /// Loss-event ratio most recently evaluated by congestion control.
     pub congestion_loss_ratio: Option<f64>,
-    /// Most recent congestion-control branch evaluated for this connection.
     pub congestion_action: Option<MetricsCongestionAction>,
     pub in_flight_packets: usize,
     pub packets_in_pipe: usize,
-    /// Packets currently tracked by the retransmission scheduler.
     pub retransmission_active_packets: usize,
-    /// Packets currently retransmission-ready (due or evidence-armed).
     pub retransmission_ready_packets: usize,
     pub retransmitted_packets: usize,
-    /// Cumulative repair activity.  Scheduler-reason counters are
-    /// non-exclusive because one attempt may have multiple reasons armed.
     pub retransmission_counters: MetricsRetransmissionCounters,
     pub next_send_sequence: u64,
     pub minimum_rtt: Option<Duration>,
     pub smoothed_rtt: Duration,
-    /// Current retransmission timeout estimate.
     pub retransmission_timeout: Duration,
-    /// Age of the oldest packet still in the pipe.
     pub oldest_pipe_packet_age: Option<Duration>,
-    /// How far past its RTO deadline the most overdue pipe packet is.
     pub maximum_packet_rto_overdue: Option<Duration>,
-    /// RTO deadlines postponed by the lazy live-estimator floor.
     pub rto_deadline_postponements: u64,
     pub congestion_window_packets: usize,
     pub received_packets: usize,
     pub next_receive_sequence: Option<u64>,
-    /// Most recent delivery-rate estimate, in packets per second.
     pub delivery_rate_packets_per_second: Option<f64>,
-    /// Whether the packet behind the most recent delivery-rate sample was
-    /// transmitted while DRE considered the connection application-limited.
     pub delivery_sample_app_limited: Option<bool>,
-    /// Application writers currently blocked waiting for send capacity.
     pub application_write_waiters: usize,
-    /// Application-limited phases detected by DRE's conjunctive predicate.
     pub application_limited_detections: u64,
-    /// Detections suppressed because an application writer was waiting.
     pub application_limited_detections_suppressed_by_waiting_writer: u64,
-    /// Control RTT last used by the congestion controller.
     pub congestion_control_rtt: Option<Duration>,
-    /// RTT floor last used by the congestion controller's queue gate.
     pub congestion_rtt_floor: Option<Duration>,
-    /// Queue-gate tolerance last computed by the congestion controller.
     pub congestion_queue_tolerance: Option<Duration>,
-    /// Continuous time for which the wider persistent-queue signal has been
-    /// armed.  `None` means the signal is currently clear.
     pub congestion_persistent_queue_for: Option<Duration>,
-    /// Observed armed-to-clear transitions of the persistent-queue signal.
-    /// Congestion-epoch resets clear the private continuity latch and therefore
-    /// do not increment this cumulative diagnostic counter.
     pub congestion_persistent_queue_resets: u64,
-    /// Recent delivery peak feeding the drain floor.
     pub congestion_delivery_peak_packets_per_second: Option<f64>,
-    /// Drain floor last applied by the congestion controller.
     pub congestion_drain_floor_packets_per_second: Option<f64>,
-    /// Drain target last applied by the congestion controller.
     pub congestion_drain_target_packets_per_second: Option<f64>,
-    /// Delivery-rate samples evaluated by the congestion controller.
+    pub congestion_loss_backoff_floor_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_raw_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoffs: u64,
+    pub congestion_loss_backoff_floor_bindings: u64,
     pub congestion_rate_samples: u64,
-    /// Bandwidth-probe decisions taken by the congestion controller.
     pub congestion_bandwidth_probe_decisions: u64,
-    /// Probe decisions that increased the send rate.
     pub congestion_bandwidth_probe_increases: u64,
-    /// Increases applied before the previous one got feedback.
     pub congestion_bandwidth_probe_before_feedback: u64,
-    /// Interval between the last two applied probe increases.
     pub congestion_last_bandwidth_probe_interval: Option<Duration>,
-    /// Delay-drain decisions taken by the congestion controller.
     pub congestion_delay_drains: u64,
-    /// Application bytes staged inside RTP but not yet packetized.
     pub pending_send_bytes: usize,
-    /// Maximum application bytes the current send stage can retain.
     pub send_stage_capacity_bytes: usize,
-    /// Whether the congestion window currently permits a new data packet.
     pub accepts_new_packet: bool,
-    /// The controller is still in its initial exponential-growth phase.
     pub slow_start: bool,
-    /// The delay controller is using its conservative high-queue mode.
     pub gentle_mode: bool,
-    /// Gentle mode is actively reducing its send-rate target.
     pub gentle_draining: bool,
-    /// Smoothed RTT is currently above the controller's queue gate.
     pub queue_building: bool,
-    /// The stale-peak protection floor is currently limiting a drain.
     pub drain_floor_binding: bool,
-    /// A loss/no-progress outage epoch is open and constraining recovery.
     pub outage_recovery: bool,
-    /// Time since the peer last provided any response while a wait is active.
     pub no_response_for: Option<Duration>,
-    /// Time since cumulative send progress while a wait is active.
     pub no_progress_for: Option<Duration>,
-    /// Present only once the proactive termination deadline has expired.
     pub stall_reason: Option<MetricsStallReason>,
 }
 

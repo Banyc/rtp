@@ -32,7 +32,8 @@ use crate::{
     },
     recv_queue::pkt_recv_space::PktRecvSpace,
     traffic_shaping::core::{
-        GentleExitCause, GentleProbeOutcome, OrdinaryBandwidthProbe, SendPacer,
+        CongestionDecision, CongestionInput, CongestionResponse, GentleExitCause, ProbeKind,
+        SendPacer, linear_backoff_step,
     },
     traffic_shaping::recovery::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     transmission::watchdog_tuning::WatchdogTuning,
@@ -58,7 +59,6 @@ const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
 pub(crate) const INIT_SEND_RATE: f64 = 128.;
 
-pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 /// Pacing interval for a healthy huge-data-loss scan. A negative result is
 /// cached for this long; a positive result must be recomputed on every call
@@ -75,28 +75,13 @@ fn metrics_gentle_exit_cause(cause: GentleExitCause) -> MetricsGentleExitCause {
     }
 }
 
-/// Fraction of the recent peak delivery rate used as a drain-floor target.
-///
-/// The floor keeps a small flow from being drained below a fair share of its own
-/// recent peak, while still allowing genuine congestion to back it off via the
-/// loss branch.  It is capped at INIT_SEND_RATE so a spike does not permanently
-/// pin a low-rate incumbent, and floored at MIN_SEND_RATE.
-const DRAIN_FLOOR_PEAK_FRACTION: f64 = 0.25;
-
-/// Grace period, in control RTTs, before a continuously binding drain floor
-/// starts to decay.  This prevents transient capacity dips from collapsing the
-/// floor, while allowing a genuine long-term capacity drop to drain past a
-/// stale windowed peak.
-const DRAIN_FLOOR_GRACE_RTTS: f64 = 3.0;
-
 #[cfg(test)]
 use crate::traffic_shaping::core::{
-    GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_REENTRY_COOLDOWN,
+    DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_REENTRY_COOLDOWN,
     GENTLE_REENTRY_COOLDOWN_RTTS, PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR,
     QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE,
     WindowedRttMin,
 };
-use crate::traffic_shaping::core::{QueueGrowth, WindowedDeliveryMax};
 
 #[derive(Debug, Clone)]
 enum FinState {
@@ -122,6 +107,11 @@ struct CongestionMetrics {
     delivery_peak_packets_per_second: Option<f64>,
     drain_floor_packets_per_second: Option<f64>,
     drain_target_packets_per_second: Option<f64>,
+    loss_backoff_floor_packets_per_second: Option<f64>,
+    loss_backoff_raw_target_packets_per_second: Option<f64>,
+    loss_backoff_target_packets_per_second: Option<f64>,
+    loss_backoffs: u64,
+    loss_backoff_floor_bindings: u64,
     bandwidth_probe_decisions: u64,
     bandwidth_probe_increases: u64,
     rate_samples: u64,
@@ -140,6 +130,9 @@ impl CongestionMetrics {
         self.delivery_peak_packets_per_second = None;
         self.drain_floor_packets_per_second = None;
         self.drain_target_packets_per_second = None;
+        self.loss_backoff_floor_packets_per_second = None;
+        self.loss_backoff_raw_target_packets_per_second = None;
+        self.loss_backoff_target_packets_per_second = None;
     }
 
     fn start_congestion_epoch(&mut self) {
@@ -189,12 +182,12 @@ pub struct ReliableLayer {
     prev_sample_rate: Option<dre::RateSample>,
     huge_data_loss_timer: Timer,
     huge_data_loss_check_after: Instant,
-    queue_growth: QueueGrowth,
-    delivery_peak: WindowedDeliveryMax,
-    bandwidth_probe: OrdinaryBandwidthProbe,
+    /// Single atomic owner of queue detection, delivered-peak tracking,
+    /// ordinary probing, and drain-floor hysteresis (see
+    /// [`CongestionResponse`]).
+    congestion_response: CongestionResponse,
     slow_start: bool,
     slow_start_acked_pkts: usize,
-    drain_floor_binding_since: Option<Instant>,
     last_congestion_loss_ratio: Option<f64>,
     last_congestion_action: Option<crate::metrics::MetricsCongestionAction>,
     /// Whether congestion-controller interval accounting is on.  Set once at
@@ -257,12 +250,9 @@ impl ReliableLayer {
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             huge_data_loss_check_after: now,
-            queue_growth: QueueGrowth::new(now),
-            delivery_peak: WindowedDeliveryMax::new(now),
-            bandwidth_probe: OrdinaryBandwidthProbe::new(),
+            congestion_response: CongestionResponse::new(now),
             slow_start: true,
             slow_start_acked_pkts: 0,
-            drain_floor_binding_since: None,
             last_congestion_loss_ratio: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
@@ -304,12 +294,9 @@ impl ReliableLayer {
             prev_sample_rate: None,
             huge_data_loss_timer: Timer::new(),
             huge_data_loss_check_after: now,
-            queue_growth: QueueGrowth::new(now),
-            delivery_peak: WindowedDeliveryMax::new(now),
-            bandwidth_probe: OrdinaryBandwidthProbe::new(),
+            congestion_response: CongestionResponse::new(now),
             slow_start: true,
             slow_start_acked_pkts: 0,
-            drain_floor_binding_since: None,
             last_congestion_loss_ratio: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
@@ -417,7 +404,7 @@ impl ReliableLayer {
     /// gate tolerance).  Used by the transmission layer to suppress
     /// retransmission-armor duplicate copies under congestion.
     pub fn queue_building(&self) -> bool {
-        self.queue_growth.building()
+        self.congestion_response.queue_building()
     }
 
     /// Test-only: force the queue_building flag so the retransmission-armor
@@ -425,7 +412,7 @@ impl ReliableLayer {
     /// having to drive a full delivery-rate sample sequence.
     #[cfg(test)]
     pub(crate) fn set_queue_building_for_test(&mut self, v: bool) {
-        self.queue_growth.set_building(v);
+        self.congestion_response.set_queue_building_for_test(v);
     }
 
     /// Test-only: directly enqueue `buf` into the send buffer, bypassing the
@@ -761,14 +748,11 @@ impl ReliableLayer {
         self.pkt_send_space.poll_deferred_loss(now);
 
         if entered_recovery {
-            if let Some(cause) = self.queue_growth.reset(now) {
+            if let Some(cause) = self.congestion_response.reset(now) {
                 self.gentle_exit_pending = Some(metrics_gentle_exit_cause(cause));
             }
-            self.delivery_peak = WindowedDeliveryMax::new(now);
-            self.bandwidth_probe.reset();
             self.slow_start = false;
             self.slow_start_acked_pkts = 0;
-            self.drain_floor_binding_since = None;
             self.last_congestion_loss_ratio = None;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
             self.last_congestion_action =
@@ -866,154 +850,105 @@ impl ReliableLayer {
         }
 
         let smooth = self.pkt_send_space.smooth_rtt();
-        // Track the recent peak delivery rate before any branch dispatch so the
-        // drain floor is fed even when the current sample is not driving a rate
-        // change.
-        let peak_delivery = self.delivery_peak.update(now, sr.delivery_rate());
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
         self.last_congestion_loss_ratio = loss_event_rate;
-        let queue = self.queue_growth.observe(
+        let control_rtt = self.control_rtt();
+        let observation = self.congestion_response.observe(
             smooth,
             self.pkt_send_space.smooth_rtt_var(),
             loss_event_rate,
+            sr.delivery_rate(),
             now,
-            self.control_rtt(),
+            control_rtt,
         );
-        let floor = queue.floor;
-        let queue_building = queue.building;
-        let mut gentle_exit = queue.gentle_exit;
         self.record_congestion_interval_state(
-            floor,
-            queue.tolerance,
-            queue.persistent_for,
-            peak_delivery,
+            observation.floor,
+            observation.tolerance,
+            observation.persistent_for,
+            observation.peak_delivery,
         );
-        let little_data_loss = loss_event_rate.map(|lr| lr < CC_DATA_LOSS_RATE);
         if self.slow_start {
-            let probed = OrdinaryBandwidthProbe::proposed_rate(sr.delivery_rate());
+            let probed = CongestionResponse::proposed_probe_rate(sr.delivery_rate());
             let caught_up = self.send_rate.get() <= probed;
-            if little_data_loss == Some(false) || queue_building || caught_up || sr.is_app_limited()
+            if observation.loss_blocks_delay_control
+                || observation.queue_building
+                || caught_up
+                || sr.is_app_limited()
             {
                 self.slow_start = false;
             }
         }
-
-        // ----- Gate-open / probe branch ------------------------------------------
-        let bw_probe_exponential = little_data_loss != Some(false) && !queue_building;
-        if !bw_probe_exponential {
-            self.queue_growth.clear_gate_open();
-        }
-
-        if bw_probe_exponential {
-            self.drain_floor_binding_since = None;
-            match self.queue_growth.probe(
-                sr.delivery_rate(),
-                self.send_rate.get(),
-                self.control_rtt(),
-                smooth,
+        let current = self.send_rate.get();
+        let outcome = self.congestion_response.decide(
+            observation,
+            CongestionInput {
+                delivery_rate: sr.delivery_rate(),
+                current_rate: current,
+                smooth_rtt: smooth,
+                control_rtt,
+                loss_event_rate,
+                minimum_rate: MIN_SEND_RATE,
+                initial_rate: INIT_SEND_RATE,
                 now,
-            ) {
-                GentleProbeOutcome::Apply(target) => {
+            },
+        );
+        match outcome.decision() {
+            CongestionDecision::Hold => {
+                self.last_congestion_action =
+                    Some(crate::metrics::MetricsCongestionAction::QueueHold);
+            }
+            CongestionDecision::Probe { target } => match outcome.probe_kind() {
+                ProbeKind::Gentle => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::GentleProbe);
                     self.set_smooth_send_rate(target, now);
-                    return gentle_exit;
                 }
-                GentleProbeOutcome::Exit(cause) => {
-                    gentle_exit = gentle_exit.or(Some(cause));
+                ProbeKind::Bandwidth => {
+                    self.last_congestion_action =
+                        Some(crate::metrics::MetricsCongestionAction::BandwidthProbe);
+                    self.record_bandwidth_probe(now, current, target);
+                    self.set_smooth_send_rate(target, now);
                 }
-                GentleProbeOutcome::Inactive => {}
+            },
+            CongestionDecision::Drain { floor, target } => {
+                self.last_congestion_action =
+                    Some(crate::metrics::MetricsCongestionAction::DelayDrain);
+                self.record_delay_drain(floor, target);
+                match linear_backoff_step(
+                    current,
+                    target,
+                    sr.interval(),
+                    control_rtt,
+                    CWND_SEND_RATE_SCALE,
+                ) {
+                    Some(new_rate) => self.set_send_rate(PosR::new(new_rate).unwrap(), now),
+                    None => {
+                        let send_rate = PosR::new(self.send_rate.get()).unwrap();
+                        self.set_send_rate(send_rate, now);
+                    }
+                }
             }
-            self.last_congestion_action =
-                Some(crate::metrics::MetricsCongestionAction::BandwidthProbe);
-            let current = self.send_rate.get();
-            let control_rtt = self.control_rtt();
-            let target_send_rate =
-                self.bandwidth_probe
-                    .target(current, sr.delivery_rate(), control_rtt, now);
-            self.record_bandwidth_probe(now, current, target_send_rate);
-            self.set_smooth_send_rate(target_send_rate, now);
-            return gentle_exit;
-        }
-
-        // ----- Drain branch ------------------------------------------------------
-        if queue_building && little_data_loss != Some(false) {
-            self.last_congestion_action = Some(crate::metrics::MetricsCongestionAction::DelayDrain);
-            let control_rtt = self.control_rtt();
-            let current = self.send_rate.get();
-            let drain_frac = self.queue_growth.drain_frac();
-            let base =
-                (peak_delivery * DRAIN_FLOOR_PEAK_FRACTION).clamp(MIN_SEND_RATE, INIT_SEND_RATE);
-
-            // Drain-floor decay: if the floor keeps binding while the queue
-            // builds, the windowed delivery peak is probably stale (the path
-            // capacity has dropped).  Decay the floor exponentially after a grace
-            // period so the delay gate can actually drain the standing queue.
-            let binding = sr.delivery_rate() * drain_frac < base;
-            if binding {
-                self.drain_floor_binding_since.get_or_insert(now);
-            } else {
-                self.drain_floor_binding_since = None;
-            }
-            let binding_for = self
-                .drain_floor_binding_since
-                .map(|s| now.saturating_duration_since(s));
-            let closed_for = queue.persistent_for;
-            let pinned_for = binding_for.zip(closed_for).map(|(b, c)| b.min(c));
-            let grace = control_rtt.mul_f64(DRAIN_FLOOR_GRACE_RTTS);
-            let drain_floor =
-                if loss_event_rate.is_none() || pinned_for.is_none_or(|pinned| pinned <= grace) {
-                    base
+            CongestionDecision::LossBackoff { raw, floor, target } => {
+                if LINEAR_BACKOFF {
+                    self.last_congestion_action =
+                        Some(crate::metrics::MetricsCongestionAction::LossBackoff);
+                    self.record_loss_backoff(raw, floor, target);
+                    if let Some(new_rate) = linear_backoff_step(
+                        current,
+                        target,
+                        sr.interval(),
+                        control_rtt,
+                        CWND_SEND_RATE_SCALE,
+                    ) {
+                        self.set_send_rate(PosR::new(new_rate).unwrap(), now);
+                    }
                 } else {
-                    let pinned = pinned_for.unwrap();
-                    let excess_rtts =
-                        (pinned.as_secs_f64() - grace.as_secs_f64()) / control_rtt.as_secs_f64();
-                    (base * 0.5f64.powf(excess_rtts)).max(MIN_SEND_RATE)
-                };
-
-            let target = (sr.delivery_rate() * drain_frac)
-                .max(drain_floor)
-                .min(current)
-                .max(MIN_SEND_RATE);
-            self.record_delay_drain(drain_floor, target);
-            let new_rate = backoff_send_rate_linear(current, target, sr.interval(), control_rtt);
-            match new_rate {
-                Some(new_rate) => self.set_send_rate(PosR::new(new_rate).unwrap(), now),
-                None => {
-                    let send_rate = PosR::new(self.send_rate.get()).unwrap();
-                    self.set_send_rate(send_rate, now);
+                    self.slow_start = false;
+                    self.set_smooth_send_rate(sr.delivery_rate(), now);
                 }
             }
-
-            let guard_exit = self
-                .queue_growth
-                .drain_episode_guard(smooth, floor, control_rtt, now);
-            return guard_exit.or(gentle_exit);
         }
-
-        if LINEAR_BACKOFF {
-            self.last_congestion_action =
-                Some(crate::metrics::MetricsCongestionAction::LossBackoff);
-            self.backoff_on_high_loss_ack_linear(sr, now);
-        } else {
-            self.slow_start = false;
-            let target_send_rate = sr.delivery_rate();
-            self.set_smooth_send_rate(target_send_rate, now);
-        }
-        gentle_exit
-    }
-
-    /// Linear backoff toward the delivery rate on a high-loss ACK sample.
-    fn backoff_on_high_loss_ack_linear(&mut self, sr: &dre::RateSample, now: Instant) {
-        let control_rtt = self.control_rtt();
-        let current = self.send_rate.get();
-        let target = sr.delivery_rate().min(current).max(MIN_SEND_RATE);
-        let new_rate = backoff_send_rate_linear(current, target, sr.interval(), control_rtt);
-        let Some(new_rate) = new_rate else {
-            return;
-        };
-        let send_rate = PosR::new(new_rate).unwrap();
-        self.set_send_rate(send_rate, now);
+        outcome.gentle_exit()
     }
 
     fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
@@ -1030,7 +965,13 @@ impl ReliableLayer {
         };
         let control_rtt = self.control_rtt();
         let current = self.send_rate.get();
-        let new_rate = backoff_send_rate_linear(current, MIN_SEND_RATE, elapsed, control_rtt);
+        let new_rate = linear_backoff_step(
+            current,
+            MIN_SEND_RATE,
+            elapsed,
+            control_rtt,
+            CWND_SEND_RATE_SCALE,
+        );
         let Some(new_rate) = new_rate else {
             return;
         };
@@ -1263,6 +1204,9 @@ impl ReliableLayer {
         metrics.delivery_peak_packets_per_second = Some(peak_delivery);
         metrics.drain_floor_packets_per_second = None;
         metrics.drain_target_packets_per_second = None;
+        metrics.loss_backoff_floor_packets_per_second = None;
+        metrics.loss_backoff_raw_target_packets_per_second = None;
+        metrics.loss_backoff_target_packets_per_second = None;
     }
 
     /// Account a bandwidth-probe decision, saturating every counter.  An
@@ -1303,6 +1247,26 @@ impl ReliableLayer {
         metrics.drain_floor_packets_per_second = Some(drain_floor);
         metrics.drain_target_packets_per_second = Some(drain_target);
         metrics.delay_drains = metrics.delay_drains.saturating_add(1);
+    }
+
+    /// Account a loss-backoff decision with the raw target, floor, and target
+    /// that were applied.  Floor bindings (floor > raw) are counted separately
+    /// so a loss response never reports a stale loss floor as evidence of
+    /// capacity.  Costs one predictable branch when no observer or logger
+    /// exists.
+    fn record_loss_backoff(&mut self, raw: f64, floor: f64, target: f64) {
+        if !self.congestion_metrics_enabled {
+            return;
+        }
+        let metrics = &mut self.congestion_metrics;
+        metrics.loss_backoff_floor_packets_per_second = Some(floor);
+        metrics.loss_backoff_raw_target_packets_per_second = Some(raw);
+        metrics.loss_backoff_target_packets_per_second = Some(target);
+        metrics.loss_backoffs = metrics.loss_backoffs.saturating_add(1);
+        if floor > raw {
+            metrics.loss_backoff_floor_bindings =
+                metrics.loss_backoff_floor_bindings.saturating_add(1);
+        }
     }
 
     pub(crate) fn metrics_at(&self, now: Instant) -> crate::metrics::MetricsSnapshot {
@@ -1377,6 +1341,19 @@ impl ReliableLayer {
             congestion_drain_target_packets_per_second: self
                 .congestion_metrics
                 .drain_target_packets_per_second,
+            congestion_loss_backoff_floor_packets_per_second: self
+                .congestion_metrics
+                .loss_backoff_floor_packets_per_second,
+            congestion_loss_backoff_raw_target_packets_per_second: self
+                .congestion_metrics
+                .loss_backoff_raw_target_packets_per_second,
+            congestion_loss_backoff_target_packets_per_second: self
+                .congestion_metrics
+                .loss_backoff_target_packets_per_second,
+            congestion_loss_backoffs: self.congestion_metrics.loss_backoffs,
+            congestion_loss_backoff_floor_bindings: self
+                .congestion_metrics
+                .loss_backoff_floor_bindings,
             congestion_rate_samples: self.congestion_metrics.rate_samples,
             congestion_bandwidth_probe_decisions: self.congestion_metrics.bandwidth_probe_decisions,
             congestion_bandwidth_probe_increases: self.congestion_metrics.bandwidth_probe_increases,
@@ -1395,10 +1372,10 @@ impl ReliableLayer {
             send_stage_capacity_bytes: self.write_unit_capacity(),
             accepts_new_packet: self.pkt_send_space.accepts_new_pkt(),
             slow_start: self.slow_start,
-            gentle_mode: self.queue_growth.gentle_mode(),
-            gentle_draining: self.queue_growth.draining(),
-            queue_building: self.queue_growth.building(),
-            drain_floor_binding: self.drain_floor_binding_since.is_some(),
+            gentle_mode: self.congestion_response.gentle_mode(),
+            gentle_draining: self.congestion_response.draining(),
+            queue_building: self.congestion_response.queue_building(),
+            drain_floor_binding: self.congestion_response.drain_floor_binding(),
             outage_recovery: self.pkt_send_space.in_outage_recovery(),
             no_response_for: self.pkt_send_space.no_resp_for(now),
             no_progress_for: self.pkt_send_space.no_progress_for(now),
@@ -1455,6 +1432,14 @@ impl ReliableLayer {
                 .congestion_drain_floor_packets_per_second,
             congestion_drain_target_packets_per_second: metrics
                 .congestion_drain_target_packets_per_second,
+            congestion_loss_backoff_floor_packets_per_second: metrics
+                .congestion_loss_backoff_floor_packets_per_second,
+            congestion_loss_backoff_raw_target_packets_per_second: metrics
+                .congestion_loss_backoff_raw_target_packets_per_second,
+            congestion_loss_backoff_target_packets_per_second: metrics
+                .congestion_loss_backoff_target_packets_per_second,
+            congestion_loss_backoffs: metrics.congestion_loss_backoffs,
+            congestion_loss_backoff_floor_bindings: metrics.congestion_loss_backoff_floor_bindings,
             congestion_rate_samples: metrics.congestion_rate_samples,
             congestion_bandwidth_probe_decisions: metrics.congestion_bandwidth_probe_decisions,
             congestion_bandwidth_probe_increases: metrics.congestion_bandwidth_probe_increases,
@@ -1492,32 +1477,6 @@ pub struct DataPkt {
 pub enum DataPktPayload {
     Data(NonZeroUsize),
     Fin,
-}
-
-/// Linear backoff of the send rate toward `target`.
-///
-/// Returns `None` if `current` is already at or below `target`. Otherwise steps
-/// down by at most `gap = current - target`, where the natural step is
-/// `current * interval / rtt` and a `probe_floor` of
-/// `interval / (8 * rtt^2)` guarantees at least one packet's worth of headway
-/// over the RTT window (`cwnd = send_rate * rtt * CWND_SEND_RATE_SCALE`).
-fn backoff_send_rate_linear(
-    current: f64,
-    target: f64,
-    interval: Duration,
-    control_rtt: Duration,
-) -> Option<f64> {
-    let gap = current - target;
-    if gap <= 0. {
-        return None;
-    }
-    let rtt_secs = control_rtt.as_secs_f64();
-    let interval_secs = interval.as_secs_f64();
-    let probe_floor = interval_secs / (CWND_SEND_RATE_SCALE as f64 * rtt_secs * rtt_secs);
-    let step = (current * interval_secs / rtt_secs)
-        .max(probe_floor)
-        .min(gap);
-    Some((current - step).max(target))
 }
 
 #[cfg(test)]
@@ -2065,9 +2024,10 @@ mod tests {
             INIT_SEND_RATE * 4.0
         );
         assert!(
-            rl.delivery_peak.update(t, 0.0) * DRAIN_FLOOR_PEAK_FRACTION > INIT_SEND_RATE,
+            rl.congestion_response.delivery_peak().update(t, 0.0) * DRAIN_FLOOR_PEAK_FRACTION
+                > INIT_SEND_RATE,
             "DRE delivery peak * DRAIN_FLOOR_PEAK_FRACTION must exceed INIT_SEND_RATE, got {}",
-            rl.delivery_peak.update(t, 0.0)
+            rl.congestion_response.delivery_peak().update(t, 0.0)
         );
         assert!(
             !rl.slow_start,
@@ -2139,7 +2099,7 @@ mod tests {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(1100);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(1000), t);
-            if rl.queue_growth.gentle_mode() {
+            if rl.congestion_response.queue_growth().gentle_mode() {
                 break;
             }
             assert!(
@@ -2147,7 +2107,12 @@ mod tests {
                 "gentle mode must enter within a few seconds"
             );
         }
-        let episode = rl.queue_growth.drain_episode().unwrap().clone();
+        let episode = rl
+            .congestion_response
+            .queue_growth()
+            .drain_episode()
+            .unwrap()
+            .clone();
         assert!(
             episode.floor0 <= Duration::from_millis(650),
             "episode floor snapshot must be taken before the ratchet, got {:?}",
@@ -2168,7 +2133,9 @@ mod tests {
             let feed_time = t + Duration::from_millis(750) * i;
             new_floor.update(feed_time, Duration::from_millis(750));
         }
-        rl.queue_growth.replace_floor(new_floor);
+        rl.congestion_response
+            .queue_growth()
+            .replace_floor(new_floor);
         t += Duration::from_millis(1);
         let shrink_threshold = gap0.mul_f64(GENTLE_DRAIN_GAP_SHRINK);
 
@@ -2186,7 +2153,10 @@ mod tests {
                 ack_seq_observed(&mut rl, seq.to_wire(), Duration::from_millis(1000), t);
 
             let smooth = rl.pkt_send_space.smooth_rtt();
-            let live_floor = rl.queue_growth.update_floor(t, smooth);
+            let live_floor = rl
+                .congestion_response
+                .queue_growth()
+                .update_floor(t, smooth);
             let live_gap = smooth.saturating_sub(live_floor);
             assert!(
                 live_gap < shrink_threshold,
@@ -2196,7 +2166,7 @@ mod tests {
             if let Some(cause) = guard_exit {
                 assert_eq!(cause, MetricsGentleExitCause::DrainGuard);
                 assert!(
-                    !rl.queue_growth.gentle_mode(),
+                    !rl.congestion_response.queue_growth().gentle_mode(),
                     "the exit signal must coincide with leaving gentle mode"
                 );
                 guard_fired = true;
@@ -2217,7 +2187,8 @@ mod tests {
         let expected_cooldown =
             GENTLE_REENTRY_COOLDOWN.max(control_rtt.mul_f64(GENTLE_REENTRY_COOLDOWN_RTTS));
         let block_until = rl
-            .queue_growth
+            .congestion_response
+            .queue_growth()
             .gentle_block_until()
             .expect("cooldown must be set");
         let cooldown = block_until.saturating_duration_since(t);
@@ -2250,7 +2221,7 @@ mod tests {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(900);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
-            if rl.queue_growth.gentle_mode() {
+            if rl.congestion_response.queue_growth().gentle_mode() {
                 break;
             }
             assert!(
@@ -2271,7 +2242,11 @@ mod tests {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(250);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
-            if let Some(open_since) = rl.queue_growth.gentle_gate_open_since() {
+            if let Some(open_since) = rl
+                .congestion_response
+                .queue_growth()
+                .gentle_gate_open_since()
+            {
                 break open_since;
             }
             assert!(
@@ -2286,7 +2261,7 @@ mod tests {
             t += Duration::from_millis(250);
             let gentle_exit =
                 ack_seq_observed(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
-            if !rl.queue_growth.gentle_mode() {
+            if !rl.congestion_response.queue_growth().gentle_mode() {
                 assert_eq!(gentle_exit, Some(MetricsGentleExitCause::GateOpen));
                 break;
             }
@@ -2325,7 +2300,7 @@ mod tests {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(900);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
-            if rl.queue_growth.gentle_mode() {
+            if rl.congestion_response.queue_growth().gentle_mode() {
                 break;
             }
             assert!(
@@ -2338,13 +2313,14 @@ mod tests {
             let seq = send_one(&mut rl, t);
             t += Duration::from_millis(900);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
-            if !rl.queue_growth.gentle_mode() {
+            if !rl.congestion_response.queue_growth().gentle_mode() {
                 break;
             }
             assert!(t < guard_start + Duration::from_secs(14), "guard must fire");
         }
         assert!(
-            rl.queue_growth
+            rl.congestion_response
+                .queue_growth()
                 .gentle_block_until()
                 .is_some_and(|u| u > t + Duration::from_secs(10)),
             "guard must set a long cooldown"
@@ -2379,7 +2355,10 @@ mod tests {
 
         // Outage recovery must clear the gentle re-entry cooldown.
         assert!(
-            rl.queue_growth.gentle_block_until().is_none(),
+            rl.congestion_response
+                .queue_growth()
+                .gentle_block_until()
+                .is_none(),
             "outage recovery must clear gentle re-entry cooldown"
         );
     }
@@ -2450,7 +2429,7 @@ mod tests {
             t += rtt;
             ack_seq(&mut rl, seq.to_wire(), rtt, t);
             assert!(
-                !rl.queue_growth.gentle_mode(),
+                !rl.congestion_response.queue_growth().gentle_mode(),
                 "gentle mode must stay false at sample {} (t={:?})",
                 sample_idx,
                 t.saturating_duration_since(t0)
@@ -2810,6 +2789,147 @@ mod tests {
         assert_eq!(m.last_bandwidth_probe_increase_at, None);
         assert_eq!(m.last_bandwidth_probe_interval, None);
     }
+
+    #[test]
+    fn transient_jitter_holds_rate_until_standing_queue_drains() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let mut t = t0;
+
+        // Ramp on a brisk 10 ms RTT so slow start exits and the send rate
+        // climbs well above the drain-floor cap.
+        let ramp_rtt = Duration::from_millis(10);
+        for _ in 0..40 {
+            send_max(&mut rl, t);
+            t += ramp_rtt;
+            ack_all(&mut rl, Some(ramp_rtt), t);
+        }
+        assert!(!rl.slow_start, "slow start must exit during the ramp");
+        let held_rate = rl.send_rate.get();
+        assert!(
+            held_rate > 2.0 * INIT_SEND_RATE,
+            "ramp must lift the send rate above the drain-floor cap, got {held_rate}"
+        );
+
+        // Transient (non-persistent) queue: raise smooth RTT ~100 ms above the
+        // ~10 ms floor with ±30 ms jitter.  The gap exceeds the ordinary queue
+        // gate (2 * rttvar) but stays under the wider persistent-queue margin
+        // (4 * rttvar), so the controller must Hold, not Drain.
+        for i in 0..48 {
+            let rtt = if i % 2 == 0 {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_millis(140)
+            };
+            rl.sample_rtt(rtt, t);
+            t += Duration::from_micros(100);
+        }
+        let seq = send_one(&mut rl, t);
+        t += Duration::from_millis(140);
+        ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(140), t);
+
+        let smooth = rl.pkt_send_space().smooth_rtt();
+        let rttvar = rl.pkt_send_space().smooth_rtt_var();
+        let tol = rttvar.mul_f64(QUEUE_RTT_FACTOR).max(QUEUE_RTT_FLOOR);
+        let persistent_tol = rttvar
+            .mul_f64(QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR)
+            .max(QUEUE_RTT_FLOOR);
+        let gap = smooth.saturating_sub(Duration::from_millis(10));
+        assert!(
+            gap > tol,
+            "gap {gap:?} must exceed the queue gate {tol:?} (smooth {smooth:?}, rttvar {rttvar:?})"
+        );
+        assert!(
+            gap <= persistent_tol,
+            "gap {gap:?} must stay under the persistent margin {persistent_tol:?}"
+        );
+        assert_eq!(
+            rl.last_congestion_action,
+            Some(crate::metrics::MetricsCongestionAction::QueueHold),
+            "a transient queue must Hold, not drain or back off"
+        );
+        assert_eq!(
+            rl.send_rate.get(),
+            held_rate,
+            "a transient queue must hold the send rate unchanged (no reduction)"
+        );
+
+        // Standing queue: sustain a ~260 ms smooth RTT so the gap blows past
+        // the persistent-queue margin.  The controller must switch to Drain
+        // and lower the rate toward the drain target.
+        for _ in 0..30 {
+            rl.sample_rtt(Duration::from_millis(260), t);
+            t += Duration::from_micros(100);
+        }
+        let seq = send_one(&mut rl, t);
+        t += Duration::from_millis(260);
+        ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(260), t);
+
+        let smooth = rl.pkt_send_space().smooth_rtt();
+        let rttvar = rl.pkt_send_space().smooth_rtt_var();
+        let persistent_tol = rttvar
+            .mul_f64(QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR)
+            .max(QUEUE_RTT_FLOOR);
+        assert!(
+            smooth.saturating_sub(Duration::from_millis(10)) > persistent_tol,
+            "smooth {smooth:?} must cross the persistent margin {persistent_tol:?}"
+        );
+        assert_eq!(
+            rl.last_congestion_action,
+            Some(crate::metrics::MetricsCongestionAction::DelayDrain),
+            "a standing queue must drain"
+        );
+        assert!(
+            rl.send_rate.get() < held_rate,
+            "a standing queue must reduce the rate below the held rate {held_rate}, got {}",
+            rl.send_rate.get()
+        );
+    }
+
+    #[test]
+    fn congestion_metrics_count_loss_floor_bindings_only_when_enabled() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        assert!(
+            !rl.congestion_metrics_enabled,
+            "test_layer must start with controller accounting disabled"
+        );
+
+        // Disabled: no loss-backoff counter or gauge may move.
+        rl.record_loss_backoff(10.0, 40.0, 40.0);
+        let m = &rl.congestion_metrics;
+        assert_eq!(m.loss_backoffs, 0);
+        assert_eq!(m.loss_backoff_floor_bindings, 0);
+        assert_eq!(m.loss_backoff_floor_packets_per_second, None);
+        assert_eq!(m.loss_backoff_raw_target_packets_per_second, None);
+        assert_eq!(m.loss_backoff_target_packets_per_second, None);
+
+        // Enabled with floor > raw: gauges set, both counters saturate-add.
+        rl.congestion_metrics_enabled = true;
+        rl.record_loss_backoff(10.0, 40.0, 40.0);
+        let m = &rl.congestion_metrics;
+        assert_eq!(m.loss_backoff_floor_packets_per_second, Some(40.0));
+        assert_eq!(m.loss_backoff_raw_target_packets_per_second, Some(10.0));
+        assert_eq!(m.loss_backoff_target_packets_per_second, Some(40.0));
+        assert_eq!(m.loss_backoffs, 1);
+        assert_eq!(m.loss_backoff_floor_bindings, 1);
+
+        // A second binding increments both counters.
+        rl.record_loss_backoff(20.0, 40.0, 40.0);
+        let m = &rl.congestion_metrics;
+        assert_eq!(m.loss_backoffs, 2);
+        assert_eq!(m.loss_backoff_floor_bindings, 2);
+
+        // Floor at or below raw still counts the backoff but never a binding.
+        rl.record_loss_backoff(40.0, 40.0, 40.0);
+        let m = &rl.congestion_metrics;
+        assert_eq!(m.loss_backoffs, 3);
+        assert_eq!(m.loss_backoff_floor_bindings, 2);
+        rl.record_loss_backoff(50.0, 40.0, 50.0);
+        let m = &rl.congestion_metrics;
+        assert_eq!(m.loss_backoffs, 4);
+        assert_eq!(m.loss_backoff_floor_bindings, 2);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2847,6 +2967,11 @@ pub struct MetricsRow {
     pub congestion_delivery_peak_packets_per_second: Option<f64>,
     pub congestion_drain_floor_packets_per_second: Option<f64>,
     pub congestion_drain_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_floor_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_raw_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoffs: u64,
+    pub congestion_loss_backoff_floor_bindings: u64,
     pub congestion_rate_samples: u64,
     pub congestion_bandwidth_probe_decisions: u64,
     pub congestion_bandwidth_probe_increases: u64,

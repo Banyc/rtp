@@ -805,6 +805,14 @@ impl Connection {
                 .congestion_drain_floor_packets_per_second,
             congestion_drain_target_packets_per_second: snapshot
                 .congestion_drain_target_packets_per_second,
+            congestion_loss_backoff_floor_packets_per_second: snapshot
+                .congestion_loss_backoff_floor_packets_per_second,
+            congestion_loss_backoff_raw_target_packets_per_second: snapshot
+                .congestion_loss_backoff_raw_target_packets_per_second,
+            congestion_loss_backoff_target_packets_per_second: snapshot
+                .congestion_loss_backoff_target_packets_per_second,
+            congestion_loss_backoffs: snapshot.congestion_loss_backoffs,
+            congestion_loss_backoff_floor_bindings: snapshot.congestion_loss_backoff_floor_bindings,
             congestion_rate_samples: snapshot.congestion_rate_samples,
             congestion_bandwidth_probe_decisions: snapshot.congestion_bandwidth_probe_decisions,
             congestion_bandwidth_probe_increases: snapshot.congestion_bandwidth_probe_increases,

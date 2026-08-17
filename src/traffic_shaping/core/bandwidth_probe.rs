@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-const BW_PROBE_GAIN: f64 = 1.0;
+const BW_PROBE_GAIN: f64 = 0.5;
 
 /// Ordinary low-loss bandwidth probing paced by transport feedback.
 ///
@@ -67,7 +67,7 @@ mod tests {
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
             probe.target(100.0, 100.0, Duration::from_millis(100), t0),
-            200.0
+            150.0
         );
         assert_eq!(
             probe.target(
@@ -85,7 +85,7 @@ mod tests {
                 Duration::from_millis(100),
                 t0 + Duration::from_millis(100),
             ),
-            200.0
+            150.0
         );
     }
 
@@ -95,7 +95,7 @@ mod tests {
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
             probe.target(100.0, 100.0, Duration::from_millis(10), t0),
-            200.0
+            150.0
         );
         assert_eq!(
             probe.target(
@@ -113,7 +113,7 @@ mod tests {
                 Duration::from_millis(30),
                 t0 + Duration::from_millis(30),
             ),
-            200.0
+            150.0
         );
     }
 
@@ -127,7 +127,7 @@ mod tests {
         );
         assert_eq!(
             probe.target(100.0, 100.0, Duration::from_secs(1), t0),
-            200.0
+            150.0
         );
     }
 
@@ -137,12 +137,12 @@ mod tests {
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
             probe.target(100.0, 100.0, Duration::from_secs(1), t0),
-            200.0
+            150.0
         );
         probe.reset();
         assert_eq!(
             probe.target(100.0, 100.0, Duration::from_secs(1), t0),
-            200.0
+            150.0
         );
     }
 }
