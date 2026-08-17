@@ -20,6 +20,10 @@ impl TailLossProber {
     /// Floor for the PTO timer so the first sample is not taken before the peer
     /// has had a reasonable chance to acknowledge the tail packet.
     const MIN_TOL: Duration = Duration::from_millis(10);
+    /// Bounded retry cadence for an overdue tail probe that is temporarily
+    /// ineligible (e.g. the send stage is not empty): the poll must not return
+    /// the same past probe deadline and busy-spin.
+    const INELIGIBLE_RETRY: Duration = Duration::from_millis(1);
     /// Lowered RTO floor used after at least one tail-loss probe has been sent.
     ///
     /// The first timeout signal keeps the 1 s `MIN_RTO` floor to absorb
@@ -88,11 +92,15 @@ impl TailLossProber {
     /// Merge the next probe time into an already-known wake deadline.
     /// A probe cannot precede `sent_time + MIN_TOL`. When another source is
     /// already due by that lower bound, keep it without calculating the RTT-
-    /// derived probe window.
+    /// derived probe window.  An overdue probe that is temporarily ineligible
+    /// is deferred to a bounded `INELIGIBLE_RETRY` cadence instead of
+    /// returning the same past deadline.
     pub fn merge_next_probe_time(
         &self,
+        now: Instant,
         sent_time: Instant,
         rtt_stats: &RttStats,
+        eligible: bool,
         current: Option<Instant>,
     ) -> Option<Instant> {
         if !self.can_probe() {
@@ -107,7 +115,10 @@ impl TailLossProber {
         if current.is_some_and(|deadline| deadline <= earliest_probe) {
             return current;
         }
-        let probe = sent_time + self.probe_window_with_srtt(rtt_stats, srtt);
+        let mut probe = sent_time + self.probe_window_with_srtt(rtt_stats, srtt);
+        if !eligible && probe <= now {
+            probe = now + Self::INELIGIBLE_RETRY;
+        }
         Some(current.map_or(probe, |deadline| deadline.min(probe)))
     }
 
@@ -237,10 +248,15 @@ mod tests {
         tlp.sent();
         assert!(!tlp.can_probe());
         // The merge contributes no deadline when the budget is exhausted.
-        assert!(
-            tlp.merge_next_probe_time(Instant::now(), &settled_rtt_stats(), None)
-                .is_none()
-        );
+        assert!(tlp
+            .merge_next_probe_time(
+                Instant::now(),
+                Instant::now(),
+                &settled_rtt_stats(),
+                true,
+                None
+            )
+            .is_none());
     }
 
     #[test]
@@ -251,8 +267,46 @@ mod tests {
         let current = sent + rtt_stats.smooth_rtt();
         assert!(current < sent + tlp.probe_window(&rtt_stats));
         assert_eq!(
-            tlp.merge_next_probe_time(sent, &rtt_stats, Some(current)),
+            tlp.merge_next_probe_time(sent, sent, &rtt_stats, true, Some(current)),
             Some(current)
+        );
+    }
+
+    #[test]
+    fn overdue_ineligible_probe_retries_on_a_bounded_cadence() {
+        let tlp = TailLossProber::new();
+        let sent = Instant::now();
+        let rtt_stats = settled_rtt_stats();
+        let probe_deadline = sent + tlp.probe_window(&rtt_stats);
+        let overdue = probe_deadline + ms(100);
+
+        // An overdue ineligible probe must not return the same stale (past)
+        // deadline and spin: it retries on the bounded 1 ms cadence.
+        let ineligible = tlp
+            .merge_next_probe_time(overdue, sent, &rtt_stats, false, None)
+            .expect("an overdue probe must still schedule a poll");
+        assert_eq!(
+            ineligible,
+            overdue + TailLossProber::INELIGIBLE_RETRY,
+            "an overdue ineligible probe must retry at now + 1ms"
+        );
+        assert!(
+            overdue < ineligible,
+            "the retry must be strictly in the future (got {ineligible:?} at {overdue:?})"
+        );
+
+        // An eligible overdue probe returns the real probe deadline.
+        assert_eq!(
+            tlp.merge_next_probe_time(overdue, sent, &rtt_stats, true, None),
+            Some(probe_deadline),
+            "an eligible overdue probe returns the real probe deadline"
+        );
+
+        // An already-overdue eligible probe outranks a future deadline.
+        let current = overdue + ms(50);
+        assert_eq!(
+            tlp.merge_next_probe_time(overdue, sent, &rtt_stats, true, Some(current)),
+            Some(probe_deadline)
         );
     }
 

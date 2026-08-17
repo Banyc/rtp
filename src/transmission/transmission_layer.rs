@@ -8,7 +8,9 @@ use crate::ack::AckInterval;
 use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
 use crate::sequence::InitialSequences;
-use crate::traffic_shaping::redundancy::{fec::FecState, fec_tuning::FecTuning};
+use crate::traffic_shaping::redundancy::{
+    fec::FecState, fec_tuning::FecTuning, retransmission_armor::RetransmissionArmorConfig,
+};
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
@@ -104,10 +106,10 @@ pub struct UnreliableLayer {
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
     pub(crate) frame_delivery: FrameMode,
-    /// Retransmission-armor duplicate-copy toggle.  Set once at construction
+    /// Retransmission-armor duplicate-copy config.  Set once at construction
     /// from the connect/accept config (which reads `RTP_RTX_DUP` in
     /// `Default`); the shared session state is seeded from here.
-    pub(crate) rtx_dup: bool,
+    pub(crate) retransmission_armor: RetransmissionArmorConfig,
     /// In-stream group FEC toggle.  Set once at construction from the
     /// connect/accept config (which reads `RTP_INSTREAM_GROUP_FEC` in
     /// `Default`); the shared session state is seeded from here.

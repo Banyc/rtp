@@ -13,6 +13,7 @@ use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::MetricsTerminationCause;
 use crate::traffic_shaping::core::SendWake;
+use crate::traffic_shaping::redundancy::retransmission_armor::ArmorDecision;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendLoopResult {
@@ -172,65 +173,26 @@ impl WriteHalf {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
             let instream = self.instream_group_fec_enabled();
-            let has_fec = self.fec.is_some() || instream;
-            // Keep both shared-state reads cold behind the local recovery
-            // check: normal data packets need neither the rtx_dup atomic nor
-            // the mutex-backed queue_building observation.
-            #[rustfmt::skip]
-            let wants_dup = is_recovery && self.rtx_dup() && !self.reliable_layer.lock().unwrap().queue_building();
-            let (primary_res, send_buf): (_, Option<&[u8]>) = if !has_fec && is_recovery {
-                let ts = data.send_ts.unwrap_or(0);
-                let cmd: u8 = match data.frame_len {
-                    Some(_) => crate::delivery::frame::wire::FRAME_DATA_TS_CMD,
-                    None => 3,
-                };
-                let mut hdr = [0u8; 19];
-                let hdr_len = if let Some(frame_len) = data.frame_len {
-                    hdr[0] = cmd;
-                    hdr[1..9].copy_from_slice(&data.seq.to_wire().to_be_bytes());
-                    hdr[9..13].copy_from_slice(&ts.to_be_bytes());
-                    hdr[13..17].copy_from_slice(&frame_len.to_be_bytes());
-                    hdr[17..19].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
-                    19
-                } else {
-                    hdr[0] = cmd;
-                    hdr[1..9].copy_from_slice(&data.seq.to_wire().to_be_bytes());
-                    hdr[9..13].copy_from_slice(&ts.to_be_bytes());
-                    hdr[13..15].copy_from_slice(&(data.data.len() as u16).to_be_bytes());
-                    15
-                };
-                let payload_slice = &payload[..data_written];
-                let iov = [
-                    std::io::IoSlice::new(&hdr[..hdr_len]),
-                    std::io::IoSlice::new(payload_slice),
-                ];
-                let res = self.utp_write.send_vectored(&iov).await;
-                let dup_buf = if wants_dup {
-                    let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
-                    Some(&codec_pkt[..n])
-                } else {
-                    None
-                };
-                (res, dup_buf)
-            } else {
-                let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
-                let utp_pkt = &codec_pkt[..n];
-                let send_buf: &[u8] = match self.fec.as_ref() {
-                    Some(fec) => {
-                        let mut fec = fec.lock().unwrap();
-                        let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
-                        &wire_pkt[..fec_n]
-                    }
-                    None => utp_pkt,
-                };
-                (self.utp_write.send(send_buf).await, Some(send_buf))
+            let armor_decision = self.retransmission_armor().decide(is_recovery, || {
+                self.reliable_layer.lock().unwrap().queue_building()
+            });
+            let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
+            let utp_pkt = &codec_pkt[..n];
+            let send_buf: &[u8] = match self.fec.as_ref() {
+                Some(fec) => {
+                    let mut fec = fec.lock().unwrap();
+                    let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
+                    &wire_pkt[..fec_n]
+                }
+                None => utp_pkt,
             };
+            let primary_res = self.utp_write.send(send_buf).await;
             match primary_res {
                 Ok(_) => {
                     if self.fec.is_some() && instream {
                         self.maybe_flush_full_fec_group(now).await?;
                     }
-                    if wants_dup && let Some(send_buf) = send_buf {
+                    if armor_decision == ArmorDecision::Duplicate {
                         let token_taken = self
                             .send_rate_limiter
                             .lock()
@@ -238,7 +200,10 @@ impl WriteHalf {
                             .take_exact_tokens(1, now);
                         if token_taken {
                             match self.utp_write.send(send_buf).await {
-                                Ok(_) => {}
+                                Ok(_) => self.log_at(
+                                    crate::metrics::MetricsEvent::RetransmissionArmorDuplicate,
+                                    now,
+                                ),
                                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
                                     if FEC_DEBUG {
                                         eprintln!("send_pkts: dup WouldBlock (transient)");
@@ -542,6 +507,7 @@ mod tests {
     use crate::metrics::{MetricsEvent, MetricsObserver, MetricsTerminationCause};
     use crate::traffic_shaping::recovery::liveness::PeerLiveness;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+    use crate::traffic_shaping::redundancy::retransmission_armor::RetransmissionArmorConfig;
     use crate::transmission::connection::new_connection_with_watchdog_tuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
@@ -647,7 +613,7 @@ mod tests {
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery: FrameMode::default(),
-            rtx_dup: false,
+            retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
         };
         let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);

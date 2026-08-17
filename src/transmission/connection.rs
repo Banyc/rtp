@@ -24,7 +24,9 @@ use crate::metrics::{
 use crate::reliable::reliable_layer::ReliableLayer;
 use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
 use crate::traffic_shaping::core::{SendPacer, SendWake};
-use crate::traffic_shaping::redundancy::fec::FecState;
+use crate::traffic_shaping::redundancy::{
+    fec::FecState, retransmission_armor::RetransmissionArmor,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceivedBatch {
@@ -66,7 +68,7 @@ pub struct Connection {
     pub(crate) send_rate_limiter: Arc<Mutex<SendPacer>>,
     pub(crate) termination: TerminationPresser,
     pub(crate) signals: Signals,
-    pub(crate) rtx_dup: bool,
+    pub(crate) retransmission_armor: RetransmissionArmor,
     pub(crate) fec_instream_flush: bool,
     pub(crate) instream_group_fec_enabled: bool,
     pub(crate) clock_epoch: Instant,
@@ -116,7 +118,7 @@ pub fn new_connection(
         send_rate_limiter,
         termination,
         signals: Signals::new(),
-        rtx_dup: unreliable_layer.rtx_dup,
+        retransmission_armor: RetransmissionArmor::new(unreliable_layer.retransmission_armor),
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         instream_group_fec_enabled: unreliable_layer.instream_group_fec,
         clock_epoch: now,
@@ -180,7 +182,7 @@ pub fn new_connection_with_watchdog_tuning(
         send_rate_limiter,
         termination,
         signals: Signals::new(),
-        rtx_dup: unreliable_layer.rtx_dup,
+        retransmission_armor: RetransmissionArmor::new(unreliable_layer.retransmission_armor),
         fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
         instream_group_fec_enabled: unreliable_layer.instream_group_fec,
         clock_epoch: now,
@@ -217,8 +219,8 @@ impl Connection {
         &self.reliable_layer
     }
 
-    pub fn rtx_dup(&self) -> bool {
-        self.rtx_dup
+    pub(crate) fn retransmission_armor(&self) -> &RetransmissionArmor {
+        &self.retransmission_armor
     }
 
     pub fn instream_group_fec_enabled(&self) -> bool {
@@ -835,6 +837,7 @@ mod tests {
     };
     use crate::traffic_shaping::core::SendWake;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+    use crate::traffic_shaping::redundancy::retransmission_armor::RetransmissionArmorConfig;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
 
@@ -853,7 +856,7 @@ mod tests {
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery,
-            rtx_dup: false,
+            retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
         }
     }

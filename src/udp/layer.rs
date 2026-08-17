@@ -10,6 +10,7 @@ use crate::delivery::frame::FrameMode;
 use crate::traffic_shaping::redundancy::{
     fec::{FecConfig, FecState},
     fec_tuning::FecTuning,
+    retransmission_armor::RetransmissionArmorConfig,
 };
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
@@ -92,7 +93,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         fec: fec_state,
         fec_tuning: tuning,
         frame_delivery,
-        rtx_dup: false,
+        retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
     })
 }

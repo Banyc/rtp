@@ -1276,9 +1276,13 @@ impl PktSendSpace {
         if let Some(seq) = self.tail_seq()
             && let Some(Some(p)) = self.send_wnd.get(&seq)
         {
-            min_next_poll_time =
-                self.tlp
-                    .merge_next_probe_time(p.sent_time, &self.rtt_stats, min_next_poll_time);
+            min_next_poll_time = self.tlp.merge_next_probe_time(
+                now,
+                p.sent_time,
+                &self.rtt_stats,
+                tail_probe_eligible,
+                min_next_poll_time,
+            );
         }
         min_next_poll_time
     }
@@ -3351,6 +3355,55 @@ mod tests {
         assert!(
             space.loss_event_window.raw_has_loss_event(),
             "the postponed loss is classified at the live deadline"
+        );
+    }
+
+    #[test]
+    fn indexed_next_poll_defers_only_an_ineligible_overdue_tail_probe() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // A genuinely due reorder deadline stays immediately due even when the
+        // tail probe is ineligible: the indexed poll returns before consulting
+        // the probe.
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        sack_one(&mut space, 1, t0 + ms(10));
+        let reorder_deadline = t0 + space.rtt_stats.reorder_window();
+        assert_eq!(
+            space.next_poll_time(reorder_deadline, false),
+            Some(reorder_deadline),
+            "an actually-due reorder deadline must remain immediately due"
+        );
+
+        // An overdue tail probe that is temporarily ineligible is deferred to
+        // the bounded 1 ms retry cadence instead of returning the same stale
+        // (past) probe deadline and spinning.  No send-window scan runs: the
+        // indexed path already avoids that.
+        let mut tlp_only = PktSendSpace::new();
+        settle_rtt_at(&mut tlp_only, t0);
+        send_packet(&mut tlp_only, t0);
+        let probe_deadline = t0 + tlp_only.tlp.probe_window(&tlp_only.rtt_stats);
+        let overdue = probe_deadline + ms(50);
+        let deferred = tlp_only
+            .next_poll_time(overdue, false)
+            .expect("an overdue ineligible tail probe still polls");
+        assert!(
+            overdue < deferred,
+            "the deferred poll must be strictly in the future (got {deferred:?} at {overdue:?})"
+        );
+        assert_eq!(
+            deferred,
+            overdue + Duration::from_millis(1),
+            "the deferred poll must sit on the bounded 1 ms retry cadence"
+        );
+
+        // An eligible overdue tail probe returns the real probe time.
+        assert_eq!(
+            tlp_only.next_poll_time(overdue, true),
+            Some(probe_deadline),
+            "an eligible overdue tail probe returns the real probe deadline"
         );
     }
 }

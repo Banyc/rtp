@@ -206,7 +206,7 @@ where
         fec: fec_state,
         fec_tuning: tuning,
         frame_delivery: FrameMode::default(),
-        rtx_dup: false,
+        retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
     }
 }
@@ -273,7 +273,7 @@ where
         fec: fec_state,
         fec_tuning: tuning,
         frame_delivery: FrameMode::default(),
-        rtx_dup: false,
+        retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
     }
 }

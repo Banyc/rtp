@@ -21,7 +21,8 @@ use crate::{
         control::handshake::{client_opening_handshake, server_opening_handshake},
         redundancy::{
             fec_tuning::{FecTuning, fec_tuning_from_env},
-            instream_group_fec_from_env, rtx_dup_from_env,
+            instream_group_fec_from_env,
+            retransmission_armor::RetransmissionArmorConfig,
         },
     },
     transmission::{
@@ -283,7 +284,7 @@ pub type FrameDeliveryAccept =
 ///
 /// `Default` reads the process environment once: `fec_tuning` and
 /// `frame_delivery` come from `RTP_FEC_TUNING` / `RTP_FRAME_DELIVERY`,
-/// `rtx_dup` from `RTP_RTX_DUP`, and `instream_group_fec` from
+/// `retransmission_armor` from `RTP_RTX_DUP`, and `instream_group_fec` from
 /// `RTP_INSTREAM_GROUP_FEC`.  Override the fields explicitly to opt out.
 #[derive(Debug, Clone)]
 pub struct AcceptConfig {
@@ -291,7 +292,7 @@ pub struct AcceptConfig {
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
     pub frame_delivery: FrameMode,
-    pub rtx_dup: bool,
+    pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub metrics_observer: Option<crate::metrics::MetricsObserver>,
 }
@@ -303,7 +304,7 @@ impl Default for AcceptConfig {
             mss: MssConfig::Default,
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
-            rtx_dup: rtx_dup_from_env(),
+            retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
         }
@@ -323,7 +324,7 @@ pub struct ConnectConfig<'a> {
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
     pub frame_delivery: FrameMode,
-    pub rtx_dup: bool,
+    pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub watchdog: Option<WatchdogTuning>,
 }
@@ -338,7 +339,7 @@ impl<'a> Default for ConnectConfig<'a> {
             mss: MssConfig::Default,
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
-            rtx_dup: rtx_dup_from_env(),
+            retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
         }
@@ -356,7 +357,7 @@ struct AcceptSetup {
     mss: ValidMss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
-    rtx_dup: bool,
+    retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
 }
@@ -373,7 +374,7 @@ impl AcceptSetup {
             mss: config.mss.resolve()?,
             tuning: config.fec_tuning,
             frame_delivery: config.frame_delivery,
-            rtx_dup: config.rtx_dup,
+            retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
         })
@@ -398,7 +399,7 @@ async fn accept(
         mss,
         tuning,
         frame_delivery,
-        rtx_dup,
+        retransmission_armor,
         instream_group_fec,
         metrics_observer,
     } = setup;
@@ -417,7 +418,7 @@ async fn accept(
         tuning,
         frame_delivery,
     )?;
-    unreliable_layer.rtx_dup = rtx_dup;
+    unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
     if handshake {
@@ -707,7 +708,7 @@ async fn connect_bound(
         mss,
         fec_tuning,
         frame_delivery,
-        rtx_dup,
+        retransmission_armor,
         instream_group_fec,
         watchdog,
     } = config;
@@ -730,7 +731,7 @@ async fn connect_bound(
         fec_tuning,
         frame_delivery,
     )?;
-    unreliable_layer.rtx_dup = rtx_dup;
+    unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
     if handshake {

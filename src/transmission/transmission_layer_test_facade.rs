@@ -52,6 +52,7 @@ impl TransmissionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traffic_shaping::redundancy::retransmission_armor::RetransmissionArmorConfig;
     use crate::transmission::test_doubles::BlockingWrite;
     use std::sync::{
         Mutex,
@@ -351,7 +352,7 @@ mod tests {
             crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
-        ul.rtx_dup = enabled;
+        ul.retransmission_armor = RetransmissionArmorConfig::from(enabled);
         ul.instream_group_fec = false;
         let tl = TransmissionLayer::new(ul, None);
         (tl, recorder)
@@ -479,7 +480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rtx_dup_queue_building_gate_suppresses_extra_copy() {
+    async fn retransmission_armor_queue_building_gate_suppresses_extra_copy() {
         let (mut tl, recorder) = harness(false, true);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
@@ -497,7 +498,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn fec_rtx_dup_reuses_identical_encoded_symbol() {
+    async fn fec_retransmission_armor_reuses_identical_encoded_symbol() {
         let (mut tl, recorder) = harness(true, true);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
@@ -528,21 +529,24 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn rtx_dup_disabled_sends_one_datagram() {
+    async fn recovery_non_fec_data_uses_the_canonical_contiguous_encoding() {
         let (mut tl, recorder) = harness(false, false);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
         wait_for_rtx_window().await;
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
+        let datagrams = recorder.lock().unwrap().datagrams();
         assert_eq!(
-            recorder.lock().unwrap().count(),
+            datagrams.len(),
             1,
-            "toggle off must send exactly one datagram (stock)"
+            "a non-FEC recovery packet without armor sends exactly one datagram"
         );
-        assert!(
-            bufs.parts_mut().1.iter().all(|&byte| byte == 0),
-            "non-FEC recovery without duplication must keep the zero-copy vectored path"
+        let encoded = bufs.parts_mut().1;
+        assert_eq!(
+            datagrams[0],
+            encoded[..datagrams[0].len()],
+            "non-FEC recovery must use the same canonical contiguous codec buffer as fresh data (no vectored header)"
         );
     }
 
@@ -582,6 +586,7 @@ mod tests {
     fn harness_with_mss(
         fec: bool,
         enabled: bool,
+        instream_group_fec: bool,
         mss: usize,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
@@ -609,16 +614,15 @@ mod tests {
             crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
-        ul.rtx_dup = enabled;
-        ul.instream_group_fec = false;
+        ul.retransmission_armor = RetransmissionArmorConfig::from(enabled);
+        ul.instream_group_fec = instream_group_fec;
         let tl = TransmissionLayer::new(ul, None);
         (tl, recorder)
     }
 
     #[tokio::test]
     async fn full_group_flushes_four_parities_inline_mid_burst() {
-        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.instream_group_fec_enabled = true;
+        let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
         stage_n_packets(&tl, 8);
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
@@ -631,8 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
-        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.instream_group_fec_enabled = true;
+        let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -655,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_data_burst_skipped_when_toggle_off_and_gate_closed() {
-        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
+        let (mut tl, recorder) = harness_with_mss(true, false, false, 8192);
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -678,8 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn ack_burst_keeps_stock_tail_gate_when_blocked() {
-        let (mut tl, recorder) = harness_with_mss(true, false, 8192);
-        tl.instream_group_fec_enabled = true;
+        let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
         {
             let rl = tl.reliable_layer();
             let mut rl = rl.lock().unwrap();
@@ -696,12 +698,12 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_off_wire_byte_identical_to_stock() {
-        let (mut tl_off, recorder_off) = harness_with_mss(true, false, 8192);
+        let (mut tl_off, recorder_off) = harness_with_mss(true, false, false, 8192);
         stage_n_packets(&tl_off, 8);
         let mut bufs = SendBufs::new();
         let _ = tl_off.send_pkts(&mut bufs).await;
         let n_off = recorder_off.lock().unwrap().count();
-        let (mut tl_stock, recorder_stock) = harness_with_mss(true, false, 8192);
+        let (mut tl_stock, recorder_stock) = harness_with_mss(true, false, false, 8192);
         stage_n_packets(&tl_stock, 8);
         let mut bufs2 = SendBufs::new();
         let _ = tl_stock.send_pkts(&mut bufs2).await;
