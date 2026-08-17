@@ -291,25 +291,22 @@ impl Connection {
         tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
-            // Arm the notification before inspecting capacity so a wake
-            // between the check and the await is never lost.
             sent_data_pkt.as_mut().enable();
-            let written_bytes = {
+            let (written_bytes, should_resume_send) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                reliable_layer.send_data_buf(data, now)
-            }?;
+                let stage_was_empty = reliable_layer.is_send_buf_empty();
+                let written_bytes = reliable_layer.send_data_buf(data, now)?;
+                (written_bytes, stage_was_empty && written_bytes > 0)
+            };
             self.log(MetricsEvent::SendDataBuffer);
             if 0 < written_bytes {
-                self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationData);
+                if should_resume_send {
+                    self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationData);
+                }
                 return Ok(written_bytes);
             }
             self.termination.check_error()?;
             {
-                // Register the blocked writer for the duration of the wait:
-                // the counter is drop-scoped, so a cancelled writer always
-                // releases its slot.  Waiting never suppresses
-                // application-limited classification (the exported
-                // suppression counter stays zero).
                 let _waiter = self
                     .reliable_layer
                     .lock()
@@ -833,7 +830,8 @@ mod tests {
     use crate::delivery::frame::FrameMode;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
     use crate::metrics::{
-        MetricsEvent, MetricsInterest, MetricsObserver, MetricsTerminationCause, SCHEMA_VERSION,
+        MetricsEvent, MetricsInterest, MetricsObserver, MetricsSendDriverResumeSource,
+        MetricsTerminationCause, SCHEMA_VERSION,
     };
     use crate::traffic_shaping::core::SendWake;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -1120,5 +1118,52 @@ mod tests {
         assert!(!reliable.pkt_send_space().accepts_new_pkt());
         drop(reliable);
         assert!(matches!(shared.next_send_wake(now), SendWake::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn application_data_resumes_only_on_empty_to_nonempty_stage() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        let application_data_requests = || {
+            observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|observation| {
+                    matches!(
+                        observation.event,
+                        MetricsEvent::SendDriverResumeRequest(
+                            MetricsSendDriverResumeSource::ApplicationData
+                        )
+                    )
+                })
+                .count()
+        };
+        assert_eq!(shared.send(b"first").await.unwrap(), b"first".len());
+        assert_eq!(
+            application_data_requests(),
+            1,
+            "the empty-to-nonempty stage edge must resume the send driver exactly once"
+        );
+        assert_eq!(shared.send(b"second").await.unwrap(), b"second".len());
+        assert_eq!(
+            application_data_requests(),
+            1,
+            "a write into an already-nonempty stage must not resume the send driver again"
+        );
+        assert_eq!(shared.send(b"third").await.unwrap(), b"third".len());
+        assert_eq!(
+            application_data_requests(),
+            1,
+            "further nonempty-stage writes stay silent on the resume request"
+        );
     }
 }

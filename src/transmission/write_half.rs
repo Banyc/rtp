@@ -219,13 +219,15 @@ impl WriteHalf {
                     continue;
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
+                    let blocked_at = Instant::now();
+                    self.log_at(crate::metrics::MetricsEvent::DataSendWouldBlock, blocked_at);
                     if FEC_DEBUG {
                         eprintln!("send_pkts: WouldBlock on data send (transient)");
                     }
                     // A blocked underlay send may have consumed real time:
                     // refresh the clock so the next pacing/token decision is
                     // computed against the fresh instant.
-                    now = Instant::now();
+                    now = blocked_at;
                     continue;
                 }
                 Err(e) => {

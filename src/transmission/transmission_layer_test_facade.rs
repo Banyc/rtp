@@ -1336,7 +1336,7 @@ mod tests {
         let mut recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
         tokio::select! {
             result = &mut recv => panic!("receive returned before the ACK-only wake: {result:?}"),
-            () = shared.ack_schedule_changed().notified() => (),
+            () = shared.resume_send().notified() => (),
         }
         // recv_pkts must now be parked waiting for the next datagram again;
         // the writer was woken by the ACK, not by the receive loop exiting.
@@ -1443,6 +1443,59 @@ mod tests {
         assert_eq!(
             sent[1], expected_deep,
             "the deep page must encode from the one pre-await history snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_data_send_writability_emits_one_typed_metric() {
+        use crate::metrics::{MetricsEvent, MetricsObserver};
+        #[derive(Debug)]
+        struct ExhaustedWrite {
+            call_count: Mutex<usize>,
+        }
+        #[async_trait]
+        impl UnreliableWrite for ExhaustedWrite {
+            async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
+                let mut c = self.call_count.lock().unwrap();
+                *c += 1;
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let mut layer = crate::udp::wrap_fec(
+            Box::new(BlackholeRead),
+            Box::new(ExhaustedWrite {
+                call_count: Mutex::new(0),
+            }),
+            false,
+        );
+        layer.metrics_observer = Some(observer);
+        let mut transmission = TransmissionLayer::new(layer, None);
+        stage_small_message(&transmission);
+        let mut send_bufs = SendBufs::new();
+        assert!(
+            transmission.send_pkts(&mut send_bufs).await.is_ok(),
+            "an exhausted underlay write must not surface as a terminal error"
+        );
+        assert!(
+            !transmission.shared.termination.has_error(),
+            "data-send WouldBlock is an I/O-pressure outcome, not a terminal error"
+        );
+        let would_blocks = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|observation| observation.event == MetricsEvent::DataSendWouldBlock)
+            .count();
+        assert_eq!(
+            would_blocks, 1,
+            "one send pass hitting the exhausted underlay must emit exactly one DataSendWouldBlock"
         );
     }
 }
