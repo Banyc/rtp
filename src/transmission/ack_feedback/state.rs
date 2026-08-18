@@ -3,6 +3,7 @@ use std::time::Instant;
 use super::AckPage;
 use super::pages::{AckPagePlan, MAX_NUM_ACK};
 use super::schedule::{ACK_FLUSH_COUNT, AckSchedule, schedule};
+use crate::metrics::MetricsAckFlushReason;
 use crate::transmission::ts_echo::TsEcho;
 
 #[derive(Debug, Clone, Copy)]
@@ -15,6 +16,7 @@ pub(crate) struct ReceivedAckWork {
 #[derive(Debug)]
 pub(crate) struct AckClaim {
     id: u64,
+    reason: MetricsAckFlushReason,
     pages: AckPagePlan,
     echo_ts: Option<u32>,
     echo_backup: Option<u32>,
@@ -24,6 +26,12 @@ pub(crate) struct AckClaim {
 }
 
 impl AckClaim {
+    /// Why this transactional claim became due (initial, age, count, fin, or
+    /// explicit).
+    pub(crate) fn reason(&self) -> MetricsAckFlushReason {
+        self.reason
+    }
+
     pub(crate) fn pages(&self) -> [Option<AckPage>; 2] {
         self.pages.pages()
     }
@@ -114,9 +122,14 @@ impl State {
         let id = self.next_claim_id;
         self.next_claim_id = self.next_claim_id.wrapping_add(1);
         self.in_flight = Some(id);
+        let reason = self
+            .schedule(now)
+            .reason()
+            .unwrap_or(MetricsAckFlushReason::Explicit);
         let echo_ts = self.ts_echo.take();
         Some(AckClaim {
             id,
+            reason,
             pages: AckPagePlan::new(self.ack_page_cursor, history_count),
             echo_ts,
             echo_backup: echo_ts,
@@ -309,7 +322,7 @@ mod tests {
         });
         assert_eq!(
             state.schedule(now),
-            AckSchedule::Due,
+            AckSchedule::Due(MetricsAckFlushReason::Initial),
             "work without a prior flush is immediately due"
         );
         let claim = state.claim(now, 0).expect("pending work must claim");

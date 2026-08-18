@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 25;
+pub const SCHEMA_VERSION: u16 = 26;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,8 +211,60 @@ pub enum MetricsEvent {
     GentleModeExit(MetricsGentleExitCause),
     /// A raw timestamp-echo RTT sample was accepted by the estimator.
     RttSample,
+    /// A successful transactional ACK-flush claim was taken by the writer,
+    /// naming why the flush was due (initial, age, count, fin, or explicit).
+    /// Distinct from wake requests: only a successful claim is a claim event.
+    AckFlush(MetricsAckFlushReason),
     /// The first terminal error that owns the session failure.
     SessionTermination(MetricsTermination),
+}
+
+/// Why a transactional ACK-flush claim became due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsAckFlushReason {
+    /// No prior flush this connection: the first claim sends immediately.
+    Initial,
+    /// The three-millisecond coalescing age deadline elapsed.
+    Age,
+    /// The count threshold (`ACK_FLUSH_COUNT`) of pending ACKs was reached.
+    Count,
+    /// The peer's FIN is pending acknowledgement (FIN outranks count).
+    Fin,
+    /// An explicit writer call claimed the flush outside the schedule.
+    Explicit,
+}
+
+impl MetricsAckFlushReason {
+    /// All five flush reasons in policy order.
+    pub const ALL: [Self; 5] = [
+        Self::Initial,
+        Self::Age,
+        Self::Count,
+        Self::Fin,
+        Self::Explicit,
+    ];
+
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Age => "age",
+            Self::Count => "count",
+            Self::Fin => "fin",
+            Self::Explicit => "explicit",
+        }
+    }
+
+    /// Stable event string: ``ack_flush_<reason>``.
+    pub const fn event_str(self) -> &'static str {
+        match self {
+            Self::Initial => "ack_flush_initial",
+            Self::Age => "ack_flush_age",
+            Self::Count => "ack_flush_count",
+            Self::Fin => "ack_flush_fin",
+            Self::Explicit => "ack_flush_explicit",
+        }
+    }
 }
 /// Producer that requested a resume-signal wake for the RTP send driver.
 ///
@@ -283,6 +335,7 @@ impl MetricsEvent {
             Self::SendDriverResumeRequest(source) => source.as_str(),
             Self::GentleModeExit(cause) => cause.event_str(),
             Self::RttSample => "rtt_sample",
+            Self::AckFlush(reason) => reason.event_str(),
             Self::SessionTermination(_) => "session_termination",
         }
     }

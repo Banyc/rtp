@@ -949,6 +949,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_flush_emits_the_reason_of_the_transactional_claim() {
+        use crate::metrics::{MetricsAckFlushReason, MetricsEvent, MetricsObserver};
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        #[derive(Debug)]
+        struct ImmediateWrite;
+        #[async_trait]
+        impl UnreliableWrite for ImmediateWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+                Ok(buf.len())
+            }
+        }
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let mut layer =
+            crate::udp::wrap_fec(Box::new(BlackholeRead), Box::new(ImmediateWrite), false);
+        layer.metrics_observer = Some(observer);
+        let mut transmission = TransmissionLayer::new(layer, None);
+        // Sparse work with no prior flush: the first successful transactional
+        // claim is due for the Initial reason.
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
+        let mut send_bufs = SendBufs::new();
+        transmission
+            .flush_acks(&mut send_bufs)
+            .await
+            .expect("flush must succeed");
+        let observations = observations.lock().unwrap();
+        let flush = observations
+            .iter()
+            .find(|observation| matches!(observation.event, MetricsEvent::AckFlush(_)))
+            .expect("a successful claim must emit an AckFlush event");
+        assert_eq!(
+            flush.event,
+            MetricsEvent::AckFlush(MetricsAckFlushReason::Initial),
+            "the first claim without a prior flush is due for the Initial reason"
+        );
+    }
+
+    #[tokio::test]
     async fn ack_flush_does_not_claim_a_fin_that_arrived_mid_flush() {
         #[derive(Debug)]
         struct SilentRead;

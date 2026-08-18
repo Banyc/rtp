@@ -476,6 +476,11 @@ impl WriteHalf {
             let Some(claim) = claim else {
                 return Ok(());
             };
+            // A successful transactional claim names why it became due; the
+            // observation is emitted before any page is sent so the claim
+            // event is never confused with the resume wake that rearmed us.
+            self.shared
+                .log_at(MetricsEvent::AckFlush(claim.reason()), now);
             (claim, encoded_page_lengths)
         };
         let fec_enabled = self.fec.is_some();

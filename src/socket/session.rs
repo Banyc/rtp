@@ -169,7 +169,7 @@ impl WriteDriver {
                 let ack_deadline = match self.write_half.ack_schedule(Instant::now()) {
                     AckSchedule::Idle => None,
                     AckSchedule::At(deadline) => Some(deadline),
-                    AckSchedule::Due => break,
+                    AckSchedule::Due(_) => break,
                 };
                 let timed_wake = match (next_wake, ack_deadline) {
                     (crate::traffic_shaping::core::SendWake::Event, None) => None,
