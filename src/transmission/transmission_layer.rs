@@ -9,7 +9,7 @@ use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
 use crate::sequence::InitialSequences;
 use crate::traffic_shaping::redundancy::{
-    fec::FecState, fec_tuning::FecTuning, retransmission_armor::RetransmissionArmorConfig,
+    RetransmissionArmorConfig, fec::FecState, fec_tuning::FecTuning,
 };
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;

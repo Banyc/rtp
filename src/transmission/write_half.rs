@@ -1,8 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::ack_feedback::schedule::AckSchedule;
-use super::ack_feedback::state::AckFlushOutcome;
+use super::ack_feedback::{AckFeedback, AckFlushOutcome, AckSchedule};
 use super::connection::Connection;
 use super::termination::{KillPolicy, TerminationWriter};
 use super::transmission_layer::{
@@ -11,9 +10,11 @@ use super::transmission_layer::{
 use crate::ack::EncodeAck;
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
-use crate::metrics::MetricsTerminationCause;
-use crate::traffic_shaping::core::SendWake;
-use crate::traffic_shaping::redundancy::retransmission_armor::ArmorDecision;
+use crate::metrics::{MetricsEvent, MetricsTerminationCause};
+use crate::traffic_shaping::core::{SendPacer, SendWake};
+use crate::traffic_shaping::redundancy::{
+    ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig, fec::FecEncoderState,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendLoopResult {
@@ -21,23 +22,68 @@ pub(crate) struct SendLoopResult {
     pub(crate) wake: SendWake,
 }
 
+/// The write-actor half: owns the unreliable write transport, the FEC encoder
+/// state (sole mutator), retransmission armor, the send pacer, the ACK
+/// feedback owner (shared with the read half for recording), and the
+/// termination writer.  All remaining shared state lives behind the
+/// [`Connection`] facades, so no mutex guard survives an await.
 #[derive(Debug)]
 pub struct WriteHalf {
-    pub(crate) utp_write: Box<dyn UnreliableWrite>,
-    pub(crate) shared: Arc<Connection>,
-    pub(crate) termination_writer: TerminationWriter,
-}
-
-impl std::ops::Deref for WriteHalf {
-    type Target = Connection;
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
+    utp_write: Box<dyn UnreliableWrite>,
+    fec: Option<FecEncoderState>,
+    fec_instream_flush: bool,
+    instream_group_fec_enabled: bool,
+    retransmission_armor: RetransmissionArmor,
+    send_pacer: SendPacer,
+    ack_feedback: Arc<AckFeedback>,
+    shared: Arc<Connection>,
+    termination_writer: TerminationWriter,
 }
 
 impl WriteHalf {
+    pub(super) fn new(
+        utp_write: Box<dyn UnreliableWrite>,
+        fec: Option<FecEncoderState>,
+        fec_instream_flush: bool,
+        instream_group_fec_enabled: bool,
+        retransmission_armor: RetransmissionArmorConfig,
+        send_pacer: SendPacer,
+        ack_feedback: Arc<AckFeedback>,
+        shared: Arc<Connection>,
+        termination_writer: TerminationWriter,
+    ) -> Self {
+        Self {
+            utp_write,
+            fec,
+            fec_instream_flush,
+            instream_group_fec_enabled,
+            retransmission_armor: RetransmissionArmor::new(retransmission_armor),
+            send_pacer,
+            ack_feedback,
+            shared,
+            termination_writer,
+        }
+    }
+
     pub(crate) fn kill_requested(&self) -> &tokio_util::sync::CancellationToken {
         self.termination_writer.kill_requested()
+    }
+
+    pub(crate) fn resume_send(&self) -> &tokio::sync::Notify {
+        self.shared.resume_send()
+    }
+
+    pub(crate) fn ack_schedule_changed(&self) -> &tokio::sync::Notify {
+        self.ack_feedback.schedule_changed()
+    }
+
+    pub(crate) fn log(&self, event: MetricsEvent) {
+        self.shared.log(event);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_pacer_for_test(&self, n: usize, now: Instant) -> usize {
+        self.send_pacer.take_at_most_tokens(n, now)
     }
 
     async fn try_send_requested_kill(&mut self, bufs: &mut SendBufs) -> Option<Result<(), IoErr>> {
@@ -52,7 +98,7 @@ impl WriteHalf {
         bufs: &mut SendBufs,
     ) -> Result<(), IoErr> {
         let error = self
-            .termination
+            .shared
             .check_error()
             .expect_err("error-present flag must publish the first terminal error");
         let _ = self.try_send_requested_kill(bufs).await;
@@ -64,13 +110,12 @@ impl WriteHalf {
     /// (the send pass's fixed `now`, never a fresh clock sampled after the
     /// stall was observed).  Emits the termination snapshot event exactly once.
     pub(crate) fn proactively_terminate_stalled_session_at(&self, now: Instant) {
-        let context = {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
+        let context = self.shared.with_reliable_layer(|reliable_layer| {
             let send_space = reliable_layer.pkt_send_space();
             let Some(reason) = send_space.stall_reason(now) else {
-                return;
+                return None;
             };
-            ProactiveTerminationContext {
+            Some(ProactiveTerminationContext {
                 reason: match reason {
                     crate::traffic_shaping::recovery::liveness::PeerStall::NoResponse => {
                         "no_response"
@@ -86,12 +131,15 @@ impl WriteHalf {
                     .no_progress_for(now)
                     .map(|duration| duration.as_millis()),
                 snapshot: format!("{:?}", reliable_layer.log()),
-            }
+            })
+        });
+        let Some(context) = context else {
+            return;
         };
-        if self.termination.has_error() {
+        if self.shared.has_error() {
             return;
         }
-        self.press_broken_pipe(
+        self.shared.press_broken_pipe(
             KillPolicy::SendKill,
             Some(context),
             MetricsTerminationCause::ProactiveStall,
@@ -108,7 +156,7 @@ impl WriteHalf {
         let (made_progress, completed_at) = self.send_pkts_inner(bufs, now).await?;
         Ok(SendLoopResult {
             made_progress,
-            wake: self.next_send_wake(completed_at),
+            wake: self.shared.next_send_wake(completed_at),
         })
     }
 
@@ -125,7 +173,7 @@ impl WriteHalf {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
         self.proactively_terminate_stalled_session_at(now);
-        if self.termination.has_error() {
+        if self.shared.has_error() {
             self.return_error_after_requested_kill(bufs).await?;
         }
         self.send_due_post_open_response(now).await?;
@@ -133,19 +181,19 @@ impl WriteHalf {
         // once and reuse it for every packet encoded by this pass.  A blocked
         // underlay send refreshes the clock for deadline/token math, but the
         // wire timestamp stays stable for the whole pass.
-        let wire_ts = self.wire_ts(now);
+        let wire_ts = self.shared.wire_ts(now);
         let mut written_bytes = 0;
         let mut written_fin = false;
         loop {
-            if self.termination.has_error() {
+            if self.shared.has_error() {
                 self.return_error_after_requested_kill(bufs).await?;
             }
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
-            let res = {
-                let mut reliable_layer = self.reliable_layer.lock().unwrap();
+            let res = self.shared.with_reliable_layer_mut(|reliable_layer| {
                 reliable_layer.send_data_pkt(payload, now)
-            };
-            self.log_at(crate::metrics::MetricsEvent::SendDataPacketAttempt, now);
+            });
+            self.shared
+                .log_at(crate::metrics::MetricsEvent::SendDataPacketAttempt, now);
             let Some(p) = res else {
                 if FEC_DEBUG {
                     eprintln!("send_data_pkt: no pkt to send (rtx=None, cwnd full or no tokens)");
@@ -172,15 +220,15 @@ impl WriteHalf {
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
-            let instream = self.instream_group_fec_enabled();
-            let armor_decision = self.retransmission_armor().decide(is_recovery, || {
-                self.reliable_layer.lock().unwrap().queue_building()
+            let instream = self.instream_group_fec_enabled;
+            let armor_decision = self.retransmission_armor.decide(is_recovery, || {
+                self.shared
+                    .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
             });
             let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
             let utp_pkt = &codec_pkt[..n];
-            let send_buf: &[u8] = match self.fec.as_ref() {
+            let send_buf: &[u8] = match self.fec.as_mut() {
                 Some(fec) => {
-                    let mut fec = fec.lock().unwrap();
                     let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
                     &wire_pkt[..fec_n]
                 }
@@ -193,14 +241,10 @@ impl WriteHalf {
                         self.maybe_flush_full_fec_group(now).await?;
                     }
                     if armor_decision == ArmorDecision::Duplicate {
-                        let token_taken = self
-                            .send_rate_limiter
-                            .lock()
-                            .unwrap()
-                            .take_exact_tokens(1, now);
+                        let token_taken = self.send_pacer.take_exact_tokens(1, now);
                         if token_taken {
                             match self.utp_write.send(send_buf).await {
-                                Ok(_) => self.log_at(
+                                Ok(_) => self.shared.log_at(
                                     crate::metrics::MetricsEvent::RetransmissionArmorDuplicate,
                                     now,
                                 ),
@@ -210,7 +254,8 @@ impl WriteHalf {
                                     }
                                 }
                                 Err(e) => {
-                                    self.press_error(e, MetricsTerminationCause::DataWrite);
+                                    self.shared
+                                        .press_error(e, MetricsTerminationCause::DataWrite);
                                     return Err(e);
                                 }
                             }
@@ -220,7 +265,8 @@ impl WriteHalf {
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     let blocked_at = Instant::now();
-                    self.log_at(crate::metrics::MetricsEvent::DataSendWouldBlock, blocked_at);
+                    self.shared
+                        .log_at(crate::metrics::MetricsEvent::DataSendWouldBlock, blocked_at);
                     if FEC_DEBUG {
                         eprintln!("send_pkts: WouldBlock on data send (transient)");
                     }
@@ -231,7 +277,8 @@ impl WriteHalf {
                     continue;
                 }
                 Err(e) => {
-                    self.press_error(e, MetricsTerminationCause::DataWrite);
+                    self.shared
+                        .press_error(e, MetricsTerminationCause::DataWrite);
                     return Err(e);
                 }
             }
@@ -240,20 +287,21 @@ impl WriteHalf {
             if PRINT_DEBUG_MSGS {
                 println!("send_pkts: {{ data: {written_bytes}; fin: {written_fin} }}");
             }
-            self.signals.sent_data_pkt.notify_waiters();
+            self.shared.publish_data_sent();
         }
         if self.fec.is_some() {
-            let baseline_can_send_tail_fec =
-                { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+            let baseline_can_send_tail_fec = self
+                .shared
+                .with_reliable_layer(|reliable_layer| reliable_layer.can_send_tail_fec(now));
             let data_path = true;
             let can_send_tail_fec = self.fec_instream_flush
                 || baseline_can_send_tail_fec
-                || (data_path && self.instream_group_fec_enabled());
+                || (data_path && self.instream_group_fec_enabled);
             self.close_fec_burst(now, can_send_tail_fec).await?;
         }
         let made_progress = 0 < written_bytes || written_fin;
         let mut completed_at = Instant::now();
-        if self.ack_flush_is_due(completed_at) {
+        if self.ack_feedback.schedule(completed_at).is_due() {
             self.flush_acks(bufs).await?;
             completed_at = Instant::now();
         }
@@ -261,13 +309,10 @@ impl WriteHalf {
     }
 
     async fn maybe_flush_full_fec_group(&mut self, now: Instant) -> Result<(), IoErr> {
-        let Some(fec) = self.fec.as_ref() else {
+        let Some(fec) = self.fec.as_mut() else {
             return Ok(());
         };
-        let should_flush = {
-            let fec = fec.lock().unwrap();
-            fec.group_data_full(self.instream_group_fec_enabled())
-        };
+        let should_flush = fec.group_data_full(self.instream_group_fec_enabled);
         if !should_flush {
             return Ok(());
         }
@@ -279,36 +324,30 @@ impl WriteHalf {
         now: Instant,
         can_send_tail_fec: bool,
     ) -> Result<(), IoErr> {
-        let Some(fec) = self.fec.as_ref() else {
+        let Some(fec) = self.fec.as_mut() else {
             return Ok(());
         };
         if !can_send_tail_fec {
-            fec.lock().unwrap().skip_open_group();
+            fec.skip_open_group();
             return Ok(());
         }
         self.flush_fec_parities(now).await
     }
 
-    fn skip_open_fec_group(&self) {
-        let Some(fec) = self.fec.as_ref() else {
+    fn skip_open_fec_group(&mut self) {
+        let Some(fec) = self.fec.as_mut() else {
             return;
         };
-        fec.lock().unwrap().skip_open_group();
+        fec.skip_open_group();
     }
 
     pub(crate) async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), IoErr> {
-        let Some(fec) = self.fec.as_ref() else {
+        let Some(fec) = self.fec.as_mut() else {
             return Ok(());
         };
-        let parity_pkts = {
-            let mut fec = fec.lock().unwrap();
-            let mut tb = self.send_rate_limiter.lock().unwrap();
-            fec.maybe_flush_parities(
-                tb.token_bucket_mut(),
-                now,
-                self.instream_group_fec_enabled(),
-            )
-        };
+        let parity_pkts = self.send_pacer.with_token_bucket(|tb| {
+            fec.maybe_flush_parities(tb, now, self.instream_group_fec_enabled)
+        });
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
@@ -319,7 +358,8 @@ impl WriteHalf {
                     return Ok(());
                 }
                 Err(e) => {
-                    self.press_error(e, MetricsTerminationCause::FecParityWrite);
+                    self.shared
+                        .press_error(e, MetricsTerminationCause::FecParityWrite);
                     return Err(e);
                 }
             }
@@ -328,21 +368,22 @@ impl WriteHalf {
     }
 
     async fn send_due_post_open_response(&mut self, now: Instant) -> Result<(), IoErr> {
-        let Some(response) = self.claim_post_open_response(now) else {
+        let Some(response) = self.shared.claim_post_open_response(now) else {
             return Ok(());
         };
         match self.utp_write.send(&response.bytes).await {
             Ok(len) if len == response.bytes.len() => Ok(()),
             Ok(_) => {
-                self.retry_post_open_response(Instant::now());
+                self.shared.retry_post_open_response(Instant::now());
                 Ok(())
             }
             Err(error) if error == std::io::ErrorKind::WouldBlock => {
-                self.retry_post_open_response(Instant::now());
+                self.shared.retry_post_open_response(Instant::now());
                 Ok(())
             }
             Err(error) => {
-                self.press_error(error, MetricsTerminationCause::HandshakeWrite);
+                self.shared
+                    .press_error(error, MetricsTerminationCause::HandshakeWrite);
                 Err(error)
             }
         }
@@ -359,7 +400,7 @@ impl WriteHalf {
     async fn send_kill_data_pkt(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
         // Session tag prefix (9 bytes) + KILL_CMD byte, when a tag exists.
         let mut buf = [0; 1 + 1 + 8];
-        let n = encode_kill(self.session_tag(), &mut buf).unwrap();
+        let n = encode_kill(self.shared.session_tag(), &mut buf).unwrap();
         let fec_enabled = self.fec.is_some();
         let res = self.send_with_fec(&buf[..n], bufs.wire_pkt_mut()).await;
         if res.is_err() && fec_enabled {
@@ -371,20 +412,22 @@ impl WriteHalf {
 
     async fn flush_kill_fec_tail(&mut self) {
         let now = Instant::now();
-        let can_send_tail_fec = { self.reliable_layer.lock().unwrap().can_send_tail_fec(now) };
+        let can_send_tail_fec = self
+            .shared
+            .with_reliable_layer(|reliable_layer| reliable_layer.can_send_tail_fec(now));
         let _ = self.close_fec_burst(now, can_send_tail_fec).await;
     }
 
     #[cfg(test)]
     pub async fn send_kill_and_abort(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        self.press_broken_pipe(
+        self.shared.press_broken_pipe(
             KillPolicy::SendKill,
             None,
             MetricsTerminationCause::LocalAbort,
         );
         match self.try_send_requested_kill(bufs).await {
             Some(result) => result,
-            None => self.termination.check_error(),
+            None => self.shared.check_error(),
         }
     }
 
@@ -393,45 +436,46 @@ impl WriteHalf {
         !self.ack_feedback.is_drained()
     }
 
-    fn ack_flush_is_due(&self, now: Instant) -> bool {
-        self.ack_feedback.schedule(now).is_due()
-    }
-
     pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         let now = Instant::now();
         let (claim, encoded_page_lengths) = {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
-            let history = reliable_layer.pkt_recv_space().ack_history();
-            let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
+            let (claim, encoded_page_lengths) = self.shared.with_reliable_layer(|reliable_layer| {
+                let history = reliable_layer.pkt_recv_space().ack_history();
+                let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
+                    return (None, [None; 2]);
+                };
+                let (payload, codec_pkt, _) = bufs.parts_mut();
+                let mut encoded_page_lengths = [None; 2];
+                for (index, page) in claim.pages().into_iter().enumerate() {
+                    let Some(page) = page else {
+                        continue;
+                    };
+                    let output = if index == 0 {
+                        &mut codec_pkt[..]
+                    } else {
+                        &mut payload[..]
+                    };
+                    let ack = EncodeAck {
+                        queue: history,
+                        first_block_index: page.first_block_index,
+                        max_blocks: page.max_blocks,
+                    };
+                    encoded_page_lengths[index] = Some(
+                        encode_ack_data(
+                            self.shared.session_tag(),
+                            Some(ack),
+                            claim.take_echo(),
+                            None,
+                            output,
+                        )
+                        .unwrap(),
+                    );
+                }
+                (Some(claim), encoded_page_lengths)
+            });
+            let Some(claim) = claim else {
                 return Ok(());
             };
-            let (payload, codec_pkt, _) = bufs.parts_mut();
-            let mut encoded_page_lengths = [None; 2];
-            for (index, page) in claim.pages().into_iter().enumerate() {
-                let Some(page) = page else {
-                    continue;
-                };
-                let output = if index == 0 {
-                    &mut codec_pkt[..]
-                } else {
-                    &mut payload[..]
-                };
-                let ack = EncodeAck {
-                    queue: history,
-                    first_block_index: page.first_block_index,
-                    max_blocks: page.max_blocks,
-                };
-                encoded_page_lengths[index] = Some(
-                    encode_ack_data(
-                        self.session_tag(),
-                        Some(ack),
-                        claim.take_echo(),
-                        None,
-                        output,
-                    )
-                    .unwrap(),
-                );
-            }
             (claim, encoded_page_lengths)
         };
         let fec_enabled = self.fec.is_some();
@@ -451,12 +495,9 @@ impl WriteHalf {
                     pages_sent += 1;
                     if fec_enabled {
                         let fec_now = Instant::now();
-                        let can_send_tail_fec = {
-                            self.reliable_layer
-                                .lock()
-                                .unwrap()
-                                .can_send_tail_fec(fec_now)
-                        };
+                        let can_send_tail_fec = self.shared.with_reliable_layer(|reliable_layer| {
+                            reliable_layer.can_send_tail_fec(fec_now)
+                        });
                         if let Err(error) = self.close_fec_burst(fec_now, can_send_tail_fec).await {
                             self.ack_feedback
                                 .complete(claim, AckFlushOutcome::Fatal { pages_sent });
@@ -467,20 +508,21 @@ impl WriteHalf {
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     self.ack_feedback
                         .complete(claim, AckFlushOutcome::WouldBlock { pages_sent });
-                    self.signals.session_outbound_progress.notify_one();
+                    self.shared.notify_session_outbound_progress();
                     return Ok(());
                 }
                 Err(error) => {
                     self.ack_feedback
                         .complete(claim, AckFlushOutcome::Fatal { pages_sent });
-                    self.press_error(error, MetricsTerminationCause::AckWrite);
+                    self.shared
+                        .press_error(error, MetricsTerminationCause::AckWrite);
                     return Err(error);
                 }
             }
         }
         self.ack_feedback
             .complete(claim, AckFlushOutcome::Sent { pages_sent });
-        self.signals.session_outbound_progress.notify_one();
+        self.shared.notify_session_outbound_progress();
         Ok(())
     }
 
@@ -489,15 +531,12 @@ impl WriteHalf {
         codec_pkt: &[u8],
         fec_buf: &mut [u8],
     ) -> Result<usize, IoErr> {
-        let send_buf: &[u8] = {
-            match self.fec.as_ref() {
-                Some(fec) => {
-                    let mut fec = fec.lock().unwrap();
-                    let n = fec.encode_data(codec_pkt, fec_buf, false);
-                    &fec_buf[..n]
-                }
-                None => codec_pkt,
+        let send_buf: &[u8] = match self.fec.as_mut() {
+            Some(fec) => {
+                let n = fec.encode_data(codec_pkt, fec_buf, false);
+                &fec_buf[..n]
             }
+            None => codec_pkt,
         };
         self.utp_write.send(send_buf).await
     }
@@ -508,8 +547,8 @@ mod tests {
     use crate::delivery::frame::FrameMode;
     use crate::metrics::{MetricsEvent, MetricsObserver, MetricsTerminationCause};
     use crate::traffic_shaping::recovery::liveness::PeerLiveness;
+    use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
-    use crate::traffic_shaping::redundancy::retransmission_armor::RetransmissionArmorConfig;
     use crate::transmission::connection::new_connection_with_watchdog_tuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
@@ -622,7 +661,7 @@ mod tests {
         let (shared, write_half, _read_half, _reaper) =
             new_connection_with_watchdog_tuning(layer, None, watchdog);
         let now = Instant::now();
-        let mut reliable = shared.reliable_layer.lock().unwrap();
+        let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
         reliable.send_data_buf(b"x", now).unwrap();
         let mut packet = vec![0; crate::udp::NO_FEC_MSS];
         assert!(reliable.send_data_pkt(&mut packet, now).is_some());

@@ -6,7 +6,7 @@ use tokio::task::{JoinError, JoinSet};
 use super::stream::{ConnReader, ConnWriter};
 
 use crate::metrics::{MetricsEvent, MetricsSendDriverWake, MetricsTerminationCause};
-use crate::transmission::ack_feedback::schedule::AckSchedule;
+use crate::transmission::ack_feedback::AckSchedule;
 
 use crate::transmission::{
     connection::{Connection, new_connection, new_connection_with_watchdog_tuning},
@@ -75,18 +75,10 @@ type SocketParts = (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper);
 /// which spawns the write/read driver tasks; the test facade holds the same
 /// composition to poke the write/read halves directly without spawning them.
 pub(crate) struct TransmissionLayer {
-    pub(crate) shared: Arc<Connection>,
-    pub(crate) write_half: WriteHalf,
-    pub(crate) read_half: ReadHalf,
-    pub(crate) termination_reaper: TerminationReaper,
-}
-
-impl std::ops::Deref for TransmissionLayer {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
+    shared: Arc<Connection>,
+    write_half: WriteHalf,
+    read_half: ReadHalf,
+    termination_reaper: TerminationReaper,
 }
 
 impl TransmissionLayer {
@@ -125,6 +117,199 @@ impl TransmissionLayer {
         } = self;
         (shared, write_half, read_half, termination_reaper)
     }
+
+    #[cfg(test)]
+    pub(crate) fn shared_for_test(&self) -> &Arc<Connection> {
+        &self.shared
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_half_for_test(&self) -> &WriteHalf {
+        &self.write_half
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_half_mut_for_test(&mut self) -> &mut WriteHalf {
+        &mut self.write_half
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_half_for_test(&mut self) -> &mut ReadHalf {
+        &mut self.read_half
+    }
+
+    #[cfg(test)]
+    pub(crate) fn termination_reaper_for_test(&self) -> &TerminationReaper {
+        &self.termination_reaper
+    }
+}
+
+/// The send-driver task: runs send passes and waits for the next wake
+/// (resume signal, ACK schedule, pacing/protocol timer, kill, or shutdown).
+struct WriteDriver {
+    write_half: WriteHalf,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl WriteDriver {
+    async fn run(mut self) {
+        let mut send_bufs = SendBufs::new();
+        let kill_requested = self.write_half.kill_requested().clone();
+        loop {
+            let pass = match self.write_half.send_pass(&mut send_bufs).await {
+                Ok(pass) => pass,
+                Err(_) => return,
+            };
+            let next_wake = pass.wake;
+            loop {
+                let resume_send = self.write_half.resume_send().notified();
+                let ack_schedule_changed = self.write_half.ack_schedule_changed().notified();
+                tokio::pin!(ack_schedule_changed);
+                ack_schedule_changed.as_mut().enable();
+                let ack_deadline = match self.write_half.ack_schedule(Instant::now()) {
+                    AckSchedule::Idle => None,
+                    AckSchedule::At(deadline) => Some(deadline),
+                    AckSchedule::Due => break,
+                };
+                let timed_wake = match (next_wake, ack_deadline) {
+                    (crate::traffic_shaping::core::SendWake::Event, None) => None,
+                    (crate::traffic_shaping::core::SendWake::Event, Some(ack)) => {
+                        Some((ack, MetricsSendDriverWake::ProtocolTimer))
+                    }
+                    (crate::traffic_shaping::core::SendWake::Pacing(pacing), None) => {
+                        Some((pacing, MetricsSendDriverWake::PacingTimer))
+                    }
+                    (crate::traffic_shaping::core::SendWake::Pacing(pacing), Some(ack))
+                        if pacing <= ack =>
+                    {
+                        Some((pacing, MetricsSendDriverWake::PacingTimer))
+                    }
+                    (crate::traffic_shaping::core::SendWake::Pacing(_), Some(ack)) => {
+                        Some((ack, MetricsSendDriverWake::ProtocolTimer))
+                    }
+                    (crate::traffic_shaping::core::SendWake::Protocol(protocol), None) => {
+                        Some((protocol, MetricsSendDriverWake::ProtocolTimer))
+                    }
+                    (crate::traffic_shaping::core::SendWake::Protocol(protocol), Some(ack)) => {
+                        Some((protocol.min(ack), MetricsSendDriverWake::ProtocolTimer))
+                    }
+                };
+                let wake = match timed_wake {
+                    Some((deadline, timer_wake)) => {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(deadline.into()) => Some(timer_wake),
+                            () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
+                            () = &mut ack_schedule_changed => None,
+                            () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
+                            () = self.stop.cancelled() => return,
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
+                            () = &mut ack_schedule_changed => None,
+                            () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
+                            () = self.stop.cancelled() => return,
+                        }
+                    }
+                };
+                if let Some(wake) = wake {
+                    self.write_half.log(MetricsEvent::SendDriverWake(wake));
+                    break;
+                }
+                self.write_half.log(MetricsEvent::SendDriverWake(
+                    MetricsSendDriverWake::AckScheduleSignal,
+                ));
+            }
+        }
+    }
+}
+
+/// The read-driver task: drains the unreliable read transport and feeds the
+/// shared reliable layer, honouring the read-shutdown (application dropped
+/// the reader) and the session stop signal.
+struct ReadDriver {
+    shared: Arc<Connection>,
+    read_half: ReadHalf,
+    read_shutdown: tokio_util::sync::CancellationToken,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+impl ReadDriver {
+    async fn run(mut self) {
+        let mut recv_bufs = RecvBufs::new();
+        let mut read_closed = self.read_shutdown.is_cancelled();
+        loop {
+            let recv_result = if read_closed {
+                tokio::select! {
+                    biased;
+                    () = self.stop.cancelled() => return,
+                    result = self.read_half.recv_pkts(&mut recv_bufs) => result,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = self.stop.cancelled() => return,
+                    () = self.read_shutdown.cancelled() => { read_closed = true; continue; }
+                    result = self.read_half.recv_pkts(&mut recv_bufs) => result,
+                }
+            };
+            let recv_pkts = match recv_result {
+                Ok(recv_pkts) => recv_pkts,
+                Err((_e, SendKillPkt::No)) => {
+                    return;
+                }
+            };
+            if read_closed && 0 < recv_pkts.num_payload_segments {
+                self.shared
+                    .request_kill_and_abort(MetricsTerminationCause::UnreadPayloadAfterReadClose);
+                return;
+            }
+        }
+    }
+}
+
+/// The session supervisor: owns the driver JoinSet and the reaper; on
+/// shutdown it stops the drivers, then joins every non-cancelled completion
+/// before the session handle resolves.
+struct SessionSupervisor {
+    shared: Arc<Connection>,
+    termination_reaper: TerminationReaper,
+    read_shutdown: tokio_util::sync::CancellationToken,
+    write_shutdown: tokio_util::sync::CancellationToken,
+    stop_drivers: tokio_util::sync::CancellationToken,
+    drivers: JoinSet<()>,
+}
+
+impl SessionSupervisor {
+    async fn run(self) {
+        let Self {
+            shared,
+            termination_reaper,
+            read_shutdown,
+            write_shutdown,
+            stop_drivers,
+            mut drivers,
+        } = self;
+        let first_exit = 'session: {
+            tokio::select! {
+                () = write_shutdown.cancelled() => shared.send_fin_buf(),
+                () = termination_reaper.ready() => break 'session None,
+                result = next_driver_exit(&mut drivers) => break 'session Some(result),
+            }
+            tokio::select! {
+                () = read_shutdown.cancelled() => (),
+                () = termination_reaper.ready() => break 'session None,
+                result = next_driver_exit(&mut drivers) => break 'session Some(result),
+            }
+            tokio::select! {
+                () = termination_reaper.ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained()) => break 'session None,
+                result = next_driver_exit(&mut drivers) => break 'session Some(result),
+            }
+        };
+        stop_drivers.cancel();
+        join_drivers(drivers, first_exit, &shared).await
+    }
 }
 
 fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHandle) {
@@ -133,157 +318,37 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
     let write_shutdown = tokio_util::sync::CancellationToken::new();
     let stop_drivers = tokio_util::sync::CancellationToken::new();
     let mut drivers = JoinSet::new();
-    drivers.spawn({
-        let stop_drivers = stop_drivers.clone();
-        let mut write_half = write_half;
-        async move {
-            let mut send_bufs = SendBufs::new();
-            let kill_requested = write_half.kill_requested().clone();
-            loop {
-                let pass = match write_half.send_pass(&mut send_bufs).await {
-                    Ok(pass) => pass,
-                    Err(_) => return,
-                };
-                let next_wake = pass.wake;
-                loop {
-                    let resume_send = write_half.resume_send().notified();
-                    let ack_schedule_changed = write_half.ack_schedule_changed().notified();
-                    tokio::pin!(ack_schedule_changed);
-                    ack_schedule_changed.as_mut().enable();
-                    let ack_deadline = match write_half.ack_schedule(Instant::now()) {
-                        AckSchedule::Idle => None,
-                        AckSchedule::At(deadline) => Some(deadline),
-                        AckSchedule::Due => break,
-                    };
-                    let timed_wake = match (next_wake, ack_deadline) {
-                        (crate::traffic_shaping::core::SendWake::Event, None) => None,
-                        (crate::traffic_shaping::core::SendWake::Event, Some(ack)) => {
-                            Some((ack, MetricsSendDriverWake::ProtocolTimer))
-                        }
-                        (crate::traffic_shaping::core::SendWake::Pacing(pacing), None) => {
-                            Some((pacing, MetricsSendDriverWake::PacingTimer))
-                        }
-                        (crate::traffic_shaping::core::SendWake::Pacing(pacing), Some(ack))
-                            if pacing <= ack =>
-                        {
-                            Some((pacing, MetricsSendDriverWake::PacingTimer))
-                        }
-                        (crate::traffic_shaping::core::SendWake::Pacing(_), Some(ack)) => {
-                            Some((ack, MetricsSendDriverWake::ProtocolTimer))
-                        }
-                        (crate::traffic_shaping::core::SendWake::Protocol(protocol), None) => {
-                            Some((protocol, MetricsSendDriverWake::ProtocolTimer))
-                        }
-                        (crate::traffic_shaping::core::SendWake::Protocol(protocol), Some(ack)) => {
-                            Some((protocol.min(ack), MetricsSendDriverWake::ProtocolTimer))
-                        }
-                    };
-                    let wake = match timed_wake {
-                        Some((deadline, timer_wake)) => {
-                            tokio::select! {
-                                () = tokio::time::sleep_until(deadline.into()) => Some(timer_wake),
-                                () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
-                                () = &mut ack_schedule_changed => None,
-                                () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
-                                () = stop_drivers.cancelled() => return,
-                            }
-                        }
-                        None => {
-                            tokio::select! {
-                                () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
-                                () = &mut ack_schedule_changed => None,
-                                () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
-                                () = stop_drivers.cancelled() => return,
-                            }
-                        }
-                    };
-                    if let Some(wake) = wake {
-                        write_half.log(MetricsEvent::SendDriverWake(wake));
-                        break;
-                    }
-                    write_half.log(MetricsEvent::SendDriverWake(
-                        MetricsSendDriverWake::AckScheduleSignal,
-                    ));
-                }
-            }
+    drivers.spawn(
+        WriteDriver {
+            write_half,
+            stop: stop_drivers.clone(),
         }
-    });
-    drivers.spawn({
-        let read_shutdown = read_shutdown.clone();
-        let stop_drivers = stop_drivers.clone();
-        let shared = Arc::clone(&shared);
-        let mut read_half = read_half;
-        async move {
-            let mut recv_bufs = RecvBufs::new();
-            let mut read_closed = read_shutdown.is_cancelled();
-            loop {
-                let recv_result = if read_closed {
-                    tokio::select! {
-                        biased;
-                        () = stop_drivers.cancelled() => return,
-                        result = read_half.recv_pkts(&mut recv_bufs) => result,
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        () = stop_drivers.cancelled() => return,
-                        () = read_shutdown.cancelled() => { read_closed = true; continue; }
-                        result = read_half.recv_pkts(&mut recv_bufs) => result,
-                    }
-                };
-                let recv_pkts = match recv_result {
-                    Ok(recv_pkts) => recv_pkts,
-                    Err((_e, SendKillPkt::No)) => {
-                        return;
-                    }
-                };
-                if read_closed && 0 < recv_pkts.num_payload_segments {
-                    shared.request_kill_and_abort(
-                        MetricsTerminationCause::UnreadPayloadAfterReadClose,
-                    );
-                    return;
-                }
-            }
+        .run(),
+    );
+    drivers.spawn(
+        ReadDriver {
+            shared: Arc::clone(&shared),
+            read_half,
+            read_shutdown: read_shutdown.clone(),
+            stop: stop_drivers.clone(),
         }
-    });
+        .run(),
+    );
     let mut tasks = JoinSet::new();
-    tasks.spawn({
-        let read_shutdown = read_shutdown.clone();
-        let write_shutdown = write_shutdown.clone();
-        let stop_drivers = stop_drivers.clone();
-        let shared = Arc::clone(&shared);
-        async move {
-            let mut drivers = drivers;
-            let first_exit = 'session: {
-                tokio::select! {
-                    () = write_shutdown.cancelled() => shared.send_fin_buf(),
-                    () = termination_reaper.ready() => break 'session None,
-                    result = next_driver_exit(&mut drivers) => break 'session Some(result),
-                }
-                tokio::select! {
-                    () = read_shutdown.cancelled() => (),
-                    () = termination_reaper.ready() => break 'session None,
-                    result = next_driver_exit(&mut drivers) => break 'session Some(result),
-                }
-                tokio::select! {
-                    () = termination_reaper.ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained()) => break 'session None,
-                    result = next_driver_exit(&mut drivers) => break 'session Some(result),
-                }
-            };
-            stop_drivers.cancel();
-            join_drivers(drivers, first_exit, &shared).await
+    tasks.spawn(
+        SessionSupervisor {
+            shared: Arc::clone(&shared),
+            termination_reaper,
+            read_shutdown: read_shutdown.clone(),
+            write_shutdown: write_shutdown.clone(),
+            stop_drivers,
+            drivers,
         }
-    });
+        .run(),
+    );
     let supervisor = SessionHandle { tasks };
-    let read = ConnReader {
-        transmission_layer: Arc::clone(&shared),
-        frame_buf: Vec::new(),
-        _shutdown_guard: read_shutdown.drop_guard(),
-    };
-    let write = ConnWriter {
-        transmission_layer: Arc::clone(&shared),
-        _shutdown_guard: write_shutdown.drop_guard(),
-    };
+    let read = ConnReader::new(Arc::clone(&shared), read_shutdown.drop_guard());
+    let write = ConnWriter::new(Arc::clone(&shared), write_shutdown.drop_guard());
     (read, write, supervisor)
 }
 
@@ -297,7 +362,7 @@ async fn join_drivers(
     shared: &Connection,
 ) {
     let unexpected_clean_exit =
-        first_exit.as_ref().is_some_and(Result::is_ok) && !shared.termination.has_error();
+        first_exit.as_ref().is_some_and(Result::is_ok) && !shared.has_error();
     let mut result = first_exit;
     loop {
         if let Some(result) = result.take() {
@@ -585,7 +650,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            a_read.transmission_layer.recv_eof().cancelled(),
+            a_read.recv_eof_for_test().cancelled(),
         )
         .await
         .expect("consuming the final payload did not publish receive EOF");
@@ -653,12 +718,12 @@ mod tests {
         drop(b_write);
         tokio::time::timeout(
             Duration::from_secs(2),
-            a_read.transmission_layer.recv_fin().cancelled(),
+            a_read.recv_fin_for_test().cancelled(),
         )
         .await
         .expect("peer FIN was not published");
         assert!(
-            !a_read.transmission_layer.recv_eof().is_cancelled(),
+            !a_read.recv_eof_for_test().is_cancelled(),
             "unread payload must prevent application EOF"
         );
         drop(a_write);

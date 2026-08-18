@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use super::pages::{AckPage, AckPagePlan, MAX_NUM_ACK};
+use super::AckPage;
+use super::pages::{AckPagePlan, MAX_NUM_ACK};
 use super::schedule::{ACK_FLUSH_COUNT, AckSchedule, schedule};
 use crate::transmission::ts_echo::TsEcho;
 

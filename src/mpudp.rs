@@ -235,7 +235,7 @@ mod tests {
         // Prove zero in-flight packets and that the receipt has been acked by
         // the peer's reliable layer: `no_data_to_send` waits until the send
         // buffer is empty AND every sent packet has been acked.
-        connected.write.transmission_layer.no_data_to_send().await?;
+        connected.write.all_sent_data_acked().await?;
         // Await the server's application-level receipt confirmation separately.
         receipt_seen.notified().await;
         // Release the server's session and join it; the set must be empty.

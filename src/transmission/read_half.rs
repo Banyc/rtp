@@ -8,33 +8,45 @@ use super::transmission_layer::{
 use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsSendDriverResumeSource, MetricsTerminationCause};
+use crate::traffic_shaping::redundancy::fec::FecDecoderState;
 use crate::{
     ack::AckBlocks,
     codec::decode,
     traffic_shaping::control::handshake::{PostOpenVerdict, is_post_open_candidate},
 };
 
+/// The read-actor half: owns the unreliable read transport, the FEC decoder
+/// state (sole mutator), and the recent-echo RTT dedup window.  All shared
+/// state lives behind the [`Connection`] facades, so no mutex guard survives
+/// an await.
 pub struct ReadHalf {
-    pub(crate) utp_read: Box<dyn UnreliableRead>,
-    pub(crate) recent_echoes: RecentEchoes,
-    pub(crate) shared: Arc<Connection>,
-}
-
-impl std::ops::Deref for ReadHalf {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
+    utp_read: Box<dyn UnreliableRead>,
+    fec: Option<FecDecoderState>,
+    recent_echoes: RecentEchoes,
+    shared: Arc<Connection>,
 }
 
 impl ReadHalf {
+    pub(super) fn new(
+        utp_read: Box<dyn UnreliableRead>,
+        fec: Option<FecDecoderState>,
+        shared: Arc<Connection>,
+    ) -> Self {
+        Self {
+            utp_read,
+            fec,
+            recent_echoes: RecentEchoes::new(),
+            shared,
+        }
+    }
+
     pub async fn recv_pkts(
         &mut self,
         bufs: &mut RecvBufs,
     ) -> Result<RecvPkts, (IoErr, SendKillPkt)> {
         let Self {
             utp_read,
+            fec,
             recent_echoes,
             shared,
         } = self;
@@ -55,10 +67,7 @@ impl ReadHalf {
         // recv → try_recv switch and the resume/notify control flow below.
         let mut has_ack_to_peer = false;
         for _ in 0..MAX_NUM_ACK {
-            shared
-                .termination
-                .check_error()
-                .map_err(|e| (e, SendKillPkt::No))?;
+            shared.check_error().map_err(|e| (e, SendKillPkt::No))?;
             let res = {
                 match has_ack_to_peer {
                     // No ACKable packet seen yet: block on the next datagram.
@@ -100,9 +109,8 @@ impl ReadHalf {
             }
             bufs.codec_pkts.clear();
             let mut orig_pkt = None;
-            match shared.fec.as_ref() {
+            match fec.as_mut() {
                 Some(fec) => {
-                    let mut fec = fec.lock().unwrap();
                     if let Some(payload) = fec.decode(read_pkt) {
                         bufs.codec_pkts.push(payload);
                     }
@@ -117,7 +125,7 @@ impl ReadHalf {
             let mut end_of_acks = false;
             for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
                 bufs.ack_from_peer.clear();
-                let data = match decode(pkt, &mut bufs.ack_from_peer, shared.session_tag) {
+                let data = match decode(pkt, &mut bufs.ack_from_peer, shared.session_tag()) {
                     Ok(x) => x,
                     Err(e) => {
                         if FEC_DEBUG {
@@ -144,46 +152,46 @@ impl ReadHalf {
                     .as_ref()
                     .is_some_and(|data| data.buf_range.is_empty() && data.frame_len.is_none());
                 let ack_next = data.ack_next;
-                let (disposition, recv_eof, gentle_mode_exit) = {
-                    let mut reliable_layer = shared.reliable_layer.lock().unwrap();
-                    // An ACK event exists only when the datagram carried an
-                    // ACK command (ack_next is Some); a data-only packet must
-                    // not fabricate one.
-                    let gentle_mode_exit = if let Some(ack_next) = ack_next {
-                        reliable_layer
-                            .recv_ack_pkt(AckBlocks::new(ack_next, &bufs.ack_from_peer), now);
-                        if FEC_DEBUG {
-                            eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
-                        }
-                        reliable_layer.take_gentle_mode_exit()
-                    } else {
-                        None
-                    };
-                    let disposition = match &data.data {
-                        None => None,
-                        Some(data) => {
-                            let disposition = reliable_layer.recv_data_pkt(
-                                data.seq,
-                                data.frame_len,
-                                &pkt[data.buf_range.clone()],
-                            );
+                let (disposition, recv_eof, gentle_mode_exit) =
+                    shared.with_reliable_layer_mut(|reliable_layer| {
+                        // An ACK event exists only when the datagram carried an
+                        // ACK command (ack_next is Some); a data-only packet must
+                        // not fabricate one.
+                        let gentle_mode_exit = if let Some(ack_next) = ack_next {
+                            reliable_layer
+                                .recv_ack_pkt(AckBlocks::new(ack_next, &bufs.ack_from_peer), now);
                             if FEC_DEBUG {
-                                eprintln!(
-                                    "recv_data_pkt seq={} empty={} ack={}",
-                                    data.seq,
-                                    data.buf_range.is_empty(),
-                                    disposition.should_ack()
-                                );
+                                eprintln!("recv_ack_pkt: balls={:?}", bufs.ack_from_peer);
                             }
-                            Some(disposition)
-                        }
-                    };
-                    (
-                        disposition,
-                        reliable_layer.recv_eof_ready(),
-                        gentle_mode_exit,
-                    )
-                };
+                            reliable_layer.take_gentle_mode_exit()
+                        } else {
+                            None
+                        };
+                        let disposition = match &data.data {
+                            None => None,
+                            Some(data) => {
+                                let disposition = reliable_layer.recv_data_pkt(
+                                    data.seq,
+                                    data.frame_len,
+                                    &pkt[data.buf_range.clone()],
+                                );
+                                if FEC_DEBUG {
+                                    eprintln!(
+                                        "recv_data_pkt seq={} empty={} ack={}",
+                                        data.seq,
+                                        data.buf_range.is_empty(),
+                                        disposition.should_ack()
+                                    );
+                                }
+                                Some(disposition)
+                            }
+                        };
+                        (
+                            disposition,
+                            reliable_layer.recv_eof_ready(),
+                            gentle_mode_exit,
+                        )
+                    });
                 if let Some(cause) = gentle_mode_exit {
                     shared.log_at(crate::metrics::MetricsEvent::GentleModeExit(cause), now);
                 }
@@ -198,8 +206,8 @@ impl ReadHalf {
                 received_batch.record_eof(recv_eof);
                 recv_pkts.num_ack_segments += 1;
                 if ack_next.is_some() {
-                    shared.signals.sent_pkt_acked.notify_waiters();
-                    shared.signals.session_outbound_progress.notify_one();
+                    shared.publish_packet_acknowledged();
+                    shared.notify_session_outbound_progress();
                     // ACK processing may have freed send-window capacity, so
                     // wake the writer directly instead of letting it wait for
                     // a timer or the next application push.
@@ -228,11 +236,10 @@ impl ReadHalf {
         }
         shared.commit_received_batch(received_batch);
         if !has_ack_to_peer {
-            let should_resume_send = {
-                let reliable_layer = shared.reliable_layer.lock().unwrap();
+            let should_resume_send = shared.with_reliable_layer(|reliable_layer| {
                 !reliable_layer.is_send_buf_empty()
                     && reliable_layer.pkt_send_space().accepts_new_pkt()
-            };
+            });
             if should_resume_send {
                 shared
                     .request_send_driver_resume(MetricsSendDriverResumeSource::ReceiveOpportunity);
@@ -240,7 +247,7 @@ impl ReadHalf {
             return Ok(recv_pkts);
         }
         if has_ack_to_peer {
-            shared.signals.recv_data_pkt.notify_waiters();
+            shared.publish_data_received();
         }
         Ok(recv_pkts)
     }

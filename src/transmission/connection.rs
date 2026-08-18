@@ -1,32 +1,25 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use super::ack_feedback::AckFeedback;
-use super::ack_feedback::state::ReceivedAckWork;
+use super::ack_feedback::{AckFeedback, ReceivedAckWork};
 use super::coordination::Signals;
+use super::observability::ConnectionObservability;
+use super::post_open_recovery::PostOpenRecovery;
 use super::read_half::ReadHalf;
 use super::termination::{KillPolicy, TerminationPresser, TerminationReaper, new_termination};
-use super::transmission_layer::{
-    LogConfig, MetricsRow, PRINT_DEBUG_MSGS, ReliableLayerLogger, UnreliableLayer,
-};
-use super::ts_echo::RecentEchoes;
+use super::transmission_layer::{LogConfig, PRINT_DEBUG_MSGS, UnreliableLayer};
 use super::watchdog_tuning::WatchdogTuning;
 use super::write_half::WriteHalf;
 
 use crate::io_err::IoErr;
 use crate::metrics::{
-    MetricsEvent, MetricsInterest, MetricsObservation, MetricsObserver,
-    MetricsSendDriverResumeSource, MetricsTermination, MetricsTerminationCause, SCHEMA_VERSION,
+    MetricsEvent, MetricsInterest, MetricsSendDriverResumeSource, MetricsTermination,
+    MetricsTerminationCause,
 };
 use crate::reliable::reliable_layer::ReliableLayer;
-use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenHandshake, PostOpenVerdict};
-use crate::traffic_shaping::core::{SendPacer, SendWake};
-use crate::traffic_shaping::redundancy::{
-    fec::FecState, retransmission_armor::RetransmissionArmor,
-};
+use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenVerdict};
+use crate::traffic_shaping::core::SendWake;
+use crate::traffic_shaping::redundancy::fec::FecStatsHandle;
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceivedBatch {
@@ -53,90 +46,34 @@ impl ReceivedBatch {
     pub(crate) fn record_eof(&mut self, recv_eof: bool) {
         self.recv_eof |= recv_eof;
     }
+
+    /// Whether this batch delivered the final received payload (application
+    /// EOF is due once the read driver commits the batch).
+    pub(crate) fn recv_eof(&self) -> bool {
+        self.recv_eof
+    }
 }
 
 #[derive(Debug)]
 pub struct Connection {
-    pub(crate) reliable_layer: Mutex<ReliableLayer>,
-    pub(crate) ack_feedback: AckFeedback,
-    post_open_handshake: Option<Mutex<PostOpenHandshake>>,
-    post_open_handshake_active: AtomicBool,
+    reliable_layer: Mutex<ReliableLayer>,
+    ack_feedback: Arc<AckFeedback>,
+    post_open_recovery: PostOpenRecovery,
     /// Session tag authenticating codec control-plane datagrams; `None` on
     /// connections opened without the handshake.
-    pub(crate) session_tag: Option<u64>,
-    pub(crate) fec: Option<Mutex<FecState>>,
-    pub(crate) send_rate_limiter: Arc<Mutex<SendPacer>>,
-    pub(crate) termination: TerminationPresser,
-    pub(crate) signals: Signals,
-    pub(crate) retransmission_armor: RetransmissionArmor,
-    pub(crate) fec_instream_flush: bool,
-    pub(crate) instream_group_fec_enabled: bool,
-    pub(crate) clock_epoch: Instant,
-    pub(crate) reliable_layer_logger: Option<ReliableLayerLogger>,
-    metrics_observer: Option<MetricsObserver>,
-    metrics_event_index: AtomicU64,
+    session_tag: Option<u64>,
+    fec_stats: Option<FecStatsHandle>,
+    termination: TerminationPresser,
+    signals: Signals,
+    clock_epoch: Instant,
+    observability: ConnectionObservability,
 }
 
 pub fn new_connection(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
-    let now = Instant::now();
-    let frame_delivery = unreliable_layer.frame_delivery;
-    let metrics_observer = unreliable_layer.metrics_observer.clone();
-    let (mut reliable_layer, send_rate_limiter) = ReliableLayer::new_at(
-        unreliable_layer.mss,
-        frame_delivery,
-        now,
-        unreliable_layer.initial_sequences,
-    );
-    if let Some(initial_rtt) = unreliable_layer.initial_rtt {
-        reliable_layer.sample_rtt(initial_rtt, now);
-    }
-    // Controller interval accounting is opt-in: it runs only when a metrics
-    // observer or a reliable-layer logger exists, so a bare connection pays
-    // exactly one predictable branch per controller decision point.
-    reliable_layer.congestion_metrics_enabled = metrics_observer.is_some() || log_config.is_some();
-    let reliable_layer_logger = log_config.as_ref().map(|c| {
-        let file = std::fs::File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&c.reliable_layer_log_path)
-            .expect("open log file");
-        Mutex::new(csv::WriterBuilder::new().from_writer(file))
-    });
-    let (termination, termination_writer, termination_reaper) = new_termination();
-    let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
-    let shared = Arc::new(Connection {
-        reliable_layer: Mutex::new(reliable_layer),
-        ack_feedback: AckFeedback::new(),
-        post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
-        post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
-        session_tag: unreliable_layer.session_tag,
-        fec: unreliable_layer.fec.map(Mutex::new),
-        send_rate_limiter,
-        termination,
-        signals: Signals::new(),
-        retransmission_armor: RetransmissionArmor::new(unreliable_layer.retransmission_armor),
-        fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
-        instream_group_fec_enabled: unreliable_layer.instream_group_fec,
-        clock_epoch: now,
-        reliable_layer_logger,
-        metrics_observer,
-        metrics_event_index: AtomicU64::new(0),
-    });
-    let write_half = WriteHalf {
-        utp_write: unreliable_layer.utp_write,
-        shared: Arc::clone(&shared),
-        termination_writer,
-    };
-    let read_half = ReadHalf {
-        utp_read: unreliable_layer.utp_read,
-        recent_echoes: RecentEchoes::new(),
-        shared: Arc::clone(&shared),
-    };
-    (shared, write_half, read_half, termination_reaper)
+    new_connection_inner(unreliable_layer, log_config, None)
 }
 
 pub fn new_connection_with_watchdog_tuning(
@@ -144,97 +81,167 @@ pub fn new_connection_with_watchdog_tuning(
     log_config: Option<LogConfig>,
     tuning: WatchdogTuning,
 ) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
+    new_connection_inner(unreliable_layer, log_config, Some(tuning))
+}
+
+fn new_connection_inner(
+    mut unreliable_layer: UnreliableLayer,
+    log_config: Option<LogConfig>,
+    watchdog_tuning: Option<WatchdogTuning>,
+) -> (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper) {
     let now = Instant::now();
+    let (fec_encoder, fec_decoder, fec_stats) = match unreliable_layer.fec.take() {
+        Some(fec) => {
+            let (encoder, decoder, stats) = fec.into_actor_parts();
+            (Some(encoder), Some(decoder), Some(stats))
+        }
+        None => (None, None, None),
+    };
     let frame_delivery = unreliable_layer.frame_delivery;
     let metrics_observer = unreliable_layer.metrics_observer.clone();
-    let (mut reliable_layer, send_rate_limiter) = ReliableLayer::new_with_watchdog_tuning_at(
-        unreliable_layer.mss,
-        frame_delivery,
-        now,
-        unreliable_layer.initial_sequences,
-        tuning,
-    );
+    let (mut reliable_layer, send_rate_limiter) = match watchdog_tuning {
+        Some(tuning) => ReliableLayer::new_with_watchdog_tuning_at(
+            unreliable_layer.mss,
+            frame_delivery,
+            now,
+            unreliable_layer.initial_sequences,
+            tuning,
+        ),
+        None => ReliableLayer::new_at(
+            unreliable_layer.mss,
+            frame_delivery,
+            now,
+            unreliable_layer.initial_sequences,
+        ),
+    };
     if let Some(initial_rtt) = unreliable_layer.initial_rtt {
         reliable_layer.sample_rtt(initial_rtt, now);
     }
-    // Controller interval accounting is opt-in: it runs only when a metrics
-    // observer or a reliable-layer logger exists, so a bare connection pays
-    // exactly one predictable branch per controller decision point.
-    reliable_layer.congestion_metrics_enabled = metrics_observer.is_some() || log_config.is_some();
-    let reliable_layer_logger = log_config.as_ref().map(|c| {
-        let file = std::fs::File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&c.reliable_layer_log_path)
-            .expect("open log file");
-        Mutex::new(csv::WriterBuilder::new().from_writer(file))
-    });
+    let observability = ConnectionObservability::new(now, log_config, metrics_observer);
+    reliable_layer.set_congestion_metrics_enabled(observability.enabled());
     let (termination, termination_writer, termination_reaper) = new_termination();
-    let post_open_handshake_active = unreliable_layer.post_open_handshake.is_some();
+    let post_open_recovery = PostOpenRecovery::new(unreliable_layer.post_open_handshake);
+    let ack_feedback = Arc::new(AckFeedback::new());
     let shared = Arc::new(Connection {
         reliable_layer: Mutex::new(reliable_layer),
-        ack_feedback: AckFeedback::new(),
-        post_open_handshake: unreliable_layer.post_open_handshake.map(Mutex::new),
-        post_open_handshake_active: AtomicBool::new(post_open_handshake_active),
+        ack_feedback: Arc::clone(&ack_feedback),
+        post_open_recovery,
         session_tag: unreliable_layer.session_tag,
-        fec: unreliable_layer.fec.map(Mutex::new),
-        send_rate_limiter,
+        fec_stats,
         termination,
         signals: Signals::new(),
-        retransmission_armor: RetransmissionArmor::new(unreliable_layer.retransmission_armor),
-        fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
-        instream_group_fec_enabled: unreliable_layer.instream_group_fec,
         clock_epoch: now,
-        reliable_layer_logger,
-        metrics_observer,
-        metrics_event_index: AtomicU64::new(0),
+        observability,
     });
-    let write_half = WriteHalf {
-        utp_write: unreliable_layer.utp_write,
-        shared: Arc::clone(&shared),
+    let write_half = WriteHalf::new(
+        unreliable_layer.utp_write,
+        fec_encoder,
+        unreliable_layer.fec_tuning.instream_flush,
+        unreliable_layer.instream_group_fec,
+        unreliable_layer.retransmission_armor,
+        send_rate_limiter,
+        ack_feedback,
+        Arc::clone(&shared),
         termination_writer,
-    };
-    let read_half = ReadHalf {
-        utp_read: unreliable_layer.utp_read,
-        recent_echoes: RecentEchoes::new(),
-        shared: Arc::clone(&shared),
-    };
+    );
+    let read_half = ReadHalf::new(unreliable_layer.utp_read, fec_decoder, Arc::clone(&shared));
     (shared, write_half, read_half, termination_reaper)
 }
 
 impl Connection {
     pub fn resume_send(&self) -> &tokio::sync::Notify {
-        &self.signals.resume_send
-    }
-    pub(crate) fn ack_schedule_changed(&self) -> &tokio::sync::Notify {
-        self.ack_feedback.schedule_changed()
-    }
-    pub(crate) fn request_send_driver_resume(&self, source: MetricsSendDriverResumeSource) {
-        self.log(MetricsEvent::SendDriverResumeRequest(source));
-        self.signals.resume_send.notify_one();
+        self.signals.resume_send()
     }
 
-    pub fn reliable_layer(&self) -> &Mutex<ReliableLayer> {
+    /// Run `use_layer` against the reliable layer under its lock; the guard never
+    /// escapes the closure, so it cannot survive an await.
+    pub(super) fn with_reliable_layer<R>(&self, use_layer: impl FnOnce(&ReliableLayer) -> R) -> R {
+        use_layer(&self.reliable_layer.lock().unwrap())
+    }
+
+    /// Run `use_layer` against the reliable layer under its lock; the guard never
+    /// escapes the closure, so it cannot survive an await.
+    pub(super) fn with_reliable_layer_mut<R>(
+        &self,
+        use_layer: impl FnOnce(&mut ReliableLayer) -> R,
+    ) -> R {
+        use_layer(&mut self.reliable_layer.lock().unwrap())
+    }
+
+    pub(crate) fn request_send_driver_resume(&self, source: MetricsSendDriverResumeSource) {
+        self.log(MetricsEvent::SendDriverResumeRequest(source));
+        self.signals.resume_send().notify_one();
+    }
+
+    /// ACK-flush owner shared between the read half (recording) and the write
+    /// half (claims).  Test-only accessor; production flows stay behind the
+    /// Connection facades.
+    #[cfg(test)]
+    pub(super) fn ack_feedback_for_test(&self) -> &AckFeedback {
+        &self.ack_feedback
+    }
+
+    pub(crate) fn publish_data_sent(&self) {
+        self.signals.sent_data_pkt().notify_waiters();
+    }
+
+    pub(crate) fn publish_data_received(&self) {
+        self.signals.recv_data_pkt().notify_waiters();
+    }
+
+    pub(crate) fn publish_packet_acknowledged(&self) {
+        self.signals.sent_pkt_acked().notify_waiters();
+    }
+
+    pub(crate) fn notify_session_outbound_progress(&self) {
+        self.signals.session_outbound_progress().notify_one();
+    }
+
+    pub(crate) fn frame_delivery_enabled(&self) -> bool {
+        self.reliable_layer.lock().unwrap().frame_delivery_enabled()
+    }
+
+    pub(crate) fn is_send_buf_empty(&self) -> bool {
+        self.reliable_layer.lock().unwrap().is_send_buf_empty()
+    }
+
+    pub(crate) fn write_unit_capacity(&self) -> usize {
+        self.reliable_layer.lock().unwrap().write_unit_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_data_buf_capacity_for_test(&self) -> usize {
+        self.reliable_layer.lock().unwrap().send_data_buf_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reliable_layer_for_test(&self) -> &Mutex<ReliableLayer> {
         &self.reliable_layer
     }
 
-    pub(crate) fn retransmission_armor(&self) -> &RetransmissionArmor {
-        &self.retransmission_armor
-    }
-
-    pub fn instream_group_fec_enabled(&self) -> bool {
-        self.instream_group_fec_enabled
-    }
-
     pub fn fec_recovered_symbols(&self) -> Option<usize> {
-        self.fec
+        self.fec_stats
             .as_ref()
-            .map(|fec| fec.lock().unwrap().recovered_symbols())
+            .map(FecStatsHandle::recovered_symbols)
     }
 
     pub fn check_error(&self) -> Result<(), IoErr> {
         self.termination.check_error()
+    }
+
+    pub(crate) fn has_error(&self) -> bool {
+        self.termination.has_error()
+    }
+
+    /// Render the first terminal error with its proactive-termination
+    /// context (when it was the trigger).
+    pub(crate) fn io_error(&self, error: IoErr) -> std::io::Error {
+        self.termination.io_error(error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_is_cancelled(&self) -> bool {
+        self.termination.terminal().is_cancelled()
     }
 
     pub(crate) fn request_kill_and_abort(&self, cause: MetricsTerminationCause) {
@@ -287,7 +294,7 @@ impl Connection {
 
     async fn send_bytes(&self, data: &[u8]) -> Result<usize, IoErr> {
         let now = Instant::now();
-        let sent_data_pkt = self.signals.sent_data_pkt.notified();
+        let sent_data_pkt = self.signals.sent_data_pkt().notified();
         tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
@@ -318,14 +325,14 @@ impl Connection {
                 }
             }
             self.termination.check_error()?;
-            sent_data_pkt.set(self.signals.sent_data_pkt.notified());
+            sent_data_pkt.set(self.signals.sent_data_pkt().notified());
         }
     }
 
     pub async fn send_frame(&self, frame: &[u8]) -> Result<usize, IoErr> {
         let now = Instant::now();
         let frame_len = frame.len();
-        let sent_data_pkt = self.signals.sent_data_pkt.notified();
+        let sent_data_pkt = self.signals.sent_data_pkt().notified();
         tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
@@ -360,7 +367,7 @@ impl Connection {
                         }
                     }
                     self.termination.check_error()?;
-                    sent_data_pkt.set(self.signals.sent_data_pkt.notified());
+                    sent_data_pkt.set(self.signals.sent_data_pkt().notified());
                 }
                 Err(error) => return Err(error),
             }
@@ -373,12 +380,12 @@ impl Connection {
     }
 
     pub fn recv_fin(&self) -> &tokio_util::sync::CancellationToken {
-        &self.signals.recv_fin
+        self.signals.recv_fin()
     }
 
     #[cfg(test)]
     pub fn recv_eof(&self) -> &tokio_util::sync::CancellationToken {
-        &self.signals.recv_eof
+        self.signals.recv_eof()
     }
 
     pub(crate) fn session_tag(&self) -> Option<u64> {
@@ -390,41 +397,15 @@ impl Connection {
         datagram: &[u8],
         now: Instant,
     ) -> PostOpenVerdict {
-        if !self.post_open_handshake_active.load(Ordering::Acquire) {
-            return PostOpenVerdict::NotHandshake;
-        }
-        let Some(handshake) = &self.post_open_handshake else {
-            return PostOpenVerdict::NotHandshake;
-        };
-        let mut handshake = handshake.lock().unwrap();
-        let observation = handshake.observe(datagram, now);
-        if observation == PostOpenVerdict::Complete || handshake.expired(now) {
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
-        }
-        observation
+        self.post_open_recovery.observe(datagram, now)
     }
 
     pub(crate) fn claim_post_open_response(&self, now: Instant) -> Option<DueResponse> {
-        if !self.post_open_handshake_active.load(Ordering::Acquire) {
-            return None;
-        }
-        let handshake = self.post_open_handshake.as_ref()?;
-        let mut handshake = handshake.lock().unwrap();
-        let response = handshake.take_due_response(now);
-        if handshake.expired(now) {
-            self.post_open_handshake_active
-                .store(false, Ordering::Release);
-        }
-        response
+        self.post_open_recovery.claim_response(now)
     }
 
     pub(crate) fn retry_post_open_response(&self, now: Instant) {
-        if self.post_open_handshake_active.load(Ordering::Acquire)
-            && let Some(handshake) = &self.post_open_handshake
-        {
-            handshake.lock().unwrap().retry_response(now);
-        }
+        self.post_open_recovery.retry_response(now);
     }
 
     pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
@@ -437,18 +418,10 @@ impl Connection {
                 reliable_layer.next_pacing_deadline(now),
             )
         };
-        if self.post_open_handshake_active.load(Ordering::Acquire)
-            && let Some(handshake) = &self.post_open_handshake
-        {
-            let handshake = handshake.lock().unwrap();
-            if handshake.expired(now) {
-                self.post_open_handshake_active
-                    .store(false, Ordering::Release);
-            } else if let Some(handshake_deadline) = handshake.next_send_time(now) {
-                protocol_deadline = Some(protocol_deadline.map_or(handshake_deadline, |current| {
-                    current.min(handshake_deadline)
-                }));
-            }
+        if let Some(handshake_deadline) = self.post_open_recovery.next_send_time(now) {
+            protocol_deadline = Some(protocol_deadline.map_or(handshake_deadline, |current| {
+                current.min(handshake_deadline)
+            }));
         }
         SendWake::after_send_pass(now, pacing_deadline, protocol_deadline)
     }
@@ -459,7 +432,7 @@ impl Connection {
     }
 
     pub async fn no_data_to_send(&self) -> Result<(), IoErr> {
-        let mut sent_pkt_acked = self.signals.sent_pkt_acked.notified();
+        let mut sent_pkt_acked = self.signals.sent_pkt_acked().notified();
         loop {
             self.termination.check_error()?;
             if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
@@ -469,13 +442,13 @@ impl Connection {
                 () = sent_pkt_acked => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            sent_pkt_acked = self.signals.sent_pkt_acked.notified();
+            sent_pkt_acked = self.signals.sent_pkt_acked().notified();
         }
     }
 
     pub(crate) async fn session_outbound_drained(&self) -> Result<(), IoErr> {
         loop {
-            let progress = self.signals.session_outbound_progress.notified();
+            let progress = self.signals.session_outbound_progress().notified();
             self.termination.check_error()?;
             let reliable_drained = self.reliable_layer.lock().unwrap().is_no_data_to_send();
             let ack_drained = self.ack_feedback.is_drained();
@@ -490,7 +463,7 @@ impl Connection {
     }
 
     pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
-        let sent_data_pkt = self.signals.sent_data_pkt.notified();
+        let sent_data_pkt = self.signals.sent_data_pkt().notified();
         tokio::pin!(sent_data_pkt);
         loop {
             self.termination.check_error()?;
@@ -504,7 +477,7 @@ impl Connection {
                 () = &mut sent_data_pkt => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            sent_data_pkt.set(self.signals.sent_data_pkt.notified());
+            sent_data_pkt.set(self.signals.sent_data_pkt().notified());
         }
     }
 
@@ -525,17 +498,17 @@ impl Connection {
             ));
         }
         if batch.recv_fin {
-            self.signals.recv_fin.cancel();
+            self.signals.recv_fin().cancel();
         }
         self.publish_recv_eof(batch.recv_eof);
-        self.signals.session_outbound_progress.notify_one();
+        self.signals.session_outbound_progress().notify_one();
     }
 
     fn publish_recv_eof(&self, recv_eof: bool) {
-        if recv_eof && !self.signals.recv_eof.is_cancelled() {
-            self.signals.recv_eof.cancel();
-            if let Some(fec) = self.fec.as_ref() {
-                fec.lock().unwrap().debug_print_stats();
+        if recv_eof && !self.signals.recv_eof().is_cancelled() {
+            self.signals.recv_eof().cancel();
+            if let Some(fec_stats) = self.fec_stats.as_ref() {
+                fec_stats.debug_print();
             }
         }
     }
@@ -547,10 +520,10 @@ impl Connection {
         if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        let mut recv_data_pkt = self.signals.recv_data_pkt.notified();
+        let mut recv_data_pkt = self.signals.recv_data_pkt().notified();
         let read_bytes = loop {
             self.termination.check_error()?;
-            if self.signals.recv_eof.is_cancelled() {
+            if self.signals.recv_eof().is_cancelled() {
                 return Ok(0);
             }
             let (read_bytes, recv_eof) = {
@@ -573,13 +546,13 @@ impl Connection {
                 () = recv_data_pkt => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            recv_data_pkt = self.signals.recv_data_pkt.notified();
+            recv_data_pkt = self.signals.recv_data_pkt().notified();
         };
         Ok(read_bytes)
     }
 
     pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, IoErr> {
-        let mut recv_data_pkt = self.signals.recv_data_pkt.notified();
+        let mut recv_data_pkt = self.signals.recv_data_pkt().notified();
         loop {
             self.termination.check_error()?;
             let (res, recv_eof) = {
@@ -601,7 +574,7 @@ impl Connection {
                         () = recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
-                    recv_data_pkt = self.signals.recv_data_pkt.notified();
+                    recv_data_pkt = self.signals.recv_data_pkt().notified();
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -610,33 +583,30 @@ impl Connection {
     }
 
     pub(crate) fn sample_rtt(&self, rtt: std::time::Duration, now: Instant) {
-        let elapsed = (self.metrics_observer.is_some() || self.reliable_layer_logger.is_some())
-            .then(|| now.saturating_duration_since(self.clock_epoch));
-        let observer_interest = self
-            .metrics_observer
-            .as_ref()
-            .map(|observer| {
-                observer.interest(
-                    MetricsEvent::RttSample,
-                    elapsed.expect("metrics observer capture includes elapsed time"),
-                )
+        let elapsed = self
+            .observability
+            .enabled()
+            .then(|| self.observability.elapsed_since(now));
+        let observer_interest = elapsed
+            .map(|elapsed| {
+                self.observability
+                    .interest(MetricsEvent::RttSample, elapsed)
             })
             .unwrap_or(MetricsInterest::Skip);
-        let enabled =
-            observer_interest != MetricsInterest::Skip || self.reliable_layer_logger.is_some();
+        let enabled = observer_interest != MetricsInterest::Skip || self.observability.has_logger();
         let captured = {
             let mut reliable_layer = self.reliable_layer.lock().unwrap();
             reliable_layer.sample_rtt(rtt, now);
             enabled.then(|| {
                 let snapshot = (observer_interest == MetricsInterest::Snapshot
-                    || self.reliable_layer_logger.is_some())
+                    || self.observability.has_logger())
                 .then(|| reliable_layer.metrics_at(now));
-                let event_index = self.metrics_event_index.fetch_add(1, Ordering::Relaxed);
+                let event_index = self.observability.next_event_index();
                 (event_index, snapshot)
             })
         };
         if let Some((event_index, snapshot)) = captured {
-            self.publish_metrics(
+            self.observability.publish(
                 event_index,
                 MetricsEvent::RttSample,
                 Some(rtt),
@@ -648,7 +618,7 @@ impl Connection {
     }
 
     pub(crate) fn log(&self, event: MetricsEvent) {
-        if self.metrics_observer.is_none() && self.reliable_layer_logger.is_none() {
+        if !self.observability.enabled() {
             return;
         }
         self.log_enabled_at(event, Instant::now());
@@ -659,36 +629,29 @@ impl Connection {
     /// `elapsed` (and every deadline derived from it) matches the moment the
     /// decision was made, not the moment the metrics call happened to run.
     pub(crate) fn log_at(&self, event: MetricsEvent, now: Instant) {
-        if self.metrics_observer.is_none() && self.reliable_layer_logger.is_none() {
+        if !self.observability.enabled() {
             return;
         }
         self.log_enabled_at(event, now);
     }
 
     fn log_enabled_at(&self, event: MetricsEvent, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.clock_epoch);
-        let observer_interest = self
-            .metrics_observer
-            .as_ref()
-            .map(|observer| observer.interest(event, elapsed))
-            .unwrap_or(MetricsInterest::Skip);
-        if observer_interest == MetricsInterest::Skip && self.reliable_layer_logger.is_none() {
+        let elapsed = self.observability.elapsed_since(now);
+        let observer_interest = self.observability.interest(event, elapsed);
+        if observer_interest == MetricsInterest::Skip && !self.observability.has_logger() {
             return;
         }
         let capture_snapshot =
-            observer_interest == MetricsInterest::Snapshot || self.reliable_layer_logger.is_some();
+            observer_interest == MetricsInterest::Snapshot || self.observability.has_logger();
         let (event_index, snapshot) = if capture_snapshot {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             let snapshot = reliable_layer.metrics_at(now);
-            let event_index = self.metrics_event_index.fetch_add(1, Ordering::Relaxed);
+            let event_index = self.observability.next_event_index();
             (event_index, Some(snapshot))
         } else {
-            (
-                self.metrics_event_index.fetch_add(1, Ordering::Relaxed),
-                None,
-            )
+            (self.observability.next_event_index(), None)
         };
-        self.publish_metrics(
+        self.observability.publish(
             event_index,
             event,
             None,
@@ -696,128 +659,6 @@ impl Connection {
             snapshot,
             observer_interest,
         );
-    }
-
-    fn publish_metrics(
-        &self,
-        event_index: u64,
-        event: MetricsEvent,
-        raw_rtt_sample: Option<std::time::Duration>,
-        elapsed: std::time::Duration,
-        snapshot: Option<crate::metrics::MetricsSnapshot>,
-        observer_interest: MetricsInterest,
-    ) {
-        let observation = MetricsObservation {
-            schema_version: SCHEMA_VERSION,
-            event_index,
-            elapsed,
-            event,
-            raw_rtt_sample,
-            snapshot,
-        };
-        if observer_interest != MetricsInterest::Skip
-            && let Some(observer) = &self.metrics_observer
-        {
-            observer.observe(observation);
-        }
-        let Some(logger) = &self.reliable_layer_logger else {
-            return;
-        };
-        let snapshot = snapshot.expect("logger capture includes a snapshot");
-        let time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let log = MetricsRow {
-            schema_version: SCHEMA_VERSION,
-            event_index,
-            op: event.as_str(),
-            time: time.as_micros(),
-            elapsed_micros: elapsed.as_micros(),
-            raw_rtt_micros: raw_rtt_sample.map(|sample| sample.as_micros()),
-            tokens: snapshot.pacer_tokens_packets,
-            send_rate: snapshot.send_rate_packets_per_second,
-            loss_rate: snapshot.loss_ratio,
-            congestion_loss_rate: snapshot.congestion_loss_ratio,
-            congestion_action: snapshot.congestion_action.map(|action| action.as_str()),
-            num_in_flight_pkts: snapshot.in_flight_packets,
-            num_pkts_in_pipe: snapshot.packets_in_pipe,
-            num_rtx_active_pkts: snapshot.retransmission_active_packets,
-            num_rtx_ready_pkts: snapshot.retransmission_ready_packets,
-            num_rtx_pkts: snapshot.retransmitted_packets,
-            send_seq: snapshot.next_send_sequence,
-            min_rtt: snapshot.minimum_rtt.map(|rtt| rtt.as_millis()),
-            rtt: snapshot.smoothed_rtt.as_millis(),
-            retransmission_timeout_micros: snapshot.retransmission_timeout.as_micros(),
-            oldest_pipe_packet_age_micros: snapshot
-                .oldest_pipe_packet_age
-                .map(|value| value.as_micros()),
-            maximum_packet_rto_overdue_micros: snapshot
-                .maximum_packet_rto_overdue
-                .map(|value| value.as_micros()),
-            rto_deadline_postponements: snapshot.rto_deadline_postponements,
-            cwnd: snapshot.congestion_window_packets,
-            num_rx_pkts: snapshot.received_packets,
-            recv_seq: snapshot.next_receive_sequence,
-            delivery_rate: snapshot.delivery_rate_packets_per_second,
-            delivery_sample_app_limited: snapshot.delivery_sample_app_limited,
-            application_write_waiters: snapshot.application_write_waiters,
-            application_limited_detections: snapshot.application_limited_detections,
-            application_limited_detections_suppressed_by_waiting_writer: snapshot
-                .application_limited_detections_suppressed_by_waiting_writer,
-            congestion_control_rtt_micros: snapshot
-                .congestion_control_rtt
-                .map(|value| value.as_micros()),
-            congestion_rtt_floor_micros: snapshot
-                .congestion_rtt_floor
-                .map(|value| value.as_micros()),
-            congestion_queue_tolerance_micros: snapshot
-                .congestion_queue_tolerance
-                .map(|value| value.as_micros()),
-            congestion_persistent_queue_for_micros: snapshot
-                .congestion_persistent_queue_for
-                .map(|value| value.as_micros()),
-            congestion_persistent_queue_resets: snapshot.congestion_persistent_queue_resets,
-            congestion_delivery_peak_packets_per_second: snapshot
-                .congestion_delivery_peak_packets_per_second,
-            congestion_drain_floor_packets_per_second: snapshot
-                .congestion_drain_floor_packets_per_second,
-            congestion_drain_target_packets_per_second: snapshot
-                .congestion_drain_target_packets_per_second,
-            congestion_loss_backoff_floor_packets_per_second: snapshot
-                .congestion_loss_backoff_floor_packets_per_second,
-            congestion_loss_backoff_raw_target_packets_per_second: snapshot
-                .congestion_loss_backoff_raw_target_packets_per_second,
-            congestion_loss_backoff_target_packets_per_second: snapshot
-                .congestion_loss_backoff_target_packets_per_second,
-            congestion_loss_backoffs: snapshot.congestion_loss_backoffs,
-            congestion_loss_backoff_floor_bindings: snapshot.congestion_loss_backoff_floor_bindings,
-            congestion_rate_samples: snapshot.congestion_rate_samples,
-            congestion_bandwidth_probe_decisions: snapshot.congestion_bandwidth_probe_decisions,
-            congestion_bandwidth_probe_increases: snapshot.congestion_bandwidth_probe_increases,
-            congestion_bandwidth_probe_before_feedback: snapshot
-                .congestion_bandwidth_probe_before_feedback,
-            congestion_last_bandwidth_probe_interval_micros: snapshot
-                .congestion_last_bandwidth_probe_interval
-                .map(|value| value.as_micros()),
-            congestion_delay_drains: snapshot.congestion_delay_drains,
-            pending_send_bytes: snapshot.pending_send_bytes,
-            send_stage_capacity_bytes: snapshot.send_stage_capacity_bytes,
-            accepts_new_packet: snapshot.accepts_new_packet,
-            slow_start: snapshot.slow_start,
-            gentle_mode: snapshot.gentle_mode,
-            gentle_draining: snapshot.gentle_draining,
-            queue_building: snapshot.queue_building,
-            drain_floor_binding: snapshot.drain_floor_binding,
-            outage_recovery: snapshot.outage_recovery,
-            no_response_for_micros: snapshot.no_response_for.map(|value| value.as_micros()),
-            no_progress_for_micros: snapshot.no_progress_for.map(|value| value.as_micros()),
-            stall_reason: snapshot.stall_reason.map(|reason| reason.as_str()),
-        };
-        logger
-            .lock()
-            .unwrap()
-            .serialize(&log)
-            .expect("write CSV log");
     }
 }
 
@@ -834,12 +675,12 @@ mod tests {
         MetricsTerminationCause, SCHEMA_VERSION,
     };
     use crate::traffic_shaping::core::SendWake;
+    use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
-    use crate::traffic_shaping::redundancy::retransmission_armor::RetransmissionArmorConfig;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
 
-    use super::new_connection;
+    use super::{new_connection, new_connection_inner};
 
     fn pending_layer(frame_delivery: FrameMode) -> UnreliableLayer {
         UnreliableLayer {
@@ -1073,14 +914,14 @@ mod tests {
     fn idle_sender_waits_for_an_event_without_a_timer() {
         let now = Instant::now();
         let (shared, _write_half, _read_half, _reaper) =
-            new_connection(pending_layer(FrameMode::default()), None);
+            new_connection_inner(pending_layer(FrameMode::default()), None, None);
         assert_eq!(shared.next_send_wake(now), SendWake::Event);
     }
 
     #[test]
     fn pacing_block_uses_a_one_shot_batch_deadline() {
         let now = Instant::now();
-        let (shared, _write_half, _read_half, _reaper) =
+        let (shared, write_half, _read_half, _reaper) =
             new_connection(pending_layer(FrameMode::default()), None);
         let payload = vec![0; crate::udp::NO_FEC_MSS * 2];
         assert!(
@@ -1092,11 +933,7 @@ mod tests {
                 .unwrap()
                 > 0
         );
-        shared
-            .send_rate_limiter
-            .lock()
-            .unwrap()
-            .take_at_most_tokens(usize::MAX, now);
+        write_half.drain_pacer_for_test(usize::MAX, now);
         let SendWake::Pacing(deadline) = shared.next_send_wake(now) else {
             panic!("staged, sendable data must wait on pacing");
         };

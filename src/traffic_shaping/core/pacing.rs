@@ -1,14 +1,24 @@
 use core::num::NonZeroUsize;
 use primitive::io::token_bucket::TokenBucket;
 use primitive::ops::float::PosR;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TARGET_WAKE_INTERVAL: Duration = Duration::from_millis(1);
 const MIN_BURST_PACKETS: usize = 64;
 const MAX_BURST_PACKETS: usize = 512;
 
-#[derive(Debug)]
+/// A cloneable synchronized send pacer.  Every operation is a synchronous
+/// complete-lock call, so no mutex guard can survive an await: callers pass
+/// the whole operation as a closure (`with_token_bucket`) or use the
+/// token-accounting convenience methods, and the lock never leaks.
+#[derive(Clone, Debug)]
 pub(crate) struct SendPacer {
+    state: Arc<Mutex<PacerState>>,
+}
+
+#[derive(Debug)]
+struct PacerState {
     bucket: TokenBucket,
     rate: PosR<f64>,
     capacity: NonZeroUsize,
@@ -17,56 +27,79 @@ pub(crate) struct SendPacer {
 impl SendPacer {
     pub(crate) fn new_prefilled(rate: PosR<f64>, now: Instant) -> Self {
         let capacity = burst_capacity(rate);
-        Self::with_tokens(rate, capacity, capacity.get(), now)
+        Self {
+            state: Arc::new(Mutex::new(PacerState::with_tokens(
+                rate,
+                capacity,
+                capacity.get(),
+                now,
+            ))),
+        }
     }
 
-    pub(crate) fn set_rate(&mut self, rate: PosR<f64>, now: Instant) {
-        self.bucket.gen_tokens(now);
-        let tokens = self.bucket.outdated_coined_tokens();
+    pub(crate) fn set_rate(&self, rate: PosR<f64>, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        state.bucket.gen_tokens(now);
+        let tokens = state.bucket.outdated_coined_tokens();
         let capacity = burst_capacity(rate);
-        *self = Self::with_tokens(rate, capacity, tokens.min(capacity.get()), now);
+        *state = PacerState::with_tokens(rate, capacity, tokens.min(capacity.get()), now);
     }
 
     #[cfg(test)]
-    pub(crate) fn gen_tokens(&mut self, now: Instant) -> usize {
-        self.bucket.gen_tokens(now)
+    pub(crate) fn gen_tokens(&self, now: Instant) -> usize {
+        self.state.lock().unwrap().bucket.gen_tokens(now)
     }
 
-    pub(crate) fn take_exact_tokens(&mut self, tokens: usize, now: Instant) -> bool {
-        self.bucket.take_exact_tokens(tokens, now)
+    pub(crate) fn take_exact_tokens(&self, tokens: usize, now: Instant) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .bucket
+            .take_exact_tokens(tokens, now)
     }
 
     #[cfg(test)]
-    pub(crate) fn take_at_most_tokens(&mut self, tokens: usize, now: Instant) -> usize {
-        self.bucket.take_at_most_tokens(tokens, now)
+    pub(crate) fn take_at_most_tokens(&self, tokens: usize, now: Instant) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .bucket
+            .take_at_most_tokens(tokens, now)
     }
 
     pub(crate) fn outdated_tokens(&self) -> f64 {
-        self.bucket.outdated_tokens()
+        self.state.lock().unwrap().bucket.outdated_tokens()
     }
 
-    pub(crate) fn token_bucket_mut(&mut self) -> &mut TokenBucket {
-        &mut self.bucket
+    /// Run `use_bucket` against the token bucket while the pacer lock is held,
+    /// returning its result.  The closure must not await: the lock is held for
+    /// the whole call.
+    pub(crate) fn with_token_bucket<R>(&self, use_bucket: impl FnOnce(&mut TokenBucket) -> R) -> R {
+        use_bucket(&mut self.state.lock().unwrap().bucket)
     }
 
     #[cfg(test)]
     fn next_token_time(&self) -> Instant {
-        self.bucket.next_token_time()
+        self.state.lock().unwrap().bucket.next_token_time()
     }
 
-    pub(crate) fn next_batch_time(&mut self, now: Instant, max_sendable_packets: usize) -> Instant {
-        let max_batch = max_sendable_packets.max(1).min(self.capacity.get());
-        let target_batch = ((self.rate.get() * TARGET_WAKE_INTERVAL.as_secs_f64()).ceil() as usize)
+    pub(crate) fn next_batch_time(&self, now: Instant, max_sendable_packets: usize) -> Instant {
+        let mut state = self.state.lock().unwrap();
+        let max_batch = max_sendable_packets.max(1).min(state.capacity.get());
+        let target_batch = ((state.rate.get() * TARGET_WAKE_INTERVAL.as_secs_f64()).ceil()
+            as usize)
             .clamp(1, max_batch);
-        self.bucket.gen_tokens(now);
-        let available = self.bucket.outdated_tokens();
+        state.bucket.gen_tokens(now);
+        let available = state.bucket.outdated_tokens();
         if available >= target_batch as f64 {
             return now;
         }
         let missing = target_batch as f64 - available;
-        now + Duration::from_secs_f64(missing / self.rate.get())
+        now + Duration::from_secs_f64(missing / state.rate.get())
     }
+}
 
+impl PacerState {
     fn with_tokens(rate: PosR<f64>, capacity: NonZeroUsize, tokens: usize, now: Instant) -> Self {
         let tokens = tokens.min(capacity.get());
         let mut backdate = Duration::from_secs_f64((tokens as f64 + 0.5) / rate.get());
@@ -137,7 +170,7 @@ mod tests {
     #[test]
     fn prefilled_pacer_has_immediate_tokens_and_a_fresh_clock() {
         let now = Instant::now();
-        let mut pacer = SendPacer::new_prefilled(rate(128.0), now);
+        let pacer = SendPacer::new_prefilled(rate(128.0), now);
         assert_eq!(pacer.gen_tokens(now), MIN_BURST_PACKETS);
         assert!(pacer.next_token_time() >= now);
     }
@@ -145,7 +178,7 @@ mod tests {
     #[test]
     fn rate_change_preserves_credited_tokens_and_clamps_capacity() {
         let now = Instant::now();
-        let mut pacer = SendPacer::new_prefilled(rate(1_000_000.0), now);
+        let pacer = SendPacer::new_prefilled(rate(1_000_000.0), now);
         assert_eq!(
             pacer.take_at_most_tokens(usize::MAX, now),
             MAX_BURST_PACKETS
@@ -159,7 +192,7 @@ mod tests {
     #[test]
     fn sparse_work_waits_for_one_token() {
         let now = Instant::now();
-        let mut pacer = SendPacer::new_prefilled(rate(10_000.0), now);
+        let pacer = SendPacer::new_prefilled(rate(10_000.0), now);
         pacer.take_at_most_tokens(usize::MAX, now);
         assert_eq!(
             pacer.next_batch_time(now, 1),
@@ -170,7 +203,7 @@ mod tests {
     #[test]
     fn backlogged_work_waits_for_a_timer_batch() {
         let now = Instant::now();
-        let mut pacer = SendPacer::new_prefilled(rate(10_000.0), now);
+        let pacer = SendPacer::new_prefilled(rate(10_000.0), now);
         pacer.take_at_most_tokens(usize::MAX, now);
         assert_eq!(
             pacer.next_batch_time(now, 64),
@@ -181,7 +214,7 @@ mod tests {
     #[test]
     fn available_batch_is_immediate() {
         let now = Instant::now();
-        let mut pacer = SendPacer::new_prefilled(rate(10_000.0), now);
+        let pacer = SendPacer::new_prefilled(rate(10_000.0), now);
         assert_eq!(pacer.next_batch_time(now, 64), now);
     }
 

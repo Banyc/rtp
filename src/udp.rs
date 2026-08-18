@@ -20,9 +20,9 @@ use crate::{
     traffic_shaping::{
         control::handshake::{client_opening_handshake, server_opening_handshake},
         redundancy::{
+            RetransmissionArmorConfig,
             fec_tuning::{FecTuning, fec_tuning_from_env},
             instream_group_fec_from_env,
-            retransmission_armor::RetransmissionArmorConfig,
         },
     },
     transmission::{

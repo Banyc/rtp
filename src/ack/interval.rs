@@ -89,6 +89,7 @@ impl AckHistory {
     /// wrapping range that reaches past it) it is folded into `next` — the
     /// map only ever holds noncumulative selective ranges — and the map
     /// anchor moves with it.
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, seq: SequenceNumber) {
         if self.next.forward_distance_to(seq) >= MAX_NUM_RECVING_PKTS as u64 {
             return;

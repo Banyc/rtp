@@ -1,4 +1,14 @@
-use std::{cell::Cell, collections::VecDeque, fmt, num::NonZeroU64, time::Instant};
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    fmt,
+    num::NonZeroU64,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use fec::{de::FecDecoder, en::FecEncoder};
 use primitive::io::token_bucket::TokenBucket;
@@ -77,25 +87,41 @@ pub struct FecConfig {
     pub small_group_parity_count: u8,
 }
 
-/// Encapsulated FEC state owned by the transmission layer. The transmission
-/// layer calls `encode_data` on each outgoing packet and `decode` on each
-/// incoming raw packet, then `maybe_flush_parities` after the send burst.
-///
-/// Parity is tail-only and burst-scoped: a group is closed (flushed or
-/// skipped) at the end of every send burst and after every ACK/kill packet,
-/// so no stale group carries over into the next burst. Parity is fixed-rate
-/// (1:4 data-to-parity, clamped) and spare-token-only — it never competes
-/// with data for send bandwidth.
+/// Split FEC ownership for the read/write actor halves.  The encoder half is
+/// owned by the write driver (encode/flush/parity), the decoder half by the
+/// read driver (decode/recover); both share one `Arc<Stats>` so the session
+/// can observe aggregate counters without touching either actor's state.
 #[derive(Debug)]
 pub struct FecState {
+    encoder: FecEncoderState,
+    decoder: FecDecoderState,
+}
+
+/// Write-actor FEC state: encodes outgoing symbols, holds the group parity
+/// buffer, and mutates the shared counters.  The sole mutator is the write
+/// driver.
+#[derive(Debug)]
+pub(crate) struct FecEncoderState {
     encoder: FecEncoder,
+    enc_buf: Vec<u8>,
+    small_group_parity_count: u8,
+    stats: Arc<Stats>,
+}
+
+/// Read-actor FEC state: decodes incoming symbols and drains recovered
+/// payloads.  The sole mutator is the read driver.
+#[derive(Debug)]
+pub(crate) struct FecDecoderState {
     decoder: FecDecoder,
     recovered: VecDeque<Vec<u8>>,
-    enc_buf: Vec<u8>,
     symbol_size: usize,
-    small_group_parity_count: u8,
-    stats: Stats,
+    stats: Arc<Stats>,
 }
+
+/// Cloneable handle over the shared FEC counters, handed to the session so
+/// observability (e.g. recovered-symbol totals) needs no actor state.
+#[derive(Clone, Debug)]
+pub(crate) struct FecStatsHandle(Arc<Stats>);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FecStats {
@@ -110,31 +136,57 @@ struct FecStats {
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
 }
 
-#[derive(Debug, Default)]
+/// Shared counters mutated by both actor halves.  All fields are atomics so
+/// the single `Arc<Stats>` can be updated from the read and write drivers
+/// without a lock.
+#[derive(Debug)]
 struct Stats {
-    pub parity_sent: usize,
-    pub groups_flushed: usize,
-    pub groups_skipped_no_surplus_tokens: usize,
-    pub parity_groups_skipped_burst_end: usize,
-    pub recovered_symbols: usize,
-    pub dropped_malformed_pkts: usize,
-    pub dropped_fec_decoder_panics: usize,
-    pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
+    pub parity_sent: AtomicUsize,
+    pub groups_flushed: AtomicUsize,
+    pub groups_skipped_no_surplus_tokens: AtomicUsize,
+    pub parity_groups_skipped_burst_end: AtomicUsize,
+    pub recovered_symbols: AtomicUsize,
+    pub dropped_malformed_pkts: AtomicUsize,
+    pub dropped_fec_decoder_panics: AtomicUsize,
+    pub group_size_skipped_burst_end: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    pub group_size_skipped_no_surplus_tokens: [AtomicU64; GROUP_SIZE_HIST_LEN],
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        let hist = || std::array::from_fn(|_| AtomicU64::new(0));
+        Self {
+            parity_sent: AtomicUsize::new(0),
+            groups_flushed: AtomicUsize::new(0),
+            groups_skipped_no_surplus_tokens: AtomicUsize::new(0),
+            parity_groups_skipped_burst_end: AtomicUsize::new(0),
+            recovered_symbols: AtomicUsize::new(0),
+            dropped_malformed_pkts: AtomicUsize::new(0),
+            dropped_fec_decoder_panics: AtomicUsize::new(0),
+            group_size_skipped_burst_end: hist(),
+            group_size_skipped_no_surplus_tokens: hist(),
+        }
+    }
 }
 
 impl Stats {
     fn snapshot(&self) -> FecStats {
         FecStats {
-            parity_sent: self.parity_sent,
-            groups_flushed: self.groups_flushed,
-            groups_skipped_no_surplus_tokens: self.groups_skipped_no_surplus_tokens,
-            groups_skipped_burst_end: self.parity_groups_skipped_burst_end,
-            recovered_symbols: self.recovered_symbols,
-            dropped_malformed_pkts: self.dropped_malformed_pkts,
-            dropped_fec_decoder_panics: self.dropped_fec_decoder_panics,
-            group_size_skipped_burst_end: self.group_size_skipped_burst_end,
-            group_size_skipped_no_surplus_tokens: self.group_size_skipped_no_surplus_tokens,
+            parity_sent: self.parity_sent.load(Ordering::Relaxed),
+            groups_flushed: self.groups_flushed.load(Ordering::Relaxed),
+            groups_skipped_no_surplus_tokens: self
+                .groups_skipped_no_surplus_tokens
+                .load(Ordering::Relaxed),
+            groups_skipped_burst_end: self.parity_groups_skipped_burst_end.load(Ordering::Relaxed),
+            recovered_symbols: self.recovered_symbols.load(Ordering::Relaxed),
+            dropped_malformed_pkts: self.dropped_malformed_pkts.load(Ordering::Relaxed),
+            dropped_fec_decoder_panics: self.dropped_fec_decoder_panics.load(Ordering::Relaxed),
+            group_size_skipped_burst_end: std::array::from_fn(|i| {
+                self.group_size_skipped_burst_end[i].load(Ordering::Relaxed)
+            }),
+            group_size_skipped_no_surplus_tokens: std::array::from_fn(|i| {
+                self.group_size_skipped_no_surplus_tokens[i].load(Ordering::Relaxed)
+            }),
         }
     }
 }
@@ -197,27 +249,46 @@ fn encodable_wire_pkt(pkt: &[u8], symbol_size: usize) -> bool {
 
 impl FecState {
     pub fn new(config: FecConfig) -> Self {
-        let encoder = FecEncoder::builder()
-            .symbol_size(config.symbol_size)
-            .build();
-        let decoder = FecDecoder::builder()
-            .max_group_size(MAX_GROUP_SIZE)
-            .symbol_size(config.symbol_size)
-            .window_size(WINDOW_SIZE)
-            .build();
+        let stats = Arc::new(Stats::default());
         Self {
-            encoder,
-            decoder,
-            recovered: VecDeque::new(),
-            enc_buf: vec![0; config.symbol_size * 2],
-            symbol_size: config.symbol_size,
-            small_group_parity_count: config
-                .small_group_parity_count
-                .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
-            stats: Stats::default(),
+            encoder: FecEncoderState {
+                encoder: FecEncoder::builder()
+                    .symbol_size(config.symbol_size)
+                    .build(),
+                enc_buf: vec![0; config.symbol_size * 2],
+                small_group_parity_count: config
+                    .small_group_parity_count
+                    .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
+                stats: Arc::clone(&stats),
+            },
+            decoder: FecDecoderState {
+                decoder: FecDecoder::builder()
+                    .max_group_size(MAX_GROUP_SIZE)
+                    .symbol_size(config.symbol_size)
+                    .window_size(WINDOW_SIZE)
+                    .build(),
+                recovered: VecDeque::new(),
+                symbol_size: config.symbol_size,
+                stats,
+            },
         }
     }
 
+    /// Split into the write-actor encoder state, the read-actor decoder
+    /// state, and the shared counters handle.  Each actor becomes the sole
+    /// mutator of its half; the handle is observation-only.
+    pub(crate) fn into_actor_parts(self) -> (FecEncoderState, FecDecoderState, FecStatsHandle) {
+        let stats = FecStatsHandle(Arc::clone(&self.encoder.stats));
+        (self.encoder, self.decoder, stats)
+    }
+
+    #[cfg(test)]
+    pub fn max_wire_pkt_size(&self) -> usize {
+        self.decoder.symbol_size + fec_hdr_size()
+    }
+}
+
+impl FecEncoderState {
     /// Skip the currently-open FEC group, recording it in the burst-end skip
     /// stats. No-op when no group is open. Called at burst boundaries where a
     /// tail flush is not permitted (more data/RTX pending), so no stale group
@@ -227,8 +298,10 @@ impl FecState {
         if data_count == 0 {
             return;
         }
-        self.stats.parity_groups_skipped_burst_end += 1;
-        inc_hist(&mut self.stats.group_size_skipped_burst_end, data_count);
+        self.stats
+            .parity_groups_skipped_burst_end
+            .fetch_add(1, Ordering::Relaxed);
+        inc_hist(&self.stats.group_size_skipped_burst_end, data_count);
         self.encoder.skip_group();
     }
 
@@ -331,13 +404,15 @@ impl FecState {
                     "FEC: flushing {depth} parities for single-symbol group (interactive, budget bypassed)"
                 );
             }
-            self.stats.groups_flushed += 1;
+            self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
             let mut parity_encoder = self.encoder.flush_parities(depth);
             let mut pkts = vec![];
             while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
                 pkts.push(self.enc_buf[..n].to_vec());
             }
-            self.stats.parity_sent += pkts.len();
+            self.stats
+                .parity_sent
+                .fetch_add(pkts.len(), Ordering::Relaxed);
             return pkts;
         }
         // In-stream group FEC path: any multi-symbol group (data_count >= 2)
@@ -353,11 +428,10 @@ impl FecState {
             let available_tokens = send_rate_limiter.gen_tokens(now);
             let parity_budget = available_tokens / PARITY_BUDGET_DEN;
             if usize::from(parity_count) > parity_budget {
-                self.stats.groups_skipped_no_surplus_tokens += 1;
-                inc_hist(
-                    &mut self.stats.group_size_skipped_no_surplus_tokens,
-                    data_count,
-                );
+                self.stats
+                    .groups_skipped_no_surplus_tokens
+                    .fetch_add(1, Ordering::Relaxed);
+                inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
                 self.encoder.skip_group();
                 return vec![];
             }
@@ -367,13 +441,15 @@ impl FecState {
                     "FEC: flushing {parity_count} parities for in-stream group of {data_count}"
                 );
             }
-            self.stats.groups_flushed += 1;
+            self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
             let mut parity_encoder = self.encoder.flush_parities(parity_count);
             let mut pkts = vec![];
             while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
                 pkts.push(self.enc_buf[..n].to_vec());
             }
-            self.stats.parity_sent += pkts.len();
+            self.stats
+                .parity_sent
+                .fetch_add(pkts.len(), Ordering::Relaxed);
             return pkts;
         }
         // Stock path: groups above `PARITY_DATA_THRESHOLD` are skipped so
@@ -395,11 +471,10 @@ impl FecState {
         let available_tokens = send_rate_limiter.gen_tokens(now);
         let parity_budget = available_tokens / PARITY_BUDGET_DEN;
         if usize::from(parity_count) > parity_budget {
-            self.stats.groups_skipped_no_surplus_tokens += 1;
-            inc_hist(
-                &mut self.stats.group_size_skipped_no_surplus_tokens,
-                data_count,
-            );
+            self.stats
+                .groups_skipped_no_surplus_tokens
+                .fetch_add(1, Ordering::Relaxed);
+            inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
             self.encoder.skip_group();
             return vec![];
         }
@@ -407,21 +482,33 @@ impl FecState {
         if FEC_DEBUG {
             eprintln!("FEC: flushing {parity_count} parities for group of {data_count}");
         }
-        self.stats.groups_flushed += 1;
+        self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
         let mut parity_encoder = self.encoder.flush_parities(parity_count);
         let mut pkts = vec![];
         while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
             pkts.push(self.enc_buf[..n].to_vec());
         }
-        self.stats.parity_sent += pkts.len();
+        self.stats
+            .parity_sent
+            .fetch_add(pkts.len(), Ordering::Relaxed);
         pkts
     }
 
+    /// Test-only accessor for the configured single-symbol interactive
+    /// parity depth.
     #[cfg(test)]
-    pub fn max_wire_pkt_size(&self) -> usize {
-        self.symbol_size + fec_hdr_size()
+    pub(crate) fn small_group_parity_count(&self) -> u8 {
+        self.small_group_parity_count
     }
 
+    /// Test-only accessor for the running parity-sent counter.
+    #[cfg(test)]
+    pub(crate) fn parity_sent(&self) -> usize {
+        self.stats.parity_sent.load(Ordering::Relaxed)
+    }
+}
+
+impl FecDecoderState {
     /// Feed an incoming raw UDP packet through the FEC decoder. Returns:
     /// - `Some(payload)` if the packet is a FEC data symbol — the payload is
     ///   the codec packet to pass to `decode()`.
@@ -430,7 +517,9 @@ impl FecState {
     ///   `pop_recovered` before reading the next raw packet.
     pub fn decode(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
         if !encodable_wire_pkt(pkt, self.symbol_size) {
-            self.stats.dropped_malformed_pkts += 1;
+            self.stats
+                .dropped_malformed_pkts
+                .fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let recovered_before = self.recovered.len();
@@ -449,11 +538,18 @@ impl FecState {
         let hdr_len = match unwound {
             Ok(hdr_len) => hdr_len,
             Err(_) => {
-                self.stats.dropped_fec_decoder_panics += 1;
+                self.stats
+                    .dropped_fec_decoder_panics
+                    .fetch_add(1, Ordering::Relaxed);
                 None
             }
         };
-        self.stats.recovered_symbols += self.recovered.len() - recovered_before;
+        let recovered = self.recovered.len() - recovered_before;
+        if recovered != 0 {
+            self.stats
+                .recovered_symbols
+                .fetch_add(recovered, Ordering::Relaxed);
+        }
         if FEC_DEBUG {
             let kind = if hdr_len.is_some() {
                 "data"
@@ -477,41 +573,44 @@ impl FecState {
     /// Number of codec payloads recovered by parity so far. Returns `None`
     /// only conceptually (always `Some(0)` when FEC is on); used by tests to
     /// assert that parity actually reconstructed lost data.
+    #[cfg(test)]
     pub(crate) fn recovered_symbols(&self) -> usize {
-        self.stats.recovered_symbols
-    }
-
-    /// Test-only accessor for the configured single-symbol interactive
-    /// parity depth.
-    #[cfg(test)]
-    pub(crate) fn small_group_parity_count(&self) -> u8 {
-        self.small_group_parity_count
-    }
-
-    /// Test-only accessor for the running parity-sent counter.
-    #[cfg(test)]
-    pub(crate) fn parity_sent(&self) -> usize {
-        self.stats.parity_sent
+        self.stats.recovered_symbols.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn dropped_malformed_pkts(&self) -> usize {
-        self.stats.dropped_malformed_pkts
+        self.stats.dropped_malformed_pkts.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn dropped_fec_decoder_panics(&self) -> usize {
-        self.stats.dropped_fec_decoder_panics
+        self.stats
+            .dropped_fec_decoder_panics
+            .load(Ordering::Relaxed)
     }
 
     /// Print the basic FEC counters to stderr. Only active when `FEC_DEBUG` is
-    /// enabled — flip that flag to debug FEC behavior. Called by the
-    /// transmission layer when the read stream reaches EOF so the snapshot is
-    /// guaranteed to be visible before the process tears down its spawned
-    /// tasks.
+    /// enabled — flip that flag to debug FEC behavior. Called by the read
+    /// driver when the read stream reaches EOF so the snapshot is guaranteed
+    /// to be visible before the process tears down its spawned tasks.
     pub fn debug_print_stats(&self) {
         if FEC_DEBUG {
             eprintln!("FEC stats: {}", self.stats.snapshot());
+        }
+    }
+}
+
+impl FecStatsHandle {
+    /// Number of codec payloads recovered by parity so far across both actor
+    /// halves (shared counter).
+    pub(crate) fn recovered_symbols(&self) -> usize {
+        self.0.recovered_symbols.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn debug_print(&self) {
+        if FEC_DEBUG {
+            eprintln!("FEC stats: {}", self.0.snapshot());
         }
     }
 }
@@ -527,9 +626,9 @@ fn parity_for(data_count: usize) -> u8 {
 /// Increment a histogram bucket: push a count if no bucket for this size yet,
 /// otherwise leave the existing one. Kept simple — sizes are small and
 /// infrequent.
-fn inc_hist(hist: &mut [u64], idx: usize) {
-    if let Some(count) = hist.get_mut(idx) {
-        *count += 1;
+fn inc_hist(hist: &[AtomicU64], idx: usize) {
+    if let Some(count) = hist.get(idx) {
+        count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -602,17 +701,17 @@ mod tests {
         // Encode one data symbol (single-symbol group).
         let data = b"hello interactive world";
         let mut sym_buf = vec![0u8; 8192];
-        let _n = fec.encode_data(data, &mut sym_buf, false);
-        assert_eq!(fec.encoder.group_data_count(), 1);
+        let _n = fec.encoder.encode_data(data, &mut sym_buf, false);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 1);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             3,
             "single-symbol group at depth 3 must emit 3 parity copies, got {}",
             pkts.len()
         );
-        assert_eq!(fec.parity_sent(), 3);
+        assert_eq!(fec.encoder.parity_sent(), 3);
     }
 
     /// A multi-symbol group must keep the stock budget gate regardless of the
@@ -628,11 +727,11 @@ mod tests {
         // PARITY_DATA_THRESHOLD is 4, so a 2-symbol group is not force-skipped.
         let data = b"first symbol payload";
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(data, &mut sym_buf, false);
-        fec.encode_data(data, &mut sym_buf, false);
-        assert_eq!(fec.encoder.group_data_count(), 2);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 2);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             0,
@@ -653,11 +752,11 @@ mod tests {
         // Two data symbols → stock parity_for(2) = 1.
         let data = b"first symbol payload";
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(data, &mut sym_buf, false);
-        fec.encode_data(data, &mut sym_buf, false);
-        assert_eq!(fec.encoder.group_data_count(), 2);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 2);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             1,
@@ -676,9 +775,9 @@ mod tests {
 
         let data = b"hello";
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(data, &mut sym_buf, false);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, false);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             0,
@@ -692,7 +791,7 @@ mod tests {
     #[test]
     fn depth_zero_is_clamped_to_one() {
         let fec = fec_state(8192 - 11, 0);
-        assert_eq!(fec.small_group_parity_count(), 1);
+        assert_eq!(fec.encoder.small_group_parity_count(), 1);
     }
 
     #[test]
@@ -701,16 +800,16 @@ mod tests {
         let symbol_size = 8192 - 11;
         let mut fec = fec_state(symbol_size, 40);
         assert_eq!(
-            fec.small_group_parity_count(),
+            fec.encoder.small_group_parity_count(),
             MAX_INTERACTIVE_PARITY_DEPTH,
             "an over-deep request must be clamped to what the decoder accepts"
         );
         let (mut tb, now) = unlimited_bucket(Instant::now());
         let payload = vec![7u8; 32];
         let mut sym_buf = vec![0u8; 8192];
-        fec.encode_data(&payload, &mut sym_buf, false);
-        assert_eq!(fec.encoder.group_data_count(), 1);
-        let parity_pkts = fec.maybe_flush_parities(&mut tb, now, false);
+        fec.encoder.encode_data(&payload, &mut sym_buf, false);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 1);
+        let parity_pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             parity_pkts.len(),
             usize::from(MAX_INTERACTIVE_PARITY_DEPTH),
@@ -753,11 +852,14 @@ mod tests {
         let data = b"payload";
         let mut sym_buf = vec![0u8; 8192];
         for _ in 0..INSTREAM_DATA_PER_GROUP {
-            fec.encode_data(data, &mut sym_buf, true);
+            fec.encoder.encode_data(data, &mut sym_buf, true);
         }
-        assert_eq!(fec.encoder.group_data_count(), INSTREAM_DATA_PER_GROUP);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            INSTREAM_DATA_PER_GROUP
+        );
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
         assert_eq!(
             pkts.len(),
             INSTREAM_PARITY_PER_GROUP,
@@ -789,11 +891,11 @@ mod tests {
         let data = b"payload";
         let mut sym_buf = vec![0u8; 8192];
         for _ in 0..5 {
-            fec.encode_data(data, &mut sym_buf, true);
+            fec.encoder.encode_data(data, &mut sym_buf, true);
         }
-        assert_eq!(fec.encoder.group_data_count(), 5);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 5);
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
         assert_eq!(
             pkts.len(),
             INSTREAM_PARITY_PER_GROUP,
@@ -815,11 +917,14 @@ mod tests {
         let data = b"payload";
         let mut sym_buf = vec![0u8; 8192];
         for _ in 0..INSTREAM_DATA_PER_GROUP {
-            fec.encode_data(data, &mut sym_buf, true);
+            fec.encoder.encode_data(data, &mut sym_buf, true);
         }
-        assert_eq!(fec.encoder.group_data_count(), INSTREAM_DATA_PER_GROUP);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            INSTREAM_DATA_PER_GROUP
+        );
 
-        let pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
         assert_eq!(
             pkts.len(),
             0,
@@ -842,16 +947,16 @@ mod tests {
         let data = b"payload";
         let mut sym_buf = vec![0u8; 8192];
         for _ in 0..8 {
-            fec.encode_data(data, &mut sym_buf, false);
+            fec.encoder.encode_data(data, &mut sym_buf, false);
         }
         // Stock force-skip at PARITY_DATA_THRESHOLD=4 means the group never
         // exceeds 4.  After 8 encode_data calls, the open group has at most
         // 4 symbols (the first 4 were force-skipped into a closed group when
         // the 5th was encoded).
         assert!(
-            fec.encoder.group_data_count() <= PARITY_DATA_THRESHOLD,
+            fec.encoder.encoder.group_data_count() <= PARITY_DATA_THRESHOLD,
             "toggle off must keep the force-skip; group_data_count={} > {}",
-            fec.encoder.group_data_count(),
+            fec.encoder.encoder.group_data_count(),
             PARITY_DATA_THRESHOLD
         );
     }
@@ -866,22 +971,28 @@ mod tests {
         let mut sym_buf = vec![0u8; 8192];
 
         // Empty group: never full.
-        assert!(!fec.group_data_full(true));
-        assert!(!fec.group_data_full(false));
+        assert!(!fec.encoder.group_data_full(true));
+        assert!(!fec.encoder.group_data_full(false));
 
         // Partial group (4 symbols): not full even with instream.
         for _ in 0..4 {
-            fec.encode_data(data, &mut sym_buf, true);
+            fec.encoder.encode_data(data, &mut sym_buf, true);
         }
-        assert!(!fec.group_data_full(true), "4 < 8 must not be full");
-        assert!(!fec.group_data_full(false));
+        assert!(!fec.encoder.group_data_full(true), "4 < 8 must not be full");
+        assert!(!fec.encoder.group_data_full(false));
 
         // Full group (8 symbols): full only with instream.
         for _ in 0..4 {
-            fec.encode_data(data, &mut sym_buf, true);
+            fec.encoder.encode_data(data, &mut sym_buf, true);
         }
-        assert!(fec.group_data_full(true), "8 == 8 must be full (instream)");
-        assert!(!fec.group_data_full(false), "toggle off must never be full");
+        assert!(
+            fec.encoder.group_data_full(true),
+            "8 == 8 must be full (instream)"
+        );
+        assert!(
+            !fec.encoder.group_data_full(false),
+            "toggle off must never be full"
+        );
     }
 
     /// Parity emitted by a full in-stream group (8 data + 4 parity) must
@@ -905,13 +1016,16 @@ mod tests {
         let mut sym_buf = vec![0u8; 8192];
         let mut wire_data_pkts = vec![];
         for p in &payloads {
-            let n = fec.encode_data(p, &mut sym_buf, true);
+            let n = fec.encoder.encode_data(p, &mut sym_buf, true);
             wire_data_pkts.push(sym_buf[..n].to_vec());
         }
-        assert_eq!(fec.encoder.group_data_count(), INSTREAM_DATA_PER_GROUP);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            INSTREAM_DATA_PER_GROUP
+        );
 
         // Flush 4 parities for the full group.
-        let parity_pkts = fec.maybe_flush_parities(&mut tb, now, true);
+        let parity_pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
         assert_eq!(parity_pkts.len(), INSTREAM_PARITY_PER_GROUP);
 
         // Feed 7 of 8 data symbols + all 4 parities to a stock decoder,
@@ -972,18 +1086,18 @@ mod tests {
             let mut fec = fec_state(symbol_size, 1);
             let pkt = wire_pkt(0, 0, data_count, parity_count, &body);
             assert!(
-                fec.decode(&pkt).is_none(),
+                fec.decoder.decode(&pkt).is_none(),
                 "parity header {data_count}+{parity_count} must be dropped"
             );
             assert_eq!(
-                fec.dropped_malformed_pkts(),
+                fec.decoder.dropped_malformed_pkts(),
                 1,
                 "parity header {data_count}+{parity_count} must be refused before the decoder"
             );
         }
         let mut fec = fec_state(symbol_size, 1);
-        assert!(fec.decode(&wire_pkt(0, 20, 20, 5, &body)).is_none());
-        assert_eq!(fec.dropped_malformed_pkts(), 0);
+        assert!(fec.decoder.decode(&wire_pkt(0, 20, 20, 5, &body)).is_none());
+        assert_eq!(fec.decoder.dropped_malformed_pkts(), 0);
     }
 
     #[test]
@@ -992,10 +1106,10 @@ mod tests {
         let mut fec = fec_state(symbol_size, 1);
         let data0 = vec![0u8; symbol_size - fec::proto::DATA_SYMBOL_HDR_SIZE];
         let parity = vec![0xFFu8; symbol_size];
-        assert!(fec.decode(&wire_pkt(0, 0, 0, 0, &data0)).is_some());
-        assert!(fec.decode(&wire_pkt(0, 2, 2, 1, &parity)).is_none());
-        assert_eq!(fec.dropped_fec_decoder_panics(), 1);
-        while fec.pop_recovered().is_some() {}
+        assert!(fec.decoder.decode(&wire_pkt(0, 0, 0, 0, &data0)).is_some());
+        assert!(fec.decoder.decode(&wire_pkt(0, 2, 2, 1, &parity)).is_none());
+        assert_eq!(fec.decoder.dropped_fec_decoder_panics(), 1);
+        while fec.decoder.pop_recovered().is_some() {}
     }
 
     use crate::testing::SplitMix64;
@@ -1041,7 +1155,7 @@ mod tests {
                 let n = rng.below(pkt.len());
                 pkt.truncate(n);
             }
-            if let Some(payload) = fec.decode(&pkt) {
+            if let Some(payload) = fec.decoder.decode(&pkt) {
                 decoded += 1;
                 assert!(
                     payload.len() <= pkt.len(),
@@ -1050,7 +1164,7 @@ mod tests {
                     payload.len()
                 );
             }
-            while let Some(recovered) = fec.pop_recovered() {
+            while let Some(recovered) = fec.decoder.pop_recovered() {
                 assert!(
                     recovered.len() <= symbol_size,
                     "round {round}: recovered {} bytes from a {symbol_size}-byte symbol",
@@ -1107,7 +1221,7 @@ mod tests {
             }
             decodable += 1;
             // No catch_unwind here: a third-party decoder panic fails the test.
-            if let Some(hdr_len) = fec.decoder.decode(&pkt, |recovered| {
+            if let Some(hdr_len) = fec.decoder.decoder.decode(&pkt, |recovered| {
                 assert!(
                     recovered.len() <= symbol_size,
                     "round {round}: decoder recovered {} bytes from a {symbol_size}-byte symbol",

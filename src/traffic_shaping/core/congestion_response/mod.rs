@@ -14,10 +14,12 @@ use queue_response::{DrainInput, QueueResponse};
 
 mod decision;
 mod loss_backoff;
-pub(crate) mod queue_response;
+mod queue_response;
 
 pub(crate) use decision::{CongestionDecision, CongestionOutcome, ProbeKind};
 pub(crate) use loss_backoff::linear_backoff_step;
+#[cfg(test)]
+pub(crate) use queue_response::DRAIN_FLOOR_PEAK_FRACTION;
 
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 

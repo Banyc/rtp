@@ -472,13 +472,6 @@ impl<V> SendWindow<V> {
             .skip(offset)
             .map(|(i, value)| (self.start.advance(i as u64), value))
     }
-
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (SequenceNumber, &mut V)> + '_ {
-        self.queue
-            .iter_mut()
-            .enumerate()
-            .map(|(i, v)| (self.start.advance(i as u64), v))
-    }
 }
 
 impl<V> SendWindow<Option<V>> {
@@ -519,12 +512,14 @@ impl<V> SendWindow<Option<V>> {
 /// `iter_from(start)` maps `start` to its local index via the forward
 /// distance from the queue start and yields only the suffix `[start..)`.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct SequenceQueue<V> {
     start: SequenceNumber,
     next: SequenceNumber,
     queue: VecDeque<V>,
 }
 
+#[cfg(test)]
 impl<V> SequenceQueue<V> {
     pub(crate) fn new(start: SequenceNumber) -> Self {
         Self {
@@ -537,15 +532,6 @@ impl<V> SequenceQueue<V> {
     /// The queue's logical start (the sequence of the front entry).
     pub(crate) fn start(&self) -> SequenceNumber {
         self.start
-    }
-
-    /// The next sequence a push will occupy.
-    pub(crate) fn next(&self) -> SequenceNumber {
-        self.next
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {

@@ -248,15 +248,16 @@ mod tests {
         tlp.sent();
         assert!(!tlp.can_probe());
         // The merge contributes no deadline when the budget is exhausted.
-        assert!(tlp
-            .merge_next_probe_time(
+        assert!(
+            tlp.merge_next_probe_time(
                 Instant::now(),
                 Instant::now(),
                 &settled_rtt_stats(),
                 true,
                 None
             )
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]

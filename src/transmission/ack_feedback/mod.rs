@@ -3,14 +3,16 @@ use std::time::Instant;
 
 use tokio::sync::Notify;
 
-use self::schedule::AckSchedule;
-use self::state::{AckClaim, AckFlushOutcome, ReceivedAckWork, State};
+use self::state::State;
 
-pub(crate) mod pages;
-pub(crate) mod schedule;
-pub(super) mod state;
+mod pages;
+mod schedule;
+mod state;
 
+pub(super) use pages::AckPage;
 pub(crate) use pages::MAX_NUM_ACK;
+pub(crate) use schedule::AckSchedule;
+pub(super) use state::{AckClaim, AckFlushOutcome, ReceivedAckWork};
 
 #[derive(Debug)]
 pub(crate) struct AckFeedback {

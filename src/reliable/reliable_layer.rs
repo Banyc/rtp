@@ -1,7 +1,7 @@
 use core::num::NonZeroUsize;
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -170,7 +170,7 @@ pub struct ReliableLayer {
     send_fin_buf: FinState,
     recv_data_buf: StockRecvStage,
     recv_fin_buf: bool,
-    send_rate_limiter: Arc<Mutex<SendPacer>>,
+    send_rate_limiter: SendPacer,
     /// Number of application writers currently blocked waiting for send
     /// capacity.  Registration is drop-scoped (`ApplicationWriteWaiter`), so
     /// a cancelled writer always releases its slot.
@@ -195,7 +195,7 @@ pub struct ReliableLayer {
     /// log_config.is_some()`; when false the accounting hooks return before
     /// any timestamp arithmetic or counter mutation, so an absent observer
     /// and logger costs exactly one predictable branch per decision point.
-    pub(crate) congestion_metrics_enabled: bool,
+    congestion_metrics_enabled: bool,
     /// One-shot transition signal consumed by the ACK owner while it still
     /// holds this layer's lock.  Kept out of the public snapshot so rare exit
     /// events do not enlarge every observation.
@@ -213,11 +213,7 @@ pub struct ReliableLayer {
 
 impl ReliableLayer {
     #[cfg(test)]
-    pub fn new(
-        mss: NonZeroUsize,
-        frame_delivery: FrameMode,
-        now: Instant,
-    ) -> (Self, Arc<Mutex<SendPacer>>) {
+    pub fn new(mss: NonZeroUsize, frame_delivery: FrameMode, now: Instant) -> (Self, SendPacer) {
         Self::new_at(mss, frame_delivery, now, InitialSequences::ZERO)
     }
 
@@ -230,9 +226,9 @@ impl ReliableLayer {
         frame_delivery: FrameMode,
         now: Instant,
         initial_sequences: InitialSequences,
-    ) -> (Self, Arc<Mutex<SendPacer>>) {
+    ) -> (Self, SendPacer) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
-        let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
+        let send_rate_limiter = SendPacer::new_prefilled(send_rate, now);
         let max_data_size_per_pkt = mss.get().checked_sub(data_overhead()).unwrap();
         let this = Self {
             mss,
@@ -273,9 +269,9 @@ impl ReliableLayer {
         now: Instant,
         initial_sequences: InitialSequences,
         tuning: WatchdogTuning,
-    ) -> (Self, Arc<Mutex<SendPacer>>) {
+    ) -> (Self, SendPacer) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
-        let send_rate_limiter = Arc::new(Mutex::new(SendPacer::new_prefilled(send_rate, now)));
+        let send_rate_limiter = SendPacer::new_prefilled(send_rate, now);
         let max_data_size_per_pkt = mss.get().checked_sub(data_overhead()).unwrap();
         let this = Self {
             mss,
@@ -328,6 +324,25 @@ impl ReliableLayer {
         self.frame_delivery.enabled
     }
 
+    /// Opt controller interval accounting in/out.  When false (no observer
+    /// and no logger) the accounting hooks return before any timestamp
+    /// arithmetic or counter mutation, so an absent observer and logger cost
+    /// exactly one predictable branch per decision point.
+    pub(crate) fn set_congestion_metrics_enabled(&mut self, enabled: bool) {
+        self.congestion_metrics_enabled = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn congestion_metrics_enabled(&self) -> bool {
+        self.congestion_metrics_enabled
+    }
+
+    /// Test-only: drain up to `n` tokens from the shared send-rate pacer.
+    #[cfg(test)]
+    pub(crate) fn drain_pacer_for_test(&self, n: usize, now: Instant) -> usize {
+        self.send_rate_limiter.take_at_most_tokens(n, now)
+    }
+
     pub fn is_no_data_to_send(&self) -> bool {
         self.is_send_buf_empty() && self.pkt_send_space.num_in_flight_pkts() == 0
     }
@@ -365,8 +380,6 @@ impl ReliableLayer {
         }
         Some(
             self.send_rate_limiter
-                .lock()
-                .unwrap()
                 .next_batch_time(now, max_sendable_packets),
         )
     }
@@ -528,11 +541,7 @@ impl ReliableLayer {
         // are already in flight.
         if self.pkt_send_space.in_outage_recovery()
             && self.pkt_send_space.has_rtx(now)
-            && !self
-                .send_rate_limiter
-                .lock()
-                .unwrap()
-                .take_exact_tokens(1, now)
+            && !self.send_rate_limiter.take_exact_tokens(1, now)
         {
             return None;
         }
@@ -605,12 +614,7 @@ impl ReliableLayer {
         };
 
         // There is a new packet (or FIN) to send: take a token now.
-        if !self
-            .send_rate_limiter
-            .lock()
-            .unwrap()
-            .take_exact_tokens(1, now)
-        {
+        if !self.send_rate_limiter.take_exact_tokens(1, now) {
             // We have data/FIN to send but the rate limiter says not yet.
             // Restore the FIN buffer state so the FIN is retried later
             // instead of being permanently consumed.
@@ -677,12 +681,7 @@ impl ReliableLayer {
             }
         };
 
-        if !self
-            .send_rate_limiter
-            .lock()
-            .unwrap()
-            .take_exact_tokens(1, now)
-        {
+        if !self.send_rate_limiter.take_exact_tokens(1, now) {
             return None;
         }
 
@@ -1155,8 +1154,7 @@ impl ReliableLayer {
             return;
         }
         self.send_rate = send_rate;
-        let mut limiter = self.send_rate_limiter.lock().unwrap();
-        limiter.set_rate(send_rate, now);
+        self.send_rate_limiter.set_rate(send_rate, now);
     }
 }
 
@@ -1284,7 +1282,7 @@ impl ReliableLayer {
                 }
             });
         crate::metrics::MetricsSnapshot {
-            pacer_tokens_packets: self.send_rate_limiter.lock().unwrap().outdated_tokens(),
+            pacer_tokens_packets: self.send_rate_limiter.outdated_tokens(),
             send_rate_packets_per_second: self.send_rate.get(),
             loss_ratio: send_window.loss_ratio,
             congestion_loss_ratio: self.last_congestion_loss_ratio,
@@ -2595,7 +2593,7 @@ mod tests {
     fn ordinary_bandwidth_probe_waits_for_previous_feedback() {
         let t0 = Instant::now();
         let mut rl = test_layer(t0);
-        rl.congestion_metrics_enabled = true;
+        rl.set_congestion_metrics_enabled(true);
         let mut t = t0;
 
         // Ramp at a brisk 10 ms RTT so slow start exits and the ordinary
@@ -2675,21 +2673,20 @@ mod tests {
         let pacer = rl.send_rate_limiter.clone();
         let current = rl.send_rate.get();
         let tokens_before = {
-            let mut pacer = pacer.lock().unwrap();
             assert!(pacer.take_at_most_tokens(usize::MAX, t0) > 0);
             pacer.outdated_tokens()
         };
         let later = t0 + Duration::from_millis(10);
         rl.set_smooth_send_rate(current, later);
         assert_eq!(
-            pacer.lock().unwrap().outdated_tokens(),
+            pacer.outdated_tokens(),
             tokens_before,
             "a no-op smoothing decision must not refresh or rebuild the pacer"
         );
         rl.set_smooth_send_rate(current * 2.0, later);
         assert!(rl.send_rate.get() > current);
         assert!(
-            pacer.lock().unwrap().outdated_tokens() > tokens_before,
+            pacer.outdated_tokens() > tokens_before,
             "a real rate change must still credit elapsed pacer tokens"
         );
     }
@@ -2736,7 +2733,7 @@ mod tests {
     fn congestion_metrics_track_persistent_queue_resets_on_signal_loss() {
         let t0 = Instant::now();
         let mut rl = test_layer(t0);
-        rl.congestion_metrics_enabled = true;
+        rl.set_congestion_metrics_enabled(true);
         let floor = Duration::from_millis(100);
         let tolerance = Duration::from_millis(25);
         let armed_for = Duration::from_millis(400);
@@ -2758,7 +2755,7 @@ mod tests {
         let t0 = Instant::now();
         let mut rl = test_layer(t0);
         assert!(
-            !rl.congestion_metrics_enabled,
+            !rl.congestion_metrics_enabled(),
             "test_layer must start with controller accounting disabled"
         );
         let mut t = t0;
@@ -2891,7 +2888,7 @@ mod tests {
         let t0 = Instant::now();
         let mut rl = test_layer(t0);
         assert!(
-            !rl.congestion_metrics_enabled,
+            !rl.congestion_metrics_enabled(),
             "test_layer must start with controller accounting disabled"
         );
 
@@ -2905,7 +2902,7 @@ mod tests {
         assert_eq!(m.loss_backoff_target_packets_per_second, None);
 
         // Enabled with floor > raw: gauges set, both counters saturate-add.
-        rl.congestion_metrics_enabled = true;
+        rl.set_congestion_metrics_enabled(true);
         rl.record_loss_backoff(10.0, 40.0, 40.0);
         let m = &rl.congestion_metrics;
         assert_eq!(m.loss_backoff_floor_packets_per_second, Some(40.0));

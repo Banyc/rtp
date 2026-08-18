@@ -217,12 +217,33 @@ pub fn unsplit(read: AsyncReadAdapter, write: AsyncWriteAdapter) -> IoStream {
 
 #[derive(Debug)]
 pub struct ConnReader {
-    pub(crate) transmission_layer: Arc<Connection>,
-    pub(crate) frame_buf: Vec<u8>,
-    pub(crate) _shutdown_guard: tokio_util::sync::DropGuard,
+    transmission_layer: Arc<Connection>,
+    frame_buf: Vec<u8>,
+    _shutdown_guard: tokio_util::sync::DropGuard,
 }
 
 impl ConnReader {
+    pub(super) fn new(
+        transmission_layer: Arc<Connection>,
+        shutdown_guard: tokio_util::sync::DropGuard,
+    ) -> Self {
+        Self {
+            transmission_layer,
+            frame_buf: Vec::new(),
+            _shutdown_guard: shutdown_guard,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn recv_fin_for_test(&self) -> &tokio_util::sync::CancellationToken {
+        self.transmission_layer.recv_fin()
+    }
+
+    #[cfg(test)]
+    pub(super) fn recv_eof_for_test(&self) -> &tokio_util::sync::CancellationToken {
+        self.transmission_layer.recv_eof()
+    }
+
     pub async fn recv(&mut self, data: &mut [u8]) -> Result<usize, IoErr> {
         if data.is_empty() {
             return Ok(0);
@@ -233,13 +254,7 @@ impl ConnReader {
             self.frame_buf.drain(..n);
             return Ok(n);
         }
-        if self
-            .transmission_layer
-            .reliable_layer()
-            .lock()
-            .unwrap()
-            .frame_delivery_enabled()
-        {
+        if self.transmission_layer.frame_delivery_enabled() {
             match self.transmission_layer.recv_frame().await? {
                 Some(frame) => {
                     let n = frame.len().min(data.len());
@@ -272,11 +287,21 @@ impl ConnReader {
 
 #[derive(Debug)]
 pub struct ConnWriter {
-    pub(crate) transmission_layer: Arc<Connection>,
-    pub(crate) _shutdown_guard: tokio_util::sync::DropGuard,
+    transmission_layer: Arc<Connection>,
+    _shutdown_guard: tokio_util::sync::DropGuard,
 }
 
 impl ConnWriter {
+    pub(super) fn new(
+        transmission_layer: Arc<Connection>,
+        shutdown_guard: tokio_util::sync::DropGuard,
+    ) -> Self {
+        Self {
+            transmission_layer,
+            _shutdown_guard: shutdown_guard,
+        }
+    }
+
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, IoErr> {
         self.transmission_layer.send(data).await
     }
@@ -286,15 +311,15 @@ impl ConnWriter {
     }
 
     pub fn is_send_buf_empty(&self) -> bool {
-        self.transmission_layer
-            .reliable_layer()
-            .lock()
-            .unwrap()
-            .is_send_buf_empty()
+        self.transmission_layer.is_send_buf_empty()
     }
 
     pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
         self.transmission_layer.send_buf_empty().await
+    }
+
+    pub(crate) async fn all_sent_data_acked(&self) -> Result<(), IoErr> {
+        self.transmission_layer.no_data_to_send().await
     }
 
     pub async fn send_kill_and_abort(&mut self) {
@@ -303,12 +328,7 @@ impl ConnWriter {
     }
 
     pub fn into_async_write(self) -> AsyncWriteAdapter {
-        let max_write_bytes = self
-            .transmission_layer
-            .reliable_layer()
-            .lock()
-            .unwrap()
-            .write_unit_capacity();
+        let max_write_bytes = self.transmission_layer.write_unit_capacity();
         let abort_session = Arc::clone(&self.transmission_layer);
         AsyncWriteAdapter {
             inner: PollWrite::new(self),
@@ -328,18 +348,8 @@ pub(crate) fn into_frame_io_parts(
             "RTP read and write halves belong to different connections",
         ));
     }
-    let read_enabled = read
-        .transmission_layer
-        .reliable_layer()
-        .lock()
-        .unwrap()
-        .frame_delivery_enabled();
-    let write_enabled = write
-        .transmission_layer
-        .reliable_layer()
-        .lock()
-        .unwrap()
-        .frame_delivery_enabled();
+    let read_enabled = read.transmission_layer.frame_delivery_enabled();
+    let write_enabled = write.transmission_layer.frame_delivery_enabled();
     if !read_enabled || !write_enabled {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -360,7 +370,7 @@ impl AsyncAsyncRead for ConnReader {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.recv(buf)
             .await
-            .map_err(|kind| self.transmission_layer.termination.io_error(kind))
+            .map_err(|kind| self.transmission_layer.io_error(kind))
     }
 }
 
@@ -368,19 +378,19 @@ impl AsyncAsyncWrite for ConnWriter {
     async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.send(buf)
             .await
-            .map_err(|kind| self.transmission_layer.termination.io_error(kind))
+            .map_err(|kind| self.transmission_layer.io_error(kind))
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
         self.transmission_layer
             .check_error()
-            .map_err(|kind| self.transmission_layer.termination.io_error(kind))?;
+            .map_err(|kind| self.transmission_layer.io_error(kind))?;
         Ok(())
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         self.transmission_layer.send_fin_buf();
-        self.transmission_layer.no_data_to_send().await?;
+        self.all_sent_data_acked().await?;
         Ok(())
     }
 }
@@ -699,12 +709,7 @@ mod tests {
         let (a_r, a_w, _a_supervisor) = socket(a, None);
         let (_b_r, b_w, _b_supervisor) = socket(b, None);
         let _a_r = a_r;
-        let capacity = a_w
-            .transmission_layer
-            .reliable_layer()
-            .lock()
-            .unwrap()
-            .send_data_buf_capacity();
+        let capacity = a_w.transmission_layer.send_data_buf_capacity_for_test();
         let mut write_stream = a_w.into_async_write();
         let big = vec![0u8; capacity * 4];
         let mut cx = Context::from_waker(std::task::Waker::noop());

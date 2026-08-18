@@ -8,9 +8,9 @@ use super::MAX_MSS;
 use super::NO_FEC_MSS;
 use crate::delivery::frame::FrameMode;
 use crate::traffic_shaping::redundancy::{
+    RetransmissionArmorConfig,
     fec::{FecConfig, FecState},
     fec_tuning::FecTuning,
-    retransmission_armor::RetransmissionArmorConfig,
 };
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 

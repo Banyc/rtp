@@ -411,13 +411,6 @@ impl PktSendSpace {
             .iter()
             .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
     }
-    fn unacked_mut(
-        send_wnd: &mut SendWindow<Option<InFlightPkt>>,
-    ) -> impl Iterator<Item = (SequenceNumber, &mut InFlightPkt)> {
-        send_wnd
-            .iter_mut()
-            .filter_map(|(k, v)| v.as_mut().map(|v| (k, v)))
-    }
 
     pub fn cwnd(&self) -> NonZeroUsize {
         self.cwnd

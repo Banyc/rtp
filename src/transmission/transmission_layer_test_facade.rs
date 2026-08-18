@@ -14,45 +14,43 @@ impl TransmissionLayer {
     /// the retransmission-armor duplicate-copy token gate can be exercised
     /// (the primary rtx bypasses the bucket; the dup needs a token).
     pub(crate) fn drain_rate_limiter_for_test(&self, n: usize, now: Instant) -> usize {
-        self.shared
-            .send_rate_limiter
-            .lock()
-            .unwrap()
-            .take_at_most_tokens(n, now)
+        self.write_half_for_test().drain_pacer_for_test(n, now)
     }
 
     pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
-        self.write_half.send_pkts(bufs).await
+        self.write_half_mut_for_test().send_pkts(bufs).await
     }
 
     pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        self.write_half.flush_acks(bufs).await
+        self.write_half_mut_for_test().flush_acks(bufs).await
     }
 
     pub fn has_pending_acks(&self) -> bool {
-        self.write_half.has_pending_acks()
+        self.write_half_for_test().has_pending_acks()
     }
 
     pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        self.write_half.send_kill_pkt(bufs).await
+        self.write_half_mut_for_test().send_kill_pkt(bufs).await
     }
 
     pub async fn send_kill_and_abort(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
-        self.write_half.send_kill_and_abort(bufs).await
+        self.write_half_mut_for_test()
+            .send_kill_and_abort(bufs)
+            .await
     }
 
     pub async fn recv_pkts(
         &mut self,
         bufs: &mut RecvBufs,
     ) -> Result<RecvPkts, (IoErr, SendKillPkt)> {
-        self.read_half.recv_pkts(bufs).await
+        self.read_half_for_test().recv_pkts(bufs).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traffic_shaping::redundancy::retransmission_armor::RetransmissionArmorConfig;
+    use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
     use crate::transmission::test_doubles::BlockingWrite;
     use std::sync::{
         Mutex,
@@ -88,7 +86,7 @@ mod tests {
     }
 
     fn settle_rtt(tl: &TransmissionLayer, rtt: Duration, n: usize) {
-        let rl = tl.reliable_layer();
+        let rl = tl.shared_for_test().reliable_layer_for_test();
         let mut rl = rl.lock().unwrap();
         let mut t = Instant::now();
         for _ in 0..n {
@@ -98,7 +96,7 @@ mod tests {
     }
 
     fn send_one_packet(tl: &TransmissionLayer, now: Instant) -> crate::sequence::SequenceNumber {
-        let rl = tl.reliable_layer();
+        let rl = tl.shared_for_test().reliable_layer_for_test();
         let mut rl = rl.lock().unwrap();
         let payload = vec![0u8; 100];
         assert_eq!(
@@ -165,11 +163,11 @@ mod tests {
         let mut recv_bufs = RecvBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
         assert!(
-            transmission.recv_fin().is_cancelled(),
+            transmission.shared_for_test().recv_fin().is_cancelled(),
             "an accepted FIN must be published even while an earlier sequence is missing"
         );
         assert!(
-            !transmission.recv_eof().is_cancelled(),
+            !transmission.shared_for_test().recv_eof().is_cancelled(),
             "an out-of-order FIN must not publish application EOF"
         );
     }
@@ -230,7 +228,7 @@ mod tests {
         let mut recv_bufs = RecvBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
         assert!(
-            !transmission.recv_fin().is_cancelled(),
+            !transmission.shared_for_test().recv_fin().is_cancelled(),
             "a duplicate sequence is not proof that the peer sent FIN"
         );
     }
@@ -275,10 +273,10 @@ mod tests {
         let mut transmission = TransmissionLayer::new(layer, None);
         let mut recv_bufs = RecvBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
-        assert!(transmission.recv_fin().is_cancelled());
+        assert!(transmission.shared_for_test().recv_fin().is_cancelled());
         assert!(transmission.has_pending_acks());
-        let shared = Arc::clone(&transmission.shared);
-        let reaper = transmission.termination_reaper.clone();
+        let shared = Arc::clone(&transmission.shared_for_test());
+        let reaper = transmission.termination_reaper_for_test().clone();
         let mut reap = Box::pin(async move {
             reaper
                 .ready_or_graceful_close(shared.recv_fin(), shared.session_outbound_drained())
@@ -394,7 +392,7 @@ mod tests {
     fn stage_small_message(tl: &TransmissionLayer) {
         let payload = [0; 100];
         let now = Instant::now();
-        let reliable = tl.reliable_layer();
+        let reliable = tl.shared_for_test().reliable_layer_for_test();
         assert_eq!(
             reliable
                 .lock()
@@ -434,10 +432,10 @@ mod tests {
             Err(std::io::ErrorKind::ConnectionReset.into())
         );
         assert_eq!(
-            tl.check_error(),
+            tl.shared_for_test().check_error(),
             Err(std::io::ErrorKind::ConnectionReset.into())
         );
-        assert!(tl.termination.terminal().is_cancelled());
+        assert!(tl.shared_for_test().terminal_is_cancelled());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             tl.send_pkts(&mut bufs).await,
@@ -456,8 +454,8 @@ mod tests {
         stage_small_message(&tl);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_pkts(&mut bufs).await, Ok(true));
-        assert_eq!(tl.check_error(), Ok(()));
-        assert!(!tl.termination.terminal().is_cancelled());
+        assert_eq!(tl.shared_for_test().check_error(), Ok(()));
+        assert!(!tl.shared_for_test().terminal_is_cancelled());
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             2,
@@ -471,7 +469,10 @@ mod tests {
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_kill_and_abort(&mut bufs).await, Ok(()));
-        assert_eq!(tl.check_error(), Err(std::io::ErrorKind::BrokenPipe.into()));
+        assert_eq!(
+            tl.shared_for_test().check_error(),
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        );
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             2,
@@ -485,7 +486,8 @@ mod tests {
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
         wait_for_rtx_window().await;
-        tl.reliable_layer()
+        tl.shared_for_test()
+            .reliable_layer_for_test()
             .lock()
             .unwrap()
             .set_queue_building_for_test(true);
@@ -513,11 +515,17 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn primary_rtx_bypasses_empty_bucket_and_dup_is_skipped() {
+    async fn tail_probe_bypasses_empty_bucket_and_dup_is_skipped() {
         let (mut tl, recorder) = harness(false, true);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
+        // Wait out the tail-loss-probe window (PTO = max(2*srtt, 10 ms) at
+        // the 1 ms settled RTT) so the *tail probe* — not a data packet — is
+        // the next recovery send.  The regular RTO stays far off (MIN_RTO
+        // floor), so a regular retransmit cannot preempt it.
         wait_for_rtx_window().await;
+        // Drain the ordinary pacer: no token is available for the armor
+        // duplicate-copy gate.
         let drained = tl.drain_rate_limiter_for_test(usize::MAX, Instant::now());
         assert!(drained > 0, "bucket should have started with tokens");
         let mut bufs = SendBufs::new();
@@ -525,7 +533,7 @@ mod tests {
         assert_eq!(
             recorder.lock().unwrap().count(),
             1,
-            "primary sends from empty bucket; dup is skipped (no token)"
+            "the tail probe still sends once from an empty bucket; the armor duplicate is skipped (no token)"
         );
     }
     #[tokio::test]
@@ -557,7 +565,7 @@ mod tests {
         let payload = vec![0u8; 100];
         let now = Instant::now();
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             assert_eq!(rl.send_data_buf(&payload, now).unwrap(), payload.len());
         }
@@ -574,7 +582,7 @@ mod tests {
         let mss = 8192usize;
         let post_fec_mss = mss - 11 - 2;
         let payload_len = post_fec_mss - crate::codec::data_overhead();
-        let rl = tl.reliable_layer();
+        let rl = tl.shared_for_test().reliable_layer_for_test();
         let mut rl = rl.lock().unwrap();
         for _ in 0..n {
             let payload = vec![0u8; payload_len];
@@ -637,13 +645,13 @@ mod tests {
     async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
         let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             rl.set_cwnd_for_test(std::num::NonZeroUsize::new(3).unwrap());
         }
         stage_n_packets(&tl, 3);
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             rl.enqueue_send_data_for_test(&[0u8; 100]);
         }
@@ -660,13 +668,13 @@ mod tests {
     async fn partial_data_burst_skipped_when_toggle_off_and_gate_closed() {
         let (mut tl, recorder) = harness_with_mss(true, false, false, 8192);
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             rl.set_cwnd_for_test(std::num::NonZeroUsize::new(3).unwrap());
         }
         stage_n_packets(&tl, 3);
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             rl.enqueue_send_data_for_test(&[0u8; 100]);
         }
@@ -683,7 +691,7 @@ mod tests {
     async fn ack_burst_keeps_stock_tail_gate_when_blocked() {
         let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             rl.enqueue_send_data_for_test(&[0u8; 100]);
         }
@@ -858,13 +866,20 @@ mod tests {
         let mut recv_bufs = RecvBufs::new();
         let mut send_bufs = SendBufs::new();
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
-        transmission.ack_schedule_changed().notified().await;
+        transmission
+            .write_half_for_test()
+            .ack_schedule_changed()
+            .notified()
+            .await;
         transmission.flush_acks(&mut send_bufs).await.unwrap();
         assert!(!transmission.has_pending_acks());
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
         tokio::time::timeout(
             Duration::from_millis(100),
-            transmission.ack_schedule_changed().notified(),
+            transmission
+                .write_half_for_test()
+                .ack_schedule_changed()
+                .notified(),
         )
         .await
         .expect("new ACK work must rearm the send schedule");
@@ -895,7 +910,11 @@ mod tests {
         use crate::transmission::transmission_layer::MAX_NUM_ACK;
         let (mut transmission, recorder) = harness(false, false);
         {
-            let mut reliable = transmission.shared.reliable_layer.lock().unwrap();
+            let mut reliable = transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap();
             // (seq 0 would fold into the cumulative front, so start at 2 to
             // keep exactly one full page of selective blocks.)
             for seq in (2..=128).step_by(2) {
@@ -907,13 +926,14 @@ mod tests {
                 "the history must hold exactly one page of balls"
             );
         }
-        transmission.shared.ack_feedback.record(
-            crate::transmission::ack_feedback::state::ReceivedAckWork {
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(crate::transmission::ack_feedback::ReceivedAckWork {
                 pending_acks: 1,
                 fin_ack: false,
                 echo_ts: None,
-            },
-        );
+            });
         let mut send_bufs = SendBufs::new();
         transmission
             .flush_acks(&mut send_bufs)
@@ -952,10 +972,10 @@ mod tests {
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
-        let shared = Arc::clone(&transmission.shared);
+        let shared = Arc::clone(&transmission.shared_for_test());
         shared
-            .ack_feedback
-            .record(crate::transmission::ack_feedback::state::ReceivedAckWork {
+            .ack_feedback_for_test()
+            .record(crate::transmission::ack_feedback::ReceivedAckWork {
                 pending_acks: 1,
                 fin_ack: false,
                 echo_ts: None,
@@ -967,8 +987,8 @@ mod tests {
             () = send_started.notified() => (),
         }
         shared
-            .ack_feedback
-            .record(crate::transmission::ack_feedback::state::ReceivedAckWork {
+            .ack_feedback_for_test()
+            .record(crate::transmission::ack_feedback::ReceivedAckWork {
                 pending_acks: 1,
                 fin_ack: true,
                 echo_ts: None,
@@ -978,7 +998,7 @@ mod tests {
             .await
             .expect("released ACK send did not finish")
             .expect("ACK send failed");
-        let (pending_acks, fin_pending) = shared.ack_feedback.pending_work();
+        let (pending_acks, fin_pending) = shared.ack_feedback_for_test().pending_work();
         assert!(
             fin_pending,
             "a FIN that arrived mid-flush was not acked by it and must stay pending"
@@ -1102,14 +1122,14 @@ mod tests {
         let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         {
-            let rl = tl.reliable_layer();
+            let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             rl.send_data_buf(&[0u8; 100], Instant::now()).unwrap();
         }
         let mut bufs = SendBufs::new();
         assert!(tl.send_pkts(&mut bufs).await.is_ok());
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let shared = Arc::clone(&tl.shared);
+        let shared = Arc::clone(&tl.shared_for_test());
         let mut send_tasks = tokio::task::JoinSet::new();
         // The parked KILL delivery is cancelled through a watch inside the
         // task, so the task exits normally instead of being aborted (no
@@ -1129,16 +1149,14 @@ mod tests {
             "local fatal state must be visible while KILL delivery is blocked"
         );
         assert!(
-            shared.termination.terminal().is_cancelled(),
+            shared.terminal_is_cancelled(),
             "session cancellation must be published before KILL delivery completes"
         );
         assert!(
             send_tasks.try_join_next().is_none(),
             "KILL delivery must still be pending"
         );
-        let err = shared
-            .termination
-            .io_error(std::io::ErrorKind::BrokenPipe.into());
+        let err = shared.io_error(std::io::ErrorKind::BrokenPipe.into());
         let msg = err.to_string();
         assert!(
             msg.contains("trigger=proactive_stall"),
@@ -1191,7 +1209,7 @@ mod tests {
             true,
         );
         let mut transmission = TransmissionLayer::new(unreliable, None);
-        let shared = Arc::clone(&transmission.shared);
+        let shared = Arc::clone(&transmission.shared_for_test());
         let mut send_tasks = tokio::task::JoinSet::new();
         // The parked operation is cancelled through a watch inside the task,
         // so the task exits normally instead of being aborted (no cancelled
@@ -1210,7 +1228,7 @@ mod tests {
             shared.check_error(),
             Err(std::io::ErrorKind::BrokenPipe.into())
         );
-        assert!(shared.termination.terminal().is_cancelled());
+        assert!(shared.terminal_is_cancelled());
         assert!(send_tasks.try_join_next().is_none());
         stop_tx.send(true).unwrap();
         let exit = send_tasks.join_next().await.unwrap().unwrap();
@@ -1264,7 +1282,8 @@ mod tests {
         let mut recv_bufs = RecvBufs::new();
         let _ = tl.recv_pkts(&mut recv_bufs).await;
         let rtt = tl
-            .reliable_layer
+            .shared_for_test()
+            .reliable_layer_for_test()
             .lock()
             .unwrap()
             .pkt_send_space()
@@ -1332,7 +1351,7 @@ mod tests {
         // window when it lands.
         stage_small_message(&transmission);
         assert!(transmission.send_pkts(&mut send_bufs).await.unwrap());
-        let shared = Arc::clone(&transmission.shared);
+        let shared = Arc::clone(&transmission.shared_for_test());
         let mut recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
         tokio::select! {
             result = &mut recv => panic!("receive returned before the ACK-only wake: {result:?}"),
@@ -1383,10 +1402,10 @@ mod tests {
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
-        let shared = Arc::clone(&transmission.shared);
+        let shared = Arc::clone(&transmission.shared_for_test());
         // Seed a history spanning two full pages (head + deep page).
         {
-            let mut reliable = shared.reliable_layer.lock().unwrap();
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
             for seq in (2..=258).step_by(2) {
                 reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
             }
@@ -1398,7 +1417,7 @@ mod tests {
         // Snapshot the expected deep page from the pre-mutation history.
         let expected_deep = {
             let mut buf = vec![0u8; 8192];
-            let reliable = shared.reliable_layer.lock().unwrap();
+            let reliable = shared.reliable_layer_for_test().lock().unwrap();
             let history = reliable.pkt_recv_space().ack_history();
             let ack = crate::ack::EncodeAck {
                 queue: history,
@@ -1409,13 +1428,14 @@ mod tests {
             buf.truncate(n);
             buf
         };
-        transmission.shared.ack_feedback.record(
-            crate::transmission::ack_feedback::state::ReceivedAckWork {
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(crate::transmission::ack_feedback::ReceivedAckWork {
                 pending_acks: 1,
                 fin_ack: false,
                 echo_ts: None,
-            },
-        );
+            });
         let mut send_bufs = SendBufs::new();
         let mut flush = Box::pin(transmission.flush_acks(&mut send_bufs));
         tokio::select! {
@@ -1424,7 +1444,7 @@ mod tests {
         }
         // Page 0 is in flight; mutate the history before page 1 is encoded.
         {
-            let mut reliable = shared.reliable_layer.lock().unwrap();
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
             for seq in (260..=300).step_by(2) {
                 reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
             }
@@ -1484,7 +1504,7 @@ mod tests {
             "an exhausted underlay write must not surface as a terminal error"
         );
         assert!(
-            !transmission.shared.termination.has_error(),
+            !transmission.shared_for_test().has_error(),
             "data-send WouldBlock is an I/O-pressure outcome, not a terminal error"
         );
         let would_blocks = observations

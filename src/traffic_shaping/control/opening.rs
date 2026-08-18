@@ -323,11 +323,12 @@ mod tests {
             assert!(!codec::in_cmd_space(encoded[0]));
             assert!(codec::decode(&encoded, &mut Vec::new(), None).is_err());
 
-            let mut fec = FecState::new(FecConfig {
+            let fec = FecState::new(FecConfig {
                 symbol_size: 1_424,
                 small_group_parity_count: 1,
             });
-            assert!(fec.decode(&encoded).is_none());
+            let (_encoder, mut decoder, _stats) = fec.into_actor_parts();
+            assert!(decoder.decode(&encoded).is_none());
         }
     }
 

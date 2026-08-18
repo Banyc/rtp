@@ -1,6 +1,8 @@
 pub(crate) mod ack_feedback;
 pub(crate) mod connection;
 pub(crate) mod coordination;
+pub(crate) mod observability;
+pub(crate) mod post_open_recovery;
 pub(crate) mod read_half;
 pub(crate) mod termination;
 #[cfg(test)]
