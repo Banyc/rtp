@@ -27,16 +27,24 @@
 
 /// Per-connection FEC tuning.
 ///
-/// - `instream_flush`: when `true`, the transmission layer force-flushes the
-///   open FEC data group at the end of every data send burst (after the last
-///   data symbol) instead of waiting for the stock `can_send_tail_fec` gate.
-///   ACK/kill bursts keep the stock gate regardless — only data bursts are
-///   force-flushed.  This is what lets a single-symbol interactive message
-///   emit its parity promptly rather than being skipped at the burst end.
+/// - `instream_flush`: when `true`, the transmission layer requests a prompt
+///   data-burst tail flush for the open FEC data group at the end of every
+///   data send burst (after the last data symbol) instead of waiting for the
+///   stock `can_send_tail_fec` gate.  This is a *policy request* only — it
+///   cannot override the sender-side condition gate: parity is still emitted
+///   only when recent loss/recovery evidence warrants recovery (the loss gate
+///   is open) and the capacity is genuinely spare (no queued/waiting
+///   application work, no queue growth, no cwnd pressure, no retransmission,
+///   no pending tail probe).  ACK/kill bursts retain the stock tail request
+///   regardless of this flag — only data bursts are force-requested.
 /// - `small_group_parity_count`: the parity depth requested for groups that
 ///   encode as exactly one data symbol.  Multi-symbol groups always keep the
 ///   stock budget gate regardless of this value (ungated depth > 1 on bulk
-///   would add ~75% overhead and defeat the point).
+///   would add ~75% overhead and defeat the point).  This tuning bypasses
+///   only the encoder's token-share check — and only after the
+///   transmission-layer condition gate (loss, spare capacity, tail request)
+///   has already succeeded — so a single-symbol interactive message emits its
+///   deeper parity promptly without ever competing with data traffic.
 ///
 /// `Default` is `(false, 1)` — stock behaviour, byte-for-byte.  The
 /// `max_diversity` preset is `(true, 3)` — the recommended setting for

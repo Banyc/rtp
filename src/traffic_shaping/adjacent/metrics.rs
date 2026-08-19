@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 26;
+pub const SCHEMA_VERSION: u16 = 28;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +318,36 @@ pub struct MetricsRetransmissionCounters {
     pub tail_probes: u64,
 }
 
+/// Cumulative FEC group-size histogram buckets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsFecGroupSizeBuckets {
+    pub one: u64,
+    pub two_to_four: u64,
+    pub five_to_seven: u64,
+    pub full_eight: u64,
+}
+
+/// Cumulative forward-error-correction activity for one connection.
+/// `None` for the whole `MetricsFecCounters` is the exact meaning of
+/// disabled FEC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsFecCounters {
+    pub parity_sent: u64,
+    pub groups_flushed: u64,
+    pub flushed_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_no_surplus_tokens: u64,
+    pub no_surplus_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_burst_end: u64,
+    pub burst_end_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_loss_gate: u64,
+    pub loss_gate_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_no_spare_capacity: u64,
+    pub no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets,
+    pub recovered_symbols: u64,
+    pub dropped_malformed_packets: u64,
+    pub dropped_decoder_panics: u64,
+}
+
 impl MetricsEvent {
     /// Stable snake-case label used by text and CSV exporters.
     pub const fn as_str(self) -> &'static str {
@@ -355,6 +385,7 @@ pub struct MetricsSnapshot {
     pub retransmission_ready_packets: usize,
     pub retransmitted_packets: usize,
     pub retransmission_counters: MetricsRetransmissionCounters,
+    pub fec_counters: Option<MetricsFecCounters>,
     pub next_send_sequence: u64,
     pub minimum_rtt: Option<Duration>,
     pub smoothed_rtt: Duration,

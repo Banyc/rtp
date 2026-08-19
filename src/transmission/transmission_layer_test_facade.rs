@@ -425,6 +425,13 @@ mod tests {
     #[tokio::test]
     async fn fatal_regular_fec_parity_send_terminates_session() {
         let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::ConnectionReset);
+        // Measured congestion loss opens the condition gate so a parity burst
+        // is actually attempted and its fatal error surfaces.
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         stage_small_message(&tl);
         let mut bufs = SendBufs::new();
         assert_eq!(
@@ -451,6 +458,11 @@ mod tests {
     #[tokio::test]
     async fn would_block_fec_parity_send_remains_non_terminal() {
         let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::WouldBlock);
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         stage_small_message(&tl);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_pkts(&mut bufs).await, Ok(true));
@@ -466,6 +478,11 @@ mod tests {
     #[tokio::test]
     async fn kill_tail_parity_error_preserves_original_terminal_error() {
         let (mut tl, attempts) = parity_error_harness(std::io::ErrorKind::ConnectionReset);
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let mut bufs = SendBufs::new();
         assert_eq!(tl.send_kill_and_abort(&mut bufs).await, Ok(()));
@@ -559,9 +576,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_symbol_depth_is_ungated_but_bulk_keeps_budget() {
+    async fn single_symbol_depth_uses_spare_capacity_after_loss_gate_opens() {
         use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
+        // Measured congestion loss above the enable threshold opens the loss
+        // gate; the single-symbol depth-3 parity then flows because the
+        // capacity is genuinely spare.
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         let payload = vec![0u8; 100];
         let now = Instant::now();
         {
@@ -574,7 +599,7 @@ mod tests {
         let n = recorder.lock().unwrap().count();
         assert_eq!(
             n, 4,
-            "max_diversity single-symbol burst must emit 1 data + 3 parity = 4 datagrams, got {n}"
+            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 3 parity = 4 datagrams, got {n}"
         );
     }
 
@@ -631,6 +656,13 @@ mod tests {
     #[tokio::test]
     async fn full_group_flushes_four_parities_inline_mid_burst() {
         let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
+        // Measured congestion loss opens the condition gate so the full
+        // in-stream group may flush its parity inline mid-burst.
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         stage_n_packets(&tl, 8);
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
@@ -642,8 +674,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_data_burst_force_flushes_when_tail_gate_closed() {
+    async fn saturated_data_burst_does_not_spend_capacity_on_parity() {
         let (mut tl, recorder) = harness_with_mss(true, false, true, 8192);
+        // Open the loss gate so the only blocking condition is capacity: a
+        // saturated burst (cwnd pressure + queued application work) must not
+        // spend capacity on parity.
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         {
             let rl = tl.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
@@ -659,8 +699,59 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 7,
-            "partial data burst with toggle on and stock gate closed must flush 3 data + 4 parity = 7 datagrams, got {n}"
+            n, 3,
+            "saturated data burst must emit 3 data + 0 parity = 3 datagrams (cwnd pressure wins over parity), got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fec_waits_for_loss_feedback_even_with_spare_capacity() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
+        // Fresh connection: no congestion feedback and no recovery samples
+        // yet, so the loss gate stays closed even though capacity is spare
+        // and the instream_flush tail policy requests a flush.
+        let payload = vec![0u8; 100];
+        let now = Instant::now();
+        {
+            let rl = tl.shared_for_test().reliable_layer_for_test();
+            let mut rl = rl.lock().unwrap();
+            assert_eq!(rl.send_data_buf(&payload, now).unwrap(), payload.len());
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 1,
+            "startup without measured congestion loss must emit 1 data + 0 parity = 1 datagram, got {n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_growth_closes_fec_spare_capacity_gate() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
+        // Loss evidence is present (gate open) but the bottleneck queue is
+        // building: parity must not spend capacity on a growing queue.
+        {
+            let rl = tl.shared_for_test().reliable_layer_for_test();
+            let mut rl = rl.lock().unwrap();
+            rl.set_congestion_loss_ratio_for_test(Some(0.08));
+            rl.set_queue_building_for_test(true);
+        }
+        let payload = vec![0u8; 100];
+        let now = Instant::now();
+        {
+            let rl = tl.shared_for_test().reliable_layer_for_test();
+            let mut rl = rl.lock().unwrap();
+            assert_eq!(rl.send_data_buf(&payload, now).unwrap(), payload.len());
+        }
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 1,
+            "queue growth must close the spare-capacity gate: 1 data + 0 parity = 1 datagram, got {n}"
         );
     }
 
@@ -1260,6 +1351,13 @@ mod tests {
         );
         let mut transmission = TransmissionLayer::new(unreliable, None);
         let shared = Arc::clone(&transmission.shared_for_test());
+        // Measured congestion loss opens the condition gate so the KILL tail
+        // actually attempts its parity (the second stalled send).
+        shared
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
         let mut send_tasks = tokio::task::JoinSet::new();
         // The parked operation is cancelled through a watch inside the task,
         // so the task exits normally instead of being aborted (no cancelled

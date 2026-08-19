@@ -404,6 +404,18 @@ impl ReliableLayer {
             && !self.pkt_send_space.has_tail_probe(now)
     }
 
+    /// Whether the sender currently has *genuinely spare* capacity for a FEC
+    /// parity burst: the stock tail gate plus zero application write waiters
+    /// and no queue-building signal.  Pacer tokens alone are not spare
+    /// capacity — queued/waiting application work, queue growth, cwnd
+    /// pressure, retransmission, and a pending tail probe must win over
+    /// parity.
+    pub(crate) fn fec_has_spare_capacity(&self, now: Instant) -> bool {
+        self.can_send_tail_fec(now)
+            && self.application_write_waiters.load(Ordering::Relaxed) == 0
+            && !self.congestion_response.queue_building()
+    }
+
     pub fn pkt_send_space(&self) -> &PktSendSpace {
         &self.pkt_send_space
     }
@@ -418,6 +430,21 @@ impl ReliableLayer {
     /// retransmission-armor duplicate copies under congestion.
     pub fn queue_building(&self) -> bool {
         self.congestion_response.queue_building()
+    }
+
+    /// The most recent congestion-loss ratio measured by the delivery-rate
+    /// controller (`None` before the first rate sample).  Feeds the FEC
+    /// condition gate's loss evidence.
+    pub(crate) fn congestion_loss_ratio(&self) -> Option<f64> {
+        self.last_congestion_loss_ratio
+    }
+
+    /// Test-only: force the congestion-loss ratio so the FEC condition gate
+    /// can be exercised deterministically without driving a full delivery-rate
+    /// sample sequence.
+    #[cfg(test)]
+    pub(crate) fn set_congestion_loss_ratio_for_test(&mut self, loss: Option<f64>) {
+        self.last_congestion_loss_ratio = loss;
     }
 
     /// Test-only: force the queue_building flag so the retransmission-armor
@@ -1302,6 +1329,9 @@ impl ReliableLayer {
                 pre_outage_reason: retransmission_counters.pre_outage_reason,
                 tail_probes: retransmission_counters.tail_probes,
             },
+            // FEC actor state is owned by `Connection`, which overlays its
+            // `FecStatsHandle` here via `Connection::metrics_snapshot`.
+            fec_counters: None,
             next_send_sequence: self.pkt_send_space.next_seq().to_wire(),
             minimum_rtt: self.pkt_send_space.min_rtt(),
             smoothed_rtt: self.pkt_send_space.smooth_rtt(),
@@ -1633,9 +1663,14 @@ mod tests {
         let now = Instant::now();
         let layer = test_layer(now);
         assert_eq!(layer.metrics_at(now).application_write_waiters, 0);
+        assert!(layer.fec_has_spare_capacity(now));
         {
             let _first = layer.application_write_waiter();
             assert_eq!(layer.metrics_at(now).application_write_waiters, 1);
+            assert!(
+                !layer.fec_has_spare_capacity(now),
+                "a waiting application writer means the empty staging queue is not spare capacity"
+            );
             {
                 let _second = layer.application_write_waiter();
                 assert_eq!(layer.metrics_at(now).application_write_waiters, 2);

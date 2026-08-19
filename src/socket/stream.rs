@@ -552,8 +552,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fec_recovers_under_loss() {
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy};
-        let rate_a = BasisPoints::new(300);
-        let rate_b = BasisPoints::new(300);
+        // 8% loss: the FEC condition gate enables at 5% measured congestion
+        // loss, so the loss evidence here deterministically opens the gate.
+        let rate_a = BasisPoints::new(800);
+        let rate_b = BasisPoints::new(800);
         let fec = true;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -589,7 +591,7 @@ mod tests {
         assert!(recovered.is_some(), "FEC should be enabled on receiver");
         assert!(
             recovered.unwrap() > 0,
-            "FEC should recover >0 symbols under 3% loss, got 0"
+            "FEC should recover >0 symbols under 8% loss, got 0"
         );
     }
 
@@ -598,8 +600,11 @@ mod tests {
         use crate::socket::socket;
         use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
-        let rate_a = BasisPoints::new(300);
-        let rate_b = BasisPoints::new(300);
+        // 8% loss: the FEC condition gate enables at 5% measured congestion
+        // loss.  A wired-but-inert gate (configured yet never opened) would
+        // emit no sender parity and fail the parity_sent assertion.
+        let rate_a = BasisPoints::new(800);
+        let rate_b = BasisPoints::new(800);
         let fec = true;
         let mss = 8192;
         let tuning = FecTuning::max_diversity();
@@ -607,8 +612,19 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let a_layer =
+        let mut a_layer =
             wrap_fec_lossy_with_mss_and_fec_tuning(a.clone(), a, fec, mss, tuning, rate_a);
+        let a_fec_counters = Arc::new(std::sync::Mutex::new(None));
+        let observed_a_fec_counters = Arc::clone(&a_fec_counters);
+        a_layer.metrics_observer = Some(crate::metrics::MetricsObserver::new(move |observation| {
+            let Some(counters) = observation
+                .snapshot
+                .and_then(|snapshot| snapshot.fec_counters)
+            else {
+                return;
+            };
+            *observed_a_fec_counters.lock().unwrap() = Some(counters);
+        }));
         let b_layer =
             wrap_fec_lossy_with_mss_and_fec_tuning(b.clone(), b, fec, mss, tuning, rate_b);
         let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
@@ -638,6 +654,9 @@ mod tests {
             }
             b_r.fec_recovered_symbols()
         });
+        // Keep the sender's connection handle so the observed sender-side
+        // parity counter can be read after the transfer completes.
+        let sender = Arc::clone(&a_w.transmission_layer);
         for m in &sent {
             a_w.send(m).await.unwrap();
             let mut echo = vec![0u8; m.len()];
@@ -650,7 +669,21 @@ mod tests {
         assert!(recovered.is_some(), "FEC should be enabled on the receiver");
         assert!(
             recovered.unwrap() > 0,
-            "FEC should recover >0 symbols under 3% loss, got 0"
+            "FEC should recover >0 symbols under 8% loss, got 0"
+        );
+        let counters = a_fec_counters
+            .lock()
+            .unwrap()
+            .expect("sender FEC counters must be observed");
+        assert!(
+            counters.parity_sent > 0,
+            "loss-triggered FEC should emit parity through typed observations; counters={counters:?}"
+        );
+
+        let parity_sent = sender.fec_parity_sent_for_test();
+        assert!(
+            parity_sent.is_some() && parity_sent.unwrap() > 0,
+            "the sender must emit parity under 8% loss once the condition gate opens, got {parity_sent:?}"
         );
     }
 

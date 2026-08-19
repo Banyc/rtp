@@ -13,7 +13,9 @@ use crate::io_err::IoErr;
 use crate::metrics::{MetricsEvent, MetricsTerminationCause};
 use crate::traffic_shaping::core::{SendPacer, SendWake};
 use crate::traffic_shaping::redundancy::{
-    ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig, fec::FecEncoderState,
+    ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig,
+    fec::FecEncoderState,
+    fec_gate::{FecConditionGate, FecGateDecision},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,7 @@ pub struct WriteHalf {
     fec: Option<FecEncoderState>,
     fec_instream_flush: bool,
     instream_group_fec_enabled: bool,
+    fec_gate: FecConditionGate,
     retransmission_armor: RetransmissionArmor,
     send_pacer: SendPacer,
     ack_feedback: Arc<AckFeedback>,
@@ -57,6 +60,7 @@ impl WriteHalf {
             fec,
             fec_instream_flush,
             instream_group_fec_enabled,
+            fec_gate: FecConditionGate::default(),
             retransmission_armor: RetransmissionArmor::new(retransmission_armor),
             send_pacer,
             ack_feedback,
@@ -67,6 +71,33 @@ impl WriteHalf {
 
     pub(crate) fn kill_requested(&self) -> &tokio_util::sync::CancellationToken {
         self.termination_writer.kill_requested()
+    }
+
+    /// In-stream group FEC is only live while the condition gate's loss
+    /// evidence is active: startup without measured congestion loss or enough
+    /// primary recovery samples emits no parity, so the in-stream group path
+    /// must not accumulate full groups while the gate is closed.
+    fn instream_group_fec_enabled(&self) -> bool {
+        self.instream_group_fec_enabled && self.fec_gate.loss_active()
+    }
+
+    /// Refresh the condition gate's loss evidence from the reliable layer's
+    /// latest measured congestion-loss ratio before making any gate decision.
+    fn refresh_fec_loss_mode(&mut self) {
+        let loss = self
+            .shared
+            .with_reliable_layer(|layer| layer.congestion_loss_ratio());
+        self.fec_gate.refresh_loss(self.fec.is_some(), loss);
+    }
+
+    /// Evaluate the condition gate for a flush decision at `now`: spare
+    /// capacity comes from the reliable layer (tail gate + zero write waiters
+    /// + no queue building); the tail policy is the caller's request.
+    fn fec_gate_decision(&self, now: Instant, tail_requested: bool) -> FecGateDecision {
+        let spare = self
+            .shared
+            .with_reliable_layer(|layer| layer.fec_has_spare_capacity(now));
+        self.fec_gate.decide(spare, tail_requested)
     }
 
     pub(crate) fn resume_send(&self) -> &tokio::sync::Notify {
@@ -177,6 +208,7 @@ impl WriteHalf {
             self.return_error_after_requested_kill(bufs).await?;
         }
         self.send_due_post_open_response(now).await?;
+        self.refresh_fec_loss_mode();
         // `now` is already fixed for one send pass: compute the wire timestamp
         // once and reuse it for every packet encoded by this pass.  A blocked
         // underlay send refreshes the clock for deadline/token math, but the
@@ -237,6 +269,7 @@ impl WriteHalf {
             let primary_res = self.utp_write.send(send_buf).await;
             match primary_res {
                 Ok(_) => {
+                    self.fec_gate.record_data_send(is_recovery);
                     if self.fec.is_some() && instream {
                         self.maybe_flush_full_fec_group(now).await?;
                     }
@@ -293,11 +326,15 @@ impl WriteHalf {
             let baseline_can_send_tail_fec = self
                 .shared
                 .with_reliable_layer(|reliable_layer| reliable_layer.can_send_tail_fec(now));
-            let data_path = true;
-            let can_send_tail_fec = self.fec_instream_flush
+            let tail_requested = self.fec_instream_flush
                 || baseline_can_send_tail_fec
-                || (data_path && self.instream_group_fec_enabled);
-            self.close_fec_burst(now, can_send_tail_fec).await?;
+                || self.instream_group_fec_enabled();
+            self.close_fec_burst(
+                now,
+                self.fec_gate_decision(now, tail_requested),
+                self.instream_group_fec_enabled(),
+            )
+            .await?;
         }
         let made_progress = 0 < written_bytes || written_fin;
         let mut completed_at = Instant::now();
@@ -309,29 +346,42 @@ impl WriteHalf {
     }
 
     async fn maybe_flush_full_fec_group(&mut self, now: Instant) -> Result<(), IoErr> {
-        let Some(fec) = self.fec.as_mut() else {
+        let instream = self.instream_group_fec_enabled();
+        let Some(fec) = self.fec.as_ref() else {
             return Ok(());
         };
-        let should_flush = fec.group_data_full(self.instream_group_fec_enabled);
-        if !should_flush {
+        if !fec.group_data_full(instream) {
             return Ok(());
         }
-        self.flush_fec_parities(now).await
+        let gate = self.fec_gate_decision(now, true);
+        self.close_fec_burst(now, gate, instream).await
     }
 
     pub(crate) async fn close_fec_burst(
         &mut self,
         now: Instant,
-        can_send_tail_fec: bool,
+        gate: FecGateDecision,
+        instream: bool,
     ) -> Result<(), IoErr> {
         let Some(fec) = self.fec.as_mut() else {
             return Ok(());
         };
-        if !can_send_tail_fec {
-            fec.skip_open_group();
-            return Ok(());
+        match gate {
+            FecGateDecision::Flush => {}
+            FecGateDecision::LossNotWarranted => {
+                fec.skip_open_group_loss_gate();
+                return Ok(());
+            }
+            FecGateDecision::NoSpareCapacity => {
+                fec.skip_open_group_no_spare_capacity();
+                return Ok(());
+            }
+            FecGateDecision::TailNotRequested => {
+                fec.skip_open_group();
+                return Ok(());
+            }
         }
-        self.flush_fec_parities(now).await
+        self.flush_fec_parities(now, instream).await
     }
 
     fn skip_open_fec_group(&mut self) {
@@ -341,26 +391,25 @@ impl WriteHalf {
         fec.skip_open_group();
     }
 
-    pub(crate) async fn flush_fec_parities(&mut self, now: Instant) -> Result<(), IoErr> {
+    pub(crate) async fn flush_fec_parities(
+        &mut self,
+        now: Instant,
+        instream: bool,
+    ) -> Result<(), IoErr> {
+        let send_pacer = self.send_pacer.clone();
         let Some(fec) = self.fec.as_mut() else {
             return Ok(());
         };
-        let parity_pkts = self.send_pacer.with_token_bucket(|tb| {
-            fec.maybe_flush_parities(tb, now, self.instream_group_fec_enabled)
-        });
+        let parity_pkts =
+            send_pacer.with_token_bucket(|bucket| fec.maybe_flush_parities(bucket, now, instream));
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
-                Err(error) if error == std::io::ErrorKind::WouldBlock => {
-                    if FEC_DEBUG {
-                        eprintln!("flush_fec_parities: WouldBlock (transient)");
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
+                Err(error) if error == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => {
                     self.shared
-                        .press_error(e, MetricsTerminationCause::FecParityWrite);
-                    return Err(e);
+                        .press_error(error, MetricsTerminationCause::FecParityWrite);
+                    return Err(error);
                 }
             }
         }
@@ -390,6 +439,7 @@ impl WriteHalf {
     }
 
     pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
+        self.refresh_fec_loss_mode();
         let fec_enabled = self.send_kill_data_pkt(bufs).await?;
         if fec_enabled {
             self.flush_kill_fec_tail().await;
@@ -412,10 +462,11 @@ impl WriteHalf {
 
     async fn flush_kill_fec_tail(&mut self) {
         let now = Instant::now();
-        let can_send_tail_fec = self
+        let tail_requested = self
             .shared
             .with_reliable_layer(|reliable_layer| reliable_layer.can_send_tail_fec(now));
-        let _ = self.close_fec_burst(now, can_send_tail_fec).await;
+        let gate = self.fec_gate_decision(now, tail_requested);
+        let _ = self.close_fec_burst(now, gate, false).await;
     }
 
     #[cfg(test)]
@@ -437,6 +488,7 @@ impl WriteHalf {
     }
 
     pub async fn flush_acks(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
+        self.refresh_fec_loss_mode();
         let now = Instant::now();
         let (claim, encoded_page_lengths) = {
             let (claim, encoded_page_lengths) = self.shared.with_reliable_layer(|reliable_layer| {
@@ -500,10 +552,11 @@ impl WriteHalf {
                     pages_sent += 1;
                     if fec_enabled {
                         let fec_now = Instant::now();
-                        let can_send_tail_fec = self.shared.with_reliable_layer(|reliable_layer| {
+                        let tail_requested = self.shared.with_reliable_layer(|reliable_layer| {
                             reliable_layer.can_send_tail_fec(fec_now)
                         });
-                        if let Err(error) = self.close_fec_burst(fec_now, can_send_tail_fec).await {
+                        let gate = self.fec_gate_decision(fec_now, tail_requested);
+                        if let Err(error) = self.close_fec_burst(fec_now, gate, false).await {
                             self.ack_feedback
                                 .complete(claim, AckFlushOutcome::Fatal { pages_sent });
                             return Err(error);

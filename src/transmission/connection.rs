@@ -149,6 +149,23 @@ fn new_connection_inner(
 }
 
 impl Connection {
+    /// Capture a transport snapshot under the reliable-layer lock, overlaying
+    /// the connection-owned FEC counters (the reliable layer itself does not
+    /// own FEC actor state, so `ReliableLayer::metrics_at` reports
+    /// `fec_counters: None`).
+    fn metrics_snapshot(
+        &self,
+        reliable_layer: &ReliableLayer,
+        now: Instant,
+    ) -> crate::metrics::MetricsSnapshot {
+        let mut snapshot = reliable_layer.metrics_at(now);
+        snapshot.fec_counters = self
+            .fec_stats
+            .as_ref()
+            .map(FecStatsHandle::metrics_counters);
+        snapshot
+    }
+
     pub fn resume_send(&self) -> &tokio::sync::Notify {
         self.signals.resume_send()
     }
@@ -223,6 +240,16 @@ impl Connection {
         self.fec_stats
             .as_ref()
             .map(FecStatsHandle::recovered_symbols)
+    }
+
+    /// Test-only: the sender-side parity-sent counter from the shared FEC
+    /// stats, so socket-level tests can assert that parity actually flowed
+    /// (a wired-but-inert condition gate would fail such an assertion).
+    #[cfg(test)]
+    pub(crate) fn fec_parity_sent_for_test(&self) -> Option<u64> {
+        self.fec_stats
+            .as_ref()
+            .map(|stats| stats.metrics_counters().parity_sent)
     }
 
     pub fn check_error(&self) -> Result<(), IoErr> {
@@ -600,7 +627,7 @@ impl Connection {
             enabled.then(|| {
                 let snapshot = (observer_interest == MetricsInterest::Snapshot
                     || self.observability.has_logger())
-                .then(|| reliable_layer.metrics_at(now));
+                .then(|| self.metrics_snapshot(&reliable_layer, now));
                 let event_index = self.observability.next_event_index();
                 (event_index, snapshot)
             })
@@ -645,7 +672,7 @@ impl Connection {
             observer_interest == MetricsInterest::Snapshot || self.observability.has_logger();
         let (event_index, snapshot) = if capture_snapshot {
             let reliable_layer = self.reliable_layer.lock().unwrap();
-            let snapshot = reliable_layer.metrics_at(now);
+            let snapshot = self.metrics_snapshot(&reliable_layer, now);
             let event_index = self.observability.next_event_index();
             (event_index, Some(snapshot))
         } else {

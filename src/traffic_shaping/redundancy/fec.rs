@@ -129,11 +129,16 @@ struct FecStats {
     pub groups_flushed: usize,
     pub groups_skipped_no_surplus_tokens: usize,
     pub groups_skipped_burst_end: usize,
+    pub groups_skipped_loss_gate: usize,
+    pub groups_skipped_no_spare_capacity: usize,
     pub recovered_symbols: usize,
     pub dropped_malformed_pkts: usize,
     pub dropped_fec_decoder_panics: usize,
+    pub group_size_flushed: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
+    pub group_size_skipped_loss_gate: [u64; GROUP_SIZE_HIST_LEN],
+    pub group_size_skipped_no_spare_capacity: [u64; GROUP_SIZE_HIST_LEN],
 }
 
 /// Shared counters mutated by both actor halves.  All fields are atomics so
@@ -145,11 +150,16 @@ struct Stats {
     pub groups_flushed: AtomicUsize,
     pub groups_skipped_no_surplus_tokens: AtomicUsize,
     pub parity_groups_skipped_burst_end: AtomicUsize,
+    pub groups_skipped_loss_gate: AtomicUsize,
+    pub groups_skipped_no_spare_capacity: AtomicUsize,
     pub recovered_symbols: AtomicUsize,
     pub dropped_malformed_pkts: AtomicUsize,
     pub dropped_fec_decoder_panics: AtomicUsize,
+    pub group_size_flushed: [AtomicU64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_burst_end: [AtomicU64; GROUP_SIZE_HIST_LEN],
     pub group_size_skipped_no_surplus_tokens: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    pub group_size_skipped_loss_gate: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    pub group_size_skipped_no_spare_capacity: [AtomicU64; GROUP_SIZE_HIST_LEN],
 }
 
 impl Default for Stats {
@@ -160,11 +170,16 @@ impl Default for Stats {
             groups_flushed: AtomicUsize::new(0),
             groups_skipped_no_surplus_tokens: AtomicUsize::new(0),
             parity_groups_skipped_burst_end: AtomicUsize::new(0),
+            groups_skipped_loss_gate: AtomicUsize::new(0),
+            groups_skipped_no_spare_capacity: AtomicUsize::new(0),
             recovered_symbols: AtomicUsize::new(0),
             dropped_malformed_pkts: AtomicUsize::new(0),
             dropped_fec_decoder_panics: AtomicUsize::new(0),
+            group_size_flushed: hist(),
             group_size_skipped_burst_end: hist(),
             group_size_skipped_no_surplus_tokens: hist(),
+            group_size_skipped_loss_gate: hist(),
+            group_size_skipped_no_spare_capacity: hist(),
         }
     }
 }
@@ -178,14 +193,27 @@ impl Stats {
                 .groups_skipped_no_surplus_tokens
                 .load(Ordering::Relaxed),
             groups_skipped_burst_end: self.parity_groups_skipped_burst_end.load(Ordering::Relaxed),
+            groups_skipped_loss_gate: self.groups_skipped_loss_gate.load(Ordering::Relaxed),
+            groups_skipped_no_spare_capacity: self
+                .groups_skipped_no_spare_capacity
+                .load(Ordering::Relaxed),
             recovered_symbols: self.recovered_symbols.load(Ordering::Relaxed),
             dropped_malformed_pkts: self.dropped_malformed_pkts.load(Ordering::Relaxed),
             dropped_fec_decoder_panics: self.dropped_fec_decoder_panics.load(Ordering::Relaxed),
-            group_size_skipped_burst_end: std::array::from_fn(|i| {
-                self.group_size_skipped_burst_end[i].load(Ordering::Relaxed)
+            group_size_flushed: std::array::from_fn(|index| {
+                self.group_size_flushed[index].load(Ordering::Relaxed)
             }),
-            group_size_skipped_no_surplus_tokens: std::array::from_fn(|i| {
-                self.group_size_skipped_no_surplus_tokens[i].load(Ordering::Relaxed)
+            group_size_skipped_burst_end: std::array::from_fn(|index| {
+                self.group_size_skipped_burst_end[index].load(Ordering::Relaxed)
+            }),
+            group_size_skipped_no_surplus_tokens: std::array::from_fn(|index| {
+                self.group_size_skipped_no_surplus_tokens[index].load(Ordering::Relaxed)
+            }),
+            group_size_skipped_loss_gate: std::array::from_fn(|index| {
+                self.group_size_skipped_loss_gate[index].load(Ordering::Relaxed)
+            }),
+            group_size_skipped_no_spare_capacity: std::array::from_fn(|index| {
+                self.group_size_skipped_no_spare_capacity[index].load(Ordering::Relaxed)
             }),
         }
     }
@@ -201,12 +229,18 @@ impl fmt::Display for FecStats {
                 &self.groups_skipped_no_surplus_tokens,
             )
             .field("groups_skipped_burst_end", &self.groups_skipped_burst_end)
+            .field("groups_skipped_loss_gate", &self.groups_skipped_loss_gate)
+            .field(
+                "groups_skipped_no_spare_capacity",
+                &self.groups_skipped_no_spare_capacity,
+            )
             .field("recovered_symbols", &self.recovered_symbols)
             .field("dropped_malformed_pkts", &self.dropped_malformed_pkts)
             .field(
                 "dropped_fec_decoder_panics",
                 &self.dropped_fec_decoder_panics,
             )
+            .field("group_size_flushed", &fmt_hist(&self.group_size_flushed))
             .field(
                 "group_size_skipped_burst_end",
                 &fmt_hist(&self.group_size_skipped_burst_end),
@@ -214,6 +248,14 @@ impl fmt::Display for FecStats {
             .field(
                 "group_size_skipped_no_surplus_tokens",
                 &fmt_hist(&self.group_size_skipped_no_surplus_tokens),
+            )
+            .field(
+                "group_size_skipped_loss_gate",
+                &fmt_hist(&self.group_size_skipped_loss_gate),
+            )
+            .field(
+                "group_size_skipped_no_spare_capacity",
+                &fmt_hist(&self.group_size_skipped_no_spare_capacity),
             )
             .finish()
     }
@@ -302,6 +344,38 @@ impl FecEncoderState {
             .parity_groups_skipped_burst_end
             .fetch_add(1, Ordering::Relaxed);
         inc_hist(&self.stats.group_size_skipped_burst_end, data_count);
+        self.encoder.skip_group();
+    }
+
+    /// Skip the currently-open FEC group, recording it in the loss-gate skip
+    /// stats. No-op when no group is open. Called at burst boundaries where
+    /// the condition gate is closed on loss/recovery evidence.
+    pub fn skip_open_group_loss_gate(&mut self) {
+        let data_count = self.encoder.group_data_count();
+        if data_count == 0 {
+            return;
+        }
+        self.stats
+            .groups_skipped_loss_gate
+            .fetch_add(1, Ordering::Relaxed);
+        inc_hist(&self.stats.group_size_skipped_loss_gate, data_count);
+        self.encoder.skip_group();
+    }
+
+    /// Skip the currently-open FEC group, recording it in the no-spare-
+    /// capacity skip stats. No-op when no group is open. Called at burst
+    /// boundaries where the condition gate is closed on capacity evidence
+    /// (queued/waiting application work, queue growth, cwnd pressure,
+    /// retransmission, or a pending tail probe).
+    pub fn skip_open_group_no_spare_capacity(&mut self) {
+        let data_count = self.encoder.group_data_count();
+        if data_count == 0 {
+            return;
+        }
+        self.stats
+            .groups_skipped_no_spare_capacity
+            .fetch_add(1, Ordering::Relaxed);
+        inc_hist(&self.stats.group_size_skipped_no_spare_capacity, data_count);
         self.encoder.skip_group();
     }
 
@@ -405,6 +479,7 @@ impl FecEncoderState {
                 );
             }
             self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
+            inc_hist(&self.stats.group_size_flushed, data_count);
             let mut parity_encoder = self.encoder.flush_parities(depth);
             let mut pkts = vec![];
             while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
@@ -442,6 +517,7 @@ impl FecEncoderState {
                 );
             }
             self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
+            inc_hist(&self.stats.group_size_flushed, data_count);
             let mut parity_encoder = self.encoder.flush_parities(parity_count);
             let mut pkts = vec![];
             while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
@@ -483,6 +559,7 @@ impl FecEncoderState {
             eprintln!("FEC: flushing {parity_count} parities for group of {data_count}");
         }
         self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
+        inc_hist(&self.stats.group_size_flushed, data_count);
         let mut parity_encoder = self.encoder.flush_parities(parity_count);
         let mut pkts = vec![];
         while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
@@ -608,6 +685,41 @@ impl FecStatsHandle {
         self.0.recovered_symbols.load(Ordering::Relaxed)
     }
 
+    /// Typed cumulative FEC counters for one connection's metrics snapshot.
+    pub(crate) fn metrics_counters(&self) -> crate::metrics::MetricsFecCounters {
+        crate::metrics::MetricsFecCounters {
+            parity_sent: self.0.parity_sent.load(Ordering::Relaxed) as u64,
+            groups_flushed: self.0.groups_flushed.load(Ordering::Relaxed) as u64,
+            flushed_group_sizes: group_size_buckets(&self.0.group_size_flushed),
+            groups_skipped_no_surplus_tokens: self
+                .0
+                .groups_skipped_no_surplus_tokens
+                .load(Ordering::Relaxed) as u64,
+            no_surplus_group_sizes: group_size_buckets(
+                &self.0.group_size_skipped_no_surplus_tokens,
+            ),
+            groups_skipped_burst_end: self
+                .0
+                .parity_groups_skipped_burst_end
+                .load(Ordering::Relaxed) as u64,
+            burst_end_group_sizes: group_size_buckets(&self.0.group_size_skipped_burst_end),
+            groups_skipped_loss_gate: self.0.groups_skipped_loss_gate.load(Ordering::Relaxed)
+                as u64,
+            loss_gate_group_sizes: group_size_buckets(&self.0.group_size_skipped_loss_gate),
+            groups_skipped_no_spare_capacity: self
+                .0
+                .groups_skipped_no_spare_capacity
+                .load(Ordering::Relaxed) as u64,
+            no_spare_capacity_group_sizes: group_size_buckets(
+                &self.0.group_size_skipped_no_spare_capacity,
+            ),
+            recovered_symbols: self.0.recovered_symbols.load(Ordering::Relaxed) as u64,
+            dropped_malformed_packets: self.0.dropped_malformed_pkts.load(Ordering::Relaxed) as u64,
+            dropped_decoder_panics: self.0.dropped_fec_decoder_panics.load(Ordering::Relaxed)
+                as u64,
+        }
+    }
+
     pub(crate) fn debug_print(&self) {
         if FEC_DEBUG {
             eprintln!("FEC stats: {}", self.0.snapshot());
@@ -629,6 +741,22 @@ fn parity_for(data_count: usize) -> u8 {
 fn inc_hist(hist: &[AtomicU64], idx: usize) {
     if let Some(count) = hist.get(idx) {
         count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Bucket a raw group-size histogram into the typed metrics buckets: exactly
+/// one, two-to-four, five-to-seven, and the full in-stream group size.
+fn group_size_buckets(hist: &[AtomicU64]) -> crate::metrics::MetricsFecGroupSizeBuckets {
+    let count = |index| {
+        hist.get(index)
+            .map(|counter: &AtomicU64| counter.load(Ordering::Relaxed))
+            .unwrap_or_default()
+    };
+    crate::metrics::MetricsFecGroupSizeBuckets {
+        one: count(1),
+        two_to_four: (2..=4).map(count).sum(),
+        five_to_seven: (5..=7).map(count).sum(),
+        full_eight: count(INSTREAM_DATA_PER_GROUP),
     }
 }
 
@@ -687,6 +815,63 @@ mod tests {
         assert!(drained > 0, "bucket should have tokens to drain");
         // Now the bucket is empty; rate=1/s so it stays ~empty for the test.
         tb
+    }
+
+    /// The three condition-gate skip reasons must each be observable with the
+    /// group size that was skipped: the loss gate, the no-spare-capacity gate,
+    /// and the burst-end tail gate record into distinct counters and distinct
+    /// group-size histograms; a successful flush records into the flushed
+    /// histogram.
+    #[test]
+    fn condition_gate_skip_reasons_are_observable_with_group_sizes() {
+        let mut fec = fec_state(8192 - 11, 1);
+        let data = b"skip me";
+        let mut sym_buf = vec![0u8; 8192];
+
+        // A single-symbol group skipped by the loss gate.
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        fec.encoder.skip_open_group_loss_gate();
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(snapshot.groups_skipped_loss_gate, 1);
+        assert_eq!(
+            snapshot.group_size_skipped_loss_gate[1], 1,
+            "the loss-gate skip must record the 1-symbol group size"
+        );
+
+        // A two-symbol group skipped by the no-spare-capacity gate.
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        fec.encoder.skip_open_group_no_spare_capacity();
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(snapshot.groups_skipped_no_spare_capacity, 1);
+        assert_eq!(
+            snapshot.group_size_skipped_no_spare_capacity[2], 1,
+            "the no-spare-capacity skip must record the 2-symbol group size"
+        );
+
+        // A three-symbol group skipped by the burst-end tail gate.
+        for _ in 0..3 {
+            fec.encoder.encode_data(data, &mut sym_buf, false);
+        }
+        fec.encoder.skip_open_group();
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(snapshot.groups_skipped_burst_end, 1);
+        assert_eq!(
+            snapshot.group_size_skipped_burst_end[3], 1,
+            "the burst-end skip must record the 3-symbol group size"
+        );
+
+        // A successful single-symbol flush records the flushed histogram.
+        let (mut tb, now) = unlimited_bucket(Instant::now());
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
+        assert_eq!(pkts.len(), 1, "a 1-symbol group must emit 1 parity");
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(snapshot.groups_flushed, 1);
+        assert_eq!(
+            snapshot.group_size_flushed[1], 1,
+            "the flush must record the 1-symbol group size"
+        );
     }
 
     /// A single-symbol group with `small_group_parity_count = 3` must emit
@@ -792,6 +977,57 @@ mod tests {
     fn depth_zero_is_clamped_to_one() {
         let fec = fec_state(8192 - 11, 0);
         assert_eq!(fec.encoder.small_group_parity_count(), 1);
+    }
+
+    /// The flushed group-size histogram preserves which in-stream decision
+    /// bucket each flush came from: a partial 5-symbol group lands in
+    /// five-to-seven, a full 8-symbol group lands in full_eight, and the
+    /// typed buckets collapse the raw histogram correctly.
+    #[test]
+    fn group_size_metrics_preserve_the_instream_decision_buckets() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let (mut tb, now) = unlimited_bucket(now);
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+
+        // Partial in-stream group (5 symbols) flushed at burst end.
+        for _ in 0..5 {
+            fec.encoder.encode_data(data, &mut sym_buf, true);
+        }
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(pkts.len(), INSTREAM_PARITY_PER_GROUP);
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(snapshot.groups_flushed, 1);
+        assert_eq!(
+            snapshot.group_size_flushed[5], 1,
+            "a 5-symbol in-stream flush must land in the five-to-seven bucket"
+        );
+
+        // Full in-stream group (8 symbols) flushed inline.
+        for _ in 0..INSTREAM_DATA_PER_GROUP {
+            fec.encoder.encode_data(data, &mut sym_buf, true);
+        }
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(pkts.len(), INSTREAM_PARITY_PER_GROUP);
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(snapshot.groups_flushed, 2);
+        assert_eq!(
+            snapshot.group_size_flushed[INSTREAM_DATA_PER_GROUP], 1,
+            "a full in-stream flush must land in the full_eight bucket"
+        );
+
+        let buckets = group_size_buckets(&fec.encoder.stats.group_size_flushed);
+        assert_eq!(buckets.one, 0);
+        assert_eq!(buckets.two_to_four, 0);
+        assert_eq!(
+            buckets.five_to_seven, 1,
+            "the 5-symbol flush must collapse into five_to_seven"
+        );
+        assert_eq!(
+            buckets.full_eight, 1,
+            "the 8-symbol flush must collapse into full_eight"
+        );
     }
 
     #[test]

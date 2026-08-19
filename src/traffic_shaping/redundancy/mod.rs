@@ -1,4 +1,5 @@
 pub(crate) mod fec;
+pub(crate) mod fec_gate;
 pub mod fec_tuning;
 mod retransmission_armor;
 pub use fec_tuning::{FecTuning, fec_tuning_from_env};
