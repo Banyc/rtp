@@ -46,12 +46,6 @@ impl ReceivedBatch {
     pub(crate) fn record_eof(&mut self, recv_eof: bool) {
         self.recv_eof |= recv_eof;
     }
-
-    /// Whether this batch delivered the final received payload (application
-    /// EOF is due once the read driver commits the batch).
-    pub(crate) fn recv_eof(&self) -> bool {
-        self.recv_eof
-    }
 }
 
 #[derive(Debug)]

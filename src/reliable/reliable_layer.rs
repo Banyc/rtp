@@ -337,12 +337,6 @@ impl ReliableLayer {
         self.congestion_metrics_enabled
     }
 
-    /// Test-only: drain up to `n` tokens from the shared send-rate pacer.
-    #[cfg(test)]
-    pub(crate) fn drain_pacer_for_test(&self, n: usize, now: Instant) -> usize {
-        self.send_rate_limiter.take_at_most_tokens(n, now)
-    }
-
     pub fn is_no_data_to_send(&self) -> bool {
         self.is_send_buf_empty() && self.pkt_send_space.num_in_flight_pkts() == 0
     }

@@ -647,14 +647,6 @@ impl FecDecoderState {
         self.recovered.pop_front()
     }
 
-    /// Number of codec payloads recovered by parity so far. Returns `None`
-    /// only conceptually (always `Some(0)` when FEC is on); used by tests to
-    /// assert that parity actually reconstructed lost data.
-    #[cfg(test)]
-    pub(crate) fn recovered_symbols(&self) -> usize {
-        self.stats.recovered_symbols.load(Ordering::Relaxed)
-    }
-
     #[cfg(test)]
     pub(crate) fn dropped_malformed_pkts(&self) -> usize {
         self.stats.dropped_malformed_pkts.load(Ordering::Relaxed)
@@ -665,16 +657,6 @@ impl FecDecoderState {
         self.stats
             .dropped_fec_decoder_panics
             .load(Ordering::Relaxed)
-    }
-
-    /// Print the basic FEC counters to stderr. Only active when `FEC_DEBUG` is
-    /// enabled — flip that flag to debug FEC behavior. Called by the read
-    /// driver when the read stream reaches EOF so the snapshot is guaranteed
-    /// to be visible before the process tears down its spawned tasks.
-    pub fn debug_print_stats(&self) {
-        if FEC_DEBUG {
-            eprintln!("FEC stats: {}", self.stats.snapshot());
-        }
     }
 }
 
