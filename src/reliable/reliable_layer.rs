@@ -825,18 +825,14 @@ impl ReliableLayer {
                 data_length: 1,
             })
         }
-        let Some(min_rtt) = self.pkt_send_space.min_rtt() else {
-            return None;
-        };
+        let min_rtt = self.pkt_send_space.min_rtt()?;
         let sr = self
             .connection_stats
             .sample_rate(&self.pkt_buf, now, min_rtt);
         self.pkt_stats_buf.clear();
         self.pkt_buf.clear();
 
-        let Some(sr) = sr else {
-            return None;
-        };
+        let sr = sr?;
         if PRINT_DEBUG_MSGS {
             println!("{sr:?}");
         }

@@ -9,7 +9,7 @@ use super::read_half::ReadHalf;
 use super::termination::{KillPolicy, TerminationPresser, TerminationReaper, new_termination};
 use super::transmission_layer::{LogConfig, PRINT_DEBUG_MSGS, UnreliableLayer};
 use super::watchdog_tuning::WatchdogTuning;
-use super::write_half::WriteHalf;
+use super::write_half::{WriteHalf, WriteHalfSettings};
 
 use crate::io_err::IoErr;
 use crate::metrics::{
@@ -130,13 +130,15 @@ fn new_connection_inner(
     let write_half = WriteHalf::new(
         unreliable_layer.utp_write,
         fec_encoder,
-        unreliable_layer.fec_tuning.instream_flush,
-        unreliable_layer.instream_group_fec,
-        unreliable_layer.retransmission_armor,
         send_rate_limiter,
         ack_feedback,
         Arc::clone(&shared),
         termination_writer,
+        WriteHalfSettings {
+            fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
+            instream_group_fec_enabled: unreliable_layer.instream_group_fec,
+            retransmission_armor: unreliable_layer.retransmission_armor,
+        },
     );
     let read_half = ReadHalf::new(unreliable_layer.utp_read, fec_decoder, Arc::clone(&shared));
     (shared, write_half, read_half, termination_reaper)

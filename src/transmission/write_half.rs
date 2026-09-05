@@ -43,18 +43,30 @@ pub struct WriteHalf {
     termination_writer: TerminationWriter,
 }
 
+/// FEC and retransmission-armor settings for the write half, bundled so
+/// the constructor stays data-first with a single settings argument.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WriteHalfSettings {
+    pub(super) fec_instream_flush: bool,
+    pub(super) instream_group_fec_enabled: bool,
+    pub(super) retransmission_armor: RetransmissionArmorConfig,
+}
+
 impl WriteHalf {
     pub(super) fn new(
         utp_write: Box<dyn UnreliableWrite>,
         fec: Option<FecEncoderState>,
-        fec_instream_flush: bool,
-        instream_group_fec_enabled: bool,
-        retransmission_armor: RetransmissionArmorConfig,
         send_pacer: SendPacer,
         ack_feedback: Arc<AckFeedback>,
         shared: Arc<Connection>,
         termination_writer: TerminationWriter,
+        settings: WriteHalfSettings,
     ) -> Self {
+        let WriteHalfSettings {
+            fec_instream_flush,
+            instream_group_fec_enabled,
+            retransmission_armor,
+        } = settings;
         Self {
             utp_write,
             fec,
@@ -143,9 +155,7 @@ impl WriteHalf {
     pub(crate) fn proactively_terminate_stalled_session_at(&self, now: Instant) {
         let context = self.shared.with_reliable_layer(|reliable_layer| {
             let send_space = reliable_layer.pkt_send_space();
-            let Some(reason) = send_space.stall_reason(now) else {
-                return None;
-            };
+            let reason = send_space.stall_reason(now)?;
             Some(ProactiveTerminationContext {
                 reason: match reason {
                     crate::traffic_shaping::recovery::liveness::PeerStall::NoResponse => {

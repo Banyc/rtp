@@ -815,9 +815,7 @@ impl PktSendSpace {
             u64::try_from(self.rtx_index.promote_due(now, rtx_window, live_rto))
                 .unwrap_or(u64::MAX),
         );
-        let Some((s, reasons)) = self.rtx_index.first_ready() else {
-            return None;
-        };
+        let (s, reasons) = self.rtx_index.first_ready()?;
         let reasons = *reasons;
         let p = self.send_wnd.get_mut(&s)?.as_mut()?;
 
@@ -3105,7 +3103,7 @@ mod tests {
         // while 4, 5 stay in flight so the later re-acks still carry real
         // SACK blocks within the sent span.
         for i in 0..6u64 {
-            send_packet(&mut space, t0 + ms(i as u64));
+            send_packet(&mut space, t0 + ms(i));
         }
         sack_one(&mut space, 1, t0 + ms(10));
         sack_one(&mut space, 2, t0 + ms(11));
@@ -3197,7 +3195,7 @@ mod tests {
                 .rtx(due)
                 .expect("RTO retransmits fire in serial order");
             assert_eq!(p.seq, sq(expected));
-            due = due + ms(1);
+            due += ms(1);
         }
         assert!(space.rtx(due).is_none());
     }

@@ -356,7 +356,6 @@ impl<'a> AckBlocks<'a> {
     /// block.  Unacked sequences at or beyond this offset are never acked by
     /// this ACK and never carry selective evidence, so sender-side analysis
     /// can stop there without scanning the whole send window.
-
     #[cfg(test)]
     pub(crate) fn relevant_unacked_end_offset(
         &self,

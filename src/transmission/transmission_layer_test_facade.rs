@@ -275,7 +275,7 @@ mod tests {
         transmission.recv_pkts(&mut recv_bufs).await.unwrap();
         assert!(transmission.shared_for_test().recv_fin().is_cancelled());
         assert!(transmission.has_pending_acks());
-        let shared = Arc::clone(&transmission.shared_for_test());
+        let shared = Arc::clone(transmission.shared_for_test());
         let reaper = transmission.termination_reaper_for_test().clone();
         let mut reap = Box::pin(async move {
             reaper
@@ -1113,7 +1113,7 @@ mod tests {
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
-        let shared = Arc::clone(&transmission.shared_for_test());
+        let shared = Arc::clone(transmission.shared_for_test());
         shared
             .ack_feedback_for_test()
             .record(crate::transmission::ack_feedback::ReceivedAckWork {
@@ -1270,7 +1270,7 @@ mod tests {
         let mut bufs = SendBufs::new();
         assert!(tl.send_pkts(&mut bufs).await.is_ok());
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let shared = Arc::clone(&tl.shared_for_test());
+        let shared = Arc::clone(tl.shared_for_test());
         let mut send_tasks = tokio::task::JoinSet::new();
         // The parked KILL delivery is cancelled through a watch inside the
         // task, so the task exits normally instead of being aborted (no
@@ -1350,7 +1350,7 @@ mod tests {
             true,
         );
         let mut transmission = TransmissionLayer::new(unreliable, None);
-        let shared = Arc::clone(&transmission.shared_for_test());
+        let shared = Arc::clone(transmission.shared_for_test());
         // Measured congestion loss opens the condition gate so the KILL tail
         // actually attempts its parity (the second stalled send).
         shared
@@ -1499,7 +1499,7 @@ mod tests {
         // window when it lands.
         stage_small_message(&transmission);
         assert!(transmission.send_pkts(&mut send_bufs).await.unwrap());
-        let shared = Arc::clone(&transmission.shared_for_test());
+        let shared = Arc::clone(transmission.shared_for_test());
         let mut recv = Box::pin(transmission.recv_pkts(&mut recv_bufs));
         tokio::select! {
             result = &mut recv => panic!("receive returned before the ACK-only wake: {result:?}"),
@@ -1550,7 +1550,7 @@ mod tests {
             false,
         );
         let mut transmission = TransmissionLayer::new(layer, None);
-        let shared = Arc::clone(&transmission.shared_for_test());
+        let shared = Arc::clone(transmission.shared_for_test());
         // Seed a history spanning two full pages (head + deep page).
         {
             let mut reliable = shared.reliable_layer_for_test().lock().unwrap();

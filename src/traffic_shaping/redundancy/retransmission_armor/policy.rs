@@ -56,21 +56,21 @@ mod tests {
     #[test]
     fn decision_reports_every_policy_branch_and_keeps_queue_observation_lazy() {
         let queue_observations = Cell::new(0);
-        let mut observe = || {
+        let observe = || {
             queue_observations.set(queue_observations.get() + 1);
             false
         };
         let armor = RetransmissionArmor::new(RetransmissionArmorConfig::enabled());
 
         assert_eq!(
-            armor.decide(true, &mut observe),
+            armor.decide(true, observe),
             ArmorDecision::Duplicate,
             "recovery + enabled + not queue-building must duplicate"
         );
         assert_eq!(queue_observations.get(), 1);
 
         assert_eq!(
-            armor.decide(false, &mut observe),
+            armor.decide(false, observe),
             ArmorDecision::SkipNotRecovery,
             "fresh sends must never duplicate"
         );
@@ -81,8 +81,7 @@ mod tests {
         );
 
         assert_eq!(
-            RetransmissionArmor::new(RetransmissionArmorConfig::disabled())
-                .decide(true, &mut observe),
+            RetransmissionArmor::new(RetransmissionArmorConfig::disabled()).decide(true, observe),
             ArmorDecision::SkipDisabled,
             "a disabled session must never duplicate"
         );
@@ -93,12 +92,12 @@ mod tests {
         );
 
         let building_observations = Cell::new(0);
-        let mut observe_building = || {
+        let observe_building = || {
             building_observations.set(building_observations.get() + 1);
             true
         };
         assert_eq!(
-            armor.decide(true, &mut observe_building),
+            armor.decide(true, observe_building),
             ArmorDecision::SkipQueueBuilding,
             "recovery + enabled + queue-building must suppress the duplicate"
         );
