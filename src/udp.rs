@@ -299,7 +299,7 @@ pub struct AcceptConfig {
     /// with a 24-byte random nonce and the rest is chacha20-encrypted with
     /// this key. Both peers must use the same key; `None` (the default)
     /// sends datagrams in the clear.
-    pub obfuscation_key: Option<[u8; 32]>,
+    pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
 impl Default for AcceptConfig {
@@ -337,7 +337,7 @@ pub struct ConnectConfig<'a> {
     /// with a 24-byte random nonce and the rest is chacha20-encrypted with
     /// this key. Both peers must use the same key; `None` (the default)
     /// sends datagrams in the clear.
-    pub obfuscation_key: Option<[u8; 32]>,
+    pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -372,7 +372,7 @@ struct AcceptSetup {
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
-    obfuscation_key: Option<[u8; 32]>,
+    obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
 impl AcceptSetup {
@@ -426,6 +426,14 @@ async fn accept(
         peer: Some(peer_addr),
     };
     let (read, write) = crate::obfuscate::maybe_wrap(read, write, obfuscation_key);
+    // The obfuscation nonce is a wire-level overhead on every datagram, so
+    // the MSS must leave room for it (the wire datagram stays within the
+    // configured MSS).
+    let mss = if obfuscation_key.is_some() {
+        mss.reduced_for_obfuscation()?
+    } else {
+        mss
+    };
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         read,
         write,
@@ -741,11 +749,19 @@ async fn connect_bound(
     let udp = Arc::new(udp);
     let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(Arc::clone(&udp));
     let (read, write) = crate::obfuscate::maybe_wrap(filtered_read, udp, obfuscation_key);
+    // The obfuscation nonce is a wire-level overhead on every datagram, so
+    // the MSS must leave room for it (the wire datagram stays within the
+    // configured MSS).
+    let mss = if obfuscation_key.is_some() {
+        mss.resolve()?.reduced_for_obfuscation()?
+    } else {
+        mss.resolve()?
+    };
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         read,
         write,
         fec,
-        mss.resolve()?,
+        mss,
         fec_tuning,
         frame_delivery,
     )?;
@@ -842,7 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn obfuscation_round_trips_through_the_public_constructors() {
-        const KEY: [u8; 32] = [7; 32];
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
         let listener = Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr();
         let msg = b"obfuscated hello";
@@ -884,6 +900,45 @@ mod tests {
         .expect("client: timed out waiting for the obfuscated echo")
         .unwrap();
         assert_eq!(msg, &buf[..n]);
+    }
+
+    #[tokio::test]
+    async fn obfuscation_reserves_the_nonce_from_the_mss() {
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
+        // A configured MSS that is valid on its own (it leaves room for the
+        // codec payload) but cannot carry the 24-byte obfuscation nonce on
+        // top of it must be rejected at connect time — the nonce is reserved
+        // from the MSS so the wire datagram stays within the configured MSS.
+        let err = connect_with(
+            "0.0.0.0:0",
+            "127.0.0.1:1",
+            ConnectConfig {
+                mss: MssConfig::Custom(crate::codec::data_overhead() + 1),
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("obfuscation nonce"),
+            "the connect must fail naming the nonce reservation, got: {err}"
+        );
+
+        // The same MSS WITHOUT obfuscation connects fine (the plain path
+        // keeps the full MSS).
+        let connected = connect_with(
+            "0.0.0.0:0",
+            "127.0.0.1:1",
+            ConnectConfig {
+                handshake: false,
+                mss: MssConfig::Custom(crate::codec::data_overhead() + 1),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        drop(connected);
     }
 
     #[test]

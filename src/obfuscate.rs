@@ -24,6 +24,15 @@ pub(crate) const NONCE_LEN: usize = tokio_chacha20::X_NONCE_BYTES;
 /// The chacha20 key length: 32 bytes.
 pub(crate) const KEY_LEN: usize = tokio_chacha20::KEY_BYTES;
 
+/// One byte PAST the caller's buffer: the receive scratch is sized
+/// `plaintext_capacity + NONCE_LEN + OVERSIZE_DETECT_EXTRA` so an oversized
+/// datagram is received (or truncated) to a length that makes
+/// [`ObfuscatedRead::decrypt_into`]'s `ciphertext_len > buf.len()` check
+/// fire — without the extra byte the socket would truncate an oversized
+/// datagram to exactly `plaintext_capacity + NONCE_LEN` and the check would
+/// silently pass, delivering truncated plaintext.
+pub(crate) const OVERSIZE_DETECT_EXTRA: usize = 1;
+
 /// A read half that strips the 24-byte nonce and chacha20-decrypts the rest.
 #[derive(Debug)]
 pub(crate) struct ObfuscatedRead<R> {
@@ -43,8 +52,16 @@ impl<R> ObfuscatedRead<R> {
     }
 
     fn ensure_scratch(&mut self, plaintext_capacity: usize) {
-        if self.scratch.len() < plaintext_capacity + NONCE_LEN {
-            self.scratch.resize(plaintext_capacity + NONCE_LEN, 0);
+        // One byte MORE than the buffer can hold: a datagram that fits the
+        // buffer is received whole, while an OVERSIZED datagram is received
+        // (or truncated) to a length that makes `decrypt_into`'s
+        // `ciphertext_len > buf.len()` check fire — without the extra byte
+        // the socket would truncate an oversized datagram to exactly
+        // `plaintext_capacity + NONCE_LEN` and the check would silently
+        // pass, delivering truncated plaintext.
+        if self.scratch.len() < plaintext_capacity + NONCE_LEN + OVERSIZE_DETECT_EXTRA {
+            self.scratch
+                .resize(plaintext_capacity + NONCE_LEN + OVERSIZE_DETECT_EXTRA, 0);
         }
     }
 
@@ -219,6 +236,21 @@ mod tests {
         // Send a raw (unwrapped) short datagram from the peer.
         b.send(&[1, 2, 3]).await.unwrap();
         let mut buf = [0u8; 1024];
+        let err = read.recv(&mut buf).await.unwrap_err();
+        assert_eq!(err, std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_datagram_larger_than_the_buffer_is_rejected_not_truncated() {
+        let (a, b) = socket_pair().await;
+        let mut read = ObfuscatedRead::new(a, key());
+        // A wrapped datagram whose plaintext exceeds the caller's buffer must
+        // be REJECTED, never silently truncated (the scratch is sized one
+        // byte past the buffer so the oversized-datagram check fires).
+        let mut write = ObfuscatedWrite::new(b, key());
+        let payload = vec![0xAB; 64];
+        write.send(&payload).await.unwrap();
+        let mut buf = [0u8; 16];
         let err = read.recv(&mut buf).await.unwrap_err();
         assert_eq!(err, std::io::ErrorKind::InvalidData);
     }

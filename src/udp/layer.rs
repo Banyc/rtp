@@ -32,6 +32,22 @@ impl ValidMss {
         Ok(Self(mss))
     }
 
+    /// Reduce the MSS by the datagram-obfuscation nonce length. The nonce is
+    /// a wire-level overhead on EVERY datagram (like the codec and FEC
+    /// headers), so the MSS — which bounds the wire datagram size — must
+    /// leave room for it: with obfuscation enabled, the effective segment
+    /// payload is `mss - NONCE_LEN` and the wire datagram still fits in the
+    /// configured MSS. Fails when the configured MSS is too small to carry
+    /// the nonce on top of the codec payload.
+    pub fn reduced_for_obfuscation(self) -> Result<Self, MssError> {
+        let nonce = crate::obfuscate::NONCE_LEN;
+        let mss = self
+            .0
+            .checked_sub(nonce)
+            .ok_or(MssError::NoRoomForObfuscationNonce { mss: self.0, nonce })?;
+        Self::try_new(mss)
+    }
+
     pub fn get(&self) -> usize {
         self.0
     }
@@ -45,6 +61,10 @@ pub enum MssError {
     TooSmallForFec { mss: usize },
     #[error("mss {mss} leaves no room for the codec payload")]
     NoRoomForCodecPayload { mss: usize },
+    #[error("mss {mss} leaves no room for the {nonce}-byte obfuscation nonce")]
+    NoRoomForObfuscationNonce { mss: usize, nonce: usize },
+    #[error("mss {mss} leaves no room for the {key_size}-byte dispatch key")]
+    NoRoomForDispatchKey { mss: usize, key_size: usize },
     #[error("mss {mss} leaves no room for the first-frame header")]
     NoRoomForFirstFrameHeader { mss: usize },
 }
@@ -233,6 +253,60 @@ mod tests {
         assert!(
             tuning.small_group_parity_count >= 1,
             "FEC on must clamp the parity depth to at least 1"
+        );
+    }
+
+    // ---- OBFUSCATION NONCE ACCOUNTING ----
+    //
+    // The datagram-obfuscation wrapper prefixes every datagram with a
+    // 24-byte nonce, so the MSS — which bounds the WIRE datagram size — must
+    // leave room for it: with obfuscation enabled the effective segment
+    // payload is `mss - NONCE_LEN` and the wire datagram still fits in the
+    // configured MSS.
+
+    #[test]
+    fn reduced_for_obfuscation_subtracts_the_nonce() {
+        let mss = ValidMss::try_new(crate::udp::NO_FEC_MSS)
+            .unwrap()
+            .reduced_for_obfuscation()
+            .unwrap();
+        assert_eq!(
+            mss.get(),
+            crate::udp::NO_FEC_MSS - crate::obfuscate::NONCE_LEN,
+            "the obfuscation nonce must be reserved from the MSS"
+        );
+        // The wire datagram (segment payload + codec overhead + nonce) still
+        // fits in the configured MSS: the payload is `mss - data_overhead`,
+        // so the wire is `(mss - data_overhead) + data_overhead + nonce` =
+        // `mss + nonce` = the configured MSS.
+        assert_eq!(
+            mss.get() + crate::obfuscate::NONCE_LEN,
+            crate::udp::NO_FEC_MSS,
+            "the wire datagram must stay within the configured MSS"
+        );
+    }
+
+    #[test]
+    fn reduced_for_obfuscation_rejects_a_mss_too_small_for_the_nonce() {
+        // A configured MSS that is valid on its own but cannot carry the
+        // nonce on top of the codec payload must be rejected.
+        let mss = ValidMss::try_new(crate::codec::data_overhead() + 1).unwrap();
+        let err = mss.reduced_for_obfuscation().unwrap_err();
+        assert!(
+            matches!(err, MssError::NoRoomForObfuscationNonce { .. }),
+            "a too-small MSS must fail with NoRoomForObfuscationNonce, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reduced_for_obfuscation_keeps_the_codec_room_check() {
+        // mss - nonce must still leave room for the codec payload.
+        let mss =
+            ValidMss::try_new(crate::codec::data_overhead() + crate::obfuscate::NONCE_LEN).unwrap();
+        let err = mss.reduced_for_obfuscation().unwrap_err();
+        assert!(
+            matches!(err, MssError::NoRoomForCodecPayload { .. }),
+            "the reduced MSS must still leave room for the codec, got {err:?}"
         );
     }
 }

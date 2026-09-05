@@ -13,8 +13,8 @@ use crate::{
     traffic_shaping::redundancy::fec_tuning::FecTuning,
     transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::{
-        self, AcceptConfig, MaybeRawFd, ValidMss, maybe_raw_fd, should_wait_after_try_send,
-        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+        self, AcceptConfig, MaybeRawFd, MssError, ValidMss, maybe_raw_fd,
+        should_wait_after_try_send, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
 
@@ -29,21 +29,20 @@ fn wrap_keyed<K: DispatchKey>(
     mss: ValidMss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
-) -> UnreliableLayer {
+) -> Result<UnreliableLayer, MssError> {
     let key_size = K::max_size();
     let mss = mss.get();
     let mss = mss
         .checked_sub(key_size)
-        .unwrap_or_else(|| panic!("mss {mss} leaves no room for the {key_size}-byte dispatch key"));
+        .ok_or(MssError::NoRoomForDispatchKey { mss, key_size })?;
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         Box::new(read),
         Box::new(write),
         fec,
-        ValidMss::try_new(mss).unwrap(),
+        ValidMss::try_new(mss)?,
         tuning,
         frame_delivery,
     )
-    .unwrap()
 }
 
 #[derive(Debug)]
@@ -90,7 +89,7 @@ impl<K: DispatchKey> Listener<K> {
             config.mss.resolve()?,
             config.fec_tuning,
             config.frame_delivery,
-        );
+        )?;
         unreliable_layer.metrics_observer = config.metrics_observer;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -154,7 +153,8 @@ impl<K: DispatchKey> Connector<K> {
             config.mss.resolve().ok()?,
             config.fec_tuning,
             config.frame_delivery,
-        );
+        )
+        .ok()?;
         unreliable_layer.metrics_observer = config.metrics_observer;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
@@ -406,7 +406,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "dispatch key")]
     async fn test_key_too_large() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = Connector::<HugeKey>::connect_without_handshake(
@@ -415,9 +414,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let _ = client
-            .open_without_handshake_with(HugeKey, AcceptConfig::default())
-            .unwrap();
+        // A dispatch key larger than the MSS leaves no room for the codec
+        // payload: the open is REJECTED (None), never a panic.
+        assert!(
+            client
+                .open_without_handshake_with(HugeKey, AcceptConfig::default())
+                .is_none(),
+            "a key too large for the MSS must be rejected, not panic"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -711,7 +715,8 @@ mod tests {
             ValidMss::try_new(mss).unwrap(),
             FecTuning::default(),
             FrameMode::default(),
-        );
+        )
+        .unwrap();
         let datagram =
             layer.fec.as_ref().unwrap().max_wire_pkt_size() + <u16 as DispatchKey>::max_size();
         assert!(
@@ -723,16 +728,14 @@ mod tests {
     #[test]
     fn frame_mode_rejects_undersized_mss() {
         let mss = 33;
-        let res = std::panic::catch_unwind(|| {
-            super::wrap_keyed::<u16>(
-                DummyRead,
-                DummyWrite,
-                true,
-                ValidMss::try_new(mss).unwrap(),
-                FecTuning::default(),
-                FrameMode::enabled(),
-            )
-        });
-        assert!(res.is_err(), "undersized mss must panic in keyed wrap");
+        let res = super::wrap_keyed::<u16>(
+            DummyRead,
+            DummyWrite,
+            true,
+            ValidMss::try_new(mss).unwrap(),
+            FecTuning::default(),
+            FrameMode::enabled(),
+        );
+        assert!(res.is_err(), "undersized mss must be rejected, not panic");
     }
 }

@@ -7,10 +7,10 @@ use crate::io_err::IoErr;
 use crate::{
     delivery::frame::FrameMode,
     socket::{ConnReader, ConnWriter, SessionHandle, socket},
-    traffic_shaping::redundancy::fec_tuning::FecTuning,
+    traffic_shaping::redundancy::{RetransmissionArmorConfig, fec_tuning::FecTuning},
     transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
-        AcceptConfig, ConnectConfig, LogConfig, ValidMss,
+        AcceptConfig, ConnectConfig, LogConfig, MssConfig, ValidMss,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
@@ -35,14 +35,7 @@ impl Listener {
     }
     pub async fn accept_with(&mut self, config: AcceptConfig) -> io::Result<Conn> {
         let conn = self.listener.accept().await?;
-        convert_conn(
-            conn,
-            None,
-            config.metrics_observer,
-            config.fec_tuning,
-            config.frame_delivery,
-        )
-        .await
+        convert_conn(conn, None, LayerTuning::from_accept(config)?).await
     }
 }
 #[derive(Debug)]
@@ -57,22 +50,85 @@ impl Conn {
         config: ConnectConfig<'_>,
     ) -> io::Result<Self> {
         let conn = MpUdpConn::connect(addrs).await?;
-        convert_conn(
-            conn,
-            config.log_config,
-            config.metrics_observer,
-            config.fec_tuning,
-            config.frame_delivery,
-        )
-        .await
+        let (log_config, tuning) = LayerTuning::from_connect(config)?;
+        convert_conn(conn, log_config, tuning).await
     }
 }
+
+/// The layer-tuning fields both [`AcceptConfig`] and [`ConnectConfig`]
+/// carry, bundled so [`convert_conn`] takes one argument instead of nine.
+struct LayerTuning {
+    fec: bool,
+    mss: ValidMss,
+    tuning: FecTuning,
+    frame_delivery: FrameMode,
+    retransmission_armor: RetransmissionArmorConfig,
+    instream_group_fec: bool,
+    metrics_observer: Option<crate::metrics::MetricsObserver>,
+}
+
+impl LayerTuning {
+    fn from_accept(config: AcceptConfig) -> io::Result<Self> {
+        reject_obfuscation(config.obfuscation_key)?;
+        Ok(Self {
+            fec: config.fec,
+            mss: resolve_mss(config.mss)?,
+            tuning: config.fec_tuning,
+            frame_delivery: config.frame_delivery,
+            retransmission_armor: config.retransmission_armor,
+            instream_group_fec: config.instream_group_fec,
+            metrics_observer: config.metrics_observer,
+        })
+    }
+
+    fn from_connect(config: ConnectConfig<'_>) -> io::Result<(Option<LogConfig<'_>>, Self)> {
+        reject_obfuscation(config.obfuscation_key)?;
+        let log_config = config.log_config;
+        Ok((
+            log_config,
+            Self {
+                fec: config.fec,
+                mss: resolve_mss(config.mss)?,
+                tuning: config.fec_tuning,
+                frame_delivery: config.frame_delivery,
+                retransmission_armor: config.retransmission_armor,
+                instream_group_fec: config.instream_group_fec,
+                metrics_observer: config.metrics_observer,
+            },
+        ))
+    }
+}
+
+/// Resolve the mpudp MSS: the shared [`MssConfig::Default`] resolves to the
+/// single-path [`crate::udp::NO_FEC_MSS`], but mpudp's default is the more
+/// conservative [`MPUDP_MSS`] (multi-path links have tighter MTU budgets).
+/// A custom config is honored as-is.
+fn resolve_mss(config: MssConfig) -> io::Result<ValidMss> {
+    match config {
+        MssConfig::Default => ValidMss::try_new(MPUDP_MSS),
+        MssConfig::Custom(mss) => ValidMss::try_new(mss),
+    }
+    .map_err(Into::into)
+}
+
+/// mpudp does not support datagram obfuscation (the wrapper is only wired
+/// into the single-path udp constructors). A configured key is REJECTED
+/// rather than silently ignored — a user who set it would otherwise get
+/// plaintext on the wire without knowing.
+fn reject_obfuscation(key: Option<[u8; crate::obfuscate::KEY_LEN]>) -> io::Result<()> {
+    match key {
+        None => Ok(()),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mpudp does not support obfuscation_key",
+        )),
+    }
+}
+
 async fn convert_conn(
     conn: MpUdpConn,
     log_config: Option<LogConfig<'_>>,
-    metrics_observer: Option<crate::metrics::MetricsObserver>,
-    tuning: FecTuning,
-    frame_delivery: FrameMode,
+    tuning: LayerTuning,
 ) -> io::Result<Conn> {
     let log_config = match log_config {
         Some(c) => {
@@ -88,12 +144,14 @@ async fn convert_conn(
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         Box::new(r),
         Box::new(w),
-        false,
-        ValidMss::try_new(MPUDP_MSS).unwrap(),
-        tuning,
-        frame_delivery,
+        tuning.fec,
+        tuning.mss,
+        tuning.tuning,
+        tuning.frame_delivery,
     )?;
-    unreliable_layer.metrics_observer = metrics_observer;
+    unreliable_layer.retransmission_armor = tuning.retransmission_armor;
+    unreliable_layer.instream_group_fec = tuning.instream_group_fec;
+    unreliable_layer.metrics_observer = tuning.metrics_observer;
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,
