@@ -23,8 +23,8 @@ use crate::io_err::IoErr;
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
 fn wrap_keyed<K: DispatchKey>(
-    read: impl UnreliableRead,
-    write: impl UnreliableWrite,
+    read: Box<dyn UnreliableRead>,
+    write: Box<dyn UnreliableWrite>,
     fec: bool,
     mss: ValidMss,
     tuning: FecTuning,
@@ -36,8 +36,8 @@ fn wrap_keyed<K: DispatchKey>(
         .checked_sub(key_size)
         .ok_or(MssError::NoRoomForDispatchKey { mss, key_size })?;
     wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Box::new(read),
-        Box::new(write),
+        read,
+        write,
         fec,
         ValidMss::try_new(mss)?,
         tuning,
@@ -82,14 +82,25 @@ impl<K: DispatchKey> Listener<K> {
             let peer = write.peer_addr();
             KeyedConnWrite::new(write, &conn_key, self.raw_fd, Some(peer))
         };
+        // Datagram obfuscation wraps the PAYLOAD (the dispatch key stays
+        // plaintext — the demux needs it to route). The nonce is reserved
+        // from the MSS so the wire datagram stays within the configured MSS.
+        let (read, write) = crate::obfuscate::maybe_wrap(read, write, config.obfuscation_key);
+        let mss = if config.obfuscation_key.is_some() {
+            config.mss.resolve()?.reduced_for_obfuscation()?
+        } else {
+            config.mss.resolve()?
+        };
         let mut unreliable_layer = wrap_keyed::<K>(
             read,
             write,
             config.fec,
-            config.mss.resolve()?,
+            mss,
             config.fec_tuning,
             config.frame_delivery,
         )?;
+        unreliable_layer.retransmission_armor = config.retransmission_armor;
+        unreliable_layer.instream_group_fec = config.instream_group_fec;
         unreliable_layer.metrics_observer = config.metrics_observer;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
@@ -146,15 +157,26 @@ impl<K: DispatchKey> Connector<K> {
         let accepted = self.listener.register_conn(dispatch_key.clone())?;
         let (read, write) = accepted.split();
         let write = KeyedConnWrite::new(write, &dispatch_key, self.raw_fd, None);
+        // Datagram obfuscation wraps the PAYLOAD (the dispatch key stays
+        // plaintext — the demux needs it to route). The nonce is reserved
+        // from the MSS so the wire datagram stays within the configured MSS.
+        let (read, write) = crate::obfuscate::maybe_wrap(read, write, config.obfuscation_key);
+        let mss = if config.obfuscation_key.is_some() {
+            config.mss.resolve().ok()?.reduced_for_obfuscation().ok()?
+        } else {
+            config.mss.resolve().ok()?
+        };
         let mut unreliable_layer = wrap_keyed::<K>(
             read,
             write,
             config.fec,
-            config.mss.resolve().ok()?,
+            mss,
             config.fec_tuning,
             config.frame_delivery,
         )
         .ok()?;
+        unreliable_layer.retransmission_armor = config.retransmission_armor;
+        unreliable_layer.instream_group_fec = config.instream_group_fec;
         unreliable_layer.metrics_observer = config.metrics_observer;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
@@ -501,6 +523,79 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn obfuscation_round_trips_through_keyed_udp() {
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
+        let server = Listener::<u8>::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        let key = 42;
+        let msg_1 = b"obfuscated keyed hello";
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let server = Arc::new(server);
+            let mut accepted = server
+                .accept_with(AcceptConfig {
+                    obfuscation_key: Some(KEY),
+                    ..AcceptConfig::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(accepted.dispatch_key, key);
+            let mut keepalive = tokio::task::JoinSet::new();
+            {
+                let server = server.clone();
+                keepalive.spawn(async move {
+                    loop {
+                        let _ = server
+                            .accept_with(AcceptConfig {
+                                obfuscation_key: Some(KEY),
+                                ..AcceptConfig::default()
+                            })
+                            .await;
+                    }
+                });
+            }
+            let mut buf = vec![0; 1024];
+            let n = accepted.read.recv(&mut buf).await.unwrap();
+            let m = &buf[..n];
+            assert_eq!(m, msg_1);
+            accepted.write.send(msg_1).await.unwrap();
+            accepted.write.send_buf_empty().await.unwrap();
+        });
+        tasks.spawn(async move {
+            let client = Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+                .await
+                .unwrap();
+            let client = Arc::new(client);
+            let mut dispatch = tokio::task::JoinSet::new();
+            {
+                let client = client.clone();
+                dispatch.spawn(async move {
+                    loop {
+                        client.dispatch().await.unwrap();
+                    }
+                });
+            }
+            let mut accepted = client
+                .open_without_handshake_with(
+                    key,
+                    AcceptConfig {
+                        obfuscation_key: Some(KEY),
+                        ..AcceptConfig::default()
+                    },
+                )
+                .unwrap();
+            accepted.write.send(msg_1).await.unwrap();
+            let mut buf = vec![0; 1024];
+            let n = accepted.read.recv(&mut buf).await.unwrap();
+            let m = &buf[..n];
+            assert_eq!(m, msg_1);
+        });
+        while let Some(res) = tasks.join_next().await {
+            res.unwrap();
+        }
+    }
+
     /// A keyed client cannot receive inbound packets on an opened connection
     /// unless its `dispatch()` loop is polled: the dispatcher matches inbound
     /// packets to `open`ed connections.
@@ -709,8 +804,8 @@ mod tests {
     fn a_keyed_fec_datagram_fits_the_requested_mss() {
         let mss = crate::udp::NO_FEC_MSS;
         let layer = super::wrap_keyed::<u16>(
-            DummyRead,
-            DummyWrite,
+            Box::new(DummyRead),
+            Box::new(DummyWrite),
             true,
             ValidMss::try_new(mss).unwrap(),
             FecTuning::default(),
@@ -729,8 +824,8 @@ mod tests {
     fn frame_mode_rejects_undersized_mss() {
         let mss = 33;
         let res = super::wrap_keyed::<u16>(
-            DummyRead,
-            DummyWrite,
+            Box::new(DummyRead),
+            Box::new(DummyWrite),
             true,
             ValidMss::try_new(mss).unwrap(),
             FecTuning::default(),
