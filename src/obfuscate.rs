@@ -11,6 +11,13 @@
 //! It is wired into the public constructors through the optional
 //! `obfuscation_key` on [`crate::udp::ConnectConfig`] /
 //! [`crate::udp::AcceptConfig`]; the wrapper types themselves are internal.
+//!
+//! The read half is a FILTER: a datagram that is not a valid obfuscated
+//! datagram (shorter than the nonce, or too large for the caller's buffer) is
+//! dropped and the next datagram is read, never surfaced as an error. A
+//! single bad datagram — e.g. a plaintext packet from a peer that is not
+//! obfuscating — must not fail the connection, and on the accept path must
+//! not kill the whole listener.
 
 use async_trait::async_trait;
 use tokio_chacha20::cipher::StreamCipher;
@@ -65,7 +72,10 @@ impl<R> ObfuscatedRead<R> {
         }
     }
 
-    /// Decrypt the datagram in `self.scratch[..n]` into `buf`.
+    /// Decrypt the datagram in `self.scratch[..n]` into `buf`. Returns
+    /// `InvalidData` when the datagram is not a valid obfuscated datagram
+    /// (shorter than the nonce, or too large for `buf`); the caller drops it
+    /// and reads the next datagram.
     fn decrypt_into(&mut self, buf: &mut [u8], n: usize) -> Result<usize, IoErr> {
         if n < NONCE_LEN {
             return Err(IoErr::from(std::io::ErrorKind::InvalidData));
@@ -87,14 +97,30 @@ impl<R> ObfuscatedRead<R> {
 impl<R: UnreliableRead> UnreliableRead for ObfuscatedRead<R> {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         self.ensure_scratch(buf.len());
-        let n = self.inner.try_recv(&mut self.scratch)?;
-        self.decrypt_into(buf, n)
+        loop {
+            let n = self.inner.try_recv(&mut self.scratch)?;
+            match self.decrypt_into(buf, n) {
+                Ok(len) => return Ok(len),
+                // Not a valid obfuscated datagram: drop it and read the next.
+                // Surfacing the error would fail the connection on a single
+                // bad datagram (and, on the accept path, kill the listener).
+                Err(error) if error == std::io::ErrorKind::InvalidData => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         self.ensure_scratch(buf.len());
-        let n = self.inner.recv(&mut self.scratch).await?;
-        self.decrypt_into(buf, n)
+        loop {
+            let n = self.inner.recv(&mut self.scratch).await?;
+            match self.decrypt_into(buf, n) {
+                Ok(len) => return Ok(len),
+                // Not a valid obfuscated datagram: drop it and read the next.
+                Err(error) if error == std::io::ErrorKind::InvalidData => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -230,29 +256,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_datagram_shorter_than_the_nonce_is_rejected() {
+    async fn a_datagram_shorter_than_the_nonce_is_dropped_not_delivered() {
         let (a, mut b) = socket_pair().await;
         let mut read = ObfuscatedRead::new(a, key());
-        // Send a raw (unwrapped) short datagram from the peer.
+        let mut write = ObfuscatedWrite::new(b.clone(), key());
+        // A raw (unwrapped) short datagram from the peer is not a valid
+        // obfuscated datagram: it is dropped, and the next valid datagram is
+        // delivered in its place — the read never surfaces an error for it.
         b.send(&[1, 2, 3]).await.unwrap();
+        let payload = b"after the short datagram";
+        write.send(payload).await.unwrap();
         let mut buf = [0u8; 1024];
-        let err = read.recv(&mut buf).await.unwrap_err();
-        assert_eq!(err, std::io::ErrorKind::InvalidData);
+        let n = read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], payload);
     }
 
     #[tokio::test]
-    async fn a_datagram_larger_than_the_buffer_is_rejected_not_truncated() {
+    async fn a_datagram_larger_than_the_buffer_is_dropped_not_truncated() {
         let (a, b) = socket_pair().await;
         let mut read = ObfuscatedRead::new(a, key());
-        // A wrapped datagram whose plaintext exceeds the caller's buffer must
-        // be REJECTED, never silently truncated (the scratch is sized one
-        // byte past the buffer so the oversized-datagram check fires).
         let mut write = ObfuscatedWrite::new(b, key());
-        let payload = vec![0xAB; 64];
-        write.send(&payload).await.unwrap();
+        // A wrapped datagram whose plaintext exceeds the caller's buffer is
+        // DROPPED, never silently truncated (the scratch is sized one byte
+        // past the buffer so the oversized-datagram check fires); the next
+        // valid datagram is delivered in its place.
+        let oversized = vec![0xAB; 64];
+        write.send(&oversized).await.unwrap();
+        let payload = b"fits";
+        write.send(payload).await.unwrap();
         let mut buf = [0u8; 16];
-        let err = read.recv(&mut buf).await.unwrap_err();
-        assert_eq!(err, std::io::ErrorKind::InvalidData);
+        let n = read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], payload);
     }
 
     #[tokio::test]
