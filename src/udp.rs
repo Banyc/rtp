@@ -752,10 +752,11 @@ async fn connect_bound(
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
     // configured MSS).
+    let mss = mss.resolve()?;
     let mss = if obfuscation_key.is_some() {
-        mss.resolve()?.reduced_for_obfuscation()?
+        mss.reduced_for_obfuscation()?
     } else {
-        mss.resolve()?
+        mss
     };
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         read,
