@@ -8,6 +8,9 @@
 //! The wrapper implements the crate's [`UnreliableRead`] / [`UnreliableWrite`]
 //! transport traits, so it can be inserted between the UDP socket and the
 //! [`UnreliableLayer`] without touching the codec or the reliable layer.
+//! It is wired into the public constructors through the optional
+//! `obfuscation_key` on [`crate::udp::ConnectConfig`] /
+//! [`crate::udp::AcceptConfig`]; the wrapper types themselves are internal.
 
 use async_trait::async_trait;
 use tokio_chacha20::cipher::StreamCipher;
@@ -16,19 +19,22 @@ use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
 
 /// The nonce length: 24 bytes (XChaCha20).
-pub const NONCE_LEN: usize = tokio_chacha20::X_NONCE_BYTES;
+pub(crate) const NONCE_LEN: usize = tokio_chacha20::X_NONCE_BYTES;
+
+/// The chacha20 key length: 32 bytes.
+pub(crate) const KEY_LEN: usize = tokio_chacha20::KEY_BYTES;
 
 /// A read half that strips the 24-byte nonce and chacha20-decrypts the rest.
 #[derive(Debug)]
-pub struct ObfuscatedRead<R> {
+pub(crate) struct ObfuscatedRead<R> {
     inner: R,
-    key: [u8; tokio_chacha20::KEY_BYTES],
+    key: [u8; KEY_LEN],
     /// Scratch buffer for the received datagram (nonce + ciphertext).
     scratch: Vec<u8>,
 }
 
 impl<R> ObfuscatedRead<R> {
-    pub fn new(inner: R, key: [u8; tokio_chacha20::KEY_BYTES]) -> Self {
+    fn new(inner: R, key: [u8; KEY_LEN]) -> Self {
         Self {
             inner,
             key,
@@ -78,15 +84,15 @@ impl<R: UnreliableRead> UnreliableRead for ObfuscatedRead<R> {
 /// A write half that prefixes a 24-byte random nonce and chacha20-encrypts
 /// the rest.
 #[derive(Debug)]
-pub struct ObfuscatedWrite<W> {
+pub(crate) struct ObfuscatedWrite<W> {
     inner: W,
-    key: [u8; tokio_chacha20::KEY_BYTES],
+    key: [u8; KEY_LEN],
     /// Scratch buffer for the outgoing datagram (nonce + ciphertext).
     scratch: Vec<u8>,
 }
 
 impl<W> ObfuscatedWrite<W> {
-    pub fn new(inner: W, key: [u8; tokio_chacha20::KEY_BYTES]) -> Self {
+    fn new(inner: W, key: [u8; KEY_LEN]) -> Self {
         Self {
             inner,
             key,
@@ -113,36 +119,20 @@ impl<W: UnreliableWrite> UnreliableWrite for ObfuscatedWrite<W> {
     }
 }
 
-/// Wrap a connected UDP socket with the obfuscation layer, returning the
-/// read and write halves. The socket must be connected (or otherwise
-/// usable for both `recv` and `send`).
-pub fn wrap_connected_socket(
-    socket: std::sync::Arc<tokio::net::UdpSocket>,
-    key: [u8; tokio_chacha20::KEY_BYTES],
-) -> (
-    ObfuscatedRead<std::sync::Arc<tokio::net::UdpSocket>>,
-    ObfuscatedWrite<std::sync::Arc<tokio::net::UdpSocket>>,
-) {
-    (
-        ObfuscatedRead::new(socket.clone(), key),
-        ObfuscatedWrite::new(socket, key),
-    )
-}
-
-/// Build the transport halves for a connected socket, obfuscating only
-/// when a key is given. `None` passes datagrams through unchanged, so the
-/// obfuscation layer is strictly opt-in: the plain path is byte-identical
+/// Wrap the transport halves with obfuscation when a key is given. `None`
+/// passes the halves through unchanged, so the plain path is byte-identical
 /// to using the socket directly.
-pub fn wrap_connected_socket_opt(
-    socket: std::sync::Arc<tokio::net::UdpSocket>,
-    key: Option<[u8; tokio_chacha20::KEY_BYTES]>,
+pub(crate) fn maybe_wrap<R: UnreliableRead, W: UnreliableWrite>(
+    read: R,
+    write: W,
+    key: Option<[u8; KEY_LEN]>,
 ) -> (Box<dyn UnreliableRead>, Box<dyn UnreliableWrite>) {
     match key {
-        Some(key) => {
-            let (read, write) = wrap_connected_socket(socket, key);
-            (Box::new(read), Box::new(write))
-        }
-        None => (Box::new(socket.clone()), Box::new(socket)),
+        Some(key) => (
+            Box::new(ObfuscatedRead::new(read, key)),
+            Box::new(ObfuscatedWrite::new(write, key)),
+        ),
+        None => (Box::new(read), Box::new(write)),
     }
 }
 
@@ -151,8 +141,8 @@ mod tests {
     use super::*;
     use tokio::net::UdpSocket;
 
-    fn key() -> [u8; tokio_chacha20::KEY_BYTES] {
-        [7; tokio_chacha20::KEY_BYTES]
+    fn key() -> [u8; KEY_LEN] {
+        [7; KEY_LEN]
     }
 
     /// A connected socket pair: `a` sends, `b` receives.
@@ -214,7 +204,7 @@ mod tests {
         assert_eq!(&buf[..n], b"payload");
         // A *different* key on the receiving side must yield garbage.
         let (a2, b2) = socket_pair().await;
-        let mut read2 = ObfuscatedRead::new(a2, [9; tokio_chacha20::KEY_BYTES]);
+        let mut read2 = ObfuscatedRead::new(a2, [9; KEY_LEN]);
         let mut write3 = ObfuscatedWrite::new(b2, key());
         write3.send(b"payload").await.unwrap();
         let mut buf2 = [0u8; 1024];
@@ -234,9 +224,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_none_key_passes_datagrams_through_unchanged() {
+    async fn maybe_wrap_with_none_passes_halves_through_unchanged() {
         let (a, mut b) = socket_pair().await;
-        let (mut read, mut write) = wrap_connected_socket_opt(a, None);
+        let (mut read, mut write) = maybe_wrap(a.clone(), a, None);
         let payload = b"plain passthrough";
         // Write half: `a` → `b`, plaintext on the wire — no nonce prefix.
         assert_eq!(write.send(payload).await.unwrap(), payload.len());

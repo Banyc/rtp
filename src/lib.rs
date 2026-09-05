@@ -6,7 +6,7 @@ mod delivery;
 pub mod io_err;
 pub mod keyed_udp;
 pub mod mpudp;
-pub mod obfuscate;
+mod obfuscate;
 mod recv_queue;
 mod reliable;
 mod sequence;
@@ -26,9 +26,6 @@ pub use keyed_udp::{
     DispatchKey, Listener as KeyedListener,
 };
 pub use mpudp::{Conn as MpConn, Listener as MpListener, MPUDP_MSS};
-pub use obfuscate::{
-    NONCE_LEN, ObfuscatedRead, ObfuscatedWrite, wrap_connected_socket, wrap_connected_socket_opt,
-};
 pub use path_probe::{EchoDemux, ProbeEcho, decode_echo, encode_probe};
 pub use socket::{
     AsyncReadAdapter, AsyncWriteAdapter, ConnReader, ConnWriter, FrameByteReader, FrameByteWriter,

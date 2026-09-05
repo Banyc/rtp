@@ -295,6 +295,11 @@ pub struct AcceptConfig {
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub metrics_observer: Option<crate::metrics::MetricsObserver>,
+    /// Optional datagram obfuscation: when set, every datagram is prefixed
+    /// with a 24-byte random nonce and the rest is chacha20-encrypted with
+    /// this key. Both peers must use the same key; `None` (the default)
+    /// sends datagrams in the clear.
+    pub obfuscation_key: Option<[u8; 32]>,
 }
 
 impl Default for AcceptConfig {
@@ -307,6 +312,7 @@ impl Default for AcceptConfig {
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
+            obfuscation_key: None,
         }
     }
 }
@@ -327,6 +333,11 @@ pub struct ConnectConfig<'a> {
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub watchdog: Option<WatchdogTuning>,
+    /// Optional datagram obfuscation: when set, every datagram is prefixed
+    /// with a 24-byte random nonce and the rest is chacha20-encrypted with
+    /// this key. Both peers must use the same key; `None` (the default)
+    /// sends datagrams in the clear.
+    pub obfuscation_key: Option<[u8; 32]>,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -342,6 +353,7 @@ impl<'a> Default for ConnectConfig<'a> {
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
+            obfuscation_key: None,
         }
     }
 }
@@ -360,6 +372,7 @@ struct AcceptSetup {
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
+    obfuscation_key: Option<[u8; 32]>,
 }
 
 impl AcceptSetup {
@@ -377,6 +390,7 @@ impl AcceptSetup {
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
+            obfuscation_key: config.obfuscation_key,
         })
     }
 
@@ -402,6 +416,7 @@ async fn accept(
         retransmission_armor,
         instream_group_fec,
         metrics_observer,
+        obfuscation_key,
     } = setup;
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
@@ -410,9 +425,10 @@ async fn accept(
         raw_fd,
         peer: Some(peer_addr),
     };
+    let (read, write) = crate::obfuscate::maybe_wrap(read, write, obfuscation_key);
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Box::new(read),
-        Box::new(write),
+        read,
+        write,
         fec,
         mss,
         tuning,
@@ -711,6 +727,7 @@ async fn connect_bound(
         retransmission_armor,
         instream_group_fec,
         watchdog,
+        obfuscation_key,
     } = config;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
@@ -723,9 +740,10 @@ async fn connect_bound(
     };
     let udp = Arc::new(udp);
     let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(Arc::clone(&udp));
+    let (read, write) = crate::obfuscate::maybe_wrap(filtered_read, udp, obfuscation_key);
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Box::new(filtered_read),
-        Box::new(udp),
+        read,
+        write,
         fec,
         mss.resolve()?,
         fec_tuning,
@@ -820,6 +838,52 @@ mod tests {
         require_tokio_udp(&listener.listener);
         #[cfg(unix)]
         assert!(tokio_udp::is_vectored_supported());
+    }
+
+    #[tokio::test]
+    async fn obfuscation_round_trips_through_the_public_constructors() {
+        const KEY: [u8; 32] = [7; 32];
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+        let msg = b"obfuscated hello";
+        let mut server_tasks = tokio::task::JoinSet::new();
+        let mut handler_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
+            loop {
+                let accepted = listener
+                    .accept_with(AcceptConfig {
+                        obfuscation_key: Some(KEY),
+                        ..AcceptConfig::default()
+                    })
+                    .await
+                    .unwrap();
+                handler_tasks.spawn(async move {
+                    let mut accepted = accepted.await.unwrap();
+                    accepted.write.send(msg).await.unwrap();
+                    let mut buf = [0; 1];
+                    accepted.read.recv(&mut buf).await.unwrap();
+                });
+            }
+        });
+        let mut connected = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the obfuscated echo")
+        .unwrap();
+        assert_eq!(msg, &buf[..n]);
     }
 
     #[test]
