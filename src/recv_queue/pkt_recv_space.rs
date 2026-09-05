@@ -76,7 +76,7 @@ impl PktRecvSpace {
     }
 
     #[cfg(test)]
-    pub(crate) fn recv_disposition(
+    fn recv_disposition(
         &mut self,
         seq: SequenceNumber,
         data: Vec<u8>,

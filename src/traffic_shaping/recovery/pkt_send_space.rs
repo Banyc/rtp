@@ -433,20 +433,6 @@ impl PktSendSpace {
         self.send_wnd.next()
     }
 
-    /// Single-accessor form of [`Self::send_window_metrics`]; retained as
-    /// public API for external consumers of the send window.
-    #[allow(dead_code)]
-    pub fn num_rtxed_pkts(&self) -> usize {
-        let mut n = 0;
-        for (_, p) in Self::unacked(&self.send_wnd) {
-            if !p.rtxed {
-                continue;
-            }
-            n += 1;
-        }
-        n
-    }
-
     pub fn reused_buf(&mut self) -> &mut ObjPool<Vec<u8>> {
         &mut self.reused_buf
     }
@@ -1180,13 +1166,6 @@ impl PktSendSpace {
         enough_samples_for_stats && tolerant_loss_rate.get() < data_loss_rate
     }
 
-    /// Single-accessor form of [`Self::send_window_metrics`]; retained as
-    /// public API for external consumers of the send window.
-    #[allow(dead_code)]
-    pub fn data_loss_rate(&self, now: Instant) -> Option<f64> {
-        self.data_loss_stats(now).map(|(_, rate)| rate)
-    }
-
     /// One send-window traversal computing both the sample count and the loss
     /// ratio, so `huge_data_loss` no longer walks `pkts_in_pipe` a second
     /// time for its sample count.
@@ -1221,9 +1200,9 @@ impl PktSendSpace {
             .record_lost(1, now, self.smooth_rtt());
     }
 
-    /// Single-accessor form of [`Self::send_window_metrics`]; retained as
-    /// public API for external consumers of the send window.
-    #[allow(dead_code)]
+    /// Test-only accessor for the pipe depth; production uses the
+    /// consolidated [`Self::send_window_observation`] instead.
+    #[cfg(test)]
     pub fn num_pkts_in_pipe(&self) -> usize {
         self.pkts_in_pipe().count()
     }
@@ -1351,11 +1330,6 @@ impl InFlightPkt {
             self.rto.max(live_rto)
         };
         effective_rto <= sent_elapsed
-    }
-
-    #[allow(dead_code)]
-    pub fn next_rto_time(&self) -> Instant {
-        self.sent_time + self.rto
     }
 
     /// Whether this packet should be declared lost by the evidence-gated

@@ -14,7 +14,7 @@ use crate::traffic_shaping::redundancy::{
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
-pub(crate) const BUF_SIZE: usize = 1024 * 64;
+const BUF_SIZE: usize = 1024 * 64;
 
 pub(crate) use crate::transmission::ack_feedback::MAX_NUM_ACK;
 

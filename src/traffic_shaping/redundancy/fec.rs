@@ -125,20 +125,20 @@ pub(crate) struct FecStatsHandle(Arc<Stats>);
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FecStats {
-    pub parity_sent: usize,
-    pub groups_flushed: usize,
-    pub groups_skipped_no_surplus_tokens: usize,
-    pub groups_skipped_burst_end: usize,
-    pub groups_skipped_loss_gate: usize,
-    pub groups_skipped_no_spare_capacity: usize,
-    pub recovered_symbols: usize,
-    pub dropped_malformed_pkts: usize,
-    pub dropped_fec_decoder_panics: usize,
-    pub group_size_flushed: [u64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_loss_gate: [u64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_no_spare_capacity: [u64; GROUP_SIZE_HIST_LEN],
+    parity_sent: usize,
+    groups_flushed: usize,
+    groups_skipped_no_surplus_tokens: usize,
+    groups_skipped_burst_end: usize,
+    groups_skipped_loss_gate: usize,
+    groups_skipped_no_spare_capacity: usize,
+    recovered_symbols: usize,
+    dropped_malformed_pkts: usize,
+    dropped_fec_decoder_panics: usize,
+    group_size_flushed: [u64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_loss_gate: [u64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_no_spare_capacity: [u64; GROUP_SIZE_HIST_LEN],
 }
 
 /// Shared counters mutated by both actor halves.  All fields are atomics so
@@ -146,20 +146,20 @@ struct FecStats {
 /// without a lock.
 #[derive(Debug)]
 struct Stats {
-    pub parity_sent: AtomicUsize,
-    pub groups_flushed: AtomicUsize,
-    pub groups_skipped_no_surplus_tokens: AtomicUsize,
-    pub parity_groups_skipped_burst_end: AtomicUsize,
-    pub groups_skipped_loss_gate: AtomicUsize,
-    pub groups_skipped_no_spare_capacity: AtomicUsize,
-    pub recovered_symbols: AtomicUsize,
-    pub dropped_malformed_pkts: AtomicUsize,
-    pub dropped_fec_decoder_panics: AtomicUsize,
-    pub group_size_flushed: [AtomicU64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_burst_end: [AtomicU64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_no_surplus_tokens: [AtomicU64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_loss_gate: [AtomicU64; GROUP_SIZE_HIST_LEN],
-    pub group_size_skipped_no_spare_capacity: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    parity_sent: AtomicUsize,
+    groups_flushed: AtomicUsize,
+    groups_skipped_no_surplus_tokens: AtomicUsize,
+    parity_groups_skipped_burst_end: AtomicUsize,
+    groups_skipped_loss_gate: AtomicUsize,
+    groups_skipped_no_spare_capacity: AtomicUsize,
+    recovered_symbols: AtomicUsize,
+    dropped_malformed_pkts: AtomicUsize,
+    dropped_fec_decoder_panics: AtomicUsize,
+    group_size_flushed: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_burst_end: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_no_surplus_tokens: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_loss_gate: [AtomicU64; GROUP_SIZE_HIST_LEN],
+    group_size_skipped_no_spare_capacity: [AtomicU64; GROUP_SIZE_HIST_LEN],
 }
 
 impl Default for Stats {
