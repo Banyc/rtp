@@ -565,30 +565,58 @@ mod tests {
         let b = wrap_fec_lossy(b.clone(), b, fec, rate_b);
         let (a_r, a_w, _a_supervisor) = socket(a, None);
         let (b_r, b_w, _b_supervisor) = socket(b, None);
-        let mut send_buf = vec![0; 4 << 20];
-        let mut recv_buf = send_buf.clone();
-        for byte in &mut send_buf {
-            *byte = rand::random();
+        let mut a_w = a_w;
+        let mut a_r = a_r;
+        let mut b_r = b_r;
+        let mut b_w = b_w;
+        // One message at a time, waiting for the echo before the next: each
+        // message is a self-contained burst followed by a quiet gap, so the
+        // sender reaches a genuine tail-FEC flush between messages (the loss
+        // gate is open: 8% loss >> the 5% enable threshold) and the parity
+        // crosses loopback well before any retransmission RTO could deliver
+        // the lost symbol.  With ~15% effective loss (an independent roll on
+        // the read and write wrapper) over 512 single-packet messages, at
+        // least one message is dropped while its parity is in flight, so
+        // recovery is all but certain — unlike a single bulk write_all,
+        // which starves the assertion on timing: parity emission depends on
+        // scarce spare-capacity moments mid-burst and the counter is read
+        // before late tail parity decodes.
+        let msg_len = 256;
+        let n_msgs = 512;
+        let mut sent = Vec::with_capacity(n_msgs);
+        for i in 0..n_msgs {
+            let mut m = vec![0u8; msg_len];
+            for byte in &mut m {
+                *byte = (i as u8).wrapping_add(rand::random());
+            }
+            sent.push(m);
         }
-        let mut a = unsplit(a_r.into_async_read(), a_w.into_async_write());
-        let mut b_r = b_r.into_async_read();
-        let b_w = b_w.into_async_write();
-        let send_buf_clone = send_buf.clone();
-        let recv_done = Arc::new(tokio::sync::Notify::new());
-        let recv_done_clone = recv_done.clone();
-        let mut send_tasks = tokio::task::JoinSet::new();
-        send_tasks.spawn(async move {
-            let _b_w = b_w;
-            a.write_all(&send_buf_clone).await.unwrap();
-            recv_done_clone.notified().await;
-            a
+        let sent_for_server = sent.clone();
+        let mut server_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
+            let mut buf = vec![0u8; msg_len];
+            for expected in &sent_for_server {
+                let n = b_r.recv(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], expected.as_slice());
+                b_w.send(&buf[..n]).await.unwrap();
+            }
+            b_r.fec_recovered_symbols()
         });
-        b_r.read_exact(&mut recv_buf).await.unwrap();
-        assert_eq!(send_buf, recv_buf);
-        recv_done.notify_waiters();
-        send_tasks.join_next().await.unwrap().unwrap();
-        let recovered = b_r.inner().fec_recovered_symbols();
-        assert!(recovered.is_some(), "FEC should be enabled on receiver");
+        let exchange = async {
+            for m in &sent {
+                a_w.send(m).await.unwrap();
+                let mut echo = vec![0u8; m.len()];
+                let n = a_r.recv(&mut echo).await.unwrap();
+                assert_eq!(&echo[..n], m.as_slice());
+            }
+            drop(a_w);
+            drop(a_r);
+        };
+        tokio::time::timeout(Duration::from_secs(120), exchange)
+            .await
+            .expect("the FEC-under-loss echo exchange stalled");
+        let recovered = server_tasks.join_next().await.unwrap().unwrap();
+        assert!(recovered.is_some(), "FEC should be enabled on the receiver");
         assert!(
             recovered.unwrap() > 0,
             "FEC should recover >0 symbols under 8% loss, got 0"

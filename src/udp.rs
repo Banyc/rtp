@@ -1452,3 +1452,110 @@ mod tests {
         assert_eq!(&buf[..n], b"hello");
     }
 }
+
+#[cfg(test)]
+mod nohandshake_obf {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn obfuscation_no_handshake_round_trips() {
+        use super::*;
+        const KEY: [u8; 32] = [7; 32];
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+        let msg = b"no handshake obfuscated";
+        let mut st = tokio::task::JoinSet::new();
+        let mut ht = tokio::task::JoinSet::new();
+        st.spawn(async move {
+            loop {
+                let accepted = listener
+                    .accept_without_handshake_with(AcceptConfig {
+                        obfuscation_key: Some(KEY),
+                        ..AcceptConfig::default()
+                    })
+                    .await
+                    .unwrap();
+                ht.spawn(async move {
+                    let mut a = accepted;
+                    eprintln!("server: accepted, sending");
+                    a.write.send(msg).await.expect("server send failed");
+                    eprintln!("server: sent");
+                    let mut buf = [0; 1];
+                    a.read.recv(&mut buf).await.expect("server recv failed");
+                    eprintln!("server: got byte");
+                });
+            }
+        });
+        let mut c = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                handshake: false,
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        // No handshake means the server never learns the client's address
+        // until the client sends its first datagram (the listener creates a
+        // conn per source address), so the client must send before the
+        // server's accept loop can complete and reply.
+        c.write.send(b"hi").await.expect("client send failed");
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(msg, &buf[..n]);
+    }
+}
+
+#[cfg(test)]
+mod nohandshake_plain {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_handshake_plain_round_trips() {
+        use super::*;
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr();
+        let msg = b"no handshake plain";
+        let mut st = tokio::task::JoinSet::new();
+        let mut ht = tokio::task::JoinSet::new();
+        st.spawn(async move {
+            loop {
+                let accepted = listener
+                    .accept_without_handshake_with(AcceptConfig::default())
+                    .await
+                    .unwrap();
+                ht.spawn(async move {
+                    let mut a = accepted;
+                    eprintln!("server: accepted, sending");
+                    a.write.send(msg).await.expect("server send failed");
+                    eprintln!("server: sent");
+                    let mut buf = [0; 1];
+                    a.read.recv(&mut buf).await.expect("server recv failed");
+                    eprintln!("server: got byte");
+                });
+            }
+        });
+        let mut c = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                handshake: false,
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        // No handshake means the server never learns the client's address
+        // until the client sends its first datagram (the listener creates a
+        // conn per source address), so the client must send before the
+        // server's accept loop can complete and reply.
+        c.write.send(b"hi").await.expect("client send failed");
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), c.read.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(msg, &buf[..n]);
+    }
+}
