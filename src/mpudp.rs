@@ -65,35 +65,36 @@ struct LayerTuning {
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
+    obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
 impl LayerTuning {
     fn from_accept(config: AcceptConfig) -> io::Result<Self> {
-        reject_obfuscation(config.obfuscation_key)?;
         Ok(Self {
             fec: config.fec,
-            mss: resolve_mss(config.mss)?,
+            mss: resolve_mss(config.mss, config.obfuscation_key.is_some())?,
             tuning: config.fec_tuning,
             frame_delivery: config.frame_delivery,
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
+            obfuscation_key: config.obfuscation_key,
         })
     }
 
     fn from_connect(config: ConnectConfig<'_>) -> io::Result<(Option<LogConfig<'_>>, Self)> {
-        reject_obfuscation(config.obfuscation_key)?;
         let log_config = config.log_config;
         Ok((
             log_config,
             Self {
                 fec: config.fec,
-                mss: resolve_mss(config.mss)?,
+                mss: resolve_mss(config.mss, config.obfuscation_key.is_some())?,
                 tuning: config.fec_tuning,
                 frame_delivery: config.frame_delivery,
                 retransmission_armor: config.retransmission_armor,
                 instream_group_fec: config.instream_group_fec,
                 metrics_observer: config.metrics_observer,
+                obfuscation_key: config.obfuscation_key,
             },
         ))
     }
@@ -102,26 +103,19 @@ impl LayerTuning {
 /// Resolve the mpudp MSS: the shared [`MssConfig::Default`] resolves to the
 /// single-path [`crate::udp::NO_FEC_MSS`], but mpudp's default is the more
 /// conservative [`MPUDP_MSS`] (multi-path links have tighter MTU budgets).
-/// A custom config is honored as-is.
-fn resolve_mss(config: MssConfig) -> io::Result<ValidMss> {
-    match config {
+/// A custom config is honored as-is. When datagram obfuscation is enabled,
+/// the 24-byte nonce is reserved from the MSS (the wire datagram stays
+/// within the configured MSS).
+fn resolve_mss(config: MssConfig, obfuscated: bool) -> io::Result<ValidMss> {
+    let mss = match config {
         MssConfig::Default => ValidMss::try_new(MPUDP_MSS),
         MssConfig::Custom(mss) => ValidMss::try_new(mss),
     }
-    .map_err(Into::into)
-}
-
-/// mpudp does not support datagram obfuscation (the wrapper is only wired
-/// into the single-path udp constructors). A configured key is REJECTED
-/// rather than silently ignored — a user who set it would otherwise get
-/// plaintext on the wire without knowing.
-fn reject_obfuscation(key: Option<[u8; crate::obfuscate::KEY_LEN]>) -> io::Result<()> {
-    match key {
-        None => Ok(()),
-        Some(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "mpudp does not support obfuscation_key",
-        )),
+    .map_err(io::Error::from)?;
+    if obfuscated {
+        mss.reduced_for_obfuscation().map_err(io::Error::from)
+    } else {
+        Ok(mss)
     }
 }
 
@@ -141,9 +135,13 @@ async fn convert_conn(
         None => None,
     };
     let (r, w) = conn.into_split();
+    // Datagram obfuscation (when a key is configured): every datagram is
+    // prefixed with a 24-byte random nonce and the rest is chacha20-
+    // encrypted, exactly like the single-path udp constructors.
+    let (r, w) = crate::obfuscate::maybe_wrap(r, w, tuning.obfuscation_key);
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        Box::new(r),
-        Box::new(w),
+        r,
+        w,
         tuning.fec,
         tuning.mss,
         tuning.tuning,
@@ -369,5 +367,99 @@ mod tests {
             ["0.0.0.0:0".parse().unwrap()].into_iter(),
             ConnectConfig::default(),
         ));
+    }
+
+    #[test]
+    fn resolve_mss_reserves_the_obfuscation_nonce() {
+        // Default (MPUDP_MSS) with obfuscation: reduced by the nonce so the
+        // wire datagram stays within the configured MSS.
+        let mss = resolve_mss(MssConfig::Default, true).unwrap();
+        assert_eq!(mss.get(), MPUDP_MSS - crate::obfuscate::NONCE_LEN);
+        // Without obfuscation: the full MPUDP_MSS.
+        let mss = resolve_mss(MssConfig::Default, false).unwrap();
+        assert_eq!(mss.get(), MPUDP_MSS);
+        // A custom MSS too small to carry the nonce on top of the codec
+        // payload is rejected.
+        let err =
+            resolve_mss(MssConfig::Custom(crate::codec::data_overhead() + 1), true).unwrap_err();
+        assert!(
+            err.to_string().contains("obfuscation nonce"),
+            "a too-small MSS must fail naming the nonce reservation, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn obfuscation_round_trips_through_mpudp() -> std::io::Result<()> {
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
+        let max_session_conns = NonZeroUsize::new(1 << 10).unwrap();
+        let mut listener = Listener::bind(
+            ["127.0.0.1:0"].map(|x| x.parse().unwrap()).into_iter(),
+            max_session_conns,
+        )
+        .await
+        .unwrap();
+        let addrs = listener.local_addrs().collect::<Vec<SocketAddr>>();
+        let msg_1 = b"obfuscated mpudp hello";
+
+        let echo_received = std::sync::Arc::new(tokio::sync::Notify::new());
+        let receipt_seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_server = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn({
+            let echo_received = std::sync::Arc::clone(&echo_received);
+            let receipt_seen = std::sync::Arc::clone(&receipt_seen);
+            let release_server = std::sync::Arc::clone(&release_server);
+            async move {
+                let mut accepted = listener
+                    .accept_with(AcceptConfig {
+                        obfuscation_key: Some(KEY),
+                        ..AcceptConfig::default()
+                    })
+                    .await
+                    .unwrap();
+                accepted.write.send(msg_1).await.unwrap();
+                accepted.write.send_buf_empty().await.unwrap();
+                echo_received.notified().await;
+                let mut receipt = [0; 1];
+                let n = accepted.read.recv(&mut receipt).await.unwrap();
+                assert_eq!(n, 1);
+                assert_eq!(receipt, [0]);
+                receipt_seen.notify_one();
+                release_server.notified().await;
+            }
+        });
+
+        let mut connected = Conn::connect_with(
+            addrs.into_iter(),
+            ConnectConfig {
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = [0; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the obfuscated echo")
+        .unwrap();
+        assert_eq!(msg_1, &buf[..n]);
+        echo_received.notify_one();
+        connected.write.send(b"\x00").await.unwrap();
+        connected.write.send_buf_empty().await?;
+        connected.write.all_sent_data_acked().await?;
+        receipt_seen.notified().await;
+        release_server.notify_one();
+        server
+            .join_next()
+            .await
+            .expect("server task missing")
+            .unwrap();
+        assert!(server.is_empty());
+        Ok(())
     }
 }
