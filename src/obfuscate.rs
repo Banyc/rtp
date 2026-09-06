@@ -60,7 +60,7 @@ pub(crate) struct ObfuscatedRead<R> {
 }
 
 impl<R> ObfuscatedRead<R> {
-    fn new(inner: R, key: [u8; KEY_LEN]) -> Self {
+    pub(crate) fn new(inner: R, key: [u8; KEY_LEN]) -> Self {
         Self {
             inner,
             key,
@@ -143,7 +143,7 @@ pub(crate) struct ObfuscatedWrite<W> {
 }
 
 impl<W> ObfuscatedWrite<W> {
-    fn new(inner: W, key: [u8; KEY_LEN]) -> Self {
+    pub(crate) fn new(inner: W, key: [u8; KEY_LEN]) -> Self {
         Self {
             inner,
             key,

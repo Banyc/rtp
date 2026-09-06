@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
@@ -20,12 +20,6 @@ const TIMESTAMP_OFFSET: usize = 17;
 const RATE_PER_SOURCE: f64 = 16.0;
 const BURST_PER_SOURCE: f64 = 32.0;
 const MAX_TRACKED_SOURCES: usize = 4096;
-
-/// The one-shot probe-obfuscation key cell shared between a [`Listener`]
-/// (which arms it via `set_probe_obfuscation_key`) and the probe responder
-/// inside the listener's dispatch closure. The key is decided once, before
-/// serving; a second set is a programming error.
-pub(crate) type ProbeKey = Arc<OnceLock<Option<[u8; crate::obfuscate::KEY_LEN]>>>;
 
 /// A probe / probe-echo exchange: a per-probe `nonce` for matching the echo
 /// back to its probe and a `timestamp_micros` (epoch-relative) for the
@@ -143,63 +137,78 @@ impl RateLimiter {
             .allow(now)
     }
 }
+/// The outcome of a probe check on one datagram at the listener dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Observe {
+    /// The datagram was a probe: echoed (when the echo socket exists) and
+    /// consumed — it must not be routed to a connection.
+    Consumed,
+    /// The datagram is not a valid obfuscated datagram (shorter than the
+    /// nonce): drop it, exactly like the obfuscation wrapper drops invalid
+    /// datagrams on the read path.
+    Dropped,
+    /// The datagram is not a probe: route it. `usize` is the plaintext
+    /// length; when a key is set the datagram buffer has been decrypted in
+    /// place at the front, so the caller truncates the packet to that
+    /// length and the connection never decrypts again.
+    Data(usize),
+}
+
 #[derive(Debug)]
 pub(crate) struct ProbeResponder {
     echo: Option<std::net::UdpSocket>,
     limiter: Mutex<RateLimiter>,
     send_error_count: AtomicUsize,
-    /// The one-shot obfuscation key for the probe side channel, armed by
-    /// the listener after bind (the rtp_mux server sets it from
-    /// `with_obfuscation_key`). When set, incoming probes are decrypted
-    /// with it and echoes are encrypted with it, so the probe channel is
-    /// indistinguishable from the obfuscated data channel. `None` keeps
-    /// the historical plaintext probe channel.
-    key: ProbeKey,
+    /// The obfuscation key for the probe side channel, fixed at listener
+    /// construction. When set, every datagram is decrypted in place before
+    /// the probe check, so the listener routes decrypted bytes to
+    /// connections (which never decrypt again); probes are echoed with the
+    /// same key. `None` keeps the historical plaintext probe channel.
+    key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 impl ProbeResponder {
-    pub(crate) fn new(echo: Option<std::net::UdpSocket>) -> Self {
+    pub(crate) fn new(
+        echo: Option<std::net::UdpSocket>,
+        key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    ) -> Self {
         Self {
             echo,
             limiter: Mutex::new(RateLimiter::default()),
             send_error_count: AtomicUsize::new(0),
-            key: Arc::new(OnceLock::new()),
+            key,
         }
-    }
-    /// A handle to the probe-key cell, shared with the listener so the key
-    /// can be armed after bind without rebuilding the dispatch closure.
-    pub(crate) fn key_cell(&self) -> ProbeKey {
-        Arc::clone(&self.key)
     }
     #[cfg(test)]
     pub(crate) fn send_error_count(&self) -> usize {
         self.send_error_count.load(Ordering::Relaxed)
     }
-    pub(crate) fn observe(&self, from: &SocketAddr, datagram: &[u8]) -> bool {
-        let key = self.key.get().copied().flatten();
-        // With a key, the probe plaintext is hidden behind the obfuscation
-        // nonce: decrypt the datagram before the probe check, and encrypt
-        // the echo on the way out. A datagram that is not an obfuscated
-        // probe (wrong length, or decrypts to non-probe bytes) is left for
-        // the connection dispatch, exactly like a plaintext non-probe.
-        let mut scratch = [0u8; PROBE_LEN];
-        let probe: &[u8] = match key {
+    /// Check `datagram` for a probe, decrypting it in place when a key is
+    /// set. A probe is echoed and consumed; anything else is routed (the
+    /// buffer holds the plaintext at the front when a key was set).
+    pub(crate) fn observe(&self, from: &SocketAddr, datagram: &mut [u8]) -> Observe {
+        let probe: &[u8] = match self.key {
             Some(key) => {
-                if datagram.len() != OBFUSCATED_PROBE_LEN {
-                    return false;
+                if datagram.len() < crate::obfuscate::NONCE_LEN {
+                    return Observe::Dropped;
                 }
                 let nonce: [u8; crate::obfuscate::NONCE_LEN] =
                     datagram[..crate::obfuscate::NONCE_LEN].try_into().unwrap();
-                scratch.copy_from_slice(&datagram[crate::obfuscate::NONCE_LEN..]);
-                crate::obfuscate::apply_keystream(key, nonce, &mut scratch);
-                &scratch
+                let ciphertext_len = datagram.len() - crate::obfuscate::NONCE_LEN;
+                // Decrypt in place: move the ciphertext down over the nonce
+                // and XOR the keystream, so the routed packet is the
+                // plaintext and the connection never decrypts again.
+                datagram.copy_within(crate::obfuscate::NONCE_LEN.., 0);
+                let plaintext = &mut datagram[..ciphertext_len];
+                crate::obfuscate::apply_keystream(key, nonce, plaintext);
+                plaintext
             }
             None => datagram,
         };
         if !is_probe_packet(probe) {
-            return false;
+            return Observe::Data(probe.len());
         }
         if probe[DIR_OFFSET] != DIR_PROBE {
-            return true;
+            return Observe::Consumed;
         }
         if !self
             .limiter
@@ -207,10 +216,10 @@ impl ProbeResponder {
             .unwrap()
             .allow(from.ip(), Instant::now())
         {
-            return true;
+            return Observe::Consumed;
         }
         if let Some(echo) = &self.echo {
-            match key {
+            match self.key {
                 Some(key) => {
                     let mut reply = [0u8; OBFUSCATED_PROBE_LEN];
                     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
@@ -236,7 +245,7 @@ impl ProbeResponder {
                 }
             }
         }
-        true
+        Observe::Consumed
     }
 }
 #[derive(Debug)]
@@ -513,16 +522,18 @@ mod tests {
         let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let raw = echo.as_raw_fd();
         let closer = unsafe { std::fs::File::from_raw_fd(raw) };
-        let responder = ProbeResponder::new(Some(echo));
+        let responder = ProbeResponder::new(Some(echo), None);
         drop(closer);
         let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert!(responder.observe(
-            &from,
-            &encode_probe(ProbeEcho {
-                nonce: 1,
-                timestamp_micros: 2
-            })
-        ));
+        let mut probe = encode_probe(ProbeEcho {
+            nonce: 1,
+            timestamp_micros: 2,
+        });
+        assert_eq!(
+            responder.observe(&from, &mut probe),
+            Observe::Consumed,
+            "a probe must be consumed (echoed)"
+        );
         assert_eq!(responder.send_error_count(), 1);
         std::mem::forget(responder);
     }

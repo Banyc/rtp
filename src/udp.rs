@@ -133,31 +133,51 @@ pub struct Listener {
     listener: IdentityUdpListener,
     local_addr: SocketAddr,
     raw_fd: MaybeRawFd,
-    /// The one-shot obfuscation key for the path-probe side channel, shared
-    /// with the probe responder inside the dispatch closure. Armed after
-    /// bind (see [`Listener::set_probe_obfuscation_key`]) so builders that
-    /// configure obfuscation after binding (e.g. `RtpMuxServer`) can arm
-    /// the probe channel with the same key as the data channel; immutable
-    /// once set.
-    probe_key: crate::path_probe::ProbeKey,
+    /// The obfuscation key for this listener, fixed at construction (see
+    /// [`Listener::bind_with_key`]). When set, the listener decrypts every
+    /// incoming datagram in place at the dispatch, routes decrypted bytes
+    /// to connections (which never decrypt again), and answers probes with
+    /// the same key; the accepted connections' write halves encrypt with it.
+    key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 impl Listener {
+    /// Bind without datagram obfuscation: datagrams travel in the clear.
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
+        Self::bind_with_key(addr, None).await
+    }
+
+    /// Bind with datagram obfuscation: every datagram is prefixed with a
+    /// 24-byte random nonce and chacha20-encrypted with `key`. The listener
+    /// decrypts each datagram once at the dispatch and routes the decrypted
+    /// bytes to connections, so nothing is decrypted twice; probes are
+    /// answered with the same key. The peer must use the same key. `None`
+    /// keeps the plaintext channel.
+    pub async fn bind_with_key(
+        addr: impl tokio::net::ToSocketAddrs,
+        key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    ) -> std::io::Result<Self> {
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
-        let responder = crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp));
-        let probe_key = responder.key_cell();
+        let responder = crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp), key);
         let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
-            Arc::new(move |addr: &SocketAddr, packet: Packet| {
-                if responder.observe(addr, packet.as_ref()) {
-                    return None;
+            Arc::new(move |addr: &SocketAddr, mut packet: Packet| {
+                match responder.observe(addr, packet.as_mut()) {
+                    crate::path_probe::Observe::Consumed | crate::path_probe::Observe::Dropped => {
+                        None
+                    }
+                    crate::path_probe::Observe::Data(len) => {
+                        // The responder decrypted in place at the front (when
+                        // a key is set); truncate the packet to the
+                        // plaintext so the connection reads plaintext.
+                        packet.truncate(len);
+                        Some(Classified {
+                            key: *addr,
+                            value: packet,
+                            policy: DispatchPolicy::Create,
+                        })
+                    }
                 }
-                Some(Classified {
-                    key: *addr,
-                    value: packet,
-                    policy: DispatchPolicy::Create,
-                })
             });
         let listener = UtpListener::new(
             udp,
@@ -168,24 +188,8 @@ impl Listener {
             listener,
             local_addr,
             raw_fd,
-            probe_key,
+            key,
         })
-    }
-
-    /// Set the obfuscation key for the path-probe side channel. When set,
-    /// the listener decrypts incoming probes with this key and encrypts its
-    /// echoes, so the probe channel is indistinguishable from the obfuscated
-    /// data channel. The key must match the key the probing peer uses for
-    /// its data channel (the rtp_mux connector sends probes with the same
-    /// key as its data). `None` (the default) keeps the plaintext probe
-    /// channel.
-    ///
-    /// The key is one-shot: it must be armed before serving and cannot be
-    /// changed afterwards. A second call panics.
-    pub fn set_probe_obfuscation_key(&self, key: Option<[u8; crate::obfuscate::KEY_LEN]>) {
-        self.probe_key
-            .set(key)
-            .expect("probe obfuscation key is set once, before serving");
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -213,8 +217,15 @@ impl Listener {
     pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<AcceptTask> {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
+        let key = self.key;
         Ok(Box::pin(async move {
-            accept(accepted, raw_fd, AcceptSetup::from_config(true, config)?).await
+            accept(
+                accepted,
+                raw_fd,
+                AcceptSetup::from_config(true, config)?,
+                key,
+            )
+            .await
         }))
     }
 
@@ -229,6 +240,7 @@ impl Listener {
             accepted,
             self.raw_fd,
             AcceptSetup::from_config(false, config)?,
+            self.key,
         )
         .await
     }
@@ -267,12 +279,14 @@ impl Listener {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
+        let key = self.key;
         Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
                 raw_fd,
                 AcceptSetup::from_config(handshake, config)?
                     .with_frame_delivery(FrameMode::enabled()),
+                key,
             )
             .await?;
             let Accepted {
@@ -320,10 +334,11 @@ pub struct AcceptConfig {
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub metrics_observer: Option<crate::metrics::MetricsObserver>,
-    /// Optional datagram obfuscation: when set, every datagram is prefixed
-    /// with a 24-byte random nonce and the rest is chacha20-encrypted with
-    /// this key. Both peers must use the same key; `None` (the default)
-    /// sends datagrams in the clear.
+    /// Datagram obfuscation key for the [`crate::keyed_udp`] and
+    /// [`crate::mpudp`] accept paths, which wrap each connection's
+    /// transport with this key. The single-path [`Listener`] does not use
+    /// this field: its key is fixed at [`Listener::bind_with_key`], and the
+    /// listener decrypts every datagram once at the dispatch.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
@@ -397,7 +412,6 @@ struct AcceptSetup {
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
-    obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
 impl AcceptSetup {
@@ -415,7 +429,6 @@ impl AcceptSetup {
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
-            obfuscation_key: config.obfuscation_key,
         })
     }
 
@@ -431,6 +444,7 @@ async fn accept(
     accepted: IdentityConn,
     raw_fd: MaybeRawFd,
     setup: AcceptSetup,
+    key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 ) -> std::io::Result<Accepted> {
     let AcceptSetup {
         handshake,
@@ -441,7 +455,6 @@ async fn accept(
         retransmission_armor,
         instream_group_fec,
         metrics_observer,
-        obfuscation_key,
     } = setup;
     let peer_addr = *accepted.conn_key();
     let (read, write) = accepted.split();
@@ -450,11 +463,18 @@ async fn accept(
         raw_fd,
         peer: Some(peer_addr),
     };
-    let (read, write) = crate::obfuscate::maybe_wrap(read, write, obfuscation_key);
+    // The listener already decrypted the read side in place at the dispatch
+    // (when a key is set), so only the write side is obfuscated here — the
+    // connection never decrypts a datagram twice.
+    let read: Box<dyn UnreliableRead> = Box::new(read);
+    let write: Box<dyn UnreliableWrite> = match key {
+        Some(key) => Box::new(crate::obfuscate::ObfuscatedWrite::new(write, key)),
+        None => Box::new(write),
+    };
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
     // configured MSS).
-    let mss = if obfuscation_key.is_some() {
+    let mss = if key.is_some() {
         mss.reduced_for_obfuscation()?
     } else {
         mss
@@ -891,20 +911,16 @@ mod tests {
     #[tokio::test]
     async fn obfuscation_round_trips_through_the_public_constructors() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind_with_key("127.0.0.1:0", Some(KEY))
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let msg = b"obfuscated hello";
         let mut server_tasks = tokio::task::JoinSet::new();
         let mut handler_tasks = tokio::task::JoinSet::new();
         server_tasks.spawn(async move {
             loop {
-                let accepted = listener
-                    .accept_with(AcceptConfig {
-                        obfuscation_key: Some(KEY),
-                        ..AcceptConfig::default()
-                    })
-                    .await
-                    .unwrap();
+                let accepted = listener.accept_with(AcceptConfig::default()).await.unwrap();
                 handler_tasks.spawn(async move {
                     let mut accepted = accepted.await.unwrap();
                     accepted.write.send(msg).await.unwrap();
@@ -1339,8 +1355,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn listener_with_probe_key_echoes_obfuscated_probes_only() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
-        listener.set_probe_obfuscation_key(Some(KEY));
+        let listener = Listener::bind_with_key("127.0.0.1:0", Some(KEY))
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let accept_loop = async move {
             loop {
@@ -1401,8 +1418,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn obfuscated_connection_carries_data_and_probes_with_one_nonce_each() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
-        let listener = Arc::new(Listener::bind("127.0.0.1:0").await.unwrap());
-        listener.set_probe_obfuscation_key(Some(KEY));
+        let listener = Arc::new(
+            Listener::bind_with_key("127.0.0.1:0", Some(KEY))
+                .await
+                .unwrap(),
+        );
         let addr = listener.local_addr();
         let mut tasks = tokio::task::JoinSet::new();
         // Server: accept the data connection and echo the payload back, while
@@ -1412,10 +1432,7 @@ mod tests {
         let server_listener = Arc::clone(&listener);
         tasks.spawn(async move {
             let mut accepted = server_listener
-                .accept_without_handshake_with(AcceptConfig {
-                    obfuscation_key: Some(KEY),
-                    ..AcceptConfig::default()
-                })
+                .accept_without_handshake_with(AcceptConfig::default())
                 .await
                 .unwrap();
             let drainer = async move {
@@ -1638,7 +1655,9 @@ mod nohandshake_obf {
     async fn obfuscation_no_handshake_round_trips() {
         use super::*;
         const KEY: [u8; 32] = [7; 32];
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind_with_key("127.0.0.1:0", Some(KEY))
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let msg = b"no handshake obfuscated";
         let mut st = tokio::task::JoinSet::new();
@@ -1646,10 +1665,7 @@ mod nohandshake_obf {
         st.spawn(async move {
             loop {
                 let accepted = listener
-                    .accept_without_handshake_with(AcceptConfig {
-                        obfuscation_key: Some(KEY),
-                        ..AcceptConfig::default()
-                    })
+                    .accept_without_handshake_with(AcceptConfig::default())
                     .await
                     .unwrap();
                 ht.spawn(async move {
