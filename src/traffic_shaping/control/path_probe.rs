@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
@@ -21,10 +21,11 @@ const RATE_PER_SOURCE: f64 = 16.0;
 const BURST_PER_SOURCE: f64 = 32.0;
 const MAX_TRACKED_SOURCES: usize = 4096;
 
-/// The settable probe-obfuscation key cell shared between a [`Listener`]
+/// The one-shot probe-obfuscation key cell shared between a [`Listener`]
 /// (which arms it via `set_probe_obfuscation_key`) and the probe responder
-/// inside the listener's dispatch closure.
-pub(crate) type ProbeKey = Arc<Mutex<Option<[u8; crate::obfuscate::KEY_LEN]>>>;
+/// inside the listener's dispatch closure. The key is decided once, before
+/// serving; a second set is a programming error.
+pub(crate) type ProbeKey = Arc<OnceLock<Option<[u8; crate::obfuscate::KEY_LEN]>>>;
 
 /// A probe / probe-echo exchange: a per-probe `nonce` for matching the echo
 /// back to its probe and a `timestamp_micros` (epoch-relative) for the
@@ -147,13 +148,13 @@ pub(crate) struct ProbeResponder {
     echo: Option<std::net::UdpSocket>,
     limiter: Mutex<RateLimiter>,
     send_error_count: AtomicUsize,
-    /// The obfuscation key for the probe side channel, settable after the
-    /// listener is bound (the rtp_mux server sets it from
+    /// The one-shot obfuscation key for the probe side channel, armed by
+    /// the listener after bind (the rtp_mux server sets it from
     /// `with_obfuscation_key`). When set, incoming probes are decrypted
     /// with it and echoes are encrypted with it, so the probe channel is
     /// indistinguishable from the obfuscated data channel. `None` keeps
     /// the historical plaintext probe channel.
-    key: Arc<Mutex<Option<[u8; crate::obfuscate::KEY_LEN]>>>,
+    key: ProbeKey,
 }
 impl ProbeResponder {
     pub(crate) fn new(echo: Option<std::net::UdpSocket>) -> Self {
@@ -161,11 +162,11 @@ impl ProbeResponder {
             echo,
             limiter: Mutex::new(RateLimiter::default()),
             send_error_count: AtomicUsize::new(0),
-            key: Arc::new(Mutex::new(None)),
+            key: Arc::new(OnceLock::new()),
         }
     }
     /// A handle to the probe-key cell, shared with the listener so the key
-    /// can be set after bind without rebuilding the dispatch closure.
+    /// can be armed after bind without rebuilding the dispatch closure.
     pub(crate) fn key_cell(&self) -> ProbeKey {
         Arc::clone(&self.key)
     }
@@ -174,7 +175,7 @@ impl ProbeResponder {
         self.send_error_count.load(Ordering::Relaxed)
     }
     pub(crate) fn observe(&self, from: &SocketAddr, datagram: &[u8]) -> bool {
-        let key = *self.key.lock().unwrap();
+        let key = self.key.get().copied().flatten();
         // With a key, the probe plaintext is hidden behind the obfuscation
         // nonce: decrypt the datagram before the probe check, and encrypt
         // the echo on the way out. A datagram that is not an obfuscated

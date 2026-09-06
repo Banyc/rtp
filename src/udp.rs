@@ -133,11 +133,12 @@ pub struct Listener {
     listener: IdentityUdpListener,
     local_addr: SocketAddr,
     raw_fd: MaybeRawFd,
-    /// The obfuscation key for the path-probe side channel, shared with
-    /// the probe responder inside the dispatch closure. Settable after
+    /// The one-shot obfuscation key for the path-probe side channel, shared
+    /// with the probe responder inside the dispatch closure. Armed after
     /// bind (see [`Listener::set_probe_obfuscation_key`]) so builders that
     /// configure obfuscation after binding (e.g. `RtpMuxServer`) can arm
-    /// the probe channel with the same key as the data channel.
+    /// the probe channel with the same key as the data channel; immutable
+    /// once set.
     probe_key: crate::path_probe::ProbeKey,
 }
 impl Listener {
@@ -178,8 +179,13 @@ impl Listener {
     /// its data channel (the rtp_mux connector sends probes with the same
     /// key as its data). `None` (the default) keeps the plaintext probe
     /// channel.
+    ///
+    /// The key is one-shot: it must be armed before serving and cannot be
+    /// changed afterwards. A second call panics.
     pub fn set_probe_obfuscation_key(&self, key: Option<[u8; crate::obfuscate::KEY_LEN]>) {
-        *self.probe_key.lock().unwrap() = key;
+        self.probe_key
+            .set(key)
+            .expect("probe obfuscation key is set once, before serving");
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -1390,6 +1396,92 @@ mod tests {
                 );
             } => {}
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn obfuscated_connection_carries_data_and_probes_with_one_nonce_each() {
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
+        let listener = Arc::new(Listener::bind("127.0.0.1:0").await.unwrap());
+        listener.set_probe_obfuscation_key(Some(KEY));
+        let addr = listener.local_addr();
+        let mut tasks = tokio::task::JoinSet::new();
+        // Server: accept the data connection and echo the payload back, while
+        // a drainer keeps the listener's dispatch loop reading so the armed
+        // probe responder answers the probe sent below (the real rtp_mux
+        // server runs the same continuous accept loop).
+        let server_listener = Arc::clone(&listener);
+        tasks.spawn(async move {
+            let mut accepted = server_listener
+                .accept_without_handshake_with(AcceptConfig {
+                    obfuscation_key: Some(KEY),
+                    ..AcceptConfig::default()
+                })
+                .await
+                .unwrap();
+            let drainer = async move {
+                loop {
+                    if server_listener.accept_without_handshake().await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::pin!(drainer);
+            let mut buf = [0u8; 64];
+            let n = tokio::select! {
+                () = &mut drainer => {
+                    panic!("accept drainer ended before the data exchange completed");
+                }
+                n = accepted.read.recv(&mut buf) => n.unwrap(),
+            };
+            accepted.write.send(&buf[..n]).await.unwrap();
+            // Keep the listener reading (and answering probes) for the rest
+            // of the test; the drainer only ends when the listener fails.
+            (&mut drainer).await;
+        });
+        // Client: connect with the same key, exchange data, then probe the
+        // session's own tuple through the tap. Both datagram kinds carry
+        // exactly one 24-byte nonce at the head (the wrapper for data, the
+        // obfuscated probe codec for probes) — a second nonce would break
+        // the decrypt on the peer and the round-trips below would fail.
+        let mut connected = connect_with(
+            "127.0.0.1:0",
+            addr,
+            ConnectConfig {
+                handshake: false,
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut tap = connected
+            .probe_tap
+            .take()
+            .expect("client connects carry a tap");
+        connected.write.send(b"data").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = connected.read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"data");
+        tap.send_probe(crate::path_probe::ProbeEcho {
+            nonce: 99,
+            timestamp_micros: 7,
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(echo) = tap.try_recv_echo() {
+                assert_eq!(echo.nonce, 99);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe echo never reached the tap on the obfuscated connection"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // The server task runs the drainer forever; dropping the JoinSet
+        // aborts it once the test body is done.
+        drop(tasks);
     }
 
     fn spawn_greeting_server(
