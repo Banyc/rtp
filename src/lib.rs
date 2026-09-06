@@ -41,6 +41,6 @@ pub use transmission::transmission_layer::{
 pub use transmission::watchdog_tuning::WatchdogTuning;
 pub use udp::{
     AcceptConfig, AcceptTask, Accepted, ConnectConfig, Connected, FrameDeliveryAccept,
-    FrameDeliveryIo, Listener, LogConfig, MAX_MSS, MssConfig, NO_FEC_MSS, connect_with,
-    connect_with_socket,
+    FrameDeliveryIo, Listener, ListenerConfig, LogConfig, MAX_MSS, MssConfig, NO_FEC_MSS,
+    connect_with, connect_with_socket,
 };

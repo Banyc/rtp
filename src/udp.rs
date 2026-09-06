@@ -128,34 +128,39 @@ async fn connect_udp(
 
 pub type AcceptTask = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Accepted>> + Send>>;
 
+/// Settings for [`Listener::bind`]: the datagram-obfuscation key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ListenerConfig {
+    /// When set, every datagram is prefixed with a 24-byte random nonce and
+    /// chacha20-encrypted with this key. The listener decrypts each datagram
+    /// once at the dispatch and routes the decrypted bytes to connections,
+    /// so nothing is decrypted twice; probes are answered with the same key.
+    /// The peer must use the same key. `None` (the default) sends datagrams
+    /// in the clear.
+    pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+}
+
 #[derive(Debug)]
 pub struct Listener {
     listener: IdentityUdpListener,
     local_addr: SocketAddr,
     raw_fd: MaybeRawFd,
     /// The obfuscation key for this listener, fixed at construction (see
-    /// [`Listener::bind_with_key`]). When set, the listener decrypts every
-    /// incoming datagram in place at the dispatch, routes decrypted bytes
-    /// to connections (which never decrypt again), and answers probes with
-    /// the same key; the accepted connections' write halves encrypt with it.
+    /// [`ListenerConfig`]). When set, the listener decrypts every incoming
+    /// datagram in place at the dispatch, routes decrypted bytes to
+    /// connections (which never decrypt again), and answers probes with the
+    /// same key; the accepted connections' write halves encrypt with it.
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 impl Listener {
-    /// Bind without datagram obfuscation: datagrams travel in the clear.
-    pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
-        Self::bind_with_key(addr, None).await
-    }
-
-    /// Bind with datagram obfuscation: every datagram is prefixed with a
-    /// 24-byte random nonce and chacha20-encrypted with `key`. The listener
-    /// decrypts each datagram once at the dispatch and routes the decrypted
-    /// bytes to connections, so nothing is decrypted twice; probes are
-    /// answered with the same key. The peer must use the same key. `None`
-    /// keeps the plaintext channel.
-    pub async fn bind_with_key(
+    /// Bind with the given settings (see [`ListenerConfig`]).
+    pub async fn bind(
         addr: impl tokio::net::ToSocketAddrs,
-        key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+        config: ListenerConfig,
     ) -> std::io::Result<Self> {
+        let ListenerConfig {
+            obfuscation_key: key,
+        } = config;
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
@@ -337,8 +342,9 @@ pub struct AcceptConfig {
     /// Datagram obfuscation key for the [`crate::keyed_udp`] and
     /// [`crate::mpudp`] accept paths, which wrap each connection's
     /// transport with this key. The single-path [`Listener`] does not use
-    /// this field: its key is fixed at [`Listener::bind_with_key`], and the
-    /// listener decrypts every datagram once at the dispatch.
+    /// this field: its key is fixed at [`Listener::bind`] via
+    /// [`ListenerConfig`], and the listener decrypts every datagram once at
+    /// the dispatch.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
 }
 
@@ -852,7 +858,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_connect() {
         let fec = true;
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let msg_1 = b"hello";
         let mut server_tasks = tokio::task::JoinSet::new();
@@ -902,7 +910,9 @@ mod tests {
     #[tokio::test]
     async fn identity_listener_uses_tokio_udp_transport() {
         fn require_tokio_udp(_listener: &UtpListener<VectoredUdpSocket, SocketAddr, Packet>) {}
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         require_tokio_udp(&listener.listener);
         #[cfg(unix)]
         assert!(tokio_udp::is_vectored_supported());
@@ -911,9 +921,14 @@ mod tests {
     #[tokio::test]
     async fn obfuscation_round_trips_through_the_public_constructors() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
-        let listener = Listener::bind_with_key("127.0.0.1:0", Some(KEY))
-            .await
-            .unwrap();
+        let listener = Listener::bind(
+            "127.0.0.1:0",
+            ListenerConfig {
+                obfuscation_key: Some(KEY),
+            },
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr();
         let msg = b"obfuscated hello";
         let mut server_tasks = tokio::task::JoinSet::new();
@@ -1071,7 +1086,9 @@ mod tests {
     async fn test_connect_with_large_mss() {
         let fec = false;
         let mss = 8192;
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let msg = {
             let mut buf = vec![0u8; 64 * 1024];
@@ -1222,7 +1239,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn listener_echoes_probe_with_direction_flipped() {
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let accept_loop = async move {
             loop {
@@ -1267,7 +1286,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn probes_never_create_connection_state() {
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let mut accept_tasks = tokio::task::JoinSet::new();
         accept_tasks
@@ -1302,7 +1323,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_floods_are_rate_limited_per_source() {
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let accept_loop = async move {
             loop {
@@ -1355,9 +1378,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn listener_with_probe_key_echoes_obfuscated_probes_only() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
-        let listener = Listener::bind_with_key("127.0.0.1:0", Some(KEY))
-            .await
-            .unwrap();
+        let listener = Listener::bind(
+            "127.0.0.1:0",
+            ListenerConfig {
+                obfuscation_key: Some(KEY),
+            },
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr();
         let accept_loop = async move {
             loop {
@@ -1419,9 +1447,14 @@ mod tests {
     async fn obfuscated_connection_carries_data_and_probes_with_one_nonce_each() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
         let listener = Arc::new(
-            Listener::bind_with_key("127.0.0.1:0", Some(KEY))
-                .await
-                .unwrap(),
+            Listener::bind(
+                "127.0.0.1:0",
+                ListenerConfig {
+                    obfuscation_key: Some(KEY),
+                },
+            )
+            .await
+            .unwrap(),
         );
         let addr = listener.local_addr();
         let mut tasks = tokio::task::JoinSet::new();
@@ -1543,7 +1576,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn probe_tap_probes_the_sessions_own_tuple() {
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let mut tasks = tokio::task::JoinSet::new();
         let addr = spawn_greeting_server(&mut tasks, listener, b"data");
         let mut connected = connect_with(
@@ -1585,7 +1620,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_with_socket_preserves_the_bound_local_addr() {
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let mut tasks = tokio::task::JoinSet::new();
         let addr = spawn_greeting_server(&mut tasks, listener, b"hello");
         let socket = VectoredUdpSocket::bind("127.0.0.1:0".parse().unwrap())
@@ -1626,7 +1663,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn dialing_a_wildcard_listener_addr_stays_connected() {
-        let listener = Listener::bind("0.0.0.0:0").await.unwrap();
+        let listener = Listener::bind("0.0.0.0:0", ListenerConfig::default())
+            .await
+            .unwrap();
         assert!(listener.local_addr().ip().is_unspecified());
         let mut tasks = tokio::task::JoinSet::new();
         let addr = spawn_greeting_server(&mut tasks, listener, b"hello");
@@ -1655,9 +1694,14 @@ mod nohandshake_obf {
     async fn obfuscation_no_handshake_round_trips() {
         use super::*;
         const KEY: [u8; 32] = [7; 32];
-        let listener = Listener::bind_with_key("127.0.0.1:0", Some(KEY))
-            .await
-            .unwrap();
+        let listener = Listener::bind(
+            "127.0.0.1:0",
+            ListenerConfig {
+                obfuscation_key: Some(KEY),
+            },
+        )
+        .await
+        .unwrap();
         let addr = listener.local_addr();
         let msg = b"no handshake obfuscated";
         let mut st = tokio::task::JoinSet::new();
@@ -1709,7 +1753,9 @@ mod nohandshake_plain {
     #[tokio::test(flavor = "multi_thread")]
     async fn no_handshake_plain_round_trips() {
         use super::*;
-        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let msg = b"no handshake plain";
         let mut st = tokio::task::JoinSet::new();

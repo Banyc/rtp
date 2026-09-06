@@ -43,9 +43,12 @@ async fn main() {
             (Box::new(read), Box::new(write))
         }
         "rtp" => {
-            let listener = rtp::udp::Listener::bind(internet_addresses[0])
-                .await
-                .unwrap();
+            let listener = rtp::udp::Listener::bind(
+                internet_addresses[0],
+                rtp::udp::ListenerConfig::default(),
+            )
+            .await
+            .unwrap();
             let (first_tx, first_rx) = tokio::sync::oneshot::channel::<rtp::udp::Accepted>();
             scope.spawn(|stop| {
                 run_udp_accept_driver(
