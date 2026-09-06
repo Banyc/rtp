@@ -40,6 +40,16 @@ pub(crate) const KEY_LEN: usize = tokio_chacha20::KEY_BYTES;
 /// silently pass, delivering truncated plaintext.
 pub(crate) const OVERSIZE_DETECT_EXTRA: usize = 1;
 
+/// Apply the chacha20 keystream for `key`/`nonce` to `buf` in place.
+/// Encryption and decryption are the same XOR operation, so this single
+/// helper serves both the wrapper halves and the obfuscated path-probe
+/// side channel (which must use the same wire shape so a passive observer
+/// cannot tell probes from data).
+pub(crate) fn apply_keystream(key: [u8; KEY_LEN], nonce: [u8; NONCE_LEN], buf: &mut [u8]) {
+    let mut cipher = StreamCipher::new_x(key, nonce);
+    cipher.encrypt(buf);
+}
+
 /// A read half that strips the 24-byte nonce and chacha20-decrypts the rest.
 #[derive(Debug)]
 pub(crate) struct ObfuscatedRead<R> {
@@ -86,9 +96,7 @@ impl<R> ObfuscatedRead<R> {
             return Err(IoErr::from(std::io::ErrorKind::InvalidData));
         }
         buf[..ciphertext_len].copy_from_slice(&self.scratch[NONCE_LEN..n]);
-        // chacha20 encryption and decryption are the same XOR operation.
-        let mut cipher = StreamCipher::new_x(self.key, nonce);
-        cipher.encrypt(&mut buf[..ciphertext_len]);
+        apply_keystream(self.key, nonce, &mut buf[..ciphertext_len]);
         Ok(ciphertext_len)
     }
 }
@@ -153,8 +161,11 @@ impl<W: UnreliableWrite> UnreliableWrite for ObfuscatedWrite<W> {
         let nonce: [u8; NONCE_LEN] = rand::random();
         self.scratch[..NONCE_LEN].copy_from_slice(&nonce);
         self.scratch[NONCE_LEN..NONCE_LEN + buf.len()].copy_from_slice(buf);
-        let mut cipher = StreamCipher::new_x(self.key, nonce);
-        cipher.encrypt(&mut self.scratch[NONCE_LEN..NONCE_LEN + buf.len()]);
+        apply_keystream(
+            self.key,
+            nonce,
+            &mut self.scratch[NONCE_LEN..NONCE_LEN + buf.len()],
+        );
         self.inner
             .send(&self.scratch[..NONCE_LEN + buf.len()])
             .await?;

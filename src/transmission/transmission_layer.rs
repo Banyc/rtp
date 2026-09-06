@@ -153,6 +153,30 @@ pub trait UnreliableWrite: core::fmt::Debug + Send + 'static {
     }
 }
 
+// Boxed halves compose: a wrapper that erases its inner transport to
+// `Box<dyn UnreliableRead>` (e.g. the obfuscation wrapper) can itself be
+// wrapped by another filter (e.g. the path-probe echo demux) without
+// special-casing the erased type.
+#[async_trait]
+impl UnreliableRead for Box<dyn UnreliableRead> {
+    fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+        self.as_mut().try_recv(buf)
+    }
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+        self.as_mut().recv(buf).await
+    }
+}
+
+#[async_trait]
+impl UnreliableWrite for Box<dyn UnreliableWrite> {
+    async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+        self.as_mut().send(buf).await
+    }
+    async fn send_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize, IoErr> {
+        self.as_mut().send_vectored(bufs).await
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProactiveTerminationContext {
     pub(crate) reason: &'static str,

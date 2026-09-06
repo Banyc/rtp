@@ -26,7 +26,10 @@ pub use keyed_udp::{
     DispatchKey, Listener as KeyedListener,
 };
 pub use mpudp::{Conn as MpConn, Listener as MpListener, MPUDP_MSS};
-pub use path_probe::{EchoDemux, ProbeEcho, decode_echo, encode_probe};
+pub use path_probe::{
+    EchoDemux, ProbeEcho, decode_echo, decode_echo_obfuscated, encode_probe,
+    encode_probe_obfuscated,
+};
 pub use socket::{
     AsyncReadAdapter, AsyncWriteAdapter, ConnReader, ConnWriter, FrameByteReader, FrameByteWriter,
     IoStream, SessionHandle, socket_with_watchdog_tuning, unsplit,

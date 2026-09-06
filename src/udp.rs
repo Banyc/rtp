@@ -133,6 +133,12 @@ pub struct Listener {
     listener: IdentityUdpListener,
     local_addr: SocketAddr,
     raw_fd: MaybeRawFd,
+    /// The obfuscation key for the path-probe side channel, shared with
+    /// the probe responder inside the dispatch closure. Settable after
+    /// bind (see [`Listener::set_probe_obfuscation_key`]) so builders that
+    /// configure obfuscation after binding (e.g. `RtpMuxServer`) can arm
+    /// the probe channel with the same key as the data channel.
+    probe_key: crate::path_probe::ProbeKey,
 }
 impl Listener {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
@@ -140,6 +146,7 @@ impl Listener {
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
         let responder = crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp));
+        let probe_key = responder.key_cell();
         let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
             Arc::new(move |addr: &SocketAddr, packet: Packet| {
                 if responder.observe(addr, packet.as_ref()) {
@@ -160,7 +167,19 @@ impl Listener {
             listener,
             local_addr,
             raw_fd,
+            probe_key,
         })
+    }
+
+    /// Set the obfuscation key for the path-probe side channel. When set,
+    /// the listener decrypts incoming probes with this key and encrypts its
+    /// echoes, so the probe channel is indistinguishable from the obfuscated
+    /// data channel. The key must match the key the probing peer uses for
+    /// its data channel (the rtp_mux connector sends probes with the same
+    /// key as its data). `None` (the default) keeps the plaintext probe
+    /// channel.
+    pub fn set_probe_obfuscation_key(&self, key: Option<[u8; crate::obfuscate::KEY_LEN]>) {
+        *self.probe_key.lock().unwrap() = key;
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -747,8 +766,14 @@ async fn connect_bound(
         None => None,
     };
     let udp = Arc::new(udp);
-    let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(Arc::clone(&udp));
-    let (read, write) = crate::obfuscate::maybe_wrap(filtered_read, udp, obfuscation_key);
+    // The obfuscation wrapper sits directly on the socket; the probe-echo
+    // demux sits AFTER it so it sees decrypted datagrams and can intercept
+    // obfuscated probe echoes. The probe tap sends obfuscated probes with
+    // the same key, so the side channel is indistinguishable from data.
+    let (read, write) =
+        crate::obfuscate::maybe_wrap(Arc::clone(&udp), Arc::clone(&udp), obfuscation_key);
+    let (probe_tap, filtered_read) =
+        crate::path_probe::client_echo_demux(Arc::clone(&udp), read, obfuscation_key);
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
     // configured MSS).
@@ -759,7 +784,7 @@ async fn connect_bound(
         mss
     };
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
-        read,
+        Box::new(filtered_read),
         write,
         fec,
         mss,
@@ -1300,6 +1325,68 @@ mod tests {
                 assert!(
                     echoes <= 48,
                     "flood was not rate limited: {echoes} echoes for 200 probes"
+                );
+            } => {}
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_with_probe_key_echoes_obfuscated_probes_only() {
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_probe_obfuscation_key(Some(KEY));
+        let addr = listener.local_addr();
+        let accept_loop = async move {
+            loop {
+                if listener.accept_without_handshake().await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::pin!(accept_loop);
+        let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::select! {
+            () = &mut accept_loop => {
+                panic!("accept loop ended before the probe body completed");
+            }
+            () = async {
+                prober.connect(addr).await.unwrap();
+                // An obfuscated probe is echoed as an obfuscated echo.
+                let probe = crate::path_probe::ProbeEcho {
+                    nonce: 0xDEAD_BEEF,
+                    timestamp_micros: 12345,
+                };
+                let wire = crate::path_probe::encode_probe_obfuscated(probe, KEY);
+                prober.send(&wire).await.unwrap();
+                let mut buf = [0u8; 64];
+                let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
+                    .await
+                    .expect("obfuscated probe echo timed out")
+                    .unwrap();
+                assert_eq!(
+                    crate::path_probe::decode_echo_obfuscated(&buf[..n], KEY),
+                    Some(probe),
+                    "the obfuscated echo must decode back to the probe"
+                );
+                // The wire echo is obfuscated: the probe magic never appears.
+                assert!(
+                    !buf[..n].windows(8).any(|w| w == [0xf7, b'R', b'T', b'P', b'E', b'X', 1, 0]),
+                    "the probe magic leaked onto the wire"
+                );
+                // A raw (unobfuscated) probe is NOT echoed: with a key set,
+                // the listener only answers obfuscated probes, and the raw
+                // datagram is dropped as an invalid obfuscated datagram.
+                let raw = crate::path_probe::encode_probe(probe);
+                prober.send(&raw).await.unwrap();
+                let mut buf2 = [0u8; 64];
+                let timed = tokio::time::timeout(
+                    std::time::Duration::from_millis(300),
+                    prober.recv(&mut buf2),
+                )
+                .await;
+                assert!(
+                    timed.is_err(),
+                    "a raw probe must not be echoed when the probe key is set"
                 );
             } => {}
         }
