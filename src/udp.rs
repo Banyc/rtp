@@ -965,6 +965,124 @@ mod tests {
         assert_eq!(msg, &buf[..n]);
     }
 
+    /// A wrong-key source's datagrams decrypt to garbage at the listener.
+    /// They must not break an established obfuscated connection (they are
+    /// routed only to the source's own connection, whose handshake fails and
+    /// times out) and must not prevent new connections from being accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrong_key_datagrams_do_not_break_established_or_new_connections() {
+        const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
+        const WRONG_KEY: [u8; crate::obfuscate::KEY_LEN] = [9; crate::obfuscate::KEY_LEN];
+        let listener = Listener::bind(
+            "127.0.0.1:0",
+            ListenerConfig {
+                obfuscation_key: Some(KEY),
+            },
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr();
+
+        // A wrong-key source sprays obfuscated datagrams (they decrypt to
+        // garbage at the listener) before and during the legitimate session.
+        let wrong_key_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        wrong_key_socket.connect(addr).await.unwrap();
+        async fn spray_wrong_key(
+            socket: &tokio::net::UdpSocket,
+            key: [u8; crate::obfuscate::KEY_LEN],
+        ) {
+            for _ in 0..16 {
+                let mut datagram = [0u8; 64];
+                let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
+                datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+                datagram[crate::obfuscate::NONCE_LEN..].fill(0xAB);
+                crate::obfuscate::apply_keystream(
+                    key,
+                    nonce,
+                    &mut datagram[crate::obfuscate::NONCE_LEN..],
+                );
+                socket.send(&datagram).await.unwrap();
+            }
+        }
+        spray_wrong_key(&wrong_key_socket, WRONG_KEY).await;
+
+        // Accept loop: every accepted connection echoes one byte back. The
+        // wrong-key source's connection is accepted too, but its handshake
+        // fails (garbage) and times out — that must not disturb the loop.
+        let mut server_tasks = tokio::task::JoinSet::new();
+        let mut handler_tasks = tokio::task::JoinSet::new();
+        server_tasks.spawn(async move {
+            loop {
+                let accepted = listener.accept_with(AcceptConfig::default()).await.unwrap();
+                handler_tasks.spawn(async move {
+                    if let Ok(mut accepted) = accepted.await {
+                        let mut buf = [0; 1];
+                        loop {
+                            accepted.read.recv(&mut buf).await.unwrap();
+                            accepted.write.send(&buf).await.unwrap();
+                        }
+                    }
+                });
+            }
+        });
+
+        // The legitimate client (correct key) connects and round-trips.
+        let mut connected = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut buf = [0; 1];
+        connected.write.send(b"x").await.unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the first echo")
+        .unwrap();
+        assert_eq!(&buf[..n], b"x");
+
+        // More wrong-key spray while the connection is live: the established
+        // connection must still round-trip.
+        spray_wrong_key(&wrong_key_socket, WRONG_KEY).await;
+        connected.write.send(b"y").await.unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connected.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the echo after the wrong-key spray")
+        .unwrap();
+        assert_eq!(&buf[..n], b"y");
+
+        // A NEW legitimate client can still connect after the flood.
+        let mut second = connect_with(
+            "0.0.0.0:0",
+            addr,
+            ConnectConfig {
+                obfuscation_key: Some(KEY),
+                ..ConnectConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        second.write.send(b"z").await.unwrap();
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            second.read.recv(&mut buf),
+        )
+        .await
+        .expect("client: timed out waiting for the echo on the new connection")
+        .unwrap();
+        assert_eq!(&buf[..n], b"z");
+    }
+
     #[tokio::test]
     async fn obfuscation_reserves_the_nonce_from_the_mss() {
         const KEY: [u8; crate::obfuscate::KEY_LEN] = [7; crate::obfuscate::KEY_LEN];
