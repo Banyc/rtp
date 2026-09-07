@@ -66,57 +66,89 @@ pub fn decode_echo(datagram: &[u8]) -> Option<ProbeEcho> {
 }
 
 /// The minimum wire length of an obfuscated probe: the 24-byte obfuscation
-/// nonce plus the 32-byte probe plaintext. A passive observer sees only
-/// random-looking datagrams — the probe magic never appears on the wire.
-pub const OBFUSCATED_PROBE_LEN: usize = PROBE_LEN + crate::obfuscate::NONCE_LEN;
-/// The maximum wire length of an obfuscated probe (nonce + padded
-/// plaintext).
-pub const MAX_OBFUSCATED_PROBE_LEN: usize = MAX_PROBE_PLAINTEXT + crate::obfuscate::NONCE_LEN;
+/// nonce plus the length prefix plus the 32-byte probe plaintext. A passive
+/// observer sees only random-looking datagrams — the probe magic never
+/// appears on the wire.
+pub const OBFUSCATED_PROBE_LEN: usize =
+    crate::obfuscate::LEN_LEN + PROBE_LEN + crate::obfuscate::NONCE_LEN;
+/// The maximum wire length of an obfuscated probe (nonce + length prefix +
+/// padded plaintext).
+pub const MAX_OBFUSCATED_PROBE_LEN: usize =
+    crate::obfuscate::LEN_LEN + MAX_PROBE_PLAINTEXT + crate::obfuscate::NONCE_LEN;
 
-/// Encode `echo` as an obfuscated probe datagram: a 24-byte random nonce
-/// followed by the chacha20-encrypted probe plaintext with a random
-/// padding tail, using the same wire shape as the datagram obfuscation
-/// wrapper so probes are indistinguishable from data traffic. The wire
-/// length varies per probe in `OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN`.
 /// Encode `echo` as an obfuscated probe datagram into `out` (reusing its
 /// capacity): a 24-byte random nonce followed by the chacha20-encrypted
-/// probe plaintext with a zero-filled random-length padding tail, using the
-/// same wire shape as the datagram obfuscation wrapper so probes are
-/// indistinguishable from data traffic. The wire length varies per probe in
-/// `OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN`.
+/// probe plaintext, using the same wire shape as the datagram obfuscation
+/// wrapper so probes are indistinguishable from data traffic. With a
+/// padding profile the plaintext is `[len u16][probe core][zero padding]`
+/// and the wire length varies per probe; without one the plaintext is the
+/// probe core alone (the historical format).
 pub fn encode_probe_obfuscated(
     echo: ProbeEcho,
     key: [u8; crate::obfuscate::KEY_LEN],
+    profile: Option<crate::obfuscate::TargetProfile>,
     out: &mut Vec<u8>,
 ) {
-    let pad_len = rand::random_range(0..=MAX_PROBE_PAD);
-    let plaintext_len = PROBE_LEN + pad_len;
-    out.resize(crate::obfuscate::NONCE_LEN + plaintext_len, 0);
     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
-    out[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
-    out[crate::obfuscate::NONCE_LEN..crate::obfuscate::NONCE_LEN + PROBE_LEN]
-        .copy_from_slice(&encode_probe(echo));
-    // The padding tail is zero-filled by resize; the chacha20 keystream
-    // randomizes it on the wire.
-    crate::obfuscate::apply_keystream(key, nonce, &mut out[crate::obfuscate::NONCE_LEN..]);
+    match profile {
+        Some(_) => {
+            let pad_len = rand::random_range(0..=MAX_PROBE_PAD);
+            let plaintext_len = crate::obfuscate::LEN_LEN + PROBE_LEN + pad_len;
+            out.resize(crate::obfuscate::NONCE_LEN + plaintext_len, 0);
+            out[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+            out[crate::obfuscate::NONCE_LEN
+                ..crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN]
+                .copy_from_slice(&(PROBE_LEN as u16).to_be_bytes());
+            out[crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN
+                ..crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN + PROBE_LEN]
+                .copy_from_slice(&encode_probe(echo));
+            // The padding tail is zero-filled by resize; the chacha20
+            // keystream randomizes it on the wire.
+            crate::obfuscate::apply_keystream(key, nonce, &mut out[crate::obfuscate::NONCE_LEN..]);
+        }
+        None => {
+            out.resize(crate::obfuscate::NONCE_LEN + PROBE_LEN, 0);
+            out[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+            out[crate::obfuscate::NONCE_LEN..].copy_from_slice(&encode_probe(echo));
+            crate::obfuscate::apply_keystream(key, nonce, &mut out[crate::obfuscate::NONCE_LEN..]);
+        }
+    }
 }
 
 /// Decode an obfuscated probe-echo datagram. Returns `None` when the
 /// datagram is not an obfuscated probe echo (wrong length, wrong key, or
-/// not an echo).
+/// not an echo). The expected format follows the padding profile.
 pub fn decode_echo_obfuscated(
     datagram: &[u8],
     key: [u8; crate::obfuscate::KEY_LEN],
+    profile: Option<crate::obfuscate::TargetProfile>,
 ) -> Option<ProbeEcho> {
-    if datagram.len() < OBFUSCATED_PROBE_LEN || datagram.len() > MAX_OBFUSCATED_PROBE_LEN {
-        return None;
-    }
     let nonce: [u8; crate::obfuscate::NONCE_LEN] =
         datagram[..crate::obfuscate::NONCE_LEN].try_into().ok()?;
     let mut plaintext = vec![0u8; datagram.len() - crate::obfuscate::NONCE_LEN];
     plaintext.copy_from_slice(&datagram[crate::obfuscate::NONCE_LEN..]);
     crate::obfuscate::apply_keystream(key, nonce, &mut plaintext);
-    decode_echo(&plaintext)
+    match profile {
+        Some(_) => {
+            if datagram.len() < OBFUSCATED_PROBE_LEN || datagram.len() > MAX_OBFUSCATED_PROBE_LEN {
+                return None;
+            }
+            // plaintext = [len u16][probe core][padding]: read the length,
+            // strip the padding, and decode the core.
+            let len = u16::from_be_bytes(plaintext[..crate::obfuscate::LEN_LEN].try_into().ok()?)
+                as usize;
+            if len != PROBE_LEN || crate::obfuscate::LEN_LEN + len > plaintext.len() {
+                return None;
+            }
+            decode_echo(&plaintext[crate::obfuscate::LEN_LEN..crate::obfuscate::LEN_LEN + len])
+        }
+        None => {
+            if plaintext.len() != PROBE_LEN {
+                return None;
+            }
+            decode_echo(&plaintext)
+        }
+    }
 }
 #[derive(Debug)]
 struct TokenBucket {
@@ -187,17 +219,22 @@ pub(crate) struct ProbeResponder {
     /// connections (which never decrypt again); probes are echoed with the
     /// same key. `None` keeps the historical plaintext probe channel.
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// The padding profile, fixed at listener construction; the dispatch
+    /// strips the length prefix and padding only when it is set.
+    profile: Option<crate::obfuscate::TargetProfile>,
 }
 impl ProbeResponder {
     pub(crate) fn new(
         echo: Option<std::net::UdpSocket>,
         key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+        profile: Option<crate::obfuscate::TargetProfile>,
     ) -> Self {
         Self {
             echo,
             limiter: Mutex::new(RateLimiter::default()),
             send_error_count: AtomicUsize::new(0),
             key,
+            profile,
         }
     }
     #[cfg(test)]
@@ -220,9 +257,30 @@ impl ProbeResponder {
                 // and XOR the keystream, so the routed packet is the
                 // plaintext and the connection never decrypts again.
                 datagram.copy_within(crate::obfuscate::NONCE_LEN.., 0);
-                let plaintext = &mut datagram[..ciphertext_len];
-                crate::obfuscate::apply_keystream(key, nonce, plaintext);
-                plaintext
+                crate::obfuscate::apply_keystream(key, nonce, &mut datagram[..ciphertext_len]);
+                match self.profile {
+                    Some(_) => {
+                        // plaintext = [len u16][payload][padding]: read the
+                        // length, strip the padding, and move the payload to
+                        // the front so the routed packet is the payload.
+                        if datagram.len() < crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN
+                        {
+                            return Observe::Dropped;
+                        }
+                        let len = u16::from_be_bytes(
+                            datagram[..crate::obfuscate::LEN_LEN].try_into().unwrap(),
+                        ) as usize;
+                        if crate::obfuscate::LEN_LEN + len > ciphertext_len {
+                            return Observe::Dropped;
+                        }
+                        datagram.copy_within(
+                            crate::obfuscate::LEN_LEN..crate::obfuscate::LEN_LEN + len,
+                            0,
+                        );
+                        &mut datagram[..len]
+                    }
+                    None => &mut datagram[..ciphertext_len],
+                }
             }
             None => datagram,
         };
@@ -245,28 +303,55 @@ impl ProbeResponder {
         }
         if let Some(echo) = &self.echo {
             match self.key {
-                Some(key) => {
-                    // Reuse the datagram buffer for the reply: shift the
-                    // decrypted plaintext right by the nonce, prepend a
-                    // fresh nonce, flip the direction, and encrypt in place.
-                    // The reply mirrors the probe's padded length.
-                    datagram.copy_within(0..probe_len, crate::obfuscate::NONCE_LEN);
-                    let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
-                    datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
-                    datagram[crate::obfuscate::NONCE_LEN + DIR_OFFSET] = DIR_ECHO;
-                    crate::obfuscate::apply_keystream(
-                        key,
-                        nonce,
-                        &mut datagram
-                            [crate::obfuscate::NONCE_LEN..crate::obfuscate::NONCE_LEN + probe_len],
-                    );
-                    if echo
-                        .send_to(&datagram[..crate::obfuscate::NONCE_LEN + probe_len], from)
-                        .is_err()
-                    {
-                        self.send_error_count.fetch_add(1, Ordering::Relaxed);
+                Some(key) => match self.profile {
+                    Some(_) => {
+                        // Reuse the datagram buffer for the reply: shift the
+                        // payload right by nonce + length prefix, prepend a
+                        // fresh nonce + length, flip the direction, zero the
+                        // padding, and encrypt in place. The reply mirrors
+                        // the probe's wire length.
+                        let total = datagram.len();
+                        datagram.copy_within(
+                            0..probe_len,
+                            crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN,
+                        );
+                        let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
+                        datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+                        datagram[crate::obfuscate::NONCE_LEN
+                            ..crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN]
+                            .copy_from_slice(&(probe_len as u16).to_be_bytes());
+                        datagram[crate::obfuscate::NONCE_LEN
+                            + crate::obfuscate::LEN_LEN
+                            + DIR_OFFSET] = DIR_ECHO;
+                        datagram[crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN
+                            + probe_len..total]
+                            .fill(0);
+                        crate::obfuscate::apply_keystream(
+                            key,
+                            nonce,
+                            &mut datagram[crate::obfuscate::NONCE_LEN..total],
+                        );
+                        if echo.send_to(&datagram[..total], from).is_err() {
+                            self.send_error_count.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                }
+                    None => {
+                        // Historical format: [nonce][probe core flipped].
+                        let total = crate::obfuscate::NONCE_LEN + probe_len;
+                        datagram.copy_within(0..probe_len, crate::obfuscate::NONCE_LEN);
+                        let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
+                        datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+                        datagram[crate::obfuscate::NONCE_LEN + DIR_OFFSET] = DIR_ECHO;
+                        crate::obfuscate::apply_keystream(
+                            key,
+                            nonce,
+                            &mut datagram[crate::obfuscate::NONCE_LEN..total],
+                        );
+                        if echo.send_to(&datagram[..total], from).is_err() {
+                            self.send_error_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                },
                 None => {
                     let mut reply = [0; PROBE_LEN];
                     reply.copy_from_slice(&datagram[..probe_len]);
@@ -290,6 +375,9 @@ pub struct EchoDemux {
     /// from the obfuscated data channel; `None` keeps the plaintext probe
     /// channel.
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// The padding profile; obfuscated probes use the length-prefixed
+    /// format only when it is set.
+    profile: Option<crate::obfuscate::TargetProfile>,
     /// Reused scratch for encoding obfuscated probes.
     scratch: Vec<u8>,
 }
@@ -297,7 +385,7 @@ impl EchoDemux {
     pub fn send_probe(&mut self, echo: ProbeEcho) -> std::io::Result<()> {
         match self.key {
             Some(key) => {
-                encode_probe_obfuscated(echo, key, &mut self.scratch);
+                encode_probe_obfuscated(echo, key, self.profile, &mut self.scratch);
                 self.socket.try_send(&self.scratch).map(drop)
             }
             None => self.socket.try_send(&encode_probe(echo)).map(drop),
@@ -320,6 +408,7 @@ pub(crate) fn client_echo_demux<R: UnreliableRead>(
     socket: Arc<tokio_udp::UdpSocket>,
     read: R,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    profile: Option<crate::obfuscate::TargetProfile>,
 ) -> (EchoDemux, EchoInterceptRead<R>) {
     let (echo_tx, echoes) = tokio::sync::mpsc::channel(64);
     let dropped_echoes = Arc::new(AtomicUsize::new(0));
@@ -340,6 +429,7 @@ pub(crate) fn client_echo_demux<R: UnreliableRead>(
             echoes,
             dropped_echoes,
             key,
+            profile,
             scratch: Vec::new(),
         },
         read,
@@ -395,6 +485,13 @@ mod tests {
 
     use std::time::Duration;
 
+    fn test_profile() -> Option<crate::obfuscate::TargetProfile> {
+        Some(crate::obfuscate::TargetProfile {
+            mode: 200,
+            spread: 50,
+        })
+    }
+
     #[test]
     fn echo_decode_roundtrip_requires_flipped_direction() {
         let probe = encode_probe(ProbeEcho {
@@ -422,7 +519,7 @@ mod tests {
             timestamp_micros: 12345,
         };
         let mut wire = Vec::new();
-        encode_probe_obfuscated(echo, key, &mut wire);
+        encode_probe_obfuscated(echo, key, test_profile(), &mut wire);
         assert!(
             (OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN).contains(&wire.len()),
             "wire length {} must be in [{OBFUSCATED_PROBE_LEN}, {MAX_OBFUSCATED_PROBE_LEN}]",
@@ -449,26 +546,26 @@ mod tests {
             nonce,
             &mut echo_wire[crate::obfuscate::NONCE_LEN..],
         );
-        echo_wire[crate::obfuscate::NONCE_LEN + DIR_OFFSET] = DIR_ECHO;
+        echo_wire[crate::obfuscate::NONCE_LEN + crate::obfuscate::LEN_LEN + DIR_OFFSET] = DIR_ECHO;
         crate::obfuscate::apply_keystream(
             key,
             nonce,
             &mut echo_wire[crate::obfuscate::NONCE_LEN..],
         );
         assert_eq!(
-            decode_echo_obfuscated(&echo_wire, key),
+            decode_echo_obfuscated(&echo_wire, key, test_profile()),
             Some(echo),
             "the obfuscated echo must decode back to the probe"
         );
         // A wrong key must not decode.
         assert_eq!(
-            decode_echo_obfuscated(&echo_wire, [9; crate::obfuscate::KEY_LEN]),
+            decode_echo_obfuscated(&echo_wire, [9; crate::obfuscate::KEY_LEN], test_profile()),
             None
         );
         // A raw (unobfuscated) echo must not decode as an obfuscated one.
         let mut raw_echo = plain;
         raw_echo[DIR_OFFSET] = DIR_ECHO;
-        assert_eq!(decode_echo_obfuscated(&raw_echo, key), None);
+        assert_eq!(decode_echo_obfuscated(&raw_echo, key, test_profile()), None);
     }
     #[test]
     fn probe_wire_sizes_vary_across_packets() {
@@ -480,7 +577,7 @@ mod tests {
         let mut sizes = std::collections::HashSet::new();
         let mut wire = Vec::new();
         for _ in 0..64 {
-            encode_probe_obfuscated(echo, key, &mut wire);
+            encode_probe_obfuscated(echo, key, test_profile(), &mut wire);
             sizes.insert(wire.len());
         }
         assert!(sizes.len() > 1, "probe wire sizes must vary, got {sizes:?}");
@@ -584,7 +681,7 @@ mod tests {
         let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let raw = echo.as_raw_fd();
         let closer = unsafe { std::fs::File::from_raw_fd(raw) };
-        let responder = ProbeResponder::new(Some(echo), None);
+        let responder = ProbeResponder::new(Some(echo), None, None);
         drop(closer);
         let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let mut probe = encode_probe(ProbeEcho {

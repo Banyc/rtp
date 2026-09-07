@@ -339,7 +339,7 @@ mod tests {
     impl UnreliableWrite for RecordingWrite {
         async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
             self.sizes.lock().unwrap().push(buf.len());
-            self.inner.send(buf).await.map_err(IoErr::from)
+            self.inner.send(buf).await
         }
     }
 
@@ -351,12 +351,12 @@ mod tests {
     #[async_trait]
     impl UnreliableRead for RecordingRead {
         fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-            let n = self.inner.try_recv(buf).map_err(IoErr::from)?;
+            let n = self.inner.try_recv(buf)?;
             self.sizes.lock().unwrap().push(n);
             Ok(n)
         }
         async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-            let n = self.inner.recv(buf).await.map_err(IoErr::from)?;
+            let n = self.inner.recv(buf).await?;
             self.sizes.lock().unwrap().push(n);
             Ok(n)
         }

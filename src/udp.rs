@@ -31,6 +31,7 @@ use crate::{
     },
 };
 
+pub use crate::obfuscate::TargetProfile;
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
@@ -138,6 +139,11 @@ pub struct ListenerConfig {
     /// The peer must use the same key. `None` (the default) sends datagrams
     /// in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// When set (with an obfuscation key), every datagram is padded to a
+    /// size drawn from this single-mode profile so the wire size
+    /// distribution converges to one peak. The peer must use the same
+    /// profile. `None` (the default) sends datagrams unpadded.
+    pub padding_profile: Option<crate::obfuscate::TargetProfile>,
 }
 
 #[derive(Debug)]
@@ -151,6 +157,10 @@ pub struct Listener {
     /// connections (which never decrypt again), and answers probes with the
     /// same key; the accepted connections' write halves encrypt with it.
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// The padding profile for this listener, fixed at construction (see
+    /// [`ListenerConfig`]); the accepted connections' write halves pad with
+    /// it.
+    profile: Option<crate::obfuscate::TargetProfile>,
 }
 impl Listener {
     /// Bind with the given settings (see [`ListenerConfig`]).
@@ -160,11 +170,13 @@ impl Listener {
     ) -> std::io::Result<Self> {
         let ListenerConfig {
             obfuscation_key: key,
+            padding_profile: profile,
         } = config;
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
-        let responder = crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp), key);
+        let responder =
+            crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp), key, profile);
         let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
             Arc::new(move |addr: &SocketAddr, mut packet: Packet| {
                 match responder.observe(addr, packet.as_mut()) {
@@ -186,7 +198,7 @@ impl Listener {
             });
         let listener = UtpListener::new(
             udp,
-            NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
+            NonZeroUsize::new(DISPATCHER_BUF_SIZE + profile.map_or(0, |p| p.max())).unwrap(),
             dispatch,
         );
         Ok(Self {
@@ -194,6 +206,7 @@ impl Listener {
             local_addr,
             raw_fd,
             key,
+            profile,
         })
     }
 
@@ -223,12 +236,14 @@ impl Listener {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         let key = self.key;
+        let profile = self.profile;
         Ok(Box::pin(async move {
             accept(
                 accepted,
                 raw_fd,
                 AcceptSetup::from_config(true, config)?,
                 key,
+                profile,
             )
             .await
         }))
@@ -246,6 +261,7 @@ impl Listener {
             self.raw_fd,
             AcceptSetup::from_config(false, config)?,
             self.key,
+            self.profile,
         )
         .await
     }
@@ -285,6 +301,7 @@ impl Listener {
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
         let key = self.key;
+        let profile = self.profile;
         Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
@@ -292,6 +309,7 @@ impl Listener {
                 AcceptSetup::from_config(handshake, config)?
                     .with_frame_delivery(FrameMode::enabled()),
                 key,
+                profile,
             )
             .await?;
             let Accepted {
@@ -346,6 +364,11 @@ pub struct AcceptConfig {
     /// [`ListenerConfig`], and the listener decrypts every datagram once at
     /// the dispatch.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// Padding profile for the [`crate::keyed_udp`] and [`crate::mpudp`]
+    /// accept paths (the single-path [`Listener`] takes its profile at
+    /// [`Listener::bind`]). When set (with an obfuscation key), every
+    /// datagram is padded to a size drawn from this single-mode profile.
+    pub padding_profile: Option<crate::obfuscate::TargetProfile>,
 }
 
 impl Default for AcceptConfig {
@@ -359,6 +382,7 @@ impl Default for AcceptConfig {
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
             obfuscation_key: None,
+            padding_profile: None,
         }
     }
 }
@@ -384,6 +408,11 @@ pub struct ConnectConfig<'a> {
     /// this key. Both peers must use the same key; `None` (the default)
     /// sends datagrams in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// Padding profile: when set (with an obfuscation key), every datagram
+    /// is padded to a size drawn from this single-mode profile so the wire
+    /// size distribution converges to one peak. Both peers must use the
+    /// same profile; `None` (the default) sends datagrams unpadded.
+    pub padding_profile: Option<crate::obfuscate::TargetProfile>,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -400,6 +429,7 @@ impl<'a> Default for ConnectConfig<'a> {
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
             obfuscation_key: None,
+            padding_profile: None,
         }
     }
 }
@@ -451,6 +481,7 @@ async fn accept(
     raw_fd: MaybeRawFd,
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    profile: Option<crate::obfuscate::TargetProfile>,
 ) -> std::io::Result<Accepted> {
     let AcceptSetup {
         handshake,
@@ -474,7 +505,7 @@ async fn accept(
     // connection never decrypts a datagram twice.
     let read: Box<dyn UnreliableRead> = Box::new(read);
     let write: Box<dyn UnreliableWrite> = match key {
-        Some(key) => Box::new(crate::obfuscate::ObfuscatedWrite::new(write, key)),
+        Some(key) => Box::new(crate::obfuscate::ObfuscatedWrite::new(write, key, profile)),
         None => Box::new(write),
     };
     // The obfuscation nonce is a wire-level overhead on every datagram, so
@@ -485,6 +516,18 @@ async fn accept(
     } else {
         mss
     };
+    if let Some(profile) = profile
+        && profile.max() > mss.get()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "padding profile max {} exceeds the reduced MSS {}",
+                profile.max(),
+                mss.get()
+            ),
+        ));
+    }
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         read,
         write,
@@ -787,6 +830,7 @@ async fn connect_bound(
         instream_group_fec,
         watchdog,
         obfuscation_key,
+        padding_profile,
     } = config;
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
@@ -802,10 +846,18 @@ async fn connect_bound(
     // demux sits AFTER it so it sees decrypted datagrams and can intercept
     // obfuscated probe echoes. The probe tap sends obfuscated probes with
     // the same key, so the side channel is indistinguishable from data.
-    let (read, write) =
-        crate::obfuscate::maybe_wrap(Arc::clone(&udp), Arc::clone(&udp), obfuscation_key);
-    let (probe_tap, filtered_read) =
-        crate::path_probe::client_echo_demux(Arc::clone(&udp), read, obfuscation_key);
+    let (read, write) = crate::obfuscate::maybe_wrap(
+        Arc::clone(&udp),
+        Arc::clone(&udp),
+        obfuscation_key,
+        padding_profile,
+    );
+    let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(
+        Arc::clone(&udp),
+        read,
+        obfuscation_key,
+        padding_profile,
+    );
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
     // configured MSS).
@@ -815,6 +867,18 @@ async fn connect_bound(
     } else {
         mss
     };
+    if let Some(profile) = padding_profile
+        && profile.max() > mss.get()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "padding profile max {} exceeds the reduced MSS {}",
+                profile.max(),
+                mss.get()
+            ),
+        ));
+    }
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         Box::new(filtered_read),
         write,
@@ -925,6 +989,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
+                padding_profile: None,
             },
         )
         .await
@@ -977,6 +1042,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
+                padding_profile: None,
             },
         )
         .await
@@ -1500,6 +1566,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
+                padding_profile: None,
             },
         )
         .await
@@ -1526,7 +1593,7 @@ mod tests {
                     timestamp_micros: 12345,
                 };
                 let mut wire = Vec::new();
-                crate::path_probe::encode_probe_obfuscated(probe, KEY, &mut wire);
+                crate::path_probe::encode_probe_obfuscated(probe, KEY, None, &mut wire);
                 prober.send(&wire).await.unwrap();
                 let mut buf = [0u8; 64];
                 let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
@@ -1534,7 +1601,7 @@ mod tests {
                     .expect("obfuscated probe echo timed out")
                     .unwrap();
                 assert_eq!(
-                    crate::path_probe::decode_echo_obfuscated(&buf[..n], KEY),
+                    crate::path_probe::decode_echo_obfuscated(&buf[..n], KEY, None),
                     Some(probe),
                     "the obfuscated echo must decode back to the probe"
                 );
@@ -1570,6 +1637,7 @@ mod tests {
                 "127.0.0.1:0",
                 ListenerConfig {
                     obfuscation_key: Some(KEY),
+                    padding_profile: None,
                 },
             )
             .await
@@ -1817,6 +1885,7 @@ mod nohandshake_obf {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
+                padding_profile: None,
             },
         )
         .await

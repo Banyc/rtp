@@ -85,7 +85,7 @@ impl<K: DispatchKey> Listener<K> {
         // Datagram obfuscation wraps the PAYLOAD (the dispatch key stays
         // plaintext — the demux needs it to route). The nonce is reserved
         // from the MSS so the wire datagram stays within the configured MSS.
-        let (read, write) = crate::obfuscate::maybe_wrap(read, write, config.obfuscation_key);
+        let (read, write) = crate::obfuscate::maybe_wrap(read, write, config.obfuscation_key, None);
         let mss = if config.obfuscation_key.is_some() {
             config.mss.resolve()?.reduced_for_obfuscation()?
         } else {
@@ -160,7 +160,7 @@ impl<K: DispatchKey> Connector<K> {
         // Datagram obfuscation wraps the PAYLOAD (the dispatch key stays
         // plaintext — the demux needs it to route). The nonce is reserved
         // from the MSS so the wire datagram stays within the configured MSS.
-        let (read, write) = crate::obfuscate::maybe_wrap(read, write, config.obfuscation_key);
+        let (read, write) = crate::obfuscate::maybe_wrap(read, write, config.obfuscation_key, None);
         let mss = if config.obfuscation_key.is_some() {
             config.mss.resolve().ok()?.reduced_for_obfuscation().ok()?
         } else {
