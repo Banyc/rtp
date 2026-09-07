@@ -45,6 +45,17 @@ pub struct PostOpenHandshake {
     pending_at: Option<Instant>,
 }
 
+/// Jittered retry delay for a retry index, deterministic per (nonce, index)
+/// so the schedule is stable across calls but random per connection.
+pub(crate) fn retry_delay(nonce: u64, index: usize) -> Duration {
+    let base = POST_OPEN_RETRY_DELAYS[index];
+    let jitter_ms = nonce
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(index as u32)
+        % 500;
+    base + Duration::from_millis(jitter_ms)
+}
+
 impl PostOpenHandshake {
     pub(crate) fn client(nonce: u64, established_at: Instant) -> Self {
         Self {
@@ -108,7 +119,7 @@ impl PostOpenHandshake {
             .then(|| {
                 POST_OPEN_RETRY_DELAYS
                     .get(self.retry_index)
-                    .map(|delay| self.established_at + *delay)
+                    .map(|_| self.established_at + retry_delay(self.nonce, self.retry_index))
             })
             .flatten();
         match (self.pending_at, scheduled) {
@@ -126,10 +137,8 @@ impl PostOpenHandshake {
         }
         let pending_due = self.pending_at.is_some_and(|pending| pending <= now);
         let mut scheduled_due = false;
-        while self.role == PostOpenRole::Server
-            && let Some(delay) = POST_OPEN_RETRY_DELAYS.get(self.retry_index)
-        {
-            if self.established_at + *delay > now {
+        while self.role == PostOpenRole::Server && self.retry_index < POST_OPEN_RETRY_DELAYS.len() {
+            if self.established_at + retry_delay(self.nonce, self.retry_index) > now {
                 break;
             }
             self.retry_index += 1;

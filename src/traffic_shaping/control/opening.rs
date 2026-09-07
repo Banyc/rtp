@@ -13,6 +13,13 @@ use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, U
 const OPENING_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SEND_RETRY_BUDGET: Duration = Duration::from_millis(500);
+/// Random pre-handshake delay so connection opens do not all start with an
+/// immediate burst.
+const OPENING_JITTER_MS: u64 = 50;
+/// Jitter on the handshake retry interval so retransmission timing does not
+/// fingerprint.
+const RETRY_JITTER_MS: u64 = 50;
+const SEND_RETRY_JITTER_MS: u64 = 25;
 
 /// Domain-separated splitmix64 finalizer over the handshake nonce.  Each
 /// derivation domain yields an independent value from the same nonce.
@@ -55,6 +62,12 @@ enum Received {
 }
 
 pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::Result<()> {
+    // Jitter the opening so connection opens do not all start with an
+    // immediate burst.
+    tokio::time::sleep(Duration::from_millis(rand::random_range(
+        0..=OPENING_JITTER_MS,
+    )))
+    .await;
     let mut nonce_bytes = [0; size_of::<u64>()];
     rand::rngs::SysRng
         .try_fill_bytes(&mut nonce_bytes)
@@ -204,8 +217,9 @@ async fn server_confirm(
 }
 
 fn retry_at(deadline: Instant) -> Instant {
+    let jitter = Duration::from_millis(rand::random_range(0..=RETRY_JITTER_MS));
     Instant::now()
-        .checked_add(RETRY_INTERVAL)
+        .checked_add(RETRY_INTERVAL + jitter)
         .map(|instant| instant.min(deadline))
         .unwrap_or(deadline)
 }
@@ -254,7 +268,10 @@ async fn send(
             return Err(timeout());
         }
         let retry_at = Instant::now()
-            .checked_add(SEND_RETRY_INTERVAL)
+            .checked_add(
+                SEND_RETRY_INTERVAL
+                    + Duration::from_millis(rand::random_range(0..=SEND_RETRY_JITTER_MS)),
+            )
             .map(|instant| instant.min(send_deadline))
             .unwrap_or(send_deadline);
         tokio::time::sleep_until(retry_at.into()).await;
@@ -290,7 +307,9 @@ mod tests {
         sequence::InitialSequences,
         socket::socket,
         traffic_shaping::{
-            control::handshake::{PostOpenVerdict, post_open::POST_OPEN_LIFETIME},
+            control::handshake::{
+                PostOpenVerdict, post_open::POST_OPEN_LIFETIME, post_open::retry_delay,
+            },
             redundancy::fec::{FecConfig, FecState},
         },
         transmission::test_doubles::PendingWrite,
@@ -477,7 +496,7 @@ mod tests {
         let mut recovery = PostOpenHandshake::server(nonce, established_at);
         assert_eq!(
             recovery.next_send_time(established_at),
-            Some(established_at + Duration::from_secs(1))
+            Some(established_at + retry_delay(nonce, 0))
         );
         let confirm = Packet {
             kind: Kind::Confirm,
@@ -504,9 +523,9 @@ mod tests {
         assert!(recovery.take_due_response(late).is_some());
         assert_eq!(
             recovery.next_send_time(late),
-            Some(established_at + Duration::from_secs(31))
+            Some(established_at + retry_delay(nonce, 4))
         );
-        let final_retry = established_at + Duration::from_secs(31);
+        let final_retry = established_at + retry_delay(nonce, 4);
         assert!(recovery.take_due_response(final_retry).is_some());
         let expired = established_at + POST_OPEN_LIFETIME;
         assert_eq!(recovery.next_send_time(final_retry), Some(expired));
