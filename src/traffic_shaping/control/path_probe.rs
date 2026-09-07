@@ -12,6 +12,11 @@ use std::{
 };
 const MAGIC: [u8; 8] = [0xf7, b'R', b'T', b'P', b'E', b'X', 1, 0];
 pub const PROBE_LEN: usize = 32;
+/// Random padding tail appended to the probe plaintext so probes do not
+/// fingerprint as a fixed-size datagram. The core fields stay at offsets
+/// `0..PROBE_LEN`; the decoder ignores the tail.
+pub const MAX_PROBE_PAD: usize = 200;
+pub const MAX_PROBE_PLAINTEXT: usize = PROBE_LEN + MAX_PROBE_PAD;
 const DIR_PROBE: u8 = 0x00;
 const DIR_ECHO: u8 = 0x01;
 const DIR_OFFSET: usize = 8;
@@ -40,7 +45,9 @@ pub fn encode_probe(echo: ProbeEcho) -> [u8; PROBE_LEN] {
     bytes
 }
 fn is_probe_packet(datagram: &[u8]) -> bool {
-    datagram.len() == PROBE_LEN && datagram[..MAGIC.len()] == MAGIC
+    datagram.len() >= PROBE_LEN
+        && datagram.len() <= MAX_PROBE_PLAINTEXT
+        && datagram[..MAGIC.len()] == MAGIC
 }
 pub fn decode_echo(datagram: &[u8]) -> Option<ProbeEcho> {
     if !is_probe_packet(datagram) || datagram[DIR_OFFSET] != DIR_ECHO {
@@ -58,25 +65,40 @@ pub fn decode_echo(datagram: &[u8]) -> Option<ProbeEcho> {
     })
 }
 
-/// The wire length of an obfuscated probe: the 24-byte obfuscation nonce
-/// plus the 32-byte probe plaintext. A passive observer sees only this
-/// random-looking datagram — the probe magic never appears on the wire.
+/// The minimum wire length of an obfuscated probe: the 24-byte obfuscation
+/// nonce plus the 32-byte probe plaintext. A passive observer sees only
+/// random-looking datagrams — the probe magic never appears on the wire.
 pub const OBFUSCATED_PROBE_LEN: usize = PROBE_LEN + crate::obfuscate::NONCE_LEN;
+/// The maximum wire length of an obfuscated probe (nonce + padded
+/// plaintext).
+pub const MAX_OBFUSCATED_PROBE_LEN: usize = MAX_PROBE_PLAINTEXT + crate::obfuscate::NONCE_LEN;
 
 /// Encode `echo` as an obfuscated probe datagram: a 24-byte random nonce
-/// followed by the chacha20-encrypted probe plaintext, using the same wire
-/// shape as the datagram obfuscation wrapper so probes are
-/// indistinguishable from data traffic.
+/// followed by the chacha20-encrypted probe plaintext with a random
+/// padding tail, using the same wire shape as the datagram obfuscation
+/// wrapper so probes are indistinguishable from data traffic. The wire
+/// length varies per probe in `OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN`.
+/// Encode `echo` as an obfuscated probe datagram into `out` (reusing its
+/// capacity): a 24-byte random nonce followed by the chacha20-encrypted
+/// probe plaintext with a zero-filled random-length padding tail, using the
+/// same wire shape as the datagram obfuscation wrapper so probes are
+/// indistinguishable from data traffic. The wire length varies per probe in
+/// `OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN`.
 pub fn encode_probe_obfuscated(
     echo: ProbeEcho,
     key: [u8; crate::obfuscate::KEY_LEN],
-) -> [u8; OBFUSCATED_PROBE_LEN] {
-    let mut datagram = [0u8; OBFUSCATED_PROBE_LEN];
+    out: &mut Vec<u8>,
+) {
+    let pad_len = rand::random_range(0..=MAX_PROBE_PAD);
+    let plaintext_len = PROBE_LEN + pad_len;
+    out.resize(crate::obfuscate::NONCE_LEN + plaintext_len, 0);
     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
-    datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
-    datagram[crate::obfuscate::NONCE_LEN..].copy_from_slice(&encode_probe(echo));
-    crate::obfuscate::apply_keystream(key, nonce, &mut datagram[crate::obfuscate::NONCE_LEN..]);
-    datagram
+    out[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+    out[crate::obfuscate::NONCE_LEN..crate::obfuscate::NONCE_LEN + PROBE_LEN]
+        .copy_from_slice(&encode_probe(echo));
+    // The padding tail is zero-filled by resize; the chacha20 keystream
+    // randomizes it on the wire.
+    crate::obfuscate::apply_keystream(key, nonce, &mut out[crate::obfuscate::NONCE_LEN..]);
 }
 
 /// Decode an obfuscated probe-echo datagram. Returns `None` when the
@@ -86,12 +108,12 @@ pub fn decode_echo_obfuscated(
     datagram: &[u8],
     key: [u8; crate::obfuscate::KEY_LEN],
 ) -> Option<ProbeEcho> {
-    if datagram.len() != OBFUSCATED_PROBE_LEN {
+    if datagram.len() < OBFUSCATED_PROBE_LEN || datagram.len() > MAX_OBFUSCATED_PROBE_LEN {
         return None;
     }
     let nonce: [u8; crate::obfuscate::NONCE_LEN] =
         datagram[..crate::obfuscate::NONCE_LEN].try_into().ok()?;
-    let mut plaintext = [0u8; PROBE_LEN];
+    let mut plaintext = vec![0u8; datagram.len() - crate::obfuscate::NONCE_LEN];
     plaintext.copy_from_slice(&datagram[crate::obfuscate::NONCE_LEN..]);
     crate::obfuscate::apply_keystream(key, nonce, &mut plaintext);
     decode_echo(&plaintext)
@@ -204,10 +226,13 @@ impl ProbeResponder {
             }
             None => datagram,
         };
-        if !is_probe_packet(probe) {
-            return Observe::Data(probe.len());
+        let probe_len = probe.len();
+        let is_probe = is_probe_packet(probe);
+        if !is_probe {
+            return Observe::Data(probe_len);
         }
-        if probe[DIR_OFFSET] != DIR_PROBE {
+        let is_dir_probe = probe[DIR_OFFSET] == DIR_PROBE;
+        if !is_dir_probe {
             return Observe::Consumed;
         }
         if !self
@@ -221,23 +246,30 @@ impl ProbeResponder {
         if let Some(echo) = &self.echo {
             match self.key {
                 Some(key) => {
-                    let mut reply = [0u8; OBFUSCATED_PROBE_LEN];
+                    // Reuse the datagram buffer for the reply: shift the
+                    // decrypted plaintext right by the nonce, prepend a
+                    // fresh nonce, flip the direction, and encrypt in place.
+                    // The reply mirrors the probe's padded length.
+                    datagram.copy_within(0..probe_len, crate::obfuscate::NONCE_LEN);
                     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
-                    reply[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
-                    reply[crate::obfuscate::NONCE_LEN..].copy_from_slice(probe);
-                    reply[crate::obfuscate::NONCE_LEN + DIR_OFFSET] = DIR_ECHO;
+                    datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
+                    datagram[crate::obfuscate::NONCE_LEN + DIR_OFFSET] = DIR_ECHO;
                     crate::obfuscate::apply_keystream(
                         key,
                         nonce,
-                        &mut reply[crate::obfuscate::NONCE_LEN..],
+                        &mut datagram
+                            [crate::obfuscate::NONCE_LEN..crate::obfuscate::NONCE_LEN + probe_len],
                     );
-                    if echo.send_to(&reply, from).is_err() {
+                    if echo
+                        .send_to(&datagram[..crate::obfuscate::NONCE_LEN + probe_len], from)
+                        .is_err()
+                    {
                         self.send_error_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 None => {
                     let mut reply = [0; PROBE_LEN];
-                    reply.copy_from_slice(probe);
+                    reply.copy_from_slice(&datagram[..probe_len]);
                     reply[DIR_OFFSET] = DIR_ECHO;
                     if echo.send_to(&reply, from).is_err() {
                         self.send_error_count.fetch_add(1, Ordering::Relaxed);
@@ -258,14 +290,16 @@ pub struct EchoDemux {
     /// from the obfuscated data channel; `None` keeps the plaintext probe
     /// channel.
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// Reused scratch for encoding obfuscated probes.
+    scratch: Vec<u8>,
 }
 impl EchoDemux {
-    pub fn send_probe(&self, echo: ProbeEcho) -> std::io::Result<()> {
+    pub fn send_probe(&mut self, echo: ProbeEcho) -> std::io::Result<()> {
         match self.key {
-            Some(key) => self
-                .socket
-                .try_send(&encode_probe_obfuscated(echo, key))
-                .map(drop),
+            Some(key) => {
+                encode_probe_obfuscated(echo, key, &mut self.scratch);
+                self.socket.try_send(&self.scratch).map(drop)
+            }
             None => self.socket.try_send(&encode_probe(echo)).map(drop),
         }
     }
@@ -306,6 +340,7 @@ pub(crate) fn client_echo_demux<R: UnreliableRead>(
             echoes,
             dropped_echoes,
             key,
+            scratch: Vec::new(),
         },
         read,
     )
@@ -386,8 +421,13 @@ mod tests {
             nonce: 0xDEAD_BEEF,
             timestamp_micros: 12345,
         };
-        let wire = encode_probe_obfuscated(echo, key);
-        assert_eq!(wire.len(), OBFUSCATED_PROBE_LEN);
+        let mut wire = Vec::new();
+        encode_probe_obfuscated(echo, key, &mut wire);
+        assert!(
+            (OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN).contains(&wire.len()),
+            "wire length {} must be in [{OBFUSCATED_PROBE_LEN}, {MAX_OBFUSCATED_PROBE_LEN}]",
+            wire.len()
+        );
         // The probe magic must never appear on the wire.
         assert!(
             !wire.windows(MAGIC.len()).any(|w| w == MAGIC),
@@ -430,6 +470,28 @@ mod tests {
         raw_echo[DIR_OFFSET] = DIR_ECHO;
         assert_eq!(decode_echo_obfuscated(&raw_echo, key), None);
     }
+    #[test]
+    fn probe_wire_sizes_vary_across_packets() {
+        let key = [7; crate::obfuscate::KEY_LEN];
+        let echo = ProbeEcho {
+            nonce: 0xDEAD_BEEF,
+            timestamp_micros: 12345,
+        };
+        let mut sizes = std::collections::HashSet::new();
+        let mut wire = Vec::new();
+        for _ in 0..64 {
+            encode_probe_obfuscated(echo, key, &mut wire);
+            sizes.insert(wire.len());
+        }
+        assert!(sizes.len() > 1, "probe wire sizes must vary, got {sizes:?}");
+        assert!(
+            sizes
+                .iter()
+                .all(|&n| (OBFUSCATED_PROBE_LEN..=MAX_OBFUSCATED_PROBE_LEN).contains(&n)),
+            "probe wire sizes must stay in [{OBFUSCATED_PROBE_LEN}, {MAX_OBFUSCATED_PROBE_LEN}], got {sizes:?}"
+        );
+    }
+
     #[test]
     fn probe_magic_is_distinct_from_the_handshake_magic() {
         let probe = encode_probe(ProbeEcho {

@@ -1525,7 +1525,8 @@ mod tests {
                     nonce: 0xDEAD_BEEF,
                     timestamp_micros: 12345,
                 };
-                let wire = crate::path_probe::encode_probe_obfuscated(probe, KEY);
+                let mut wire = Vec::new();
+                crate::path_probe::encode_probe_obfuscated(probe, KEY, &mut wire);
                 prober.send(&wire).await.unwrap();
                 let mut buf = [0u8; 64];
                 let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))

@@ -46,9 +46,8 @@ pub(crate) fn pad_handshake(core: &[u8], out: &mut [u8], mss: Mss) -> usize {
     let pad_len = rand::random_range(0..=max_pad);
     out[..PACKET_LEN].copy_from_slice(core);
     out[PAD_LEN_OFFSET..PADDED_HEADER_LEN].copy_from_slice(&(pad_len as u16).to_be_bytes());
-    for byte in &mut out[PADDED_HEADER_LEN..PADDED_HEADER_LEN + pad_len] {
-        *byte = rand::random();
-    }
+    // Zero-filled tail; the chacha20 keystream randomizes it on the wire.
+    out[PADDED_HEADER_LEN..PADDED_HEADER_LEN + pad_len].fill(0);
     PADDED_HEADER_LEN + pad_len
 }
 
