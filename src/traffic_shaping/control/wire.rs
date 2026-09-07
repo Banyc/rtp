@@ -2,6 +2,9 @@
 pub(crate) const MAGIC: [u8; 8] = [0xf7, b'R', b'T', b'P', b'O', b'P', 1, 0];
 pub(crate) const FEC_GUARD: u8 = 0xff;
 pub(crate) const PACKET_LEN: usize = 18;
+pub(crate) const FEC_GUARD_OFFSET: usize = 8;
+pub(crate) const KIND_OFFSET: usize = 9;
+pub(crate) const NONCE_OFFSET: usize = 10;
 pub(crate) const SEND_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub(crate) type RecoveryResponse = [u8; PACKET_LEN];
@@ -39,19 +42,25 @@ impl Packet {
     pub(crate) fn encode(self) -> [u8; PACKET_LEN] {
         let mut bytes = [0; PACKET_LEN];
         bytes[..MAGIC.len()].copy_from_slice(&MAGIC);
-        bytes[8] = FEC_GUARD;
-        bytes[9] = self.kind as u8;
-        bytes[10..].copy_from_slice(&self.nonce.to_be_bytes());
+        bytes[FEC_GUARD_OFFSET] = FEC_GUARD;
+        bytes[KIND_OFFSET] = self.kind as u8;
+        bytes[NONCE_OFFSET..].copy_from_slice(&self.nonce.to_be_bytes());
         bytes
     }
 
+    /// Decode a handshake packet, stripping a random padding tail when
+    /// present (see [`super::padding`]).
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != PACKET_LEN || bytes[..MAGIC.len()] != MAGIC || bytes[8] != FEC_GUARD {
+        if bytes.len() < PACKET_LEN
+            || bytes[..MAGIC.len()] != MAGIC
+            || bytes[FEC_GUARD_OFFSET] != FEC_GUARD
+        {
             return None;
         }
+        let core = super::padding::strip_padding(bytes)?;
         Some(Self {
-            kind: Kind::decode(bytes[9])?,
-            nonce: u64::from_be_bytes(bytes[10..].try_into().ok()?),
+            kind: Kind::decode(core[KIND_OFFSET])?,
+            nonce: u64::from_be_bytes(core[NONCE_OFFSET..].try_into().ok()?),
         })
     }
 }
@@ -82,7 +91,7 @@ mod tests {
         }
         // The FEC_GUARD byte.
         let mut mutated = valid;
-        mutated[MAGIC.len()] ^= 0x01;
+        mutated[FEC_GUARD_OFFSET] ^= 0x01;
         assert_eq!(
             Packet::decode(&mutated),
             None,
@@ -92,7 +101,7 @@ mod tests {
         // range must be rejected.
         for kind in [0u8].into_iter().chain(6..=255) {
             let mut mutated = valid;
-            mutated[MAGIC.len() + 1] = kind;
+            mutated[KIND_OFFSET] = kind;
             assert_eq!(
                 Packet::decode(&mutated),
                 None,
@@ -110,13 +119,22 @@ mod tests {
             "a {}-byte packet must not decode as an {PACKET_LEN}-byte packet",
             PACKET_LEN - 1
         );
-        let mut padded = valid.to_vec();
-        padded.push(0);
+        // A 20-byte packet whose pad_len field does not match its length is
+        // rejected: pad_len=1 claims one padding byte but none follow.
+        let mut mismatched = valid.to_vec();
+        mismatched.extend_from_slice(&1u16.to_be_bytes());
         assert_eq!(
-            Packet::decode(&padded),
+            Packet::decode(&mismatched),
             None,
-            "a {}-byte packet must not decode as an {PACKET_LEN}-byte packet",
-            PACKET_LEN + 1
+            "a padded packet with a mismatched pad_len must be rejected"
+        );
+        // A 20-byte packet with pad_len=0 is a valid (zero-padded) packet.
+        let mut zero_padded = valid.to_vec();
+        zero_padded.extend_from_slice(&0u16.to_be_bytes());
+        assert_eq!(
+            Packet::decode(&zero_padded),
+            Some(valid_packet()),
+            "a padded packet with pad_len=0 must decode"
         );
     }
 }

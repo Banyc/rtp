@@ -1,5 +1,7 @@
 #[path = "opening.rs"]
 pub(crate) mod opening;
+#[path = "padding.rs"]
+pub(crate) mod padding;
 #[path = "post_open.rs"]
 pub(crate) mod post_open;
 #[path = "wire.rs"]

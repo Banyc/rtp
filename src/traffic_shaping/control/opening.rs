@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use rand::TryRng;
 
+use super::padding::{Mss, pad_handshake};
 use super::post_open::PostOpenHandshake;
-use super::wire::{Kind, PACKET_LEN, Packet, SEND_RETRY_INTERVAL};
+use super::wire::{Kind, Packet, SEND_RETRY_INTERVAL};
 use crate::sequence::{InitialSequences, SequenceNumber};
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
@@ -60,11 +61,27 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
         .expect("operating-system randomness unavailable");
     let nonce = u64::from_be_bytes(nonce_bytes);
     let deadline = Instant::now() + OPENING_TIMEOUT;
-    client_phase(unreliable, nonce, Kind::Hello, Kind::HelloAck, deadline).await?;
+    let mss = Mss::new(unreliable.mss.get());
+    client_phase(
+        unreliable,
+        nonce,
+        Kind::Hello,
+        Kind::HelloAck,
+        deadline,
+        mss,
+    )
+    .await?;
     // Confirm→ConfirmAck is the final unambiguous leg that directly precedes
     // RTP traffic; the Hello→HelloAck leg is deliberately not sampled.
-    let initial_rtt =
-        client_phase(unreliable, nonce, Kind::Confirm, Kind::ConfirmAck, deadline).await?;
+    let initial_rtt = client_phase(
+        unreliable,
+        nonce,
+        Kind::Confirm,
+        Kind::ConfirmAck,
+        deadline,
+        mss,
+    )
+    .await?;
     unreliable.initial_rtt = initial_rtt;
     unreliable.post_open_handshake = Some(PostOpenHandshake::client(nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(nonce));
@@ -75,16 +92,17 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
 
 pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::Result<()> {
     let deadline = Instant::now() + OPENING_TIMEOUT;
+    let mss = Mss::new(unreliable.mss.get());
     let hello = loop {
-        match receive_until(&mut unreliable.utp_read, deadline).await? {
+        match receive_until(&mut unreliable.utp_read, deadline, mss).await? {
             Received::Handshake(packet) if packet.kind == Kind::Hello => break packet,
             Received::Deadline => return Err(timeout()),
             Received::Handshake(_) | Received::NextProtocol => {}
         }
     };
-    let initial_rtt = server_wait_for_confirm(unreliable, hello.nonce, deadline).await?;
+    let initial_rtt = server_wait_for_confirm(unreliable, hello.nonce, deadline, mss).await?;
     unreliable.initial_rtt = initial_rtt;
-    server_confirm(unreliable, hello.nonce, deadline).await?;
+    server_confirm(unreliable, hello.nonce, deadline, mss).await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(hello.nonce));
     let (client_to_server, server_to_client) = directional_initial_sequences(hello.nonce);
@@ -98,6 +116,7 @@ async fn client_phase(
     request: Kind,
     response: Kind,
     deadline: Instant,
+    mss: Mss,
 ) -> io::Result<Option<Duration>> {
     let request = Packet {
         kind: request,
@@ -109,12 +128,12 @@ async fn client_phase(
         if Instant::now() >= deadline {
             return Err(timeout());
         }
-        send(&mut unreliable.utp_write, &request, deadline).await?;
+        send_padded(&mut unreliable.utp_write, &request, deadline, mss).await?;
         attempts += 1;
         let sent_at = Instant::now();
         let retry_at = retry_at(deadline);
         loop {
-            match receive_until(&mut unreliable.utp_read, retry_at).await? {
+            match receive_until(&mut unreliable.utp_read, retry_at, mss).await? {
                 Received::Handshake(packet) if packet.nonce == nonce && packet.kind == response => {
                     // A sample is valid only when the request succeeded on its
                     // first transmission; after a retry the response is
@@ -132,6 +151,7 @@ async fn server_wait_for_confirm(
     unreliable: &mut UnreliableLayer,
     nonce: u64,
     deadline: Instant,
+    mss: Mss,
 ) -> io::Result<Option<Duration>> {
     let hello_ack = Packet {
         kind: Kind::HelloAck,
@@ -143,12 +163,12 @@ async fn server_wait_for_confirm(
         if Instant::now() >= deadline {
             return Err(timeout());
         }
-        send(&mut unreliable.utp_write, &hello_ack, deadline).await?;
+        send_padded(&mut unreliable.utp_write, &hello_ack, deadline, mss).await?;
         attempts += 1;
         let sent_at = Instant::now();
         let retry_at = retry_at(deadline);
         loop {
-            match receive_until(&mut unreliable.utp_read, retry_at).await? {
+            match receive_until(&mut unreliable.utp_read, retry_at, mss).await? {
                 Received::Handshake(packet)
                     if packet.nonce == nonce && packet.kind == Kind::Confirm =>
                 {
@@ -173,13 +193,14 @@ async fn server_confirm(
     unreliable: &mut UnreliableLayer,
     nonce: u64,
     deadline: Instant,
+    mss: Mss,
 ) -> io::Result<()> {
     let confirm_ack = Packet {
         kind: Kind::ConfirmAck,
         nonce,
     }
     .encode();
-    send(&mut unreliable.utp_write, &confirm_ack, deadline).await
+    send_padded(&mut unreliable.utp_write, &confirm_ack, deadline, mss).await
 }
 
 fn retry_at(deadline: Instant) -> Instant {
@@ -192,11 +213,14 @@ fn retry_at(deadline: Instant) -> Instant {
 async fn receive_until(
     read: &mut Box<dyn UnreliableRead>,
     deadline: Instant,
+    mss: Mss,
 ) -> io::Result<Received> {
     if Instant::now() >= deadline {
         return Ok(Received::Deadline);
     }
-    let mut bytes = [0; PACKET_LEN + 1];
+    // Sized to the connection's MSS-derived maximum padded handshake packet
+    // so a peer padding up to its own MSS is never truncated or dropped.
+    let mut bytes = vec![0u8; mss.max_padded_len()];
     tokio::select! {
         result = read.recv(&mut bytes) => {
             let len = result.map_err(io::Error::from)?;
@@ -237,12 +261,28 @@ async fn send(
     }
 }
 
+/// Send a handshake packet with a random padding tail (see
+/// [`pad_handshake`]), retrying on WouldBlock like [`send`]. The peer strips
+/// the tail in `receive_until` before decoding. `mss` is the connection's
+/// MSS; the padding bound is derived from it in the padding module.
+async fn send_padded(
+    write: &mut Box<dyn UnreliableWrite>,
+    core: &[u8],
+    deadline: Instant,
+    mss: Mss,
+) -> io::Result<()> {
+    let mut padded = vec![0u8; mss.max_padded_len()];
+    let n = pad_handshake(core, &mut padded, mss);
+    send(write, &padded[..n], deadline).await
+}
+
 fn timeout() -> io::Error {
     io::ErrorKind::TimedOut.into()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::padding::PADDED_HEADER_LEN;
     use super::*;
     use crate::{
         codec,
@@ -269,6 +309,99 @@ mod tests {
         }
         buf[..datagram.len()].copy_from_slice(datagram);
         Ok(datagram.len())
+    }
+
+    #[derive(Debug)]
+    struct RecordingWrite {
+        inner: Arc<tokio::net::UdpSocket>,
+        sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+    #[async_trait]
+    impl UnreliableWrite for RecordingWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+            self.sizes.lock().unwrap().push(buf.len());
+            self.inner.send(buf).await.map_err(IoErr::from)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingRead {
+        inner: Arc<tokio::net::UdpSocket>,
+        sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+    #[async_trait]
+    impl UnreliableRead for RecordingRead {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            let n = self.inner.try_recv(buf).map_err(IoErr::from)?;
+            self.sizes.lock().unwrap().push(n);
+            Ok(n)
+        }
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            let n = self.inner.recv(buf).await.map_err(IoErr::from)?;
+            self.sizes.lock().unwrap().push(n);
+            Ok(n)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handshake_datagrams_are_padded_to_variable_sizes() {
+        // Run the real opening handshake over a socket pair and record every
+        // datagram size on the wire: with handshake padding, no datagram is
+        // the old fixed 18-byte size — each carries a random tail up to the
+        // MSS-derived bound, and the sizes vary across packets.
+        let mss = Mss::new(crate::udp::NO_FEC_MSS);
+        let mut all_sizes = Vec::new();
+        for _ in 0..5 {
+            let a = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+            let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut client = wrap_fec(
+                Box::new(RecordingRead {
+                    inner: Arc::clone(&a),
+                    sizes: Arc::clone(&sizes),
+                }),
+                Box::new(RecordingWrite {
+                    inner: Arc::clone(&a),
+                    sizes: Arc::clone(&sizes),
+                }),
+                false,
+            );
+            let mut server = wrap_fec(
+                Box::new(RecordingRead {
+                    inner: Arc::clone(&b),
+                    sizes: Arc::clone(&sizes),
+                }),
+                Box::new(RecordingWrite {
+                    inner: Arc::clone(&b),
+                    sizes: Arc::clone(&sizes),
+                }),
+                false,
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::try_join!(
+                    client_opening_handshake(&mut client),
+                    server_opening_handshake(&mut server),
+                )
+            })
+            .await
+            .expect("opening handshake hung")
+            .expect("opening handshake failed");
+            all_sizes.extend(sizes.lock().unwrap().iter().copied());
+        }
+        assert!(!all_sizes.is_empty());
+        assert!(
+            all_sizes
+                .iter()
+                .all(|&n| (PADDED_HEADER_LEN..=mss.max_padded_len()).contains(&n)),
+            "every handshake datagram must carry a padding tail, got sizes {all_sizes:?}"
+        );
+        let distinct: std::collections::HashSet<usize> = all_sizes.iter().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "handshake datagram sizes must vary across packets, got {all_sizes:?}"
+        );
     }
 
     #[test]
@@ -317,9 +450,14 @@ mod tests {
             };
             let encoded = packet.encode();
             assert_eq!(Packet::decode(&encoded), Some(packet));
+            // A padded packet with a mismatched pad_len is rejected; a
+            // zero-padded (pad_len=0) packet decodes.
             let mut overlong = encoded.to_vec();
-            overlong.push(0);
+            overlong.extend_from_slice(&1u16.to_be_bytes());
             assert_eq!(Packet::decode(&overlong), None);
+            let mut zero_padded = encoded.to_vec();
+            zero_padded.extend_from_slice(&0u16.to_be_bytes());
+            assert_eq!(Packet::decode(&zero_padded), Some(packet));
             assert!(!codec::in_cmd_space(encoded[0]));
             assert!(codec::decode(&encoded, &mut Vec::new(), None).is_err());
 
@@ -590,7 +728,7 @@ mod tests {
             }
         }
 
-        let mut received = [0; 64];
+        let mut received = [0; Mss::new(crate::udp::NO_FEC_MSS).max_padded_len()];
         loop {
             let len = server.utp_read.try_recv(&mut received).unwrap();
             if Packet::decode(&received[..len]).is_none() {
@@ -895,12 +1033,14 @@ mod tests {
             Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
             false,
         );
+        let mss = Mss::new(client.mss.get());
         let result = client_phase(
             &mut client,
             0x1234,
             Kind::Confirm,
             Kind::ConfirmAck,
             Instant::now() + Duration::from_millis(20),
+            mss,
         )
         .await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);

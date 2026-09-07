@@ -11,6 +11,7 @@ use crate::ack::EncodeAck;
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsEvent, MetricsTerminationCause};
+use crate::traffic_shaping::control::handshake::padding::{Mss, pad_handshake};
 use crate::traffic_shaping::core::{SendPacer, SendWake};
 use crate::traffic_shaping::redundancy::{
     ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig,
@@ -41,6 +42,9 @@ pub struct WriteHalf {
     ack_feedback: Arc<AckFeedback>,
     shared: Arc<Connection>,
     termination_writer: TerminationWriter,
+    /// Connection MSS, used to derive the handshake padding bound (see
+    /// [`crate::traffic_shaping::control::handshake::padding`]).
+    mss: Mss,
 }
 
 /// FEC and retransmission-armor settings for the write half, bundled so
@@ -50,6 +54,9 @@ pub(super) struct WriteHalfSettings {
     pub(super) fec_instream_flush: bool,
     pub(super) instream_group_fec_enabled: bool,
     pub(super) retransmission_armor: RetransmissionArmorConfig,
+    /// Connection MSS, used to derive the handshake padding bound (see
+    /// [`crate::traffic_shaping::control::handshake::padding`]).
+    pub(super) mss: Mss,
 }
 
 impl WriteHalf {
@@ -66,6 +73,7 @@ impl WriteHalf {
             fec_instream_flush,
             instream_group_fec_enabled,
             retransmission_armor,
+            mss,
         } = settings;
         Self {
             utp_write,
@@ -78,6 +86,7 @@ impl WriteHalf {
             ack_feedback,
             shared,
             termination_writer,
+            mss,
         }
     }
 
@@ -430,8 +439,10 @@ impl WriteHalf {
         let Some(response) = self.shared.claim_post_open_response(now) else {
             return Ok(());
         };
-        match self.utp_write.send(&response.bytes).await {
-            Ok(len) if len == response.bytes.len() => Ok(()),
+        let mut padded = vec![0u8; self.mss.max_padded_len()];
+        let n = pad_handshake(&response.bytes, &mut padded, self.mss);
+        match self.utp_write.send(&padded[..n]).await {
+            Ok(len) if len == n => Ok(()),
             Ok(_) => {
                 self.shared.retry_post_open_response(Instant::now());
                 Ok(())

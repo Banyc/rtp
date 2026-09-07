@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use super::wire::{
-    FEC_GUARD, Kind, MAGIC, PACKET_LEN, Packet, RecoveryResponse, SEND_RETRY_INTERVAL,
+    FEC_GUARD, FEC_GUARD_OFFSET, Kind, MAGIC, PACKET_LEN, Packet, RecoveryResponse,
+    SEND_RETRY_INTERVAL,
 };
 
 const POST_OPEN_RETRY_DELAYS: [Duration; 5] = [
@@ -159,5 +160,7 @@ impl PostOpenHandshake {
 }
 
 pub(crate) fn is_post_open_candidate(datagram: &[u8]) -> bool {
-    datagram.len() == PACKET_LEN && datagram[..MAGIC.len()] == MAGIC && datagram[8] == FEC_GUARD
+    datagram.len() >= PACKET_LEN
+        && datagram[..MAGIC.len()] == MAGIC
+        && datagram[FEC_GUARD_OFFSET] == FEC_GUARD
 }
