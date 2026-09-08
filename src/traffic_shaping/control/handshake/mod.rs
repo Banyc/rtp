@@ -1,10 +1,10 @@
-#[path = "opening.rs"]
+//! The connection-opening protocol: the client/server opening handshake
+//! ([`opening`]), its wire format ([`wire`]), the MSS-derived datagram
+//! padding ([`padding`]), and the post-open recovery ([`post_open`]).
+
 pub(crate) mod opening;
-#[path = "padding.rs"]
 pub(crate) mod padding;
-#[path = "post_open.rs"]
 pub(crate) mod post_open;
-#[path = "wire.rs"]
 pub(crate) mod wire;
 
 pub(crate) use opening::{client_opening_handshake, server_opening_handshake};

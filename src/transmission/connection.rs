@@ -17,7 +17,6 @@ use crate::metrics::{
     MetricsTerminationCause,
 };
 use crate::reliable::reliable_layer::ReliableLayer;
-use crate::traffic_shaping::control::handshake::padding::Mss;
 use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenVerdict};
 use crate::traffic_shaping::core::SendWake;
 use crate::traffic_shaping::redundancy::fec::FecStatsHandle;
@@ -139,7 +138,7 @@ fn new_connection_inner(
             fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
             instream_group_fec_enabled: unreliable_layer.instream_group_fec,
             retransmission_armor: unreliable_layer.retransmission_armor,
-            mss: Mss::new(unreliable_layer.mss.get()),
+            mss: unreliable_layer.mss.get(),
         },
     );
     let read_half = ReadHalf::new(unreliable_layer.utp_read, fec_decoder, Arc::clone(&shared));

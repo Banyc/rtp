@@ -198,17 +198,17 @@ impl Listener {
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
-        let responder = crate::path_probe::ProbeResponder::new(
+        let responder = crate::probe::ProbeResponder::new(
             probe_echo_socket(&udp),
             key,
-            crate::path_probe::probe_settings(),
+            crate::probe::probe_settings(),
             profile,
         );
         let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
             Arc::new(move |addr: &SocketAddr, mut packet: Packet| {
                 match responder.observe(addr, packet.as_mut()) {
-                    crate::path_probe::Observe::Consumed | crate::path_probe::Observe::Dropped => None,
-                    crate::path_probe::Observe::Data(len) => {
+                    crate::probe::Observe::Consumed | crate::probe::Observe::Dropped => None,
+                    crate::probe::Observe::Data(len) => {
                         // The responder decrypted in place at the front (when
                         // a key is set); truncate the packet to the
                         // plaintext so the connection reads plaintext.
@@ -362,7 +362,7 @@ pub struct FrameDeliveryIo {
     pub supervisor: SessionHandle,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
-    pub probe_tap: Option<crate::path_probe::EchoDemux>,
+    pub probe_tap: Option<crate::probe::EchoDemux>,
 }
 pub type FrameDeliveryAccept =
     std::pin::Pin<Box<dyn Future<Output = std::io::Result<FrameDeliveryIo>> + Send>>;
@@ -591,7 +591,7 @@ fn make_frame_delivery_io(
     supervisor: SessionHandle,
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
-    probe_tap: Option<crate::path_probe::EchoDemux>,
+    probe_tap: Option<crate::probe::EchoDemux>,
 ) -> std::io::Result<FrameDeliveryIo> {
     let (read, write) = into_frame_io_parts(read, write)?.into_parts();
     Ok(FrameDeliveryIo {
@@ -643,7 +643,7 @@ pub struct Connected {
     pub supervisor: SessionHandle,
     pub local_addr: SocketAddr,
     pub peer_addr: SocketAddr,
-    pub probe_tap: Option<crate::path_probe::EchoDemux>,
+    pub probe_tap: Option<crate::probe::EchoDemux>,
 }
 
 impl FrameDeliveryIo {
@@ -889,11 +889,11 @@ async fn connect_bound(
             settings: padding_profile,
         }),
     );
-    let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(
+    let (probe_tap, filtered_read) = crate::probe::client_echo_demux(
         Arc::clone(&udp),
         read,
         obfuscation_key,
-        crate::path_probe::probe_settings(),
+        crate::probe::probe_settings(),
     );
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
@@ -1504,7 +1504,7 @@ mod tests {
             }
             () = async {
                 prober.connect(addr).await.unwrap();
-                let probe = crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
+                let probe = crate::probe::encode_probe(crate::probe::ProbeEcho {
                     nonce: 0xDEAD_BEEF,
                     timestamp_micros: 12345,
                 });
@@ -1514,10 +1514,10 @@ mod tests {
                     .await
                     .expect("probe echo timed out")
                     .unwrap();
-                let echo = crate::path_probe::decode_echo(&buf[..n]).expect("not a probe echo");
+                let echo = crate::probe::decode_echo(&buf[..n]).expect("not a probe echo");
                 assert_eq!(
                     echo,
-                    crate::path_probe::ProbeEcho {
+                    crate::probe::ProbeEcho {
                         nonce: 0xDEAD_BEEF,
                         timestamp_micros: 12345
                     }
@@ -1540,7 +1540,7 @@ mod tests {
         let prober = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         prober
             .send_to(
-                &crate::path_probe::encode_probe(crate::path_probe::ProbeEcho {
+                &crate::probe::encode_probe(crate::probe::ProbeEcho {
                     nonce: 1,
                     timestamp_micros: 2,
                 }),
@@ -1590,8 +1590,8 @@ mod tests {
                 prober.connect(addr).await.unwrap();
                 for nonce in 0..200u64 {
                     let _ = prober
-                        .send(&crate::path_probe::encode_probe(
-                            crate::path_probe::ProbeEcho {
+                        .send(&crate::probe::encode_probe(
+                            crate::probe::ProbeEcho {
                                 nonce,
                                 timestamp_micros: 0,
                             },
@@ -1606,7 +1606,7 @@ mod tests {
                 )
                 .await
                 {
-                    if crate::path_probe::decode_echo(&buf[..n]).is_some() {
+                    if crate::probe::decode_echo(&buf[..n]).is_some() {
                         echoes += 1;
                     }
                 }
@@ -1648,15 +1648,15 @@ mod tests {
             () = async {
                 prober.connect(addr).await.unwrap();
                 // An obfuscated probe is echoed as an obfuscated echo.
-                let probe = crate::path_probe::ProbeEcho {
+                let probe = crate::probe::ProbeEcho {
                     nonce: 0xDEAD_BEEF,
                     timestamp_micros: 12345,
                 };
                 let mut wire = Vec::new();
-                crate::path_probe::encode_probe_obfuscated(
+                crate::probe::encode_probe_obfuscated(
                     probe,
                     KEY,
-                    crate::path_probe::probe_settings(),
+                    crate::probe::probe_settings(),
                     &mut wire,
                 );
                 prober.send(&wire).await.unwrap();
@@ -1666,10 +1666,10 @@ mod tests {
                     .expect("obfuscated probe echo timed out")
                     .unwrap();
                 assert_eq!(
-                    crate::path_probe::decode_echo_obfuscated(
+                    crate::probe::decode_echo_obfuscated(
                         &buf[..n],
                         KEY,
-                        crate::path_probe::probe_settings()
+                        crate::probe::probe_settings()
                     ),
                     Some(probe),
                     "the obfuscated echo must decode back to the probe"
@@ -1682,7 +1682,7 @@ mod tests {
                 // A raw (unobfuscated) probe is NOT echoed: with a key set,
                 // the listener only answers obfuscated probes, and the raw
                 // datagram is dropped as an invalid obfuscated datagram.
-                let raw = crate::path_probe::encode_probe(probe);
+                let raw = crate::probe::encode_probe(probe);
                 prober.send(&raw).await.unwrap();
                 let mut buf2 = [0u8; 64];
                 let timed = tokio::time::timeout(
@@ -1768,7 +1768,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"data");
-        tap.send_probe(crate::path_probe::ProbeEcho {
+        tap.send_probe(crate::probe::ProbeEcho {
             nonce: 99,
             timestamp_micros: 7,
         })
@@ -1855,7 +1855,7 @@ mod tests {
         let mut buf = [0; 16];
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"data");
-        tap.send_probe(crate::path_probe::ProbeEcho {
+        tap.send_probe(crate::probe::ProbeEcho {
             nonce: 99,
             timestamp_micros: 7,
         })

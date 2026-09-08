@@ -3,48 +3,32 @@
 //! Every handshake packet is sent with a random-length tail so the opening
 //! exchange does not fingerprint as a run of tiny fixed-size datagrams. The
 //! tail length is drawn from [`PaddingSettings`] with a uniform random
-//! target over `PACKET_LEN..=Mss::max_padded_len()`, so a handshake
-//! datagram can be as large as a data datagram. The payload size (the
-//! 18-byte core) is known to both sides, so the padding uses the static
-//! payload-sized mode: `[core][padding]` with no length field. All padding
-//! wire-format logic lives in [`crate::obfuscate::padding`]; this module
-//! only derives the settings from the MSS.
+//! target over `PACKET_LEN..=mss`, so a handshake datagram can be as large
+//! as a data datagram. The payload size (the 18-byte core) is known to both
+//! sides, so the padding uses the static payload-sized mode: `[core]
+//! [padding]` with no length field. All padding wire-format logic lives in
+//! [`crate::obfuscate::padding`]; this module only derives the settings
+//! from the MSS value.
 
 use super::wire::PACKET_LEN;
 use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, TargetKind};
 
-/// A connection's MSS, typed so the padding bound cannot be confused with
-/// an arbitrary size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Mss(usize);
+/// Largest padding tail for an MSS: the padded packet may reach a full
+/// MSS-sized datagram.
+pub(crate) const fn max_handshake_pad(mss: usize) -> usize {
+    mss.saturating_sub(PACKET_LEN)
+}
 
-impl Mss {
-    pub(crate) const fn new(mss: usize) -> Self {
-        Self(mss)
-    }
-
-    /// Largest padding tail: the padded packet may reach a full MSS-sized
-    /// datagram.
-    pub(crate) const fn max_handshake_pad(self) -> usize {
-        self.0.saturating_sub(PACKET_LEN)
-    }
-
-    /// Largest padded handshake packet (the send and receive buffer size).
-    pub(crate) const fn max_padded_len(self) -> usize {
-        self.0
-    }
-
-    /// The handshake's padding settings: uniform random over the
-    /// MSS-derived range, static payload-sized (the core size is known to
-    /// both sides, so no length field rides on the wire).
-    pub(crate) fn settings(self) -> PaddingSettings {
-        PaddingSettings {
-            target: TargetKind::Uniform {
-                lo: PACKET_LEN,
-                hi: PACKET_LEN + self.max_handshake_pad(),
-            },
-            payload_sized: PayloadSized::Static,
-        }
+/// The handshake's padding settings for an MSS: uniform random over the
+/// MSS-derived range, static payload-sized (the core size is known to both
+/// sides, so no length field rides on the wire).
+pub(crate) fn handshake_settings(mss: usize) -> PaddingSettings {
+    PaddingSettings {
+        target: TargetKind::Uniform {
+            lo: PACKET_LEN,
+            hi: PACKET_LEN + max_handshake_pad(mss),
+        },
+        payload_sized: PayloadSized::Static,
     }
 }
 
@@ -58,12 +42,11 @@ pub(crate) const HANDSHAKE_DECODE_SETTINGS: PaddingSettings = PaddingSettings {
 
 /// Pad an 18-byte handshake packet with a random-length tail:
 /// `[core][random padding]` (static payload-sized). Writes into `out`
-/// (which must hold at least `mss.max_padded_len()` bytes) and returns the
-/// padded length.
-pub(crate) fn pad_handshake(core: &[u8], out: &mut [u8], mss: Mss) -> usize {
+/// (which must hold at least `mss` bytes) and returns the padded length.
+pub(crate) fn pad_handshake(core: &[u8], out: &mut [u8], mss: usize) -> usize {
     debug_assert_eq!(core.len(), PACKET_LEN);
-    debug_assert!(out.len() >= mss.max_padded_len());
-    padding::encode_plaintext(core, out, Some(mss.settings()))
+    debug_assert!(out.len() >= mss);
+    padding::encode_plaintext(core, out, Some(handshake_settings(mss)))
 }
 
 #[cfg(test)]
@@ -82,14 +65,14 @@ mod tests {
     #[test]
     fn pad_round_trips_through_decode() {
         let core = core();
-        let mss = Mss::new(220);
-        let mut padded = vec![0u8; mss.max_padded_len()];
+        let mss = 220;
+        let mut padded = vec![0u8; mss];
         let n = pad_handshake(&core, &mut padded, mss);
         assert!(
-            (PACKET_LEN..=mss.max_padded_len()).contains(&n),
+            (PACKET_LEN..=mss).contains(&n),
             "padded length {n} must be in [{}, {}]",
             PACKET_LEN,
-            mss.max_padded_len()
+            mss
         );
         assert_eq!(padded[..PACKET_LEN], core);
         // The static decode reads the known core size and ignores the tail.
@@ -99,7 +82,7 @@ mod tests {
                 .unwrap();
         assert_eq!(len, PACKET_LEN);
         assert_eq!(&decoded, &core);
-        let mut other = vec![0u8; mss.max_padded_len()];
+        let mut other = vec![0u8; mss];
         let m = pad_handshake(&core, &mut other, mss);
         assert_ne!(
             &padded[..n],
@@ -140,10 +123,10 @@ mod tests {
     fn pad_lengths_follow_the_uniform_draw() {
         const MAX_PAD: usize = 200;
         const SAMPLES: usize = 201_000;
-        let mss = Mss::new(PACKET_LEN + MAX_PAD);
+        let mss = PACKET_LEN + MAX_PAD;
         let mut counts = [0usize; MAX_PAD + 1];
         let core = core();
-        let mut out = vec![0u8; mss.max_padded_len()];
+        let mut out = vec![0u8; mss];
         for _ in 0..SAMPLES {
             let n = pad_handshake(&core, &mut out, mss);
             counts[n - PACKET_LEN] += 1;
@@ -165,11 +148,9 @@ mod tests {
 
     #[test]
     fn max_pad_tracks_mss() {
-        assert_eq!(Mss::new(17).max_handshake_pad(), 0);
-        assert_eq!(Mss::new(18).max_handshake_pad(), 0);
-        assert_eq!(Mss::new(19).max_handshake_pad(), 1);
-        assert_eq!(Mss::new(1424).max_handshake_pad(), 1406);
-        assert_eq!(Mss::new(1424).max_padded_len(), 1424);
-        assert_eq!(Mss::new(17).max_padded_len(), 17);
+        assert_eq!(max_handshake_pad(17), 0);
+        assert_eq!(max_handshake_pad(18), 0);
+        assert_eq!(max_handshake_pad(19), 1);
+        assert_eq!(max_handshake_pad(1424), 1406);
     }
 }

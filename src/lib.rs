@@ -17,7 +17,7 @@ pub mod traffic_shaping;
 mod transmission;
 pub mod udp;
 pub use traffic_shaping::adjacent::metrics;
-pub use traffic_shaping::control::path_probe;
+pub use traffic_shaping::control::probe;
 
 pub use delivery::frame::{FrameMode, frame_delivery_from_env};
 pub use io_err::IoErr;
@@ -26,7 +26,7 @@ pub use keyed_udp::{
     DispatchKey, Listener as KeyedListener,
 };
 pub use mpudp::{Conn as MpConn, Listener as MpListener, MPUDP_MSS};
-pub use path_probe::{
+pub use probe::{
     EchoDemux, ProbeEcho, decode_echo, decode_echo_obfuscated, encode_probe,
     encode_probe_obfuscated,
 };
