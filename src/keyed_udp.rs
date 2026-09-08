@@ -13,8 +13,8 @@ use crate::{
     traffic_shaping::redundancy::fec_tuning::FecTuning,
     transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::{
-        self, AcceptConfig, MaybeRawFd, MssError, ValidMss, maybe_raw_fd,
-        should_wait_after_try_send, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+        self, AcceptConfig, MaybeRawFd, Mss, MssError, maybe_raw_fd, should_wait_after_try_send,
+        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
 
@@ -26,7 +26,7 @@ fn wrap_keyed<K: DispatchKey>(
     read: Box<dyn UnreliableRead>,
     write: Box<dyn UnreliableWrite>,
     fec: bool,
-    mss: ValidMss,
+    mss: Mss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
 ) -> Result<UnreliableLayer, MssError> {
@@ -39,7 +39,7 @@ fn wrap_keyed<K: DispatchKey>(
         read,
         write,
         fec,
-        ValidMss::try_new(mss)?,
+        Mss::try_new(mss)?,
         tuning,
         frame_delivery,
     )
@@ -825,7 +825,7 @@ mod tests {
             Box::new(DummyRead),
             Box::new(DummyWrite),
             true,
-            ValidMss::try_new(mss).unwrap(),
+            Mss::try_new(mss).unwrap(),
             FecTuning::default(),
             FrameMode::default(),
         )
@@ -845,7 +845,7 @@ mod tests {
             Box::new(DummyRead),
             Box::new(DummyWrite),
             true,
-            ValidMss::try_new(mss).unwrap(),
+            Mss::try_new(mss).unwrap(),
             FecTuning::default(),
             FrameMode::enabled(),
         );

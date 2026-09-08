@@ -189,7 +189,7 @@ where
 {
     let (mss, fec_state, tuning) = checked_mss_and_fec(
         fec,
-        ValidMss::try_new(NO_FEC_MSS).unwrap(),
+        Mss::try_new(NO_FEC_MSS).unwrap(),
         fec_tuning_from_env(),
         FrameMode::default(),
     )
@@ -256,7 +256,7 @@ where
 {
     let (mss, fec_state, tuning) = checked_mss_and_fec(
         fec,
-        ValidMss::try_new(mss).unwrap(),
+        Mss::try_new(mss).unwrap(),
         tuning,
         FrameMode::default(),
     )

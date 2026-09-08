@@ -162,7 +162,7 @@ impl Drop for ApplicationWriteWaiter {
 
 #[derive(Debug)]
 pub struct ReliableLayer {
-    mss: NonZeroUsize,
+    mss: crate::mss::Mss,
     /// Cached `mss - data_overhead()`: the maximum payload bytes per data
     /// packet, computed once at construction instead of on every packetize.
     max_data_size_per_pkt: usize,
@@ -213,7 +213,7 @@ pub struct ReliableLayer {
 
 impl ReliableLayer {
     #[cfg(test)]
-    pub fn new(mss: NonZeroUsize, frame_delivery: FrameMode, now: Instant) -> (Self, SendPacer) {
+    pub fn new(mss: crate::mss::Mss, frame_delivery: FrameMode, now: Instant) -> (Self, SendPacer) {
         Self::new_at(mss, frame_delivery, now, InitialSequences::ZERO)
     }
 
@@ -222,7 +222,7 @@ impl ReliableLayer {
     /// at `initial_sequences.recv`.  The zero-seeded `new()` keeps skipped-
     /// handshake peers zero-compatible.
     pub fn new_at(
-        mss: NonZeroUsize,
+        mss: crate::mss::Mss,
         frame_delivery: FrameMode,
         now: Instant,
         initial_sequences: InitialSequences,
@@ -233,7 +233,7 @@ impl ReliableLayer {
         let this = Self {
             mss,
             max_data_size_per_pkt,
-            send_data_buf: StockSendStage::new(mss),
+            send_data_buf: StockSendStage::new(mss.get()),
             send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
@@ -264,7 +264,7 @@ impl ReliableLayer {
     }
 
     pub fn new_with_watchdog_tuning_at(
-        mss: NonZeroUsize,
+        mss: crate::mss::Mss,
         frame_delivery: FrameMode,
         now: Instant,
         initial_sequences: InitialSequences,
@@ -276,7 +276,7 @@ impl ReliableLayer {
         let this = Self {
             mss,
             max_data_size_per_pkt,
-            send_data_buf: StockSendStage::new(mss),
+            send_data_buf: StockSendStage::new(mss.get()),
             send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
@@ -1604,15 +1604,14 @@ mod tests {
 
     #[test]
     fn send_data_buf_len_keeps_default_at_8_kib() {
-        let mss = std::num::NonZeroUsize::new(NO_FEC_MSS).unwrap();
-        assert_eq!(send_data_buf_len(mss), SEND_DATA_BUF_LEN);
+        assert_eq!(send_data_buf_len(NO_FEC_MSS), SEND_DATA_BUF_LEN);
     }
 
     #[test]
     fn send_data_buf_len_scales_to_whole_packets_above_default() {
-        let mss = std::num::NonZeroUsize::new(8192).unwrap();
+        let mss = 8192;
         let len = send_data_buf_len(mss);
-        let payload = mss.get() - data_overhead();
+        let payload = mss - data_overhead();
         let expected = (MAX_SEND_DATA_BUF_LEN / payload) * payload;
         assert_eq!(len, expected);
         assert!(len > SEND_DATA_BUF_LEN);
@@ -1621,27 +1620,22 @@ mod tests {
         // Spot checks for the larger-overhead wire format.
         let payload_2015 = 2015 - data_overhead();
         assert_eq!(
-            send_data_buf_len(nz(2015)),
+            send_data_buf_len(2015),
             (MAX_SEND_DATA_BUF_LEN / payload_2015) * payload_2015
         );
         let payload_9000 = 9000 - data_overhead();
         assert_eq!(
-            send_data_buf_len(nz(9000)),
+            send_data_buf_len(9000),
             (MAX_SEND_DATA_BUF_LEN / payload_9000) * payload_9000
         );
 
         // Sanity check for the default-MSS path.
-        let default_mss = std::num::NonZeroUsize::new(NO_FEC_MSS).unwrap();
-        assert_eq!(send_data_buf_len(default_mss), SEND_DATA_BUF_LEN);
-    }
-
-    fn nz(n: usize) -> std::num::NonZeroUsize {
-        std::num::NonZeroUsize::new(n).unwrap()
+        assert_eq!(send_data_buf_len(NO_FEC_MSS), SEND_DATA_BUF_LEN);
     }
 
     fn test_layer(now: Instant) -> super::ReliableLayer {
         super::ReliableLayer::new(
-            NonZeroUsize::new(TEST_MSS).unwrap(),
+            crate::mss::Mss::try_new(TEST_MSS).unwrap(),
             crate::delivery::frame::FrameMode::default(),
             now,
         )
@@ -1784,7 +1778,7 @@ mod tests {
             Err(std::io::ErrorKind::BrokenPipe.into())
         );
         let (mut frame, _) = super::ReliableLayer::new(
-            NonZeroUsize::new(TEST_MSS).unwrap(),
+            crate::mss::Mss::try_new(TEST_MSS).unwrap(),
             crate::delivery::frame::FrameMode::enabled(),
             now,
         );
@@ -2469,7 +2463,7 @@ mod tests {
         let now = Instant::now();
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
-            NonZeroUsize::new(mss).unwrap(),
+            crate::mss::Mss::try_new(mss).unwrap(),
             crate::delivery::frame::FrameMode::enabled(),
             now,
         )
@@ -2509,7 +2503,7 @@ mod tests {
         let now = Instant::now();
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
-            NonZeroUsize::new(mss).unwrap(),
+            crate::mss::Mss::try_new(mss).unwrap(),
             crate::delivery::frame::FrameMode::enabled(),
             now,
         )

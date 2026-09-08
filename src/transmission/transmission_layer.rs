@@ -1,4 +1,3 @@
-use core::num::NonZeroUsize;
 use std::{io::IoSlice, path::PathBuf, sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
@@ -102,7 +101,7 @@ pub struct UnreliableLayer {
     pub(crate) initial_rtt: Option<Duration>,
     /// Optional typed transport-observation callback installed by the caller.
     pub(crate) metrics_observer: Option<crate::metrics::MetricsObserver>,
-    pub(crate) mss: NonZeroUsize,
+    pub(crate) mss: crate::mss::Mss,
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
     pub(crate) frame_delivery: FrameMode,

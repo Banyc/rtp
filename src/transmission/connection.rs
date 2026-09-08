@@ -138,7 +138,7 @@ fn new_connection_inner(
             fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
             instream_group_fec_enabled: unreliable_layer.instream_group_fec,
             retransmission_armor: unreliable_layer.retransmission_armor,
-            mss: unreliable_layer.mss.get(),
+            mss: unreliable_layer.mss,
         },
     );
     let read_half = ReadHalf::new(unreliable_layer.utp_read, fec_decoder, Arc::clone(&shared));
@@ -715,7 +715,7 @@ mod tests {
             initial_sequences: crate::sequence::InitialSequences::ZERO,
             initial_rtt: None,
             metrics_observer: None,
-            mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
+            mss: crate::mss::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery,

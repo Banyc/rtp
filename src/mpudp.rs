@@ -10,7 +10,7 @@ use crate::{
     traffic_shaping::redundancy::{RetransmissionArmorConfig, fec_tuning::FecTuning},
     transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
-        AcceptConfig, ConnectConfig, LogConfig, MssConfig, ValidMss,
+        AcceptConfig, ConnectConfig, LogConfig, Mss, MssConfig,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
@@ -59,7 +59,7 @@ impl Conn {
 /// carry, bundled so [`convert_conn`] takes one argument instead of nine.
 struct LayerTuning {
     fec: bool,
-    mss: ValidMss,
+    mss: Mss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
     retransmission_armor: RetransmissionArmorConfig,
@@ -106,10 +106,10 @@ impl LayerTuning {
 /// A custom config is honored as-is. When datagram obfuscation is enabled,
 /// the 24-byte nonce is reserved from the MSS (the wire datagram stays
 /// within the configured MSS).
-fn resolve_mss(config: MssConfig, obfuscated: bool) -> io::Result<ValidMss> {
+fn resolve_mss(config: MssConfig, obfuscated: bool) -> io::Result<Mss> {
     let mss = match config {
-        MssConfig::Default => ValidMss::try_new(MPUDP_MSS),
-        MssConfig::Custom(mss) => ValidMss::try_new(mss),
+        MssConfig::Default => Mss::try_new(MPUDP_MSS),
+        MssConfig::Custom(mss) => Mss::try_new(mss),
     }
     .map_err(io::Error::from)?;
     if obfuscated {

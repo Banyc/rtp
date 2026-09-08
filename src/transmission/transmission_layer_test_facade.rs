@@ -345,7 +345,7 @@ mod tests {
             Box::new(read),
             Box::new(write),
             fec,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             tuning,
             crate::delivery::frame::FrameMode::default(),
         )
@@ -381,7 +381,7 @@ mod tests {
                 error,
             }),
             true,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::max_diversity(),
             crate::delivery::frame::FrameMode::default(),
         )
@@ -642,7 +642,7 @@ mod tests {
             Box::new(read),
             Box::new(write),
             fec,
-            crate::udp::ValidMss::try_new(mss).unwrap(),
+            crate::udp::Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             crate::delivery::frame::FrameMode::default(),
         )
@@ -1255,7 +1255,7 @@ mod tests {
                 kill_started: Arc::clone(&kill_started),
             }),
             false,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             FecTuning::default(),
             crate::delivery::frame::FrameMode::default(),
         )

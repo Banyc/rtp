@@ -44,7 +44,7 @@ pub struct WriteHalf {
     termination_writer: TerminationWriter,
     /// Connection MSS, used to derive the handshake padding bound (see
     /// [`crate::traffic_shaping::control::handshake::padding`]).
-    mss: usize,
+    mss: crate::mss::Mss,
 }
 
 /// FEC and retransmission-armor settings for the write half, bundled so
@@ -56,7 +56,7 @@ pub(super) struct WriteHalfSettings {
     pub(super) retransmission_armor: RetransmissionArmorConfig,
     /// Connection MSS, used to derive the handshake padding bound (see
     /// [`crate::traffic_shaping::control::handshake::padding`]).
-    pub(super) mss: usize,
+    pub(super) mss: crate::mss::Mss,
 }
 
 impl WriteHalf {
@@ -439,7 +439,7 @@ impl WriteHalf {
         let Some(response) = self.shared.claim_post_open_response(now) else {
             return Ok(());
         };
-        let mut padded = vec![0u8; self.mss];
+        let mut padded = vec![0u8; self.mss.get()];
         let n = pad_handshake(&response.bytes, &mut padded, self.mss);
         match self.utp_write.send(&padded[..n]).await {
             Ok(len) if len == n => Ok(()),
@@ -729,7 +729,7 @@ mod tests {
             initial_sequences: crate::sequence::InitialSequences::ZERO,
             initial_rtt: None,
             metrics_observer: Some(observer),
-            mss: NonZeroUsize::new(crate::udp::NO_FEC_MSS).unwrap(),
+            mss: crate::mss::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery: FrameMode::default(),

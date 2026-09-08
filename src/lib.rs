@@ -6,6 +6,7 @@ mod delivery;
 pub mod io_err;
 pub mod keyed_udp;
 pub mod mpudp;
+mod mss;
 mod obfuscate;
 mod recv_queue;
 mod reliable;

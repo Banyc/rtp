@@ -455,7 +455,7 @@ mod tests {
             Box::new(a.clone()),
             Box::new(a),
             false,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             frame_delivery,
         )
@@ -464,7 +464,7 @@ mod tests {
             Box::new(b.clone()),
             Box::new(b),
             false,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             frame_delivery,
         )
@@ -734,7 +734,7 @@ mod tests {
             Box::new(a.clone()),
             Box::new(a),
             false,
-            crate::udp::ValidMss::try_new(mss).unwrap(),
+            crate::udp::Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             crate::delivery::frame::FrameMode::default(),
         )
@@ -804,7 +804,7 @@ mod tests {
             Box::new(a.clone()),
             Box::new(a),
             fec,
-            crate::udp::ValidMss::try_new(mss).unwrap(),
+            crate::udp::Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             fd,
         )
@@ -813,7 +813,7 @@ mod tests {
             Box::new(b.clone()),
             Box::new(b),
             fec,
-            crate::udp::ValidMss::try_new(mss).unwrap(),
+            crate::udp::Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             fd,
         )
@@ -881,7 +881,7 @@ mod tests {
             Box::new(a.clone()),
             Box::new(a),
             fec,
-            crate::udp::ValidMss::try_new(mss).unwrap(),
+            crate::udp::Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             fd,
         )
@@ -890,7 +890,7 @@ mod tests {
             Box::new(b.clone()),
             Box::new(b),
             fec,
-            crate::udp::ValidMss::try_new(mss).unwrap(),
+            crate::udp::Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             fd,
         )
@@ -975,7 +975,7 @@ mod tests {
             Box::new(a.clone()),
             Box::new(a),
             false,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             frame_delivery,
         )
@@ -984,7 +984,7 @@ mod tests {
             Box::new(b.clone()),
             Box::new(b),
             false,
-            crate::udp::ValidMss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             frame_delivery,
         )

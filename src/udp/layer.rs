@@ -1,79 +1,18 @@
-use core::num::NonZeroUsize;
-
 use fec::proto::{data_mss, symbol_size};
-use thiserror::Error;
 
-use super::MAX_MSS;
+#[cfg(test)]
+use crate::mss::MAX_MSS;
+
 #[cfg(test)]
 use super::NO_FEC_MSS;
 use crate::delivery::frame::FrameMode;
+use crate::mss::{Mss, MssError};
 use crate::traffic_shaping::redundancy::{
     RetransmissionArmorConfig,
     fec::{FecConfig, FecState},
     fec_tuning::FecTuning,
 };
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
-
-/// A maximum segment size that has been validated against the datagram
-/// ceiling and the codec payload overhead.  Construction is fallible; every
-/// downstream layer builder takes a [`ValidMss`] and therefore cannot panic
-/// on the MSS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValidMss(usize);
-
-impl ValidMss {
-    pub fn try_new(mss: usize) -> Result<Self, MssError> {
-        if mss > MAX_MSS {
-            return Err(MssError::ExceedsDatagramCeiling { mss, max: MAX_MSS });
-        }
-        if crate::codec::data_overhead() >= mss {
-            return Err(MssError::NoRoomForCodecPayload { mss });
-        }
-        Ok(Self(mss))
-    }
-
-    /// Reduce the MSS by the datagram-obfuscation nonce length. The nonce is
-    /// a wire-level overhead on EVERY datagram (like the codec and FEC
-    /// headers), so the MSS — which bounds the wire datagram size — must
-    /// leave room for it: with obfuscation enabled, the effective segment
-    /// payload is `mss - NONCE_LEN` and the wire datagram still fits in the
-    /// configured MSS. Fails when the configured MSS is too small to carry
-    /// the nonce on top of the codec payload.
-    pub fn reduced_for_obfuscation(self) -> Result<Self, MssError> {
-        let nonce = crate::obfuscate::NONCE_LEN;
-        let mss = self
-            .0
-            .checked_sub(nonce)
-            .ok_or(MssError::NoRoomForObfuscationNonce { mss: self.0, nonce })?;
-        Self::try_new(mss)
-    }
-
-    pub fn get(&self) -> usize {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum MssError {
-    #[error("mss {mss} exceeds the {max}-byte datagram ceiling")]
-    ExceedsDatagramCeiling { mss: usize, max: usize },
-    #[error("mss {mss} is too small for the FEC header")]
-    TooSmallForFec { mss: usize },
-    #[error("mss {mss} leaves no room for the codec payload")]
-    NoRoomForCodecPayload { mss: usize },
-    #[error("mss {mss} leaves no room for the {nonce}-byte obfuscation nonce")]
-    NoRoomForObfuscationNonce { mss: usize, nonce: usize },
-    #[error("mss {mss} leaves no room for the {key_size}-byte dispatch key")]
-    NoRoomForDispatchKey { mss: usize, key_size: usize },
-    #[error("mss {mss} leaves no room for the first-frame header")]
-    NoRoomForFirstFrameHeader { mss: usize },
-}
-
-impl From<MssError> for std::io::Error {
-    fn from(error: MssError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-    }
-}
 
 #[cfg(test)]
 pub(crate) fn wrap_fec(
@@ -85,7 +24,7 @@ pub(crate) fn wrap_fec(
         read,
         write,
         fec,
-        ValidMss::try_new(NO_FEC_MSS).unwrap(),
+        Mss::try_new(NO_FEC_MSS).unwrap(),
         FecTuning::default(),
         FrameMode::default(),
     )
@@ -96,7 +35,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
     read: Box<dyn UnreliableRead>,
     write: Box<dyn UnreliableWrite>,
     fec: bool,
-    mss: ValidMss,
+    mss: Mss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
 ) -> Result<UnreliableLayer, MssError> {
@@ -120,10 +59,10 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
 
 pub(crate) fn checked_mss_and_fec(
     fec: bool,
-    mss: ValidMss,
+    mss: Mss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
-) -> Result<(NonZeroUsize, Option<FecState>, FecTuning), MssError> {
+) -> Result<(Mss, Option<FecState>, FecTuning), MssError> {
     let mss = mss.get();
     let fec_state = if fec {
         let symbol_size = symbol_size(mss).ok_or(MssError::TooSmallForFec { mss })?;
@@ -161,7 +100,7 @@ pub(crate) fn checked_mss_and_fec(
             ..tuning
         }
     };
-    Ok((NonZeroUsize::new(mss).unwrap(), fec_state, tuning))
+    Ok((Mss::try_new(mss).unwrap(), fec_state, tuning))
 }
 
 #[cfg(test)]
@@ -175,7 +114,7 @@ mod tests {
         ($name:ident, $expected:pat, $fec:expr, $mss:expr, $frame_delivery:expr) => {
             #[test]
             fn $name() {
-                let mss = ValidMss::try_new($mss);
+                let mss = Mss::try_new($mss);
                 let res = match mss {
                     Ok(mss) => {
                         checked_mss_and_fec($fec, mss, FecTuning::default(), $frame_delivery)
@@ -224,7 +163,7 @@ mod tests {
     fn mss_1400_is_accepted_with_fec_on_and_off() {
         let (mss, fec_state, tuning) = checked_mss_and_fec(
             false,
-            ValidMss::try_new(1_400).unwrap(),
+            Mss::try_new(1_400).unwrap(),
             FecTuning::default(),
             FrameMode::default(),
         )
@@ -239,7 +178,7 @@ mod tests {
 
         let (mss, fec_state, tuning) = checked_mss_and_fec(
             true,
-            ValidMss::try_new(1_400).unwrap(),
+            Mss::try_new(1_400).unwrap(),
             FecTuning::default(),
             FrameMode::default(),
         )
@@ -266,7 +205,7 @@ mod tests {
 
     #[test]
     fn reduced_for_obfuscation_subtracts_the_nonce() {
-        let mss = ValidMss::try_new(crate::udp::NO_FEC_MSS)
+        let mss = Mss::try_new(crate::udp::NO_FEC_MSS)
             .unwrap()
             .reduced_for_obfuscation()
             .unwrap();
@@ -290,7 +229,7 @@ mod tests {
     fn reduced_for_obfuscation_rejects_a_mss_too_small_for_the_nonce() {
         // A configured MSS that is valid on its own but cannot carry the
         // nonce on top of the codec payload must be rejected.
-        let mss = ValidMss::try_new(crate::codec::data_overhead() + 1).unwrap();
+        let mss = Mss::try_new(crate::codec::data_overhead() + 1).unwrap();
         let err = mss.reduced_for_obfuscation().unwrap_err();
         assert!(
             matches!(err, MssError::NoRoomForObfuscationNonce { .. }),
@@ -302,7 +241,7 @@ mod tests {
     fn reduced_for_obfuscation_keeps_the_codec_room_check() {
         // mss - nonce must still leave room for the codec payload.
         let mss =
-            ValidMss::try_new(crate::codec::data_overhead() + crate::obfuscate::NONCE_LEN).unwrap();
+            Mss::try_new(crate::codec::data_overhead() + crate::obfuscate::NONCE_LEN).unwrap();
         let err = mss.reduced_for_obfuscation().unwrap_err();
         assert!(
             matches!(err, MssError::NoRoomForCodecPayload { .. }),

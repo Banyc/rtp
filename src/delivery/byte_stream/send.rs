@@ -1,7 +1,5 @@
 //! Send-side byte-stream staging buffer (stock mode).
 
-use core::num::NonZeroUsize;
-
 use primitive::{
     ops::len::{Capacity, Len, LenExt},
     queue::cap_queue::CapVecQueue,
@@ -13,11 +11,11 @@ const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
 
 /// Send staging buffer size for a given MSS.
-pub(crate) fn send_data_buf_len(mss: NonZeroUsize) -> usize {
-    if mss.get() <= crate::udp::NO_FEC_MSS {
+pub(crate) fn send_data_buf_len(mss: usize) -> usize {
+    if mss <= crate::udp::NO_FEC_MSS {
         return SEND_DATA_BUF_LEN;
     }
-    let payload = mss.get() - data_overhead();
+    let payload = mss - data_overhead();
     let pkts = MAX_SEND_DATA_BUF_LEN / payload;
     pkts * payload
 }
@@ -29,7 +27,7 @@ pub(crate) struct StockSendStage {
 }
 
 impl StockSendStage {
-    pub(crate) fn new(mss: NonZeroUsize) -> Self {
+    pub(crate) fn new(mss: usize) -> Self {
         Self {
             buf: CapVecQueue::new_vec(send_data_buf_len(mss)),
         }

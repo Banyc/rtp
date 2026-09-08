@@ -1,4 +1,3 @@
-
 use super::super::wire::PACKET_LEN;
 use super::*;
 use crate::{
@@ -68,7 +67,7 @@ async fn handshake_datagrams_are_padded_to_variable_sizes() {
     // datagram size on the wire: with handshake padding, no datagram is
     // the old fixed 18-byte size — each carries a random tail up to the
     // MSS-derived bound, and the sizes vary across packets.
-    let mss = crate::udp::NO_FEC_MSS;
+    let mss = crate::mss::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap();
     let mut all_sizes = Vec::new();
     for _ in 0..5 {
         let a = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -111,7 +110,9 @@ async fn handshake_datagrams_are_padded_to_variable_sizes() {
     }
     assert!(!all_sizes.is_empty());
     assert!(
-        all_sizes.iter().all(|&n| (PACKET_LEN..=mss).contains(&n)),
+        all_sizes
+            .iter()
+            .all(|&n| (PACKET_LEN..=mss.get()).contains(&n)),
         "every handshake datagram must carry a padding tail, got sizes {all_sizes:?}"
     );
     let distinct: std::collections::HashSet<usize> = all_sizes.iter().copied().collect();
@@ -747,7 +748,7 @@ async fn client_cannot_succeed_without_a_delivered_confirmation() {
         Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
         false,
     );
-    let mss = client.mss.get();
+    let mss = client.mss;
     let result = client_phase(
         &mut client,
         0x1234,

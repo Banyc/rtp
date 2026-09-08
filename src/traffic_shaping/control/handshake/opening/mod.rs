@@ -74,7 +74,7 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
         .expect("operating-system randomness unavailable");
     let nonce = u64::from_be_bytes(nonce_bytes);
     let deadline = Instant::now() + OPENING_TIMEOUT;
-    let mss = unreliable.mss.get();
+    let mss = unreliable.mss;
     client_phase(
         unreliable,
         nonce,
@@ -105,7 +105,7 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
 
 pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::Result<()> {
     let deadline = Instant::now() + OPENING_TIMEOUT;
-    let mss = unreliable.mss.get();
+    let mss = unreliable.mss;
     let hello = loop {
         match receive_until(&mut unreliable.utp_read, deadline, mss).await? {
             Received::Handshake(packet) if packet.kind == Kind::Hello => break packet,
@@ -129,7 +129,7 @@ async fn client_phase(
     request: Kind,
     response: Kind,
     deadline: Instant,
-    mss: usize,
+    mss: crate::mss::Mss,
 ) -> io::Result<Option<Duration>> {
     let request = Packet {
         kind: request,
@@ -164,7 +164,7 @@ async fn server_wait_for_confirm(
     unreliable: &mut UnreliableLayer,
     nonce: u64,
     deadline: Instant,
-    mss: usize,
+    mss: crate::mss::Mss,
 ) -> io::Result<Option<Duration>> {
     let hello_ack = Packet {
         kind: Kind::HelloAck,
@@ -206,7 +206,7 @@ async fn server_confirm(
     unreliable: &mut UnreliableLayer,
     nonce: u64,
     deadline: Instant,
-    mss: usize,
+    mss: crate::mss::Mss,
 ) -> io::Result<()> {
     let confirm_ack = Packet {
         kind: Kind::ConfirmAck,
@@ -227,14 +227,14 @@ fn retry_at(deadline: Instant) -> Instant {
 async fn receive_until(
     read: &mut Box<dyn UnreliableRead>,
     deadline: Instant,
-    mss: usize,
+    mss: crate::mss::Mss,
 ) -> io::Result<Received> {
     if Instant::now() >= deadline {
         return Ok(Received::Deadline);
     }
     // Sized to the connection's MSS-derived maximum padded handshake packet
     // so a peer padding up to its own MSS is never truncated or dropped.
-    let mut bytes = vec![0u8; mss];
+    let mut bytes = vec![0u8; mss.get()];
     tokio::select! {
         result = read.recv(&mut bytes) => {
             let len = result.map_err(io::Error::from)?;
@@ -286,9 +286,9 @@ async fn send_padded(
     write: &mut Box<dyn UnreliableWrite>,
     core: &[u8],
     deadline: Instant,
-    mss: usize,
+    mss: crate::mss::Mss,
 ) -> io::Result<()> {
-    let mut padded = vec![0u8; mss];
+    let mut padded = vec![0u8; mss.get()];
     let n = pad_handshake(core, &mut padded, mss);
     send(write, &padded[..n], deadline).await
 }

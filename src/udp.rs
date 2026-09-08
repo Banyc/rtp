@@ -36,7 +36,7 @@ pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
 mod layer;
-pub(crate) use layer::{MssError, ValidMss, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery};
+pub(crate) use layer::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
 #[cfg(test)]
 pub(crate) use layer::{checked_mss_and_fec, wrap_fec};
 
@@ -52,11 +52,8 @@ mod raw_send;
 #[cfg(test)]
 pub mod testing;
 
+pub use crate::mss::{MAX_MSS, Mss, MssError};
 pub const NO_FEC_MSS: usize = 1424;
-/// Maximum user-configured MSS. Datagrams larger than this are rejected before
-/// they reach the kernel because on some platforms (notably macOS) oversized
-/// UDP sends fail with `EMSGSIZE` and are treated as fatal connection errors.
-pub const MAX_MSS: usize = 64 * 1024;
 const DISPATCHER_BUF_SIZE: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,10 +63,10 @@ pub enum MssConfig {
     Custom(usize),
 }
 impl MssConfig {
-    pub fn resolve(self) -> Result<ValidMss, MssError> {
+    pub fn resolve(self) -> Result<Mss, MssError> {
         match self {
-            Self::Default => ValidMss::try_new(NO_FEC_MSS),
-            Self::Custom(mss) => ValidMss::try_new(mss),
+            Self::Default => Mss::try_new(NO_FEC_MSS),
+            Self::Custom(mss) => Mss::try_new(mss),
         }
     }
 }
@@ -464,13 +461,13 @@ impl<'a> Default for ConnectConfig<'a> {
 
 /// Tuning for the private [`accept`] helper: bundles the settings splashed
 /// out of a public [`AcceptConfig`] (plus the `handshake` flag and the
-/// already-resolved [`ValidMss`]) so the accept path takes a single config
+/// already-resolved [`Mss`]) so the accept path takes a single config
 /// argument in the `(data, …, config)` shape used across the crate.
 #[derive(Debug, Clone)]
 struct AcceptSetup {
     handshake: bool,
     fec: bool,
-    mss: ValidMss,
+    mss: Mss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
     retransmission_armor: RetransmissionArmorConfig,
@@ -1259,7 +1256,7 @@ mod tests {
             Box::new(Dummy),
             Box::new(Dummy),
             false,
-            ValidMss::try_new(NO_FEC_MSS).unwrap(),
+            Mss::try_new(NO_FEC_MSS).unwrap(),
             FecTuning::default(),
             FrameMode::default(),
         )
@@ -1271,7 +1268,7 @@ mod tests {
     #[test]
     fn checked_mss_rejects_oversized() {
         assert!(matches!(
-            ValidMss::try_new(MAX_MSS + 1),
+            Mss::try_new(MAX_MSS + 1),
             Err(MssError::ExceedsDatagramCeiling { .. })
         ));
     }
@@ -1279,7 +1276,7 @@ mod tests {
     #[test]
     fn checked_mss_rejects_undersized() {
         assert!(matches!(
-            ValidMss::try_new(1),
+            Mss::try_new(1),
             Err(MssError::NoRoomForCodecPayload { .. })
         ));
     }
@@ -1313,7 +1310,7 @@ mod tests {
             Box::new(Dummy),
             Box::new(Dummy),
             true,
-            ValidMss::try_new(NO_FEC_MSS).unwrap(),
+            Mss::try_new(NO_FEC_MSS).unwrap(),
             FecTuning::default(),
             FrameMode::default(),
         )
@@ -1465,7 +1462,7 @@ mod tests {
             Box::new(Dummy),
             Box::new(Dummy),
             false,
-            ValidMss::try_new(mss).unwrap(),
+            Mss::try_new(mss).unwrap(),
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
             FrameMode::enabled(),
         );
