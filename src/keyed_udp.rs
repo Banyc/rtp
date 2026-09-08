@@ -13,14 +13,12 @@ use crate::{
     traffic_shaping::redundancy::fec_tuning::FecTuning,
     transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::{
-        self, AcceptConfig, MaybeRawFd, Mss, MssError, maybe_raw_fd, should_wait_after_try_send,
-        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+        self, AcceptConfig, DISPATCHER_BUF_SIZE, MaybeRawFd, Mss, MssError, maybe_raw_fd,
+        should_wait_after_try_send, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
 
 use crate::io_err::IoErr;
-
-const DISPATCHER_BUF_SIZE: usize = 1024;
 
 fn wrap_keyed<K: DispatchKey>(
     read: Box<dyn UnreliableRead>,

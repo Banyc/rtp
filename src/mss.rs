@@ -46,6 +46,13 @@ impl Mss {
     pub const fn get(&self) -> usize {
         self.0
     }
+
+    /// The maximum payload bytes per data packet: `mss - data_overhead()`.
+    /// Guaranteed non-negative by [`Mss::try_new`], which rejects an MSS
+    /// with no room for the codec payload.
+    pub fn max_data_size_per_pkt(&self) -> usize {
+        self.0 - codec::data_overhead()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

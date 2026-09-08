@@ -158,6 +158,15 @@ pub(crate) fn encode_plaintext(
     }
 }
 
+/// Read the u16 length prefix from the front of `plaintext`. Returns `None`
+/// when the plaintext is shorter than the prefix.
+fn read_len_prefix(plaintext: &[u8]) -> Option<usize> {
+    if plaintext.len() < LEN_LEN {
+        return None;
+    }
+    Some(u16::from_be_bytes([plaintext[0], plaintext[1]]) as usize)
+}
+
 /// Decode the obfuscated plaintext `plaintext` into `buf`: read the length
 /// prefix (dynamic), strip the padding, and copy the payload out. Returns
 /// the payload length, or `None` when the plaintext is not valid (shorter
@@ -170,10 +179,7 @@ pub(crate) fn decode_plaintext(
     match settings {
         Some(settings) => match settings.payload_sized {
             PayloadSized::Dynamic => {
-                if plaintext.len() < LEN_LEN {
-                    return None;
-                }
-                let len = u16::from_be_bytes(plaintext[..LEN_LEN].try_into().unwrap()) as usize;
+                let len = read_len_prefix(plaintext)?;
                 if len > buf.len() || LEN_LEN + len > plaintext.len() {
                     return None;
                 }
@@ -211,10 +217,7 @@ pub(crate) fn decode_plaintext_in_place(
     match settings {
         Some(settings) => match settings.payload_sized {
             PayloadSized::Dynamic => {
-                if n < LEN_LEN {
-                    return None;
-                }
-                let len = u16::from_be_bytes(buf[..LEN_LEN].try_into().unwrap()) as usize;
+                let len = read_len_prefix(&buf[..n])?;
                 if LEN_LEN + len > n {
                     return None;
                 }

@@ -22,9 +22,11 @@ use crate::metrics::MetricsGentleExitCause;
 use crate::sequence::{InitialSequences, SequenceNumber};
 use crate::{
     ack::AckBlocks,
-    codec::data_overhead,
     delivery::{
-        byte_stream::{recv::StockRecvStage, send::StockSendStage},
+        byte_stream::{
+            recv::StockRecvStage,
+            send::{MAX_SEND_DATA_BUF_LEN, StockSendStage},
+        },
         frame::{
             FrameMode,
             send::{FrameSendStage, MAX_FRAME_LEN},
@@ -39,7 +41,6 @@ use crate::{
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
-const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
 /// The frame-delivery [`MAX_FRAME_LEN`] is defined in
 /// [`crate::delivery::frame::send`] and must stay equal to the stock
 /// `MAX_SEND_DATA_BUF_LEN` so a frame can occupy the whole staging buffer.
@@ -229,7 +230,7 @@ impl ReliableLayer {
     ) -> (Self, SendPacer) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let send_rate_limiter = SendPacer::new_prefilled(send_rate, now);
-        let max_data_size_per_pkt = mss.get().checked_sub(data_overhead()).unwrap();
+        let max_data_size_per_pkt = mss.max_data_size_per_pkt();
         let this = Self {
             mss,
             max_data_size_per_pkt,
@@ -272,7 +273,7 @@ impl ReliableLayer {
     ) -> (Self, SendPacer) {
         let send_rate = PosR::new(INIT_SEND_RATE).unwrap();
         let send_rate_limiter = SendPacer::new_prefilled(send_rate, now);
-        let max_data_size_per_pkt = mss.get().checked_sub(data_overhead()).unwrap();
+        let max_data_size_per_pkt = mss.max_data_size_per_pkt();
         let this = Self {
             mss,
             max_data_size_per_pkt,
@@ -1512,12 +1513,11 @@ mod tests {
     use crate::delivery::byte_stream::send::send_data_buf_len;
     use primitive::ops::float::PosR;
 
-    const SEND_DATA_BUF_LEN: usize = 8 * 1024;
-
     const TEST_MSS: usize = 1200;
     use crate::{
         ack::{AckBlocks, AckInterval},
         codec::data_overhead,
+        delivery::byte_stream::send::SEND_DATA_BUF_LEN,
         udp::NO_FEC_MSS,
     };
 

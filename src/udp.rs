@@ -54,7 +54,7 @@ pub mod testing;
 
 pub use crate::mss::{MAX_MSS, Mss, MssError};
 pub const NO_FEC_MSS: usize = 1424;
-const DISPATCHER_BUF_SIZE: usize = 1024;
+pub(crate) const DISPATCHER_BUF_SIZE: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MssConfig {
