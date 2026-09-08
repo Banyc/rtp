@@ -505,7 +505,10 @@ async fn accept(
     // connection never decrypts a datagram twice.
     let read: Box<dyn UnreliableRead> = Box::new(read);
     let write: Box<dyn UnreliableWrite> = match key {
-        Some(key) => Box::new(crate::obfuscate::ObfuscatedWrite::new(write, key, profile)),
+        Some(key) => Box::new(crate::obfuscate::ObfuscatedWrite::new(
+            write,
+            crate::obfuscate::Obfuscation { key, profile },
+        )),
         None => Box::new(write),
     };
     // The obfuscation nonce is a wire-level overhead on every datagram, so
@@ -849,8 +852,10 @@ async fn connect_bound(
     let (read, write) = crate::obfuscate::maybe_wrap(
         Arc::clone(&udp),
         Arc::clone(&udp),
-        obfuscation_key,
-        padding_profile,
+        obfuscation_key.map(|key| crate::obfuscate::Obfuscation {
+            key,
+            profile: padding_profile,
+        }),
     );
     let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(
         Arc::clone(&udp),

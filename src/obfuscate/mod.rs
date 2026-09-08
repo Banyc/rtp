@@ -3,10 +3,11 @@
 //! key, so a passive observer sees only random bytes and cannot distinguish
 //! the traffic from any other encrypted UDP protocol (QUIC, WireGuard, DTLS).
 //!
-//! The module is split into two parts:
-//! - [`mask`]: the nonce + chacha20 keystream masking wrapper.
+//! The module is split into three parts:
+//! - [`mask`]: the nonce + chacha20 keystream masking layer.
 //! - [`padding`]: the obfuscated-plaintext padding format
 //!   (`[len u16][payload][padding]` with a profile, `[payload]` without).
+//! - [`wrapper`]: the composition — the only layer that touches both.
 //!
 //! The wrapper is wired into the public constructors through the optional
 //! `obfuscation_key` on [`crate::udp::ConnectConfig`] /
@@ -14,5 +15,7 @@
 
 pub(crate) mod mask;
 pub(crate) mod padding;
+pub(crate) mod wrapper;
 
-pub(crate) use mask::{KEY_LEN, NONCE_LEN, ObfuscatedWrite, apply_keystream, maybe_wrap};
+pub(crate) use mask::{KEY_LEN, NONCE_LEN, apply_keystream};
+pub(crate) use wrapper::{ObfuscatedWrite, Obfuscation, maybe_wrap};

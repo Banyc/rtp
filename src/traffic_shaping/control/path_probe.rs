@@ -104,10 +104,9 @@ pub fn encode_probe_obfuscated(
     out.resize(crate::obfuscate::NONCE_LEN + max_plaintext, 0);
     out[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
     let plaintext_len = padding::encode_plaintext(
-        profile,
-        target,
         &core,
         &mut out[crate::obfuscate::NONCE_LEN..],
+        padding::PadSettings { profile, target },
     );
     crate::obfuscate::apply_keystream(
         key,
@@ -136,7 +135,7 @@ pub fn decode_echo_obfuscated(
     plaintext.copy_from_slice(&datagram[crate::obfuscate::NONCE_LEN..]);
     crate::obfuscate::apply_keystream(key, nonce, &mut plaintext);
     let mut core = [0u8; PROBE_LEN];
-    let len = padding::decode_plaintext(profile, &plaintext, &mut core)?;
+    let len = padding::decode_plaintext(&plaintext, &mut core, profile)?;
     if len != PROBE_LEN {
         return None;
     }
@@ -250,7 +249,7 @@ impl ProbeResponder {
                 // plaintext and the connection never decrypts again.
                 datagram.copy_within(crate::obfuscate::NONCE_LEN.., 0);
                 crate::obfuscate::apply_keystream(key, nonce, &mut datagram[..ciphertext_len]);
-                match padding::decode_plaintext_in_place(self.profile, datagram, ciphertext_len) {
+                match padding::decode_plaintext_in_place(datagram, ciphertext_len, self.profile) {
                     Some(len) => &mut datagram[..len],
                     None => return Observe::Dropped,
                 }
@@ -292,10 +291,12 @@ impl ProbeResponder {
                     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
                     datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
                     let plaintext_len = padding::encode_plaintext(
-                        self.profile,
-                        total - crate::obfuscate::NONCE_LEN,
                         &core[..probe_len],
                         &mut datagram[crate::obfuscate::NONCE_LEN..total],
+                        padding::PadSettings {
+                            profile: self.profile,
+                            target: total - crate::obfuscate::NONCE_LEN,
+                        },
                     );
                     crate::obfuscate::apply_keystream(
                         key,

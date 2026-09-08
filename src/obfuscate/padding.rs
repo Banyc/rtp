@@ -33,10 +33,19 @@ impl TargetProfile {
     }
 }
 
+/// The padding decision for one plaintext: the profile (policy) and the
+/// target plaintext size to pad to (drawn by the caller). `profile` is
+/// `None` for the historical unpadded format.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PadSettings {
+    pub profile: Option<TargetProfile>,
+    pub target: usize,
+}
+
 /// The largest plaintext a datagram can carry for a caller buffer of
 /// `plaintext_capacity`: the profile's max target (when padding) or the
 /// buffer alone (when not). Callers size their buffers to this.
-pub(crate) fn max_plaintext(profile: Option<TargetProfile>, plaintext_capacity: usize) -> usize {
+pub(crate) fn max_plaintext(plaintext_capacity: usize, profile: Option<TargetProfile>) -> usize {
     match profile {
         Some(profile) => profile.max().max(plaintext_capacity + LEN_LEN),
         None => plaintext_capacity,
@@ -45,20 +54,16 @@ pub(crate) fn max_plaintext(profile: Option<TargetProfile>, plaintext_capacity: 
 
 /// Encode `payload` as the obfuscated plaintext into `out` (which must be
 /// sized to at least [`max_plaintext`]): `[len u16][payload][zero padding]`
-/// padded to `target` (floored at the payload, never shrunk) when a profile
-/// is set, or the payload alone otherwise. Returns the plaintext length.
-pub(crate) fn encode_plaintext(
-    profile: Option<TargetProfile>,
-    target: usize,
-    payload: &[u8],
-    out: &mut [u8],
-) -> usize {
-    let plaintext_len = match profile {
-        Some(_) => target.max(payload.len() + LEN_LEN),
+/// padded to the target (floored at the payload, never shrunk) when a
+/// profile is set, or the payload alone otherwise. Returns the plaintext
+/// length.
+pub(crate) fn encode_plaintext(payload: &[u8], out: &mut [u8], settings: PadSettings) -> usize {
+    let plaintext_len = match settings.profile {
+        Some(_) => settings.target.max(payload.len() + LEN_LEN),
         None => payload.len(),
     };
     let mut pos = 0;
-    if profile.is_some() {
+    if settings.profile.is_some() {
         out[..LEN_LEN].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         pos = LEN_LEN;
     }
@@ -74,9 +79,9 @@ pub(crate) fn encode_plaintext(
 /// Returns the payload length, or `None` when the plaintext is not valid
 /// (shorter than the length prefix, or the payload is too large for `buf`).
 pub(crate) fn decode_plaintext(
-    profile: Option<TargetProfile>,
     plaintext: &[u8],
     buf: &mut [u8],
+    profile: Option<TargetProfile>,
 ) -> Option<usize> {
     match profile {
         Some(_) => {
@@ -105,9 +110,9 @@ pub(crate) fn decode_plaintext(
 /// front. Returns the payload length, or `None` when the plaintext is not
 /// valid.
 pub(crate) fn decode_plaintext_in_place(
-    profile: Option<TargetProfile>,
     buf: &mut [u8],
     n: usize,
+    profile: Option<TargetProfile>,
 ) -> Option<usize> {
     match profile {
         Some(_) => {
@@ -140,12 +145,12 @@ mod tests {
     fn encode_decode_round_trips_with_and_without_a_profile() {
         let payload = b"hello";
         let mut buf = [0u8; 512];
-        for profile in [None, Some(profile())] {
-            let target = profile.map_or(0, |p| p.draw());
-            let mut plaintext = vec![0u8; max_plaintext(profile, payload.len())];
-            let n = encode_plaintext(profile, target, payload, &mut plaintext);
+        for (profile, target) in [(None, 0), (Some(profile()), 200)] {
+            let settings = PadSettings { profile, target };
+            let mut plaintext = vec![0u8; max_plaintext(payload.len(), profile)];
+            let n = encode_plaintext(payload, &mut plaintext, settings);
             assert_eq!(
-                decode_plaintext(profile, &plaintext[..n], &mut buf),
+                decode_plaintext(&plaintext[..n], &mut buf, profile),
                 Some(payload.len())
             );
             assert_eq!(&buf[..payload.len()], payload);
@@ -156,8 +161,15 @@ mod tests {
     fn a_profile_pads_to_the_target_and_never_shrinks() {
         let profile = profile();
         let payload = b"tiny";
-        let mut plaintext = vec![0u8; max_plaintext(Some(profile), payload.len())];
-        let n = encode_plaintext(Some(profile), 200, payload, &mut plaintext);
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(profile))];
+        let n = encode_plaintext(
+            payload,
+            &mut plaintext,
+            PadSettings {
+                profile: Some(profile),
+                target: 200,
+            },
+        );
         assert_eq!(n, 200);
         assert_eq!(&plaintext[..LEN_LEN], &(payload.len() as u16).to_be_bytes());
         assert_eq!(&plaintext[LEN_LEN..LEN_LEN + payload.len()], payload);
@@ -169,8 +181,15 @@ mod tests {
         // A payload larger than the target is sent at its natural size (plus
         // the length prefix) — never shrunk.
         let big = vec![0xAB; 300];
-        let mut out = vec![0u8; max_plaintext(Some(profile), big.len())];
-        let n = encode_plaintext(Some(profile), 200, &big, &mut out);
+        let mut out = vec![0u8; max_plaintext(big.len(), Some(profile))];
+        let n = encode_plaintext(
+            &big,
+            &mut out,
+            PadSettings {
+                profile: Some(profile),
+                target: 200,
+            },
+        );
         assert_eq!(n, big.len() + LEN_LEN);
     }
 
@@ -181,19 +200,26 @@ mod tests {
         // Without a profile, a payload larger than the buffer is rejected.
         let mut plaintext = vec![0u8; payload.len()];
         plaintext.copy_from_slice(payload);
-        assert_eq!(decode_plaintext(None, &plaintext, &mut buf), None);
+        assert_eq!(decode_plaintext(&plaintext, &mut buf, None), None);
         // With a profile, a plaintext shorter than the length prefix is
         // rejected.
-        assert_eq!(decode_plaintext(Some(profile()), &[0x00], &mut buf), None);
+        assert_eq!(decode_plaintext(&[0x00], &mut buf, Some(profile())), None);
     }
 
     #[test]
     fn in_place_decode_moves_the_payload_to_the_front() {
         let profile = profile();
         let payload = b"hello";
-        let mut plaintext = vec![0u8; max_plaintext(Some(profile), payload.len())];
-        let n = encode_plaintext(Some(profile), 200, payload, &mut plaintext);
-        let len = decode_plaintext_in_place(Some(profile), &mut plaintext, n).unwrap();
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(profile))];
+        let n = encode_plaintext(
+            payload,
+            &mut plaintext,
+            PadSettings {
+                profile: Some(profile),
+                target: 200,
+            },
+        );
+        let len = decode_plaintext_in_place(&mut plaintext, n, Some(profile)).unwrap();
         assert_eq!(len, payload.len());
         assert_eq!(&plaintext[..len], payload);
     }

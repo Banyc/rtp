@@ -138,7 +138,13 @@ async fn convert_conn(
     // Datagram obfuscation (when a key is configured): every datagram is
     // prefixed with a 24-byte random nonce and the rest is chacha20-
     // encrypted, exactly like the single-path udp constructors.
-    let (r, w) = crate::obfuscate::maybe_wrap(r, w, tuning.obfuscation_key, None);
+    let (r, w) = crate::obfuscate::maybe_wrap(
+        r,
+        w,
+        tuning
+            .obfuscation_key
+            .map(|key| crate::obfuscate::Obfuscation { key, profile: None }),
+    );
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         r,
         w,
