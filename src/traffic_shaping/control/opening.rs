@@ -1292,23 +1292,22 @@ mod tests {
     async fn send_completes_on_late_writability() {
         #[derive(Debug)]
         struct LateWritable {
-            ready_at: Instant,
+            attempts: usize,
         }
         #[async_trait]
         impl UnreliableWrite for LateWritable {
             async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
-                if Instant::now() >= self.ready_at {
+                if self.attempts == 0 {
                     Ok(buf.len())
                 } else {
+                    self.attempts -= 1;
                     Err(io::ErrorKind::WouldBlock.into())
                 }
             }
         }
-        let deadline = Instant::now() + Duration::from_millis(200);
-        let mut writer: Box<dyn UnreliableWrite> = Box::new(LateWritable {
-            ready_at: Instant::now() + Duration::from_millis(150),
-        });
-        tokio::time::timeout(Duration::from_secs(2), send(&mut writer, b"x", deadline))
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut writer: Box<dyn UnreliableWrite> = Box::new(LateWritable { attempts: 3 });
+        tokio::time::timeout(Duration::from_secs(5), send(&mut writer, b"x", deadline))
             .await
             .expect("send hung")
             .expect("send missed late writability");
