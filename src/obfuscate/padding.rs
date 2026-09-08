@@ -7,29 +7,42 @@
 /// The length-prefix size (u16) inside the obfuscated plaintext.
 pub(crate) const LEN_LEN: usize = 2;
 
-/// A fixed single-mode target profile for datagram padding: every datagram
-/// is padded to a size drawn from a triangular distribution peaked at
-/// `mode` and falling to zero at `mode ± spread`. The draw is independent of
-/// the traffic, so the wire size distribution converges to one mode without
-/// any traffic-correlated feedback.
+/// The padding policy for datagrams: how the target plaintext size is
+/// chosen for each datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TargetProfile {
-    pub mode: usize,
-    pub spread: usize,
+pub enum PaddingProfile {
+    /// Pad every datagram to exactly this size (a payload larger than the
+    /// target is sent at its natural size — never shrunk).
+    Fixed(usize),
+    /// Pad every datagram to a random size drawn from a triangular
+    /// distribution peaked at `mode` and falling to zero at `mode ± spread`.
+    /// The draw is independent of the traffic, so the wire size
+    /// distribution converges to one mode without any traffic-correlated
+    /// feedback.
+    Random { mode: usize, spread: usize },
 }
 
-impl TargetProfile {
-    /// Draw a target size: triangular around `mode` in `[mode - spread,
-    /// mode + spread]` (the difference of two uniforms is triangular).
+impl PaddingProfile {
+    /// Draw a target size for one datagram: the fixed size, or a triangular
+    /// draw around `mode` in `[mode - spread, mode + spread]` (the
+    /// difference of two uniforms is triangular).
     pub fn draw(&self) -> usize {
-        let u = rand::random_range(0..=self.spread) as isize;
-        let v = rand::random_range(0..=self.spread) as isize;
-        (self.mode as isize + u - v).max(0) as usize
+        match self {
+            Self::Fixed(size) => *size,
+            Self::Random { mode, spread } => {
+                let u = rand::random_range(0..=*spread) as isize;
+                let v = rand::random_range(0..=*spread) as isize;
+                (*mode as isize + u - v).max(0) as usize
+            }
+        }
     }
 
     /// The largest target size the profile can draw.
     pub fn max(&self) -> usize {
-        self.mode + self.spread
+        match self {
+            Self::Fixed(size) => *size,
+            Self::Random { mode, spread } => mode + spread,
+        }
     }
 }
 
@@ -38,14 +51,14 @@ impl TargetProfile {
 /// `None` for the historical unpadded format.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PadSettings {
-    pub profile: Option<TargetProfile>,
+    pub profile: Option<PaddingProfile>,
     pub target: usize,
 }
 
 /// The largest plaintext a datagram can carry for a caller buffer of
 /// `plaintext_capacity`: the profile's max target (when padding) or the
 /// buffer alone (when not). Callers size their buffers to this.
-pub(crate) fn max_plaintext(plaintext_capacity: usize, profile: Option<TargetProfile>) -> usize {
+pub(crate) fn max_plaintext(plaintext_capacity: usize, profile: Option<PaddingProfile>) -> usize {
     match profile {
         Some(profile) => profile.max().max(plaintext_capacity + LEN_LEN),
         None => plaintext_capacity,
@@ -81,7 +94,7 @@ pub(crate) fn encode_plaintext(payload: &[u8], out: &mut [u8], settings: PadSett
 pub(crate) fn decode_plaintext(
     plaintext: &[u8],
     buf: &mut [u8],
-    profile: Option<TargetProfile>,
+    profile: Option<PaddingProfile>,
 ) -> Option<usize> {
     match profile {
         Some(_) => {
@@ -112,7 +125,7 @@ pub(crate) fn decode_plaintext(
 pub(crate) fn decode_plaintext_in_place(
     buf: &mut [u8],
     n: usize,
-    profile: Option<TargetProfile>,
+    profile: Option<PaddingProfile>,
 ) -> Option<usize> {
     match profile {
         Some(_) => {
@@ -134,8 +147,8 @@ pub(crate) fn decode_plaintext_in_place(
 mod tests {
     use super::*;
 
-    fn profile() -> TargetProfile {
-        TargetProfile {
+    fn profile() -> PaddingProfile {
+        PaddingProfile::Random {
             mode: 200,
             spread: 50,
         }
@@ -145,7 +158,11 @@ mod tests {
     fn encode_decode_round_trips_with_and_without_a_profile() {
         let payload = b"hello";
         let mut buf = [0u8; 512];
-        for (profile, target) in [(None, 0), (Some(profile()), 200)] {
+        for (profile, target) in [
+            (None, 0),
+            (Some(profile()), 200),
+            (Some(PaddingProfile::Fixed(300)), 300),
+        ] {
             let settings = PadSettings { profile, target };
             let mut plaintext = vec![0u8; max_plaintext(payload.len(), profile)];
             let n = encode_plaintext(payload, &mut plaintext, settings);
@@ -188,6 +205,44 @@ mod tests {
             PadSettings {
                 profile: Some(profile),
                 target: 200,
+            },
+        );
+        assert_eq!(n, big.len() + LEN_LEN);
+    }
+
+    #[test]
+    fn a_fixed_profile_pads_every_datagram_to_the_same_size() {
+        let profile = PaddingProfile::Fixed(250);
+        let payload = b"tiny";
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(profile))];
+        for _ in 0..16 {
+            let n = encode_plaintext(
+                payload,
+                &mut plaintext,
+                PadSettings {
+                    profile: Some(profile),
+                    target: profile.draw(),
+                },
+            );
+            assert_eq!(n, 250, "every datagram must pad to the fixed size");
+        }
+        assert_eq!(&plaintext[..LEN_LEN], &(payload.len() as u16).to_be_bytes());
+        assert_eq!(&plaintext[LEN_LEN..LEN_LEN + payload.len()], payload);
+        assert!(
+            plaintext[LEN_LEN + payload.len()..250]
+                .iter()
+                .all(|&b| b == 0)
+        );
+        // A payload larger than the fixed size is sent at its natural size
+        // (plus the length prefix) — never shrunk.
+        let big = vec![0xAB; 300];
+        let mut out = vec![0u8; max_plaintext(big.len(), Some(profile))];
+        let n = encode_plaintext(
+            &big,
+            &mut out,
+            PadSettings {
+                profile: Some(profile),
+                target: profile.draw(),
             },
         );
         assert_eq!(n, big.len() + LEN_LEN);

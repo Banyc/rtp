@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 
 use super::mask::{KEY_LEN, NONCE_LEN, apply_keystream};
-use super::padding::{self, TargetProfile};
+use super::padding::{self, PaddingProfile};
 use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
 
@@ -39,7 +39,7 @@ pub(crate) const OVERSIZE_DETECT_EXTRA: usize = 1;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Obfuscation {
     pub key: [u8; KEY_LEN],
-    pub profile: Option<TargetProfile>,
+    pub profile: Option<PaddingProfile>,
 }
 
 /// A read half that strips the 24-byte nonce, chacha20-decrypts the rest,
@@ -355,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn a_profile_pads_every_datagram_to_the_target_band() {
         let (a, mut b) = socket_pair().await;
-        let profile = TargetProfile {
+        let profile = PaddingProfile::Random {
             mode: 200,
             spread: 50,
         };
@@ -387,9 +387,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_fixed_profile_pads_every_datagram_to_the_same_size() {
+        let (a, mut b) = socket_pair().await;
+        let profile = PaddingProfile::Fixed(200);
+        let settings = Obfuscation {
+            key: [7; KEY_LEN],
+            profile: Some(profile),
+        };
+        let mut write = ObfuscatedWrite::new(a, settings);
+        let mut read = ObfuscatedRead::new(b.clone(), settings);
+        // Small payloads are padded to exactly the fixed size.
+        let mut sizes = Vec::new();
+        for _ in 0..16 {
+            write.send(b"tiny").await.unwrap();
+            let mut wire = [0u8; 1024];
+            let n = b.recv(&mut wire).await.unwrap();
+            sizes.push(n);
+        }
+        assert!(
+            sizes.iter().all(|&n| n == NONCE_LEN + 200),
+            "padded wire sizes must all be the fixed size, got {sizes:?}"
+        );
+        // The payload still round-trips through the padded wrapper.
+        write.send(b"round trip").await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = read.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"round trip");
+    }
+
+    #[tokio::test]
     async fn a_profile_never_shrinks_a_large_payload() {
         let (a, mut b) = socket_pair().await;
-        let profile = TargetProfile {
+        let profile = PaddingProfile::Random {
             mode: 100,
             spread: 20,
         };

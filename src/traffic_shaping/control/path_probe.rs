@@ -86,7 +86,7 @@ pub const MAX_OBFUSCATED_PROBE_LEN: usize =
 pub fn encode_probe_obfuscated(
     echo: ProbeEcho,
     key: [u8; crate::obfuscate::KEY_LEN],
-    profile: Option<padding::TargetProfile>,
+    profile: Option<padding::PaddingProfile>,
     out: &mut Vec<u8>,
 ) {
     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
@@ -132,7 +132,7 @@ pub fn encode_probe_obfuscated(
 pub fn decode_echo_obfuscated(
     datagram: &[u8],
     key: [u8; crate::obfuscate::KEY_LEN],
-    profile: Option<padding::TargetProfile>,
+    profile: Option<padding::PaddingProfile>,
 ) -> Option<ProbeEcho> {
     // The wire length bounds follow the profile: the padded format carries
     // a length prefix, the historical format does not.
@@ -242,13 +242,13 @@ pub(crate) struct ProbeResponder {
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     /// The padding profile, fixed at listener construction; the dispatch
     /// strips the length prefix and padding only when it is set.
-    profile: Option<crate::obfuscate::padding::TargetProfile>,
+    profile: Option<crate::obfuscate::padding::PaddingProfile>,
 }
 impl ProbeResponder {
     pub(crate) fn new(
         echo: Option<std::net::UdpSocket>,
         key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-        profile: Option<crate::obfuscate::padding::TargetProfile>,
+        profile: Option<crate::obfuscate::padding::PaddingProfile>,
     ) -> Self {
         Self {
             echo,
@@ -387,7 +387,7 @@ pub struct EchoDemux {
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     /// The padding profile; obfuscated probes use the length-prefixed
     /// format only when it is set.
-    profile: Option<crate::obfuscate::padding::TargetProfile>,
+    profile: Option<crate::obfuscate::padding::PaddingProfile>,
     /// Reused scratch for encoding obfuscated probes.
     scratch: Vec<u8>,
 }
@@ -418,7 +418,7 @@ pub(crate) fn client_echo_demux<R: UnreliableRead>(
     socket: Arc<tokio_udp::UdpSocket>,
     read: R,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    profile: Option<crate::obfuscate::padding::TargetProfile>,
+    profile: Option<crate::obfuscate::padding::PaddingProfile>,
 ) -> (EchoDemux, EchoInterceptRead<R>) {
     let (echo_tx, echoes) = tokio::sync::mpsc::channel(64);
     let dropped_echoes = Arc::new(AtomicUsize::new(0));
@@ -495,8 +495,8 @@ mod tests {
 
     use std::time::Duration;
 
-    fn test_profile() -> Option<crate::obfuscate::padding::TargetProfile> {
-        Some(crate::obfuscate::padding::TargetProfile {
+    fn test_profile() -> Option<crate::obfuscate::padding::PaddingProfile> {
+        Some(crate::obfuscate::padding::PaddingProfile::Random {
             mode: 200,
             spread: 50,
         })
