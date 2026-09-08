@@ -90,7 +90,10 @@ impl<K: DispatchKey> Listener<K> {
             write,
             config
                 .obfuscation_key
-                .map(|key| crate::obfuscate::Obfuscation { key, profile: None }),
+                .map(|key| crate::obfuscate::Obfuscation {
+                    key,
+                    settings: None,
+                }),
         );
         let mss = if config.obfuscation_key.is_some() {
             config.mss.resolve()?.reduced_for_obfuscation()?
@@ -171,7 +174,10 @@ impl<K: DispatchKey> Connector<K> {
             write,
             config
                 .obfuscation_key
-                .map(|key| crate::obfuscate::Obfuscation { key, profile: None }),
+                .map(|key| crate::obfuscate::Obfuscation {
+                    key,
+                    settings: None,
+                }),
         );
         let mss = if config.obfuscation_key.is_some() {
             config.mss.resolve().ok()?.reduced_for_obfuscation().ok()?

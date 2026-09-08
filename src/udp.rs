@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-pub use crate::obfuscate::padding::PaddingProfile;
+pub use crate::obfuscate::padding::{PaddingSettings, PayloadSized, RandomKind, TargetKind};
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
@@ -140,10 +140,11 @@ pub struct ListenerConfig {
     /// in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     /// When set (with an obfuscation key), every datagram is padded to a
-    /// target size chosen by this profile: a fixed size ([`PaddingProfile::Fixed`])
-    /// or a random draw ([`PaddingProfile::Random`]). The peer must use the
-    /// same profile. `None` (the default) sends datagrams unpadded.
-    pub padding_profile: Option<crate::obfuscate::padding::PaddingProfile>,
+    /// target size chosen by these settings: a fixed size
+    /// ([`PaddingSettings::target`] = [`TargetKind::Fixed`]) or a random
+    /// draw ([`TargetKind::Random`]). The peer must use the same settings.
+    /// `None` (the default) sends datagrams unpadded.
+    pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 
 #[derive(Debug)]
@@ -160,7 +161,7 @@ pub struct Listener {
     /// The padding profile for this listener, fixed at construction (see
     /// [`ListenerConfig`]); the accepted connections' write halves pad with
     /// it.
-    profile: Option<crate::obfuscate::padding::PaddingProfile>,
+    profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 impl Listener {
     /// Bind with the given settings (see [`ListenerConfig`]).
@@ -175,8 +176,12 @@ impl Listener {
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
-        let responder =
-            crate::path_probe::ProbeResponder::new(probe_echo_socket(&udp), key, profile);
+        let responder = crate::path_probe::ProbeResponder::new(
+            probe_echo_socket(&udp),
+            key,
+            crate::path_probe::probe_settings(),
+            profile,
+        );
         let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
             Arc::new(move |addr: &SocketAddr, mut packet: Packet| {
                 match responder.observe(addr, packet.as_mut()) {
@@ -364,13 +369,13 @@ pub struct AcceptConfig {
     /// [`ListenerConfig`], and the listener decrypts every datagram once at
     /// the dispatch.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// Padding profile for the [`crate::keyed_udp`] and [`crate::mpudp`]
-    /// accept paths (the single-path [`Listener`] takes its profile at
+    /// Padding settings for the [`crate::keyed_udp`] and [`crate::mpudp`]
+    /// accept paths (the single-path [`Listener`] takes its settings at
     /// [`Listener::bind`]). When set (with an obfuscation key), every
-    /// datagram is padded to a target size chosen by this profile: a fixed
-    /// size ([`PaddingProfile::Fixed`]) or a random draw
-    /// ([`PaddingProfile::Random`]).
-    pub padding_profile: Option<crate::obfuscate::padding::PaddingProfile>,
+    /// datagram is padded to a target size chosen by these settings: a
+    /// fixed size ([`TargetKind::Fixed`]) or a random draw
+    /// ([`TargetKind::Random`]).
+    pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 
 impl Default for AcceptConfig {
@@ -410,12 +415,12 @@ pub struct ConnectConfig<'a> {
     /// this key. Both peers must use the same key; `None` (the default)
     /// sends datagrams in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// Padding profile: when set (with an obfuscation key), every datagram
-    /// is padded to a target size chosen by this profile: a fixed size
-    /// ([`PaddingProfile::Fixed`]) or a random draw
-    /// ([`PaddingProfile::Random`]). Both peers must use the same profile;
-    /// `None` (the default) sends datagrams unpadded.
-    pub padding_profile: Option<crate::obfuscate::padding::PaddingProfile>,
+    /// Padding settings: when set (with an obfuscation key), every datagram
+    /// is padded to a target size chosen by these settings: a fixed size
+    /// ([`TargetKind::Fixed`]) or a random draw ([`TargetKind::Random`]).
+    /// Both peers must use the same settings; `None` (the default) sends
+    /// datagrams unpadded.
+    pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -484,7 +489,7 @@ async fn accept(
     raw_fd: MaybeRawFd,
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    profile: Option<crate::obfuscate::padding::PaddingProfile>,
+    profile: Option<crate::obfuscate::padding::PaddingSettings>,
 ) -> std::io::Result<Accepted> {
     let AcceptSetup {
         handshake,
@@ -510,7 +515,10 @@ async fn accept(
     let write: Box<dyn UnreliableWrite> = match key {
         Some(key) => Box::new(crate::obfuscate::ObfuscatedWrite::new(
             write,
-            crate::obfuscate::Obfuscation { key, profile },
+            crate::obfuscate::Obfuscation {
+                key,
+                settings: profile,
+            },
         )),
         None => Box::new(write),
     };
@@ -857,14 +865,14 @@ async fn connect_bound(
         Arc::clone(&udp),
         obfuscation_key.map(|key| crate::obfuscate::Obfuscation {
             key,
-            profile: padding_profile,
+            settings: padding_profile,
         }),
     );
     let (probe_tap, filtered_read) = crate::path_probe::client_echo_demux(
         Arc::clone(&udp),
         read,
         obfuscation_key,
-        padding_profile,
+        crate::path_probe::probe_settings(),
     );
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
@@ -1601,7 +1609,12 @@ mod tests {
                     timestamp_micros: 12345,
                 };
                 let mut wire = Vec::new();
-                crate::path_probe::encode_probe_obfuscated(probe, KEY, None, &mut wire);
+                crate::path_probe::encode_probe_obfuscated(
+                    probe,
+                    KEY,
+                    crate::path_probe::probe_settings(),
+                    &mut wire,
+                );
                 prober.send(&wire).await.unwrap();
                 let mut buf = [0u8; 64];
                 let n = tokio::time::timeout(std::time::Duration::from_secs(2), prober.recv(&mut buf))
@@ -1609,7 +1622,11 @@ mod tests {
                     .expect("obfuscated probe echo timed out")
                     .unwrap();
                 assert_eq!(
-                    crate::path_probe::decode_echo_obfuscated(&buf[..n], KEY, None),
+                    crate::path_probe::decode_echo_obfuscated(
+                        &buf[..n],
+                        KEY,
+                        crate::path_probe::probe_settings()
+                    ),
                     Some(probe),
                     "the obfuscated echo must decode back to the probe"
                 );

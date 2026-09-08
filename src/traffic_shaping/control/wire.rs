@@ -57,7 +57,13 @@ impl Packet {
         {
             return None;
         }
-        let core = super::padding::strip_padding(bytes)?;
+        let mut core = [0u8; PACKET_LEN];
+        let n = crate::obfuscate::padding::decode_plaintext(
+            bytes,
+            &mut core,
+            Some(super::padding::HANDSHAKE_DECODE_SETTINGS),
+        )?;
+        debug_assert_eq!(n, PACKET_LEN);
         Some(Self {
             kind: Kind::decode(core[KIND_OFFSET])?,
             nonce: u64::from_be_bytes(core[NONCE_OFFSET..].try_into().ok()?),
@@ -119,22 +125,15 @@ mod tests {
             "a {}-byte packet must not decode as an {PACKET_LEN}-byte packet",
             PACKET_LEN - 1
         );
-        // A 20-byte packet whose pad_len field does not match its length is
-        // rejected: pad_len=1 claims one padding byte but none follow.
-        let mut mismatched = valid.to_vec();
-        mismatched.extend_from_slice(&1u16.to_be_bytes());
+        // Any tail is padding: the core size is known, so a longer packet
+        // decodes as the core (the static payload-sized mode has no length
+        // field).
+        let mut padded = valid.to_vec();
+        padded.extend_from_slice(&[0xAB; 7]);
         assert_eq!(
-            Packet::decode(&mismatched),
-            None,
-            "a padded packet with a mismatched pad_len must be rejected"
-        );
-        // A 20-byte packet with pad_len=0 is a valid (zero-padded) packet.
-        let mut zero_padded = valid.to_vec();
-        zero_padded.extend_from_slice(&0u16.to_be_bytes());
-        assert_eq!(
-            Packet::decode(&zero_padded),
+            Packet::decode(&padded),
             Some(valid_packet()),
-            "a padded packet with pad_len=0 must decode"
+            "a padded packet must decode as the core"
         );
     }
 }

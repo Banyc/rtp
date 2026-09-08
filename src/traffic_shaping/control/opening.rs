@@ -299,7 +299,7 @@ fn timeout() -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::super::padding::PADDED_HEADER_LEN;
+    use super::super::wire::PACKET_LEN;
     use super::*;
     use crate::{
         codec,
@@ -413,7 +413,7 @@ mod tests {
         assert!(
             all_sizes
                 .iter()
-                .all(|&n| (PADDED_HEADER_LEN..=mss.max_padded_len()).contains(&n)),
+                .all(|&n| (PACKET_LEN..=mss.max_padded_len()).contains(&n)),
             "every handshake datagram must carry a padding tail, got sizes {all_sizes:?}"
         );
         let distinct: std::collections::HashSet<usize> = all_sizes.iter().copied().collect();
@@ -469,14 +469,11 @@ mod tests {
             };
             let encoded = packet.encode();
             assert_eq!(Packet::decode(&encoded), Some(packet));
-            // A padded packet with a mismatched pad_len is rejected; a
-            // zero-padded (pad_len=0) packet decodes.
-            let mut overlong = encoded.to_vec();
-            overlong.extend_from_slice(&1u16.to_be_bytes());
-            assert_eq!(Packet::decode(&overlong), None);
-            let mut zero_padded = encoded.to_vec();
-            zero_padded.extend_from_slice(&0u16.to_be_bytes());
-            assert_eq!(Packet::decode(&zero_padded), Some(packet));
+            // Static payload-sized mode: any tail is padding and is ignored,
+            // so a padded packet decodes to the same packet.
+            let mut padded = encoded.to_vec();
+            padded.extend_from_slice(&[0xAB; 8]);
+            assert_eq!(Packet::decode(&padded), Some(packet));
             assert!(!codec::in_cmd_space(encoded[0]));
             assert!(codec::decode(&encoded, &mut Vec::new(), None).is_err());
 

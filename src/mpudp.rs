@@ -143,7 +143,10 @@ async fn convert_conn(
         w,
         tuning
             .obfuscation_key
-            .map(|key| crate::obfuscate::Obfuscation { key, profile: None }),
+            .map(|key| crate::obfuscate::Obfuscation {
+                key,
+                settings: None,
+            }),
     );
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         r,

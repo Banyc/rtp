@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 
 use super::mask::{KEY_LEN, NONCE_LEN, apply_keystream};
-use super::padding::{self, PaddingProfile};
+use super::padding::{self, PaddingSettings};
 use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
 
@@ -35,11 +35,11 @@ use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
 pub(crate) const OVERSIZE_DETECT_EXTRA: usize = 1;
 
 /// The obfuscation settings for one transport half: the masking key and the
-/// padding profile (`None` = historical unpadded format).
+/// padding settings (`None` = historical unpadded format).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Obfuscation {
     pub key: [u8; KEY_LEN],
-    pub profile: Option<PaddingProfile>,
+    pub settings: Option<PaddingSettings>,
 }
 
 /// A read half that strips the 24-byte nonce, chacha20-decrypts the rest,
@@ -62,14 +62,14 @@ impl<R> ObfuscatedRead<R> {
     }
 
     fn ensure_scratch(&mut self, plaintext_capacity: usize) {
-        // The largest plaintext this wrapper can receive: the profile's max
+        // The largest plaintext this wrapper can receive: the settings' max
         // target (when padding) or the caller's buffer (when not). One byte
         // MORE so an oversized datagram is received (or truncated) to a
         // length that makes `decrypt_into`'s length check fire — without the
         // extra byte the socket would truncate an oversized datagram to
         // exactly the scratch size and the check would silently pass,
         // delivering truncated plaintext.
-        let max_plaintext = padding::max_plaintext(plaintext_capacity, self.settings.profile);
+        let max_plaintext = padding::max_plaintext(plaintext_capacity, self.settings.settings);
         let need = max_plaintext + NONCE_LEN + OVERSIZE_DETECT_EXTRA;
         if self.scratch.len() < need {
             self.scratch.resize(need, 0);
@@ -79,9 +79,9 @@ impl<R> ObfuscatedRead<R> {
     /// Decrypt the datagram in `self.scratch[..n]` into `buf`. Returns
     /// `InvalidData` when the datagram is not a valid obfuscated datagram
     /// (shorter than the nonce, or the payload is too large for `buf`); the
-    /// caller drops it and reads the next datagram. With a padding profile
+    /// caller drops it and reads the next datagram. With padding settings
     /// the plaintext is `[len u16][payload][padding]` and the length prefix
-    /// is read to strip the padding; without one the plaintext is the
+    /// is read to strip the padding; without them the plaintext is the
     /// payload alone (the historical format).
     fn decrypt_into(&mut self, buf: &mut [u8], n: usize) -> Result<usize, IoErr> {
         if n < NONCE_LEN {
@@ -92,7 +92,7 @@ impl<R> ObfuscatedRead<R> {
         // padding) and copy the payload out (the padding tail is discarded).
         apply_keystream(self.settings.key, nonce, &mut self.scratch[NONCE_LEN..n]);
         let plaintext = &self.scratch[NONCE_LEN..n];
-        padding::decode_plaintext(plaintext, buf, self.settings.profile)
+        padding::decode_plaintext(plaintext, buf, self.settings.settings)
             .ok_or_else(|| IoErr::from(std::io::ErrorKind::InvalidData))
     }
 }
@@ -129,7 +129,7 @@ impl<R: UnreliableRead> UnreliableRead for ObfuscatedRead<R> {
 }
 
 /// A write half that prefixes a 24-byte random nonce, chacha20-encrypts the
-/// rest, and pads the plaintext to a profile-drawn target size.
+/// rest, and pads the plaintext to a settings-drawn target size.
 #[derive(Debug)]
 pub(crate) struct ObfuscatedWrite<W> {
     inner: W,
@@ -151,12 +151,11 @@ impl<W> ObfuscatedWrite<W> {
 #[async_trait]
 impl<W: UnreliableWrite> UnreliableWrite for ObfuscatedWrite<W> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
-        // With a padding profile the plaintext is [len u16][payload]
-        // [padding] padded to a profile-drawn target (floored at the
-        // payload, never shrunk); without one the plaintext is the payload
+        // With padding settings the plaintext is [len u16][payload]
+        // [padding] padded to a settings-drawn target (floored at the
+        // payload, never shrunk); without them the plaintext is the payload
         // alone — the historical wire format.
-        let target = self.settings.profile.map_or(0, |p| p.draw());
-        let max_plaintext = padding::max_plaintext(buf.len(), self.settings.profile);
+        let max_plaintext = padding::max_plaintext(buf.len(), self.settings.settings);
         if self.scratch.len() < max_plaintext + NONCE_LEN {
             self.scratch.resize(max_plaintext + NONCE_LEN, 0);
         }
@@ -165,10 +164,7 @@ impl<W: UnreliableWrite> UnreliableWrite for ObfuscatedWrite<W> {
         let plaintext_len = padding::encode_plaintext(
             buf,
             &mut self.scratch[NONCE_LEN..NONCE_LEN + max_plaintext],
-            padding::PadSettings {
-                profile: self.settings.profile,
-                target,
-            },
+            self.settings.settings,
         );
         apply_keystream(
             self.settings.key,
@@ -201,13 +197,14 @@ pub(crate) fn maybe_wrap<R: UnreliableRead, W: UnreliableWrite>(
 
 #[cfg(test)]
 mod tests {
+    use super::padding::{PayloadSized, RandomKind, TargetKind};
     use super::*;
     use tokio::net::UdpSocket;
 
     fn settings() -> Obfuscation {
         Obfuscation {
             key: [7; KEY_LEN],
-            profile: None,
+            settings: None,
         }
     }
 
@@ -275,7 +272,7 @@ mod tests {
             a2,
             Obfuscation {
                 key: [9; KEY_LEN],
-                profile: None,
+                settings: None,
             },
         );
         let mut write3 = ObfuscatedWrite::new(b2.clone(), settings());
@@ -283,7 +280,7 @@ mod tests {
             b2,
             Obfuscation {
                 key: [9; KEY_LEN],
-                profile: None,
+                settings: None,
             },
         );
         write3.send(b"wrong key").await.unwrap();
@@ -355,13 +352,16 @@ mod tests {
     #[tokio::test]
     async fn a_profile_pads_every_datagram_to_the_target_band() {
         let (a, mut b) = socket_pair().await;
-        let profile = PaddingProfile::Random {
-            mode: 200,
-            spread: 50,
-        };
         let settings = Obfuscation {
             key: [7; KEY_LEN],
-            profile: Some(profile),
+            settings: Some(PaddingSettings {
+                target: TargetKind::Random {
+                    kind: RandomKind::Triangular,
+                    mode: 200,
+                    spread: 50,
+                },
+                payload_sized: PayloadSized::Dynamic,
+            }),
         };
         let mut write = ObfuscatedWrite::new(a, settings);
         let mut read = ObfuscatedRead::new(b.clone(), settings);
@@ -389,10 +389,12 @@ mod tests {
     #[tokio::test]
     async fn a_fixed_profile_pads_every_datagram_to_the_same_size() {
         let (a, mut b) = socket_pair().await;
-        let profile = PaddingProfile::Fixed(200);
         let settings = Obfuscation {
             key: [7; KEY_LEN],
-            profile: Some(profile),
+            settings: Some(PaddingSettings {
+                target: TargetKind::Fixed(200),
+                payload_sized: PayloadSized::Dynamic,
+            }),
         };
         let mut write = ObfuscatedWrite::new(a, settings);
         let mut read = ObfuscatedRead::new(b.clone(), settings);
@@ -418,15 +420,18 @@ mod tests {
     #[tokio::test]
     async fn a_profile_never_shrinks_a_large_payload() {
         let (a, mut b) = socket_pair().await;
-        let profile = PaddingProfile::Random {
-            mode: 100,
-            spread: 20,
-        };
         let mut write = ObfuscatedWrite::new(
             a,
             Obfuscation {
                 key: [7; KEY_LEN],
-                profile: Some(profile),
+                settings: Some(PaddingSettings {
+                    target: TargetKind::Random {
+                        kind: RandomKind::Triangular,
+                        mode: 100,
+                        spread: 20,
+                    },
+                    payload_sized: PayloadSized::Dynamic,
+                }),
             },
         );
         // A payload larger than the profile band is sent at its natural size

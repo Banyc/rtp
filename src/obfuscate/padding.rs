@@ -1,113 +1,175 @@
-//! The obfuscated-plaintext padding format: `[len u16][payload][padding]`
-//! when a padding profile is set, `[payload]` otherwise. The real payload
-//! length rides inside the ciphertext so a datagram can be padded to a
-//! target size without a wire length field; the padding is zero-filled and
-//! the chacha20 keystream randomizes it on the wire.
+//! The obfuscated-plaintext padding format. The wire format is
+//! `[len u16][payload][padding]` when the payload size is unknown to the
+//! receiver (dynamic), `[payload][padding]` when it is known (static), and
+//! `[payload]` when unpadded. The real payload length rides inside the
+//! ciphertext (dynamic) or is implied by the protocol (static); the
+//! padding is zero-filled and the chacha20 keystream randomizes it on the
+//! wire.
+//!
+//! All padding options (the target policy and the payload-sized mode) and
+//! actions (draw, encode, decode) live here; every user in the crate
+//! passes a [`PaddingSettings`] to the encode/decode functions.
 
 /// The length-prefix size (u16) inside the obfuscated plaintext.
 pub(crate) const LEN_LEN: usize = 2;
 
-/// The padding policy for datagrams: how the target plaintext size is
-/// chosen for each datagram.
+/// The random draw shape for a random target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaddingProfile {
-    /// Pad every datagram to exactly this size (a payload larger than the
-    /// target is sent at its natural size — never shrunk).
+pub enum RandomKind {
+    /// Uniform in `[mode - spread, mode + spread]`.
+    Uniform,
+    /// Triangular peaked at `mode`, falling to zero at `mode ± spread`.
+    Triangular,
+}
+
+/// How the target plaintext size is chosen for each datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// Pad every datagram to exactly this size.
     Fixed(usize),
-    /// Pad every datagram to a random size drawn from a triangular
-    /// distribution peaked at `mode` and falling to zero at `mode ± spread`.
-    /// The draw is independent of the traffic, so the wire size
-    /// distribution converges to one mode without any traffic-correlated
-    /// feedback.
-    Random { mode: usize, spread: usize },
+    /// Pad every datagram to a random size.
+    Random {
+        kind: RandomKind,
+        mode: usize,
+        spread: usize,
+    },
 }
 
-impl PaddingProfile {
-    /// Draw a target size for one datagram: the fixed size, or a triangular
-    /// draw around `mode` in `[mode - spread, mode + spread]` (the
-    /// difference of two uniforms is triangular).
+/// Whether the payload size is known to the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadSized {
+    /// Known payload size: the wire format is `[payload][padding]` with
+    /// no length field.
+    Static,
+    /// Unknown payload size: the wire format is `[len u16][payload]
+    /// [padding]` with a length field.
+    Dynamic,
+}
+
+/// The padding settings for one encode/decode: the target policy and the
+/// payload-sized mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaddingSettings {
+    pub target: TargetKind,
+    pub payload_sized: PayloadSized,
+}
+
+impl PaddingSettings {
+    /// Draw a target size for one datagram: the fixed size, a uniform draw
+    /// in `[mode - spread, mode + spread]`, or a triangular draw peaked at
+    /// `mode` (the difference of two uniforms is triangular).
     pub fn draw(&self) -> usize {
-        match self {
-            Self::Fixed(size) => *size,
-            Self::Random { mode, spread } => {
-                let u = rand::random_range(0..=*spread) as isize;
-                let v = rand::random_range(0..=*spread) as isize;
-                (*mode as isize + u - v).max(0) as usize
-            }
+        match self.target {
+            TargetKind::Fixed(size) => size,
+            TargetKind::Random { kind, mode, spread } => match kind {
+                RandomKind::Uniform => {
+                    let lo = mode.saturating_sub(spread);
+                    let hi = mode + spread;
+                    rand::random_range(lo..=hi)
+                }
+                RandomKind::Triangular => {
+                    let u = rand::random_range(0..=spread) as isize;
+                    let v = rand::random_range(0..=spread) as isize;
+                    (mode as isize + u - v).max(0) as usize
+                }
+            },
         }
     }
 
-    /// The largest target size the profile can draw.
+    /// The largest target size the settings can draw.
     pub fn max(&self) -> usize {
-        match self {
-            Self::Fixed(size) => *size,
-            Self::Random { mode, spread } => mode + spread,
+        match self.target {
+            TargetKind::Fixed(size) => size,
+            TargetKind::Random { mode, spread, .. } => mode + spread,
         }
     }
-}
-
-/// The padding decision for one plaintext: the profile (policy) and the
-/// target plaintext size to pad to (drawn by the caller). `profile` is
-/// `None` for the historical unpadded format.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PadSettings {
-    pub profile: Option<PaddingProfile>,
-    pub target: usize,
 }
 
 /// The largest plaintext a datagram can carry for a caller buffer of
-/// `plaintext_capacity`: the profile's max target (when padding) or the
+/// `plaintext_capacity`: the settings' max target (when padding) or the
 /// buffer alone (when not). Callers size their buffers to this.
-pub(crate) fn max_plaintext(plaintext_capacity: usize, profile: Option<PaddingProfile>) -> usize {
-    match profile {
-        Some(profile) => profile.max().max(plaintext_capacity + LEN_LEN),
+pub(crate) fn max_plaintext(plaintext_capacity: usize, settings: Option<PaddingSettings>) -> usize {
+    match settings {
+        Some(settings) => {
+            let payload_plus_header = match settings.payload_sized {
+                PayloadSized::Dynamic => plaintext_capacity + LEN_LEN,
+                PayloadSized::Static => plaintext_capacity,
+            };
+            settings.max().max(payload_plus_header)
+        }
         None => plaintext_capacity,
     }
 }
 
 /// Encode `payload` as the obfuscated plaintext into `out` (which must be
 /// sized to at least [`max_plaintext`]): `[len u16][payload][zero padding]`
-/// padded to the target (floored at the payload, never shrunk) when a
-/// profile is set, or the payload alone otherwise. Returns the plaintext
-/// length.
-pub(crate) fn encode_plaintext(payload: &[u8], out: &mut [u8], settings: PadSettings) -> usize {
-    let plaintext_len = match settings.profile {
-        Some(_) => settings.target.max(payload.len() + LEN_LEN),
-        None => payload.len(),
-    };
-    let mut pos = 0;
-    if settings.profile.is_some() {
-        out[..LEN_LEN].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-        pos = LEN_LEN;
+/// (dynamic) or `[payload][zero padding]` (static), padded to a drawn
+/// target (floored at the payload, never shrunk) when settings are given,
+/// or the payload alone otherwise. Returns the plaintext length.
+pub(crate) fn encode_plaintext(
+    payload: &[u8],
+    out: &mut [u8],
+    settings: Option<PaddingSettings>,
+) -> usize {
+    match settings {
+        Some(settings) => {
+            let target = settings.draw();
+            let header_len = match settings.payload_sized {
+                PayloadSized::Dynamic => LEN_LEN,
+                PayloadSized::Static => 0,
+            };
+            let plaintext_len = target.max(payload.len() + header_len);
+            let mut pos = 0;
+            if settings.payload_sized == PayloadSized::Dynamic {
+                out[..LEN_LEN].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                pos = LEN_LEN;
+            }
+            out[pos..pos + payload.len()].copy_from_slice(payload);
+            // Zero the padding tail explicitly (the buffer is reused, so
+            // stale bytes from a previous send must not leak into the
+            // padding).
+            out[pos + payload.len()..plaintext_len].fill(0);
+            plaintext_len
+        }
+        None => {
+            out[..payload.len()].copy_from_slice(payload);
+            payload.len()
+        }
     }
-    out[pos..pos + payload.len()].copy_from_slice(payload);
-    // Zero the padding tail explicitly (the buffer is reused, so stale bytes
-    // from a previous send must not leak into the padding).
-    out[pos + payload.len()..plaintext_len].fill(0);
-    plaintext_len
 }
 
 /// Decode the obfuscated plaintext `plaintext` into `buf`: read the length
-/// prefix (when padding), strip the padding, and copy the payload out.
-/// Returns the payload length, or `None` when the plaintext is not valid
-/// (shorter than the length prefix, or the payload is too large for `buf`).
+/// prefix (dynamic), strip the padding, and copy the payload out. Returns
+/// the payload length, or `None` when the plaintext is not valid (shorter
+/// than the length prefix, or the payload is too large for `buf`).
 pub(crate) fn decode_plaintext(
     plaintext: &[u8],
     buf: &mut [u8],
-    profile: Option<PaddingProfile>,
+    settings: Option<PaddingSettings>,
 ) -> Option<usize> {
-    match profile {
-        Some(_) => {
-            if plaintext.len() < LEN_LEN {
-                return None;
+    match settings {
+        Some(settings) => match settings.payload_sized {
+            PayloadSized::Dynamic => {
+                if plaintext.len() < LEN_LEN {
+                    return None;
+                }
+                let len = u16::from_be_bytes(plaintext[..LEN_LEN].try_into().unwrap()) as usize;
+                if len > buf.len() || LEN_LEN + len > plaintext.len() {
+                    return None;
+                }
+                buf[..len].copy_from_slice(&plaintext[LEN_LEN..LEN_LEN + len]);
+                Some(len)
             }
-            let len = u16::from_be_bytes(plaintext[..LEN_LEN].try_into().unwrap()) as usize;
-            if len > buf.len() || LEN_LEN + len > plaintext.len() {
-                return None;
+            PayloadSized::Static => {
+                // The payload size is known: the caller's buffer is the
+                // payload size.
+                if plaintext.len() < buf.len() {
+                    return None;
+                }
+                buf.copy_from_slice(&plaintext[..buf.len()]);
+                Some(buf.len())
             }
-            buf[..len].copy_from_slice(&plaintext[LEN_LEN..LEN_LEN + len]);
-            Some(len)
-        }
+        },
         None => {
             if plaintext.len() > buf.len() {
                 return None;
@@ -119,26 +181,35 @@ pub(crate) fn decode_plaintext(
 }
 
 /// Decode the obfuscated plaintext in `buf[..n]` in place: read the length
-/// prefix (when padding), strip the padding, and move the payload to the
-/// front. Returns the payload length, or `None` when the plaintext is not
-/// valid.
+/// prefix (dynamic), strip the padding, and move the payload to the front.
+/// Returns the payload length, or `None` when the plaintext is not valid.
 pub(crate) fn decode_plaintext_in_place(
     buf: &mut [u8],
     n: usize,
-    profile: Option<PaddingProfile>,
+    settings: Option<PaddingSettings>,
 ) -> Option<usize> {
-    match profile {
-        Some(_) => {
-            if n < LEN_LEN {
-                return None;
+    match settings {
+        Some(settings) => match settings.payload_sized {
+            PayloadSized::Dynamic => {
+                if n < LEN_LEN {
+                    return None;
+                }
+                let len = u16::from_be_bytes(buf[..LEN_LEN].try_into().unwrap()) as usize;
+                if LEN_LEN + len > n {
+                    return None;
+                }
+                buf.copy_within(LEN_LEN..LEN_LEN + len, 0);
+                Some(len)
             }
-            let len = u16::from_be_bytes(buf[..LEN_LEN].try_into().unwrap()) as usize;
-            if LEN_LEN + len > n {
-                return None;
+            PayloadSized::Static => {
+                // The payload size is known: the caller's buffer is the
+                // payload size.
+                if n < buf.len() {
+                    return None;
+                }
+                Some(buf.len())
             }
-            buf.copy_within(LEN_LEN..LEN_LEN + len, 0);
-            Some(len)
-        }
+        },
         None => Some(n),
     }
 }
@@ -147,27 +218,50 @@ pub(crate) fn decode_plaintext_in_place(
 mod tests {
     use super::*;
 
-    fn profile() -> PaddingProfile {
-        PaddingProfile::Random {
-            mode: 200,
-            spread: 50,
+    fn triangular() -> PaddingSettings {
+        PaddingSettings {
+            target: TargetKind::Random {
+                kind: RandomKind::Triangular,
+                mode: 200,
+                spread: 50,
+            },
+            payload_sized: PayloadSized::Dynamic,
+        }
+    }
+
+    fn uniform() -> PaddingSettings {
+        PaddingSettings {
+            target: TargetKind::Random {
+                kind: RandomKind::Uniform,
+                mode: 200,
+                spread: 50,
+            },
+            payload_sized: PayloadSized::Dynamic,
         }
     }
 
     #[test]
-    fn encode_decode_round_trips_with_and_without_a_profile() {
+    fn encode_decode_round_trips_with_and_without_settings() {
         let payload = b"hello";
-        let mut buf = [0u8; 512];
-        for (profile, target) in [
-            (None, 0),
-            (Some(profile()), 200),
-            (Some(PaddingProfile::Fixed(300)), 300),
+        for settings in [
+            None,
+            Some(triangular()),
+            Some(PaddingSettings {
+                target: TargetKind::Fixed(300),
+                payload_sized: PayloadSized::Dynamic,
+            }),
+            Some(PaddingSettings {
+                target: TargetKind::Fixed(300),
+                payload_sized: PayloadSized::Static,
+            }),
         ] {
-            let settings = PadSettings { profile, target };
-            let mut plaintext = vec![0u8; max_plaintext(payload.len(), profile)];
+            let mut plaintext = vec![0u8; max_plaintext(payload.len(), settings)];
             let n = encode_plaintext(payload, &mut plaintext, settings);
+            // Static mode treats the decode buffer as the payload size, so
+            // decode into a buffer of exactly the payload size.
+            let mut buf = vec![0u8; payload.len()];
             assert_eq!(
-                decode_plaintext(&plaintext[..n], &mut buf, profile),
+                decode_plaintext(&plaintext[..n], &mut buf, settings),
                 Some(payload.len())
             );
             assert_eq!(&buf[..payload.len()], payload);
@@ -176,18 +270,14 @@ mod tests {
 
     #[test]
     fn a_profile_pads_to_the_target_and_never_shrinks() {
-        let profile = profile();
+        let settings = triangular();
         let payload = b"tiny";
-        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(profile))];
-        let n = encode_plaintext(
-            payload,
-            &mut plaintext,
-            PadSettings {
-                profile: Some(profile),
-                target: 200,
-            },
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
+        let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+        assert!(
+            (150..=250).contains(&n),
+            "a triangular draw must land in the band, got {n}"
         );
-        assert_eq!(n, 200);
         assert_eq!(&plaintext[..LEN_LEN], &(payload.len() as u16).to_be_bytes());
         assert_eq!(&plaintext[LEN_LEN..LEN_LEN + payload.len()], payload);
         assert!(
@@ -198,32 +288,21 @@ mod tests {
         // A payload larger than the target is sent at its natural size (plus
         // the length prefix) — never shrunk.
         let big = vec![0xAB; 300];
-        let mut out = vec![0u8; max_plaintext(big.len(), Some(profile))];
-        let n = encode_plaintext(
-            &big,
-            &mut out,
-            PadSettings {
-                profile: Some(profile),
-                target: 200,
-            },
-        );
+        let mut out = vec![0u8; max_plaintext(big.len(), Some(settings))];
+        let n = encode_plaintext(&big, &mut out, Some(settings));
         assert_eq!(n, big.len() + LEN_LEN);
     }
 
     #[test]
     fn a_fixed_profile_pads_every_datagram_to_the_same_size() {
-        let profile = PaddingProfile::Fixed(250);
+        let settings = PaddingSettings {
+            target: TargetKind::Fixed(250),
+            payload_sized: PayloadSized::Dynamic,
+        };
         let payload = b"tiny";
-        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(profile))];
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
         for _ in 0..16 {
-            let n = encode_plaintext(
-                payload,
-                &mut plaintext,
-                PadSettings {
-                    profile: Some(profile),
-                    target: profile.draw(),
-                },
-            );
+            let n = encode_plaintext(payload, &mut plaintext, Some(settings));
             assert_eq!(n, 250, "every datagram must pad to the fixed size");
         }
         assert_eq!(&plaintext[..LEN_LEN], &(payload.len() as u16).to_be_bytes());
@@ -236,46 +315,80 @@ mod tests {
         // A payload larger than the fixed size is sent at its natural size
         // (plus the length prefix) — never shrunk.
         let big = vec![0xAB; 300];
-        let mut out = vec![0u8; max_plaintext(big.len(), Some(profile))];
-        let n = encode_plaintext(
-            &big,
-            &mut out,
-            PadSettings {
-                profile: Some(profile),
-                target: profile.draw(),
-            },
-        );
+        let mut out = vec![0u8; max_plaintext(big.len(), Some(settings))];
+        let n = encode_plaintext(&big, &mut out, Some(settings));
         assert_eq!(n, big.len() + LEN_LEN);
+    }
+
+    #[test]
+    fn static_mode_carries_no_length_field() {
+        let settings = PaddingSettings {
+            target: TargetKind::Fixed(250),
+            payload_sized: PayloadSized::Static,
+        };
+        let payload = b"hello";
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
+        let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+        assert_eq!(n, 250);
+        // The payload is at the front with no length prefix.
+        assert_eq!(&plaintext[..payload.len()], payload);
+        assert!(
+            plaintext[payload.len()..n].iter().all(|&b| b == 0),
+            "the padding tail must be zero-filled"
+        );
+        // The decode reads the known payload size from the front.
+        let mut buf = [0u8; 5];
+        assert_eq!(
+            decode_plaintext(&plaintext[..n], &mut buf, Some(settings)),
+            Some(payload.len())
+        );
+        assert_eq!(&buf, payload);
+        // A plaintext shorter than the known payload size is rejected.
+        assert_eq!(
+            decode_plaintext(&plaintext[..4], &mut buf, Some(settings)),
+            None
+        );
     }
 
     #[test]
     fn decode_rejects_an_invalid_plaintext() {
         let payload = b"hello";
         let mut buf = [0u8; 4];
-        // Without a profile, a payload larger than the buffer is rejected.
+        // Without settings, a payload larger than the buffer is rejected.
         let mut plaintext = vec![0u8; payload.len()];
         plaintext.copy_from_slice(payload);
         assert_eq!(decode_plaintext(&plaintext, &mut buf, None), None);
-        // With a profile, a plaintext shorter than the length prefix is
-        // rejected.
-        assert_eq!(decode_plaintext(&[0x00], &mut buf, Some(profile())), None);
+        // With dynamic settings, a plaintext shorter than the length prefix
+        // is rejected.
+        assert_eq!(
+            decode_plaintext(&[0x00], &mut buf, Some(triangular())),
+            None
+        );
     }
 
     #[test]
     fn in_place_decode_moves_the_payload_to_the_front() {
-        let profile = profile();
+        let settings = triangular();
         let payload = b"hello";
-        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(profile))];
-        let n = encode_plaintext(
-            payload,
-            &mut plaintext,
-            PadSettings {
-                profile: Some(profile),
-                target: 200,
-            },
-        );
-        let len = decode_plaintext_in_place(&mut plaintext, n, Some(profile)).unwrap();
+        let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
+        let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+        let len = decode_plaintext_in_place(&mut plaintext, n, Some(settings)).unwrap();
         assert_eq!(len, payload.len());
         assert_eq!(&plaintext[..len], payload);
+    }
+
+    #[test]
+    fn uniform_and_triangular_draws_cover_the_band() {
+        for settings in [uniform(), triangular()] {
+            let mut sizes = std::collections::HashSet::new();
+            for _ in 0..256 {
+                sizes.insert(settings.draw());
+            }
+            assert!(
+                sizes.iter().all(|&n| (150..=250).contains(&n)),
+                "draws must stay in the band, got {sizes:?}"
+            );
+            assert!(sizes.len() > 1, "draws must vary, got {sizes:?}");
+        }
     }
 }
