@@ -287,17 +287,19 @@ impl ProbeResponder {
                     // [nonce][core flipped].
                     let total = match self.profile {
                         Some(_) => datagram.len(),
-                        None => crate::obfuscate::NONCE_LEN + probe_len,
+                        None => crate::obfuscate::NONCE_LEN + PROBE_LEN,
                     };
-                    // Flip the direction in a stack copy of the core, then
-                    // encode the reply plaintext and encrypt in place.
+                    // Flip the direction in a stack copy of the core (the
+                    // first PROBE_LEN bytes; a malformed probe's extra tail
+                    // is dropped), then encode the reply plaintext and
+                    // encrypt in place.
                     let mut core = [0u8; PROBE_LEN];
-                    core[..probe_len].copy_from_slice(&datagram[..probe_len]);
+                    core.copy_from_slice(&datagram[..PROBE_LEN]);
                     core[DIR_OFFSET] = DIR_ECHO;
                     let nonce: [u8; crate::obfuscate::NONCE_LEN] = rand::random();
                     datagram[..crate::obfuscate::NONCE_LEN].copy_from_slice(&nonce);
                     let plaintext_len = padding::encode_plaintext(
-                        &core[..probe_len],
+                        &core,
                         &mut datagram[crate::obfuscate::NONCE_LEN..total],
                         padding::PadSettings {
                             profile: self.profile,
