@@ -197,7 +197,7 @@ pub(crate) fn maybe_wrap<R: UnreliableRead, W: UnreliableWrite>(
 
 #[cfg(test)]
 mod tests {
-    use super::padding::{PayloadSized, TargetKind};
+    use super::padding::TargetKind;
     use super::*;
     use tokio::net::UdpSocket;
 
@@ -354,7 +354,7 @@ mod tests {
         let (a, mut b) = socket_pair().await;
         let settings = Obfuscation {
             key: [7; KEY_LEN],
-            settings: Some(PaddingSettings::data_channel(TargetKind::Triangular {
+            settings: Some(PaddingSettings::dynamic_target(TargetKind::Triangular {
                 mode: 200,
                 spread: 50,
             })),
@@ -387,7 +387,7 @@ mod tests {
         let (a, mut b) = socket_pair().await;
         let settings = Obfuscation {
             key: [7; KEY_LEN],
-            settings: Some(PaddingSettings::data_channel(TargetKind::Fixed(200))),
+            settings: Some(PaddingSettings::dynamic_target(TargetKind::Fixed(200))),
         };
         let mut write = ObfuscatedWrite::new(a, settings);
         let mut read = ObfuscatedRead::new(b.clone(), settings);
@@ -417,7 +417,7 @@ mod tests {
             a,
             Obfuscation {
                 key: [7; KEY_LEN],
-                settings: Some(PaddingSettings::data_channel(TargetKind::Triangular {
+                settings: Some(PaddingSettings::dynamic_target(TargetKind::Triangular {
                     mode: 100,
                     spread: 20,
                 })),

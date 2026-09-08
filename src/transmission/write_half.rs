@@ -632,7 +632,6 @@ mod tests {
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
     use crate::transmission::watchdog_tuning::WatchdogTuning;
-    use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 

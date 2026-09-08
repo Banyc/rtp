@@ -49,11 +49,12 @@ pub struct PaddingSettings {
 }
 
 impl PaddingSettings {
-    /// The data channel's padding settings: the receiver never knows the
-    /// payload size (the reliable layer's segments vary), so the dynamic
-    /// payload-sized mode is the only option — a static mode would treat the
-    /// decode buffer as the payload size and drop every datagram.
-    pub const fn data_channel(target: TargetKind) -> Self {
+    /// Dynamic payload-sized settings: the payload size rides in a u16
+    /// prefix. The data channel's receiver never knows the payload size (the
+    /// reliable layer's segments vary), so this is the only public
+    /// constructor — a static data-channel setting is unrepresentable. Also
+    /// used by the probe channel and the probe echo.
+    pub const fn dynamic_target(target: TargetKind) -> Self {
         Self {
             target,
             payload_sized: PayloadSized::Dynamic,
@@ -67,15 +68,6 @@ impl PaddingSettings {
         Self {
             target,
             payload_sized: PayloadSized::Static,
-        }
-    }
-
-    /// Dynamic payload-sized settings: the payload size rides in a u16
-    /// prefix. Used by the probe channel and the probe echo.
-    pub(crate) const fn dynamic_target(target: TargetKind) -> Self {
-        Self {
-            target,
-            payload_sized: PayloadSized::Dynamic,
         }
     }
 
@@ -247,14 +239,14 @@ mod tests {
     use super::*;
 
     fn triangular() -> PaddingSettings {
-        PaddingSettings::data_channel(TargetKind::Triangular {
+        PaddingSettings::dynamic_target(TargetKind::Triangular {
             mode: 200,
             spread: 50,
         })
     }
 
     fn uniform() -> PaddingSettings {
-        PaddingSettings::data_channel(TargetKind::Uniform { lo: 150, hi: 250 })
+        PaddingSettings::dynamic_target(TargetKind::Uniform { lo: 150, hi: 250 })
     }
 
     #[test]
@@ -263,7 +255,7 @@ mod tests {
         for settings in [
             None,
             Some(triangular()),
-            Some(PaddingSettings::data_channel(TargetKind::Fixed(300))),
+            Some(PaddingSettings::dynamic_target(TargetKind::Fixed(300))),
             Some(PaddingSettings::static_target(TargetKind::Fixed(300))),
         ] {
             let mut plaintext = vec![0u8; max_plaintext(payload.len(), settings)];
@@ -306,7 +298,7 @@ mod tests {
 
     #[test]
     fn a_fixed_profile_pads_every_datagram_to_the_same_size() {
-        let settings = PaddingSettings::data_channel(TargetKind::Fixed(250));
+        let settings = PaddingSettings::dynamic_target(TargetKind::Fixed(250));
         let payload = b"tiny";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
         for _ in 0..16 {

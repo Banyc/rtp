@@ -1500,7 +1500,6 @@ pub enum DataPktPayload {
 #[cfg(test)]
 mod tests {
     use core::num::NonZeroU64;
-    use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
     use super::{
