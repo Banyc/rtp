@@ -127,7 +127,7 @@ async fn connect_udp(
 pub type AcceptTask = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Accepted>> + Send>>;
 
 /// Settings for [`Listener::bind`]: the datagram-obfuscation key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ListenerConfig {
     /// When set, every datagram is prefixed with a 24-byte random nonce and
     /// chacha20-encrypted with this key. The listener decrypts each datagram
@@ -147,20 +147,11 @@ pub struct ListenerConfig {
     /// standalone ACK datagrams are padded to a triangular-random target
     /// fitted from recent sent data-packet sizes, hiding ACKs among data
     /// packets from a passive DPI observer. Data packets are unpadded. The
-    /// default may be flipped to false based on the netem_test A/B perf
-    /// measurement (bulk throughput / interactive latency); both peers must
+    /// netem_test A/B (rtp_padding_bench) showed bulk throughput dropped
+    /// 15-45% on rate-limited links, so the default is opt-in (`false`);
+    /// interactive latency was not observably affected. Both peers must
     /// agree.
     pub ack_padding: bool,
-}
-
-impl Default for ListenerConfig {
-    fn default() -> Self {
-        Self {
-            obfuscation_key: None,
-            padding_profile: None,
-            ack_padding: true,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -408,8 +399,9 @@ pub struct AcceptConfig {
     /// standalone ACK datagrams are padded to a triangular-random target
     /// fitted from recent sent data-packet sizes, hiding ACKs among data
     /// packets from a passive DPI observer. Data packets are unpadded. The
-    /// default may be flipped to false based on the netem_test A/B perf
-    /// measurement (bulk throughput / interactive latency); both peers must
+    /// netem_test A/B (rtp_padding_bench) showed bulk throughput dropped
+    /// 15-45% on rate-limited links, so the default is opt-in (`false`);
+    /// interactive latency was not observably affected. Both peers must
     /// agree.
     pub ack_padding: bool,
 }
@@ -426,7 +418,7 @@ impl Default for AcceptConfig {
             metrics_observer: None,
             obfuscation_key: None,
             padding_profile: None,
-            ack_padding: true,
+            ack_padding: false,
         }
     }
 }
@@ -462,8 +454,9 @@ pub struct ConnectConfig<'a> {
     /// standalone ACK datagrams are padded to a triangular-random target
     /// fitted from recent sent data-packet sizes, hiding ACKs among data
     /// packets from a passive DPI observer. Data packets are unpadded. The
-    /// default may be flipped to false based on the netem_test A/B perf
-    /// measurement (bulk throughput / interactive latency); both peers must
+    /// netem_test A/B (rtp_padding_bench) showed bulk throughput dropped
+    /// 15-45% on rate-limited links, so the default is opt-in (`false`);
+    /// interactive latency was not observably affected. Both peers must
     /// agree.
     pub ack_padding: bool,
 }
@@ -483,7 +476,7 @@ impl<'a> Default for ConnectConfig<'a> {
             watchdog: None,
             obfuscation_key: None,
             padding_profile: None,
-            ack_padding: true,
+            ack_padding: false,
         }
     }
 }
