@@ -51,10 +51,15 @@ impl PaddingSettings {
     pub fn draw(&self) -> usize {
         match self.target {
             TargetKind::Fixed(size) => size,
-            TargetKind::Uniform { lo, hi } => rand::random_range(lo..=hi),
+            TargetKind::Uniform { lo, hi } => {
+                debug_assert!(lo <= hi, "uniform padding range must not be inverted");
+                rand::random_range(lo..=hi)
+            }
             TargetKind::Triangular { mode, spread } => {
                 let u = rand::random_range(0..=spread) as isize;
                 let v = rand::random_range(0..=spread) as isize;
+                // Clamped at zero: when `mode < spread` the lower tail is
+                // truncated (the draw is still bounded by `mode + spread`).
                 (mode as isize + u - v).max(0) as usize
             }
         }
@@ -106,6 +111,10 @@ pub(crate) fn encode_plaintext(
             let plaintext_len = target.max(payload.len() + header_len);
             let mut pos = 0;
             if settings.payload_sized == PayloadSized::Dynamic {
+                debug_assert!(
+                    payload.len() <= u16::MAX as usize,
+                    "the u16 length prefix cannot carry a payload larger than 65535 bytes"
+                );
                 out[..LEN_LEN].copy_from_slice(&(payload.len() as u16).to_be_bytes());
                 pos = LEN_LEN;
             }
