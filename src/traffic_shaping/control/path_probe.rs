@@ -129,13 +129,19 @@ pub fn decode_echo_obfuscated(
     {
         return None;
     }
+    if profile.is_none() && datagram.len() != crate::obfuscate::NONCE_LEN + PROBE_LEN {
+        return None;
+    }
     let nonce: [u8; crate::obfuscate::NONCE_LEN] =
         datagram[..crate::obfuscate::NONCE_LEN].try_into().ok()?;
-    let mut plaintext = vec![0u8; datagram.len() - crate::obfuscate::NONCE_LEN];
-    plaintext.copy_from_slice(&datagram[crate::obfuscate::NONCE_LEN..]);
-    crate::obfuscate::apply_keystream(key, nonce, &mut plaintext);
+    // Decrypt into a stack buffer: the length checks above bound the
+    // plaintext, so there is no per-call allocation.
+    let mut plaintext = [0u8; padding::LEN_LEN + MAX_PROBE_PLAINTEXT];
+    let plaintext_len = datagram.len() - crate::obfuscate::NONCE_LEN;
+    plaintext[..plaintext_len].copy_from_slice(&datagram[crate::obfuscate::NONCE_LEN..]);
+    crate::obfuscate::apply_keystream(key, nonce, &mut plaintext[..plaintext_len]);
     let mut core = [0u8; PROBE_LEN];
-    let len = padding::decode_plaintext(&plaintext, &mut core, profile)?;
+    let len = padding::decode_plaintext(&plaintext[..plaintext_len], &mut core, profile)?;
     if len != PROBE_LEN {
         return None;
     }
