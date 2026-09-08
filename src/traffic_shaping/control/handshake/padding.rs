@@ -12,7 +12,7 @@
 
 use super::wire::PACKET_LEN;
 use crate::mss::Mss;
-use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, TargetKind};
+use crate::obfuscate::padding::{self, PaddingSettings, TargetKind};
 
 /// Largest padding tail for an MSS: the padded packet may reach a full
 /// MSS-sized datagram.
@@ -24,22 +24,17 @@ pub(crate) const fn max_handshake_pad(mss: Mss) -> usize {
 /// MSS-derived range, static payload-sized (the core size is known to both
 /// sides, so no length field rides on the wire).
 pub(crate) fn handshake_settings(mss: Mss) -> PaddingSettings {
-    PaddingSettings {
-        target: TargetKind::Uniform {
-            lo: PACKET_LEN,
-            hi: PACKET_LEN + max_handshake_pad(mss),
-        },
-        payload_sized: PayloadSized::Static,
-    }
+    PaddingSettings::static_target(TargetKind::Uniform {
+        lo: PACKET_LEN,
+        hi: PACKET_LEN + max_handshake_pad(mss),
+    })
 }
 
 /// The handshake's decode settings: static payload-sized, so the decode
 /// reads the first `PACKET_LEN` bytes and ignores the padding tail. The
 /// target is irrelevant to the decode.
-pub(crate) const HANDSHAKE_DECODE_SETTINGS: PaddingSettings = PaddingSettings {
-    target: TargetKind::Fixed(0),
-    payload_sized: PayloadSized::Static,
-};
+pub(crate) const HANDSHAKE_DECODE_SETTINGS: PaddingSettings =
+    PaddingSettings::static_target(TargetKind::Fixed(0));
 
 /// Pad an 18-byte handshake packet with a random-length tail:
 /// `[core][random padding]` (static payload-sized). Writes into `out`

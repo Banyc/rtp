@@ -354,13 +354,10 @@ mod tests {
         let (a, mut b) = socket_pair().await;
         let settings = Obfuscation {
             key: [7; KEY_LEN],
-            settings: Some(PaddingSettings {
-                target: TargetKind::Triangular {
-                    mode: 200,
-                    spread: 50,
-                },
-                payload_sized: PayloadSized::Dynamic,
-            }),
+            settings: Some(PaddingSettings::data_channel(TargetKind::Triangular {
+                mode: 200,
+                spread: 50,
+            })),
         };
         let mut write = ObfuscatedWrite::new(a, settings);
         let mut read = ObfuscatedRead::new(b.clone(), settings);
@@ -390,10 +387,7 @@ mod tests {
         let (a, mut b) = socket_pair().await;
         let settings = Obfuscation {
             key: [7; KEY_LEN],
-            settings: Some(PaddingSettings {
-                target: TargetKind::Fixed(200),
-                payload_sized: PayloadSized::Dynamic,
-            }),
+            settings: Some(PaddingSettings::data_channel(TargetKind::Fixed(200))),
         };
         let mut write = ObfuscatedWrite::new(a, settings);
         let mut read = ObfuscatedRead::new(b.clone(), settings);
@@ -423,13 +417,10 @@ mod tests {
             a,
             Obfuscation {
                 key: [7; KEY_LEN],
-                settings: Some(PaddingSettings {
-                    target: TargetKind::Triangular {
-                        mode: 100,
-                        spread: 20,
-                    },
-                    payload_sized: PayloadSized::Dynamic,
-                }),
+                settings: Some(PaddingSettings::data_channel(TargetKind::Triangular {
+                    mode: 100,
+                    spread: 20,
+                })),
             },
         );
         // A payload larger than the profile band is sent at its natural size

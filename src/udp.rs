@@ -161,25 +161,6 @@ pub struct Listener {
     /// it.
     profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
-/// The data channel's padding must use the dynamic payload-sized mode: the
-/// receiver never knows the payload size (the reliable layer's segments
-/// vary), so a static mode — which treats the decode buffer as the payload
-/// size — would drop every datagram at the dispatch. The handshake uses
-/// static internally (its decode buffer is exactly the core size), but the
-/// data channel's settings come from the config.
-fn validate_data_padding(
-    profile: Option<crate::obfuscate::padding::PaddingSettings>,
-) -> std::io::Result<()> {
-    if let Some(profile) = profile
-        && profile.payload_sized == PayloadSized::Static
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the data channel's padding must use the dynamic payload-sized mode (the receiver does not know the payload size)",
-        ));
-    }
-    Ok(())
-}
 
 impl Listener {
     /// Bind with the given settings (see [`ListenerConfig`]).
@@ -191,7 +172,7 @@ impl Listener {
             obfuscation_key: key,
             padding_profile: profile,
         } = config;
-        validate_data_padding(profile)?;
+
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
@@ -863,7 +844,7 @@ async fn connect_bound(
         obfuscation_key,
         padding_profile,
     } = config;
-    validate_data_padding(padding_profile)?;
+
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
     let log_config = match log_config {
@@ -1279,29 +1260,6 @@ mod tests {
             Mss::try_new(1),
             Err(MssError::NoRoomForCodecPayload { .. })
         ));
-    }
-
-    #[test]
-    fn data_padding_rejects_static_payload_sized_mode() {
-        // The data channel's receiver never knows the payload size, so a
-        // static mode (which treats the decode buffer as the payload size)
-        // would drop every datagram at the dispatch. The config must reject
-        // it; dynamic (and no padding) are valid.
-        assert!(validate_data_padding(None).is_ok());
-        assert!(
-            validate_data_padding(Some(PaddingSettings {
-                target: TargetKind::Fixed(250),
-                payload_sized: PayloadSized::Dynamic,
-            }))
-            .is_ok()
-        );
-        assert!(
-            validate_data_padding(Some(PaddingSettings {
-                target: TargetKind::Fixed(250),
-                payload_sized: PayloadSized::Static,
-            }))
-            .is_err()
-        );
     }
 
     #[test]

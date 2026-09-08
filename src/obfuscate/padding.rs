@@ -37,14 +37,48 @@ pub enum PayloadSized {
 }
 
 /// The padding settings for one encode/decode: the target policy and the
-/// payload-sized mode.
+/// payload-sized mode. The fields are private: the payload-sized mode is a
+/// per-channel invariant (the data channel's receiver never knows the
+/// payload size, so it must be dynamic; the handshake's core size is known,
+/// so it is static), and the constructors make the invalid combinations
+/// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaddingSettings {
-    pub target: TargetKind,
-    pub payload_sized: PayloadSized,
+    target: TargetKind,
+    payload_sized: PayloadSized,
 }
 
 impl PaddingSettings {
+    /// The data channel's padding settings: the receiver never knows the
+    /// payload size (the reliable layer's segments vary), so the dynamic
+    /// payload-sized mode is the only option — a static mode would treat the
+    /// decode buffer as the payload size and drop every datagram.
+    pub const fn data_channel(target: TargetKind) -> Self {
+        Self {
+            target,
+            payload_sized: PayloadSized::Dynamic,
+        }
+    }
+
+    /// Static payload-sized settings: the payload size is known to the
+    /// receiver (the decode buffer is exactly the payload size). Used by the
+    /// handshake, whose 18-byte core is known to both sides.
+    pub(crate) const fn static_target(target: TargetKind) -> Self {
+        Self {
+            target,
+            payload_sized: PayloadSized::Static,
+        }
+    }
+
+    /// Dynamic payload-sized settings: the payload size rides in a u16
+    /// prefix. Used by the probe channel and the probe echo.
+    pub(crate) const fn dynamic_target(target: TargetKind) -> Self {
+        Self {
+            target,
+            payload_sized: PayloadSized::Dynamic,
+        }
+    }
+
     /// Draw a target size for one datagram: the fixed size, a uniform draw
     /// in `[lo, hi]`, or a triangular draw peaked at `mode` (the difference
     /// of two uniforms is triangular).
@@ -213,20 +247,14 @@ mod tests {
     use super::*;
 
     fn triangular() -> PaddingSettings {
-        PaddingSettings {
-            target: TargetKind::Triangular {
-                mode: 200,
-                spread: 50,
-            },
-            payload_sized: PayloadSized::Dynamic,
-        }
+        PaddingSettings::data_channel(TargetKind::Triangular {
+            mode: 200,
+            spread: 50,
+        })
     }
 
     fn uniform() -> PaddingSettings {
-        PaddingSettings {
-            target: TargetKind::Uniform { lo: 150, hi: 250 },
-            payload_sized: PayloadSized::Dynamic,
-        }
+        PaddingSettings::data_channel(TargetKind::Uniform { lo: 150, hi: 250 })
     }
 
     #[test]
@@ -235,14 +263,8 @@ mod tests {
         for settings in [
             None,
             Some(triangular()),
-            Some(PaddingSettings {
-                target: TargetKind::Fixed(300),
-                payload_sized: PayloadSized::Dynamic,
-            }),
-            Some(PaddingSettings {
-                target: TargetKind::Fixed(300),
-                payload_sized: PayloadSized::Static,
-            }),
+            Some(PaddingSettings::data_channel(TargetKind::Fixed(300))),
+            Some(PaddingSettings::static_target(TargetKind::Fixed(300))),
         ] {
             let mut plaintext = vec![0u8; max_plaintext(payload.len(), settings)];
             let n = encode_plaintext(payload, &mut plaintext, settings);
@@ -284,10 +306,7 @@ mod tests {
 
     #[test]
     fn a_fixed_profile_pads_every_datagram_to_the_same_size() {
-        let settings = PaddingSettings {
-            target: TargetKind::Fixed(250),
-            payload_sized: PayloadSized::Dynamic,
-        };
+        let settings = PaddingSettings::data_channel(TargetKind::Fixed(250));
         let payload = b"tiny";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
         for _ in 0..16 {
@@ -311,10 +330,7 @@ mod tests {
 
     #[test]
     fn static_mode_carries_no_length_field() {
-        let settings = PaddingSettings {
-            target: TargetKind::Fixed(250),
-            payload_sized: PayloadSized::Static,
-        };
+        let settings = PaddingSettings::static_target(TargetKind::Fixed(250));
         let payload = b"hello";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
         let n = encode_plaintext(payload, &mut plaintext, Some(settings));

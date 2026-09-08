@@ -1,5 +1,5 @@
 use crate::io_err::IoErr;
-use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, TargetKind};
+use crate::obfuscate::padding::{self, PaddingSettings, TargetKind};
 use crate::transmission::transmission_layer::UnreliableRead;
 use async_trait::async_trait;
 use std::{
@@ -43,13 +43,10 @@ pub struct ProbeEcho {
 /// prefix). The probe always randomizes its size so it does not fingerprint
 /// as a fixed-size datagram.
 pub fn probe_settings() -> PaddingSettings {
-    PaddingSettings {
-        target: TargetKind::Uniform {
-            lo: padding::LEN_LEN + PROBE_LEN,
-            hi: padding::LEN_LEN + PROBE_LEN + MAX_PROBE_PAD,
-        },
-        payload_sized: PayloadSized::Dynamic,
-    }
+    PaddingSettings::dynamic_target(TargetKind::Uniform {
+        lo: padding::LEN_LEN + PROBE_LEN,
+        hi: padding::LEN_LEN + PROBE_LEN + MAX_PROBE_PAD,
+    })
 }
 
 pub fn encode_probe(echo: ProbeEcho) -> [u8; PROBE_LEN] {
@@ -350,10 +347,9 @@ impl ProbeResponder {
                     let plaintext_len = padding::encode_plaintext(
                         &core,
                         &mut datagram[crate::obfuscate::NONCE_LEN..total],
-                        Some(PaddingSettings {
-                            target: TargetKind::Fixed(total - crate::obfuscate::NONCE_LEN),
-                            payload_sized: PayloadSized::Dynamic,
-                        }),
+                        Some(PaddingSettings::dynamic_target(TargetKind::Fixed(
+                            total - crate::obfuscate::NONCE_LEN,
+                        ))),
                     );
                     crate::obfuscate::apply_keystream(
                         key,
