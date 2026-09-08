@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-pub use crate::obfuscate::TargetProfile;
+pub use crate::obfuscate::padding::TargetProfile;
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
@@ -143,7 +143,7 @@ pub struct ListenerConfig {
     /// size drawn from this single-mode profile so the wire size
     /// distribution converges to one peak. The peer must use the same
     /// profile. `None` (the default) sends datagrams unpadded.
-    pub padding_profile: Option<crate::obfuscate::TargetProfile>,
+    pub padding_profile: Option<crate::obfuscate::padding::TargetProfile>,
 }
 
 #[derive(Debug)]
@@ -160,7 +160,7 @@ pub struct Listener {
     /// The padding profile for this listener, fixed at construction (see
     /// [`ListenerConfig`]); the accepted connections' write halves pad with
     /// it.
-    profile: Option<crate::obfuscate::TargetProfile>,
+    profile: Option<crate::obfuscate::padding::TargetProfile>,
 }
 impl Listener {
     /// Bind with the given settings (see [`ListenerConfig`]).
@@ -368,7 +368,7 @@ pub struct AcceptConfig {
     /// accept paths (the single-path [`Listener`] takes its profile at
     /// [`Listener::bind`]). When set (with an obfuscation key), every
     /// datagram is padded to a size drawn from this single-mode profile.
-    pub padding_profile: Option<crate::obfuscate::TargetProfile>,
+    pub padding_profile: Option<crate::obfuscate::padding::TargetProfile>,
 }
 
 impl Default for AcceptConfig {
@@ -412,7 +412,7 @@ pub struct ConnectConfig<'a> {
     /// is padded to a size drawn from this single-mode profile so the wire
     /// size distribution converges to one peak. Both peers must use the
     /// same profile; `None` (the default) sends datagrams unpadded.
-    pub padding_profile: Option<crate::obfuscate::TargetProfile>,
+    pub padding_profile: Option<crate::obfuscate::padding::TargetProfile>,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -481,7 +481,7 @@ async fn accept(
     raw_fd: MaybeRawFd,
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    profile: Option<crate::obfuscate::TargetProfile>,
+    profile: Option<crate::obfuscate::padding::TargetProfile>,
 ) -> std::io::Result<Accepted> {
     let AcceptSetup {
         handshake,

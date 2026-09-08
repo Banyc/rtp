@@ -5,11 +5,11 @@
 //! traffic from any other encrypted UDP protocol (QUIC, WireGuard, DTLS).
 //!
 //! The obfuscated plaintext is `[len u16][payload][padding]` when a padding
-//! profile is set (see [`TargetProfile`]): the real payload length rides
-//! inside the ciphertext so a datagram can be padded to a target size without
-//! a wire length field. The padding is zero-filled; the chacha20 keystream
-//! randomizes it on the wire. Without a profile the plaintext is the payload
-//! alone — the historical wire format.
+//! profile is set (see [`padding::TargetProfile`]): the real payload length
+//! rides inside the ciphertext so a datagram can be padded to a target size
+//! without a wire length field. The padding is zero-filled; the chacha20
+//! keystream randomizes it on the wire. Without a profile the plaintext is
+//! the payload alone — the historical wire format.
 //!
 //! The wrapper implements the crate's [`UnreliableRead`] / [`UnreliableWrite`]
 //! transport traits, so it can be inserted between the UDP socket and the
@@ -25,20 +25,20 @@
 //! obfuscating — must not fail the connection, and on the accept path must
 //! not kill the whole listener.
 
+pub(crate) mod padding;
+
 use async_trait::async_trait;
 use tokio_chacha20::cipher::StreamCipher;
 
 use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
+use padding::TargetProfile;
 
 /// The nonce length: 24 bytes (XChaCha20).
 pub(crate) const NONCE_LEN: usize = tokio_chacha20::X_NONCE_BYTES;
 
 /// The chacha20 key length: 32 bytes.
 pub(crate) const KEY_LEN: usize = tokio_chacha20::KEY_BYTES;
-
-/// The length-prefix size (u16) inside the obfuscated plaintext.
-pub(crate) const LEN_LEN: usize = 2;
 
 /// One byte PAST the caller's buffer: the receive scratch is sized
 /// `max_plaintext + NONCE_LEN + OVERSIZE_DETECT_EXTRA` so an oversized
@@ -48,32 +48,6 @@ pub(crate) const LEN_LEN: usize = 2;
 /// scratch size and the check would silently pass, delivering truncated
 /// plaintext.
 pub(crate) const OVERSIZE_DETECT_EXTRA: usize = 1;
-
-/// A fixed single-mode target profile for datagram padding: every datagram
-/// is padded to a size drawn from a triangular distribution peaked at
-/// `mode` and falling to zero at `mode ± spread`. The draw is independent of
-/// the traffic, so the wire size distribution converges to one mode without
-/// any traffic-correlated feedback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TargetProfile {
-    pub mode: usize,
-    pub spread: usize,
-}
-
-impl TargetProfile {
-    /// Draw a target size: triangular around `mode` in `[mode - spread,
-    /// mode + spread]` (the difference of two uniforms is triangular).
-    pub fn draw(&self) -> usize {
-        let u = rand::random_range(0..=self.spread) as isize;
-        let v = rand::random_range(0..=self.spread) as isize;
-        (self.mode as isize + u - v).max(0) as usize
-    }
-
-    /// The largest target size the profile can draw.
-    pub fn max(&self) -> usize {
-        self.mode + self.spread
-    }
-}
 
 /// Apply the chacha20 keystream for `key`/`nonce` to `buf` in place.
 /// Encryption and decryption are the same XOR operation, so this single
@@ -116,10 +90,7 @@ impl<R> ObfuscatedRead<R> {
         // extra byte the socket would truncate an oversized datagram to
         // exactly the scratch size and the check would silently pass,
         // delivering truncated plaintext.
-        let max_plaintext = match self.profile {
-            Some(profile) => profile.max().max(plaintext_capacity + LEN_LEN),
-            None => plaintext_capacity,
-        };
+        let max_plaintext = padding::max_plaintext(self.profile, plaintext_capacity);
         let need = max_plaintext + NONCE_LEN + OVERSIZE_DETECT_EXTRA;
         if self.scratch.len() < need {
             self.scratch.resize(need, 0);
@@ -142,26 +113,8 @@ impl<R> ObfuscatedRead<R> {
         // padding) and copy the payload out (the padding tail is discarded).
         apply_keystream(self.key, nonce, &mut self.scratch[NONCE_LEN..n]);
         let plaintext = &self.scratch[NONCE_LEN..n];
-        match self.profile {
-            Some(_) => {
-                if plaintext.len() < LEN_LEN {
-                    return Err(IoErr::from(std::io::ErrorKind::InvalidData));
-                }
-                let len = u16::from_be_bytes(plaintext[..LEN_LEN].try_into().unwrap()) as usize;
-                if len > buf.len() || LEN_LEN + len > plaintext.len() {
-                    return Err(IoErr::from(std::io::ErrorKind::InvalidData));
-                }
-                buf[..len].copy_from_slice(&plaintext[LEN_LEN..LEN_LEN + len]);
-                Ok(len)
-            }
-            None => {
-                if plaintext.len() > buf.len() {
-                    return Err(IoErr::from(std::io::ErrorKind::InvalidData));
-                }
-                buf[..plaintext.len()].copy_from_slice(plaintext);
-                Ok(plaintext.len())
-            }
-        }
+        padding::decode_plaintext(self.profile, plaintext, buf)
+            .ok_or_else(|| IoErr::from(std::io::ErrorKind::InvalidData))
     }
 }
 
@@ -227,25 +180,19 @@ impl<W: UnreliableWrite> UnreliableWrite for ObfuscatedWrite<W> {
         // [padding] padded to a profile-drawn target (floored at the
         // payload, never shrunk); without one the plaintext is the payload
         // alone — the historical wire format.
-        let (plaintext_len, len_prefix) = match self.profile {
-            Some(profile) => (profile.draw().max(buf.len() + LEN_LEN), true),
-            None => (buf.len(), false),
-        };
-        if self.scratch.len() < plaintext_len + NONCE_LEN {
-            self.scratch.resize(plaintext_len + NONCE_LEN, 0);
+        let target = self.profile.map_or(0, |p| p.draw());
+        let max_plaintext = padding::max_plaintext(self.profile, buf.len());
+        if self.scratch.len() < max_plaintext + NONCE_LEN {
+            self.scratch.resize(max_plaintext + NONCE_LEN, 0);
         }
         let nonce: [u8; NONCE_LEN] = rand::random();
         self.scratch[..NONCE_LEN].copy_from_slice(&nonce);
-        let mut pos = NONCE_LEN;
-        if len_prefix {
-            self.scratch[pos..pos + LEN_LEN].copy_from_slice(&(buf.len() as u16).to_be_bytes());
-            pos += LEN_LEN;
-        }
-        self.scratch[pos..pos + buf.len()].copy_from_slice(buf);
-        pos += buf.len();
-        // Zero the padding tail explicitly (the scratch is reused, so stale
-        // bytes from a previous send must not leak into the padding).
-        self.scratch[pos..NONCE_LEN + plaintext_len].fill(0);
+        let plaintext_len = padding::encode_plaintext(
+            self.profile,
+            target,
+            buf,
+            &mut self.scratch[NONCE_LEN..NONCE_LEN + max_plaintext],
+        );
         apply_keystream(
             self.key,
             nonce,
@@ -458,6 +405,6 @@ mod tests {
         write.send(&big).await.unwrap();
         let mut wire = [0u8; 1024];
         let n = b.recv(&mut wire).await.unwrap();
-        assert_eq!(n, NONCE_LEN + LEN_LEN + big.len());
+        assert_eq!(n, NONCE_LEN + padding::LEN_LEN + big.len());
     }
 }
