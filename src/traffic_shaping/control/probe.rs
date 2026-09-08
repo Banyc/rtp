@@ -732,6 +732,18 @@ mod tests {
             Some(probe),
             "the echo must decode back to the probe"
         );
+        // The echo wire is obfuscated: neither the probe magic nor the
+        // plaintext echo core appears on the wire.
+        assert!(
+            !buf[..n].windows(MAGIC.len()).any(|w| w == MAGIC),
+            "the probe magic leaked onto the echo wire"
+        );
+        let mut plain_echo = encode_probe(probe);
+        plain_echo[DIR_OFFSET] = DIR_ECHO;
+        assert!(
+            !buf[..n].windows(plain_echo.len()).any(|w| w == plain_echo),
+            "the plaintext echo leaked onto the wire"
+        );
     }
 
     #[test]
