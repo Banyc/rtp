@@ -11,7 +11,7 @@
 //! only derives the settings from the MSS.
 
 use super::wire::PACKET_LEN;
-use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, RandomKind, TargetKind};
+use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, TargetKind};
 
 /// A connection's MSS, typed so the padding bound cannot be confused with
 /// an arbitrary size.
@@ -38,12 +38,10 @@ impl Mss {
     /// MSS-derived range, static payload-sized (the core size is known to
     /// both sides, so no length field rides on the wire).
     pub(crate) fn settings(self) -> PaddingSettings {
-        let max_pad = self.max_handshake_pad();
         PaddingSettings {
-            target: TargetKind::Random {
-                kind: RandomKind::Uniform,
-                mode: PACKET_LEN + max_pad / 2,
-                spread: max_pad - max_pad / 2,
+            target: TargetKind::Uniform {
+                lo: PACKET_LEN,
+                hi: PACKET_LEN + self.max_handshake_pad(),
             },
             payload_sized: PayloadSized::Static,
         }

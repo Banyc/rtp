@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-pub use crate::obfuscate::padding::{PaddingSettings, PayloadSized, RandomKind, TargetKind};
+pub use crate::obfuscate::padding::{PaddingSettings, PayloadSized, TargetKind};
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
@@ -142,8 +142,9 @@ pub struct ListenerConfig {
     /// When set (with an obfuscation key), every datagram is padded to a
     /// target size chosen by these settings: a fixed size
     /// ([`PaddingSettings::target`] = [`TargetKind::Fixed`]) or a random
-    /// draw ([`TargetKind::Random`]). The peer must use the same settings.
-    /// `None` (the default) sends datagrams unpadded.
+    /// draw ([`TargetKind::Uniform`] / [`TargetKind::Triangular`]). The
+    /// peer must use the same settings. `None` (the default) sends
+    /// datagrams unpadded.
     pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 
@@ -374,7 +375,7 @@ pub struct AcceptConfig {
     /// [`Listener::bind`]). When set (with an obfuscation key), every
     /// datagram is padded to a target size chosen by these settings: a
     /// fixed size ([`TargetKind::Fixed`]) or a random draw
-    /// ([`TargetKind::Random`]).
+    /// ([`TargetKind::Uniform`] / [`TargetKind::Triangular`]).
     pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 
@@ -417,9 +418,9 @@ pub struct ConnectConfig<'a> {
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     /// Padding settings: when set (with an obfuscation key), every datagram
     /// is padded to a target size chosen by these settings: a fixed size
-    /// ([`TargetKind::Fixed`]) or a random draw ([`TargetKind::Random`]).
-    /// Both peers must use the same settings; `None` (the default) sends
-    /// datagrams unpadded.
+    /// ([`TargetKind::Fixed`]) or a random draw ([`TargetKind::Uniform`] /
+    /// [`TargetKind::Triangular`]). Both peers must use the same settings;
+    /// `None` (the default) sends datagrams unpadded.
     pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
 }
 

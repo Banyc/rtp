@@ -197,7 +197,7 @@ pub(crate) fn maybe_wrap<R: UnreliableRead, W: UnreliableWrite>(
 
 #[cfg(test)]
 mod tests {
-    use super::padding::{PayloadSized, RandomKind, TargetKind};
+    use super::padding::{PayloadSized, TargetKind};
     use super::*;
     use tokio::net::UdpSocket;
 
@@ -355,8 +355,7 @@ mod tests {
         let settings = Obfuscation {
             key: [7; KEY_LEN],
             settings: Some(PaddingSettings {
-                target: TargetKind::Random {
-                    kind: RandomKind::Triangular,
+                target: TargetKind::Triangular {
                     mode: 200,
                     spread: 50,
                 },
@@ -425,8 +424,7 @@ mod tests {
             Obfuscation {
                 key: [7; KEY_LEN],
                 settings: Some(PaddingSettings {
-                    target: TargetKind::Random {
-                        kind: RandomKind::Triangular,
+                    target: TargetKind::Triangular {
                         mode: 100,
                         spread: 20,
                     },

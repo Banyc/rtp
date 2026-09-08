@@ -1,5 +1,5 @@
 use crate::io_err::IoErr;
-use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, RandomKind, TargetKind};
+use crate::obfuscate::padding::{self, PaddingSettings, PayloadSized, TargetKind};
 use crate::transmission::transmission_layer::UnreliableRead;
 use async_trait::async_trait;
 use std::{
@@ -44,10 +44,9 @@ pub struct ProbeEcho {
 /// as a fixed-size datagram.
 pub fn probe_settings() -> PaddingSettings {
     PaddingSettings {
-        target: TargetKind::Random {
-            kind: RandomKind::Uniform,
-            mode: padding::LEN_LEN + PROBE_LEN + MAX_PROBE_PAD / 2,
-            spread: MAX_PROBE_PAD / 2,
+        target: TargetKind::Uniform {
+            lo: padding::LEN_LEN + PROBE_LEN,
+            hi: padding::LEN_LEN + PROBE_LEN + MAX_PROBE_PAD,
         },
         payload_sized: PayloadSized::Dynamic,
     }

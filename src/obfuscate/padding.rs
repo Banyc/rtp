@@ -13,26 +13,16 @@
 /// The length-prefix size (u16) inside the obfuscated plaintext.
 pub(crate) const LEN_LEN: usize = 2;
 
-/// The random draw shape for a random target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RandomKind {
-    /// Uniform in `[mode - spread, mode + spread]`.
-    Uniform,
-    /// Triangular peaked at `mode`, falling to zero at `mode ± spread`.
-    Triangular,
-}
-
 /// How the target plaintext size is chosen for each datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
     /// Pad every datagram to exactly this size.
     Fixed(usize),
-    /// Pad every datagram to a random size.
-    Random {
-        kind: RandomKind,
-        mode: usize,
-        spread: usize,
-    },
+    /// Pad every datagram to a uniform random size in `[lo, hi]`.
+    Uniform { lo: usize, hi: usize },
+    /// Pad every datagram to a triangular random size peaked at `mode`,
+    /// falling to zero at `mode ± spread`.
+    Triangular { mode: usize, spread: usize },
 }
 
 /// Whether the payload size is known to the receiver.
@@ -56,23 +46,17 @@ pub struct PaddingSettings {
 
 impl PaddingSettings {
     /// Draw a target size for one datagram: the fixed size, a uniform draw
-    /// in `[mode - spread, mode + spread]`, or a triangular draw peaked at
-    /// `mode` (the difference of two uniforms is triangular).
+    /// in `[lo, hi]`, or a triangular draw peaked at `mode` (the difference
+    /// of two uniforms is triangular).
     pub fn draw(&self) -> usize {
         match self.target {
             TargetKind::Fixed(size) => size,
-            TargetKind::Random { kind, mode, spread } => match kind {
-                RandomKind::Uniform => {
-                    let lo = mode.saturating_sub(spread);
-                    let hi = mode + spread;
-                    rand::random_range(lo..=hi)
-                }
-                RandomKind::Triangular => {
-                    let u = rand::random_range(0..=spread) as isize;
-                    let v = rand::random_range(0..=spread) as isize;
-                    (mode as isize + u - v).max(0) as usize
-                }
-            },
+            TargetKind::Uniform { lo, hi } => rand::random_range(lo..=hi),
+            TargetKind::Triangular { mode, spread } => {
+                let u = rand::random_range(0..=spread) as isize;
+                let v = rand::random_range(0..=spread) as isize;
+                (mode as isize + u - v).max(0) as usize
+            }
         }
     }
 
@@ -80,7 +64,8 @@ impl PaddingSettings {
     pub fn max(&self) -> usize {
         match self.target {
             TargetKind::Fixed(size) => size,
-            TargetKind::Random { mode, spread, .. } => mode + spread,
+            TargetKind::Uniform { hi, .. } => hi,
+            TargetKind::Triangular { mode, spread } => mode + spread,
         }
     }
 }
@@ -220,8 +205,7 @@ mod tests {
 
     fn triangular() -> PaddingSettings {
         PaddingSettings {
-            target: TargetKind::Random {
-                kind: RandomKind::Triangular,
+            target: TargetKind::Triangular {
                 mode: 200,
                 spread: 50,
             },
@@ -231,11 +215,7 @@ mod tests {
 
     fn uniform() -> PaddingSettings {
         PaddingSettings {
-            target: TargetKind::Random {
-                kind: RandomKind::Uniform,
-                mode: 200,
-                spread: 50,
-            },
+            target: TargetKind::Uniform { lo: 150, hi: 250 },
             payload_sized: PayloadSized::Dynamic,
         }
     }
