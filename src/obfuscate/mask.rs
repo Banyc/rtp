@@ -1,22 +1,14 @@
-//! Datagram obfuscation: a transport wrapper that prefixes every datagram
-//! with a 24-byte random nonce and chacha20-encrypts the rest with a given
-//! key. The wire shape is `[nonce 24][ciphertext]` — no authentication tag —
-//! so a passive observer sees only random bytes and cannot distinguish the
-//! traffic from any other encrypted UDP protocol (QUIC, WireGuard, DTLS).
-//!
-//! The obfuscated plaintext is `[len u16][payload][padding]` when a padding
-//! profile is set (see [`padding::TargetProfile`]): the real payload length
-//! rides inside the ciphertext so a datagram can be padded to a target size
-//! without a wire length field. The padding is zero-filled; the chacha20
-//! keystream randomizes it on the wire. Without a profile the plaintext is
-//! the payload alone — the historical wire format.
+//! The masking transport wrapper: prefixes every datagram with a 24-byte
+//! random nonce and chacha20-encrypts the rest with a given key. The wire
+//! shape is `[nonce 24][ciphertext]` — no authentication tag — so a passive
+//! observer sees only random bytes and cannot distinguish the traffic from
+//! any other encrypted UDP protocol (QUIC, WireGuard, DTLS).
 //!
 //! The wrapper implements the crate's [`UnreliableRead`] / [`UnreliableWrite`]
 //! transport traits, so it can be inserted between the UDP socket and the
-//! [`UnreliableLayer`] without touching the codec or the reliable layer.
-//! It is wired into the public constructors through the optional
-//! `obfuscation_key` on [`crate::udp::ConnectConfig`] /
-//! [`crate::udp::AcceptConfig`]; the wrapper types themselves are internal.
+//! [`UnreliableLayer`] without touching the codec or the reliable layer. The
+//! obfuscated-plaintext format (length prefix + padding) lives in
+//! [`super::padding`].
 //!
 //! The read half is a FILTER: a datagram that is not a valid obfuscated
 //! datagram (shorter than the nonce, or too large for the caller's buffer) is
@@ -25,14 +17,12 @@
 //! obfuscating — must not fail the connection, and on the accept path must
 //! not kill the whole listener.
 
-pub(crate) mod padding;
-
 use async_trait::async_trait;
 use tokio_chacha20::cipher::StreamCipher;
 
+use super::padding::{self, TargetProfile};
 use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
-use padding::TargetProfile;
 
 /// The nonce length: 24 bytes (XChaCha20).
 pub(crate) const NONCE_LEN: usize = tokio_chacha20::X_NONCE_BYTES;
