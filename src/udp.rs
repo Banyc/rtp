@@ -127,7 +127,7 @@ async fn connect_udp(
 pub type AcceptTask = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Accepted>> + Send>>;
 
 /// Settings for [`Listener::bind`]: the datagram-obfuscation key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerConfig {
     /// When set, every datagram is prefixed with a 24-byte random nonce and
     /// chacha20-encrypted with this key. The listener decrypts each datagram
@@ -143,6 +143,24 @@ pub struct ListenerConfig {
     /// peer must use the same settings. `None` (the default) sends
     /// datagrams unpadded.
     pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
+    /// When true and no padding_profile is set,
+    /// standalone ACK datagrams are padded to a triangular-random target
+    /// fitted from recent sent data-packet sizes, hiding ACKs among data
+    /// packets from a passive DPI observer. Data packets are unpadded. The
+    /// default may be flipped to false based on the netem_test A/B perf
+    /// measurement (bulk throughput / interactive latency); both peers must
+    /// agree.
+    pub ack_padding: bool,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            obfuscation_key: None,
+            padding_profile: None,
+            ack_padding: true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -160,6 +178,11 @@ pub struct Listener {
     /// [`ListenerConfig`]); the accepted connections' write halves pad with
     /// it.
     profile: Option<crate::obfuscate::padding::PaddingSettings>,
+    /// The fitted ACK-padding toggle for this listener, fixed at
+    /// construction (see [`ListenerConfig`]); the accepted connections'
+    /// write halves pad standalone ACKs with it. The listener READ side
+    /// needs no flag: the fitted-ack demux is content-based.
+    ack_padding: bool,
 }
 
 impl Listener {
@@ -171,6 +194,7 @@ impl Listener {
         let ListenerConfig {
             obfuscation_key: key,
             padding_profile: profile,
+            ack_padding,
         } = config;
 
         let udp = bind_udp(addr).await?;
@@ -210,6 +234,7 @@ impl Listener {
             raw_fd,
             key,
             profile,
+            ack_padding,
         })
     }
 
@@ -240,6 +265,7 @@ impl Listener {
         let raw_fd = self.raw_fd;
         let key = self.key;
         let profile = self.profile;
+        let ack_padding = self.ack_padding;
         Ok(Box::pin(async move {
             accept(
                 accepted,
@@ -247,6 +273,7 @@ impl Listener {
                 AcceptSetup::from_config(true, config)?,
                 key,
                 profile,
+                ack_padding,
             )
             .await
         }))
@@ -265,6 +292,7 @@ impl Listener {
             AcceptSetup::from_config(false, config)?,
             self.key,
             self.profile,
+            self.ack_padding,
         )
         .await
     }
@@ -305,6 +333,7 @@ impl Listener {
         let local_addr = self.local_addr;
         let key = self.key;
         let profile = self.profile;
+        let ack_padding = self.ack_padding;
         Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
@@ -313,6 +342,7 @@ impl Listener {
                     .with_frame_delivery(FrameMode::enabled()),
                 key,
                 profile,
+                ack_padding,
             )
             .await?;
             let Accepted {
@@ -374,6 +404,14 @@ pub struct AcceptConfig {
     /// fixed size ([`TargetKind::Fixed`]) or a random draw
     /// ([`TargetKind::Uniform`] / [`TargetKind::Triangular`]).
     pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
+    /// When true and no padding_profile is set,
+    /// standalone ACK datagrams are padded to a triangular-random target
+    /// fitted from recent sent data-packet sizes, hiding ACKs among data
+    /// packets from a passive DPI observer. Data packets are unpadded. The
+    /// default may be flipped to false based on the netem_test A/B perf
+    /// measurement (bulk throughput / interactive latency); both peers must
+    /// agree.
+    pub ack_padding: bool,
 }
 
 impl Default for AcceptConfig {
@@ -388,6 +426,7 @@ impl Default for AcceptConfig {
             metrics_observer: None,
             obfuscation_key: None,
             padding_profile: None,
+            ack_padding: true,
         }
     }
 }
@@ -419,6 +458,14 @@ pub struct ConnectConfig<'a> {
     /// [`TargetKind::Triangular`]). Both peers must use the same settings;
     /// `None` (the default) sends datagrams unpadded.
     pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
+    /// When true and no padding_profile is set,
+    /// standalone ACK datagrams are padded to a triangular-random target
+    /// fitted from recent sent data-packet sizes, hiding ACKs among data
+    /// packets from a passive DPI observer. Data packets are unpadded. The
+    /// default may be flipped to false based on the netem_test A/B perf
+    /// measurement (bulk throughput / interactive latency); both peers must
+    /// agree.
+    pub ack_padding: bool,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -436,6 +483,7 @@ impl<'a> Default for ConnectConfig<'a> {
             watchdog: None,
             obfuscation_key: None,
             padding_profile: None,
+            ack_padding: true,
         }
     }
 }
@@ -488,6 +536,7 @@ async fn accept(
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     profile: Option<crate::obfuscate::padding::PaddingSettings>,
+    ack_padding: bool,
 ) -> std::io::Result<Accepted> {
     let AcceptSetup {
         handshake,
@@ -551,6 +600,9 @@ async fn accept(
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
+    // Fitted ACK padding lives in the write half; a padding profile wins
+    // (the write half never mixes profile padding with fitted ACK padding).
+    unreliable_layer.ack_padding = ack_padding && profile.is_none();
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -843,6 +895,7 @@ async fn connect_bound(
         watchdog,
         obfuscation_key,
         padding_profile,
+        ack_padding,
     } = config;
 
     let local_addr = udp.local_addr()?;
@@ -905,6 +958,9 @@ async fn connect_bound(
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
+    // Fitted ACK padding lives in the write half; a padding profile wins
+    // (the write half never mixes profile padding with fitted ACK padding).
+    unreliable_layer.ack_padding = ack_padding && padding_profile.is_none();
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -1005,6 +1061,7 @@ mod tests {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding_profile: None,
+                ack_padding: false,
             },
         )
         .await
@@ -1058,6 +1115,7 @@ mod tests {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding_profile: None,
+                ack_padding: false,
             },
         )
         .await
@@ -1582,6 +1640,7 @@ mod tests {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding_profile: None,
+                ack_padding: false,
             },
         )
         .await
@@ -1662,6 +1721,7 @@ mod tests {
                 ListenerConfig {
                     obfuscation_key: Some(KEY),
                     padding_profile: None,
+                    ack_padding: false,
                 },
             )
             .await
@@ -1910,6 +1970,7 @@ mod nohandshake_obf {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding_profile: None,
+                ack_padding: false,
             },
         )
         .await

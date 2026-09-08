@@ -208,6 +208,7 @@ where
         frame_delivery: FrameMode::default(),
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
+        ack_padding: false,
     }
 }
 
@@ -275,5 +276,6 @@ where
         frame_delivery: FrameMode::default(),
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
+        ack_padding: false,
     }
 }

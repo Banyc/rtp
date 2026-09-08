@@ -181,8 +181,16 @@ pub fn decode(
             }
             ACK_CMD => {
                 require_tag(session_tag, tag_seen)?;
-                // Latest-only framing: at most one ACK_CMD per datagram.
+                // Latest-only framing: at most one ACK_CMD per datagram. A
+                // second ACK_CMD after a complete ACK is the zero-tail
+                // padding rule (the fitted-ack fill is zeros): consume the
+                // rest of the datagram and require every byte to be 0x00,
+                // so a padded ACK decodes with the padding stripped. Any
+                // nonzero byte keeps the historical Corrupted verdict.
                 if ack_cmd_seen {
+                    if buf[rdr.position() as usize..].iter().all(|&b| b == 0) {
+                        break;
+                    }
                     return Err(DecodeError::Corrupted);
                 }
                 ack_cmd_seen = true;
@@ -615,5 +623,124 @@ mod tests {
         let mut acks = Vec::new();
         let decoded = decode(&buf[..n], &mut acks, None).unwrap();
         assert!(decoded.killed);
+    }
+
+    #[test]
+    fn a_padded_ack_decodes_with_the_same_ack_content() {
+        let tag: u64 = 0x1234_5678_9abc_def0;
+        let mut queue = AckHistory::new();
+        for s in 10..15 {
+            queue.insert(seq(s));
+        }
+        let ack = EncodeAck {
+            queue: &queue,
+            first_block_index: 0,
+            max_blocks: 64,
+        };
+        let mut buf = vec![0u8; 256];
+        let n = encode_ack_data(None, Some(ack), None, None, &mut buf).unwrap();
+        let content = buf[..n].to_vec();
+        // The padded form: the ACK content followed by an all-zero tail (the
+        // fitted-ack fill). The padding rides INSIDE the datagram and must
+        // be stripped at decode.
+        let mut padded = content.clone();
+        padded.extend_from_slice(&[0x00; 128]);
+        let mut acks = Vec::new();
+        let decoded = decode(&padded, &mut acks, None).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(0)));
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].start, seq(10));
+        assert_eq!(acks[0].size.get(), 5);
+        assert!(decoded.data.is_none());
+        // The unpadded form decodes identically.
+        let mut acks = Vec::new();
+        let decoded = decode(&content, &mut acks, None).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(0)));
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].start, seq(10));
+        assert_eq!(acks[0].size.get(), 5);
+        // A TAGGED padded ACK also decodes (flush_acks pages carry the tag
+        // on handshaked connections).
+        let mut tagged = vec![6u8];
+        tagged.extend_from_slice(&tag.to_be_bytes());
+        tagged.extend_from_slice(&content);
+        tagged.extend_from_slice(&[0x00; 64]);
+        let mut acks = Vec::new();
+        let decoded = decode(&tagged, &mut acks, Some(tag)).unwrap();
+        assert_eq!(decoded.ack_next, Some(seq(0)));
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].size.get(), 5);
+    }
+
+    #[test]
+    fn a_nonzero_tail_after_an_ack_is_corrupted() {
+        // [ACK content][0x00 — second ACK_CMD: enters padding mode]
+        // [0x00 x 3][0xAB] — a nonzero byte in the tail is rejected.
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&7u64.to_be_bytes());
+        buf.push(0); // count 0
+        buf.push(0); // second ACK_CMD → padding mode
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0xAB]);
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+        // The same tail with NO zero padding start byte (a nonzero byte read
+        // as a command) is Corrupted too.
+        let mut buf2 = vec![0u8];
+        buf2.extend_from_slice(&7u64.to_be_bytes());
+        buf2.push(0);
+        buf2.push(0xAB); // unknown command after the ACK
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf2, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn an_all_zero_tail_without_a_complete_ack_is_corrupted() {
+        // The zero-tail rule ONLY fires after a complete ACK_CMD. A data- or
+        // echo-only datagram whose trailing zeros would otherwise look like
+        // padding stays Corrupted (today's behavior).
+        //
+        // Data-only: DATA_CMD + all-zero body cut off before the length
+        // field completes.
+        let mut data = vec![1u8]; // DATA_CMD
+        data.extend_from_slice(&[0x00; 8]); // seq
+        data.push(0x00); // truncated u16 length field
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&data, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+        // Echo-only: ECHO_TS_CMD + timestamp + an all-zero tail that
+        // truncates the ACK parse (no count byte), so the padding rule must
+        // not rescue it.
+        let mut echo = vec![4u8]; // ECHO_TS_CMD
+        echo.extend_from_slice(&0u32.to_be_bytes()); // ts
+        echo.extend_from_slice(&[0x00; 9]); // 0x00 (ACK_CMD) + 8 zero bytes, no count
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&echo, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn a_zero_tail_containing_a_nonzero_byte_is_corrupted() {
+        // A valid ACK followed by padding that mixes zeros and a nonzero
+        // byte is rejected — the fill must be exactly zeros.
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&3u64.to_be_bytes());
+        buf.push(0); // count 0
+        buf.push(0); // second ACK_CMD → padding mode
+        buf.extend_from_slice(&[0x00, 0x00, 0x07, 0x00, 0x00]);
+        let mut acks = Vec::new();
+        assert!(matches!(
+            decode(&buf, &mut acks, None),
+            Err(DecodeError::Corrupted)
+        ));
     }
 }

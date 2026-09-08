@@ -109,6 +109,9 @@ impl<K: DispatchKey> Listener<K> {
         unreliable_layer.retransmission_armor = config.retransmission_armor;
         unreliable_layer.instream_group_fec = config.instream_group_fec;
         unreliable_layer.metrics_observer = config.metrics_observer;
+        // Fitted ACK padding lives in the write half; a padding profile
+        // wins (it is ignored otherwise on this path, matching today).
+        unreliable_layer.ack_padding = config.ack_padding && config.padding_profile.is_none();
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -194,6 +197,9 @@ impl<K: DispatchKey> Connector<K> {
         unreliable_layer.retransmission_armor = config.retransmission_armor;
         unreliable_layer.instream_group_fec = config.instream_group_fec;
         unreliable_layer.metrics_observer = config.metrics_observer;
+        // Fitted ACK padding lives in the write half; a padding profile
+        // wins (it is ignored otherwise on this path, matching today).
+        unreliable_layer.ack_padding = config.ack_padding && config.padding_profile.is_none();
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
             read,

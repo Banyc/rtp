@@ -54,6 +54,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         frame_delivery,
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
+        ack_padding: false,
     })
 }
 

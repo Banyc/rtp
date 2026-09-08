@@ -66,6 +66,10 @@ struct LayerTuning {
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
     obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
+    /// Fitted ACK-padding toggle, resolved from the config: a padding
+    /// profile wins (the write half never mixes profile padding with
+    /// fitted ACK padding).
+    ack_padding: bool,
 }
 
 impl LayerTuning {
@@ -79,6 +83,7 @@ impl LayerTuning {
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
             obfuscation_key: config.obfuscation_key,
+            ack_padding: config.ack_padding && config.padding_profile.is_none(),
         })
     }
 
@@ -95,6 +100,7 @@ impl LayerTuning {
                 instream_group_fec: config.instream_group_fec,
                 metrics_observer: config.metrics_observer,
                 obfuscation_key: config.obfuscation_key,
+                ack_padding: config.ack_padding && config.padding_profile.is_none(),
             },
         ))
     }
@@ -159,6 +165,9 @@ async fn convert_conn(
     unreliable_layer.retransmission_armor = tuning.retransmission_armor;
     unreliable_layer.instream_group_fec = tuning.instream_group_fec;
     unreliable_layer.metrics_observer = tuning.metrics_observer;
+    // Fitted ACK padding lives in the write half (resolved from the
+    // connect/accept config; a profile wins).
+    unreliable_layer.ack_padding = tuning.ack_padding;
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,
