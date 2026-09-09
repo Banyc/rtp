@@ -325,6 +325,14 @@ mod tests {
         enabled: bool,
         tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        harness_with_tuning_and_ack_padding(fec, enabled, tuning, false)
+    }
+    fn harness_with_tuning_and_ack_padding(
+        fec: bool,
+        enabled: bool,
+        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        ack_padding: bool,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
         #[async_trait]
@@ -352,6 +360,7 @@ mod tests {
         .unwrap();
         ul.retransmission_armor = RetransmissionArmorConfig::from(enabled);
         ul.instream_group_fec = false;
+        ul.ack_padding = ack_padding;
         let tl = TransmissionLayer::new(ul, None);
         (tl, recorder)
     }
@@ -1036,6 +1045,73 @@ mod tests {
             sent.iter().all(|datagram| !datagram.is_empty()),
             "an ACK flush sent {} datagrams, one of them empty",
             sent.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn fitted_ack_padding_pads_acks_into_the_observed_data_band() {
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        let (mut transmission, recorder) = harness_with_tuning_and_ack_padding(
+            false,
+            false,
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            true,
+        );
+        let now = Instant::now();
+        // Populate the sampler with >= MIN_SAMPLES data packets (each ~111 B
+        // on the wire: cmd + seq + len + 100 B payload), so the fitted band
+        // is anchored at the data size.
+        let mut send_bufs = SendBufs::new();
+        for _ in 0..16 {
+            transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap()
+                .send_data_buf(&[0u8; 100], now)
+                .unwrap();
+            assert!(
+                transmission.send_pkts(&mut send_bufs).await.unwrap(),
+                "each staged data packet must send (and be sampled)"
+            );
+        }
+        // Give the flush a claimable page: a small recv history plus pending
+        // ack work.
+        {
+            let mut reliable = transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap();
+            for seq in [2u64, 4, 6] {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
+            }
+        }
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
+        transmission.flush_acks(&mut send_bufs).await.unwrap();
+        let sent = recorder.lock().unwrap().datagrams();
+        let ack_wire = sent.last().expect("the flush must send the padded ACK");
+        // The padded ACK decodes: the codec's zero-tail rule strips the fill
+        // and the ack content survives.
+        let mut acks = Vec::new();
+        let decoded = crate::codec::decode(ack_wire, &mut acks, None).unwrap();
+        assert!(
+            decoded.ack_next.is_some(),
+            "the padded ACK must decode, got {ack_wire:?}"
+        );
+        // The padded ACK is data-sized: at least as large as the observed
+        // data packets, so it is hidden among them by wire size.
+        assert!(
+            ack_wire.len() >= 100,
+            "the padded ACK must be data-sized, got {} bytes",
+            ack_wire.len()
         );
     }
 

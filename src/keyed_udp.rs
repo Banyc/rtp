@@ -14,7 +14,8 @@ use crate::{
     transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::{
         self, AcceptConfig, DISPATCHER_BUF_SIZE, MaybeRawFd, Mss, MssError, maybe_raw_fd,
-        should_wait_after_try_send, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+        should_wait_after_try_send, validate_padding_against_mss,
+        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
 
@@ -101,6 +102,7 @@ impl<K: DispatchKey> Listener<K> {
         } else {
             config.mss.resolve()?
         };
+        validate_padding_against_mss(profile, mss)?;
         let mut unreliable_layer = wrap_keyed::<K>(
             read,
             write,
@@ -191,6 +193,7 @@ impl<K: DispatchKey> Connector<K> {
         } else {
             config.mss.resolve().ok()?
         };
+        validate_padding_against_mss(profile, mss).ok()?;
         let mut unreliable_layer = wrap_keyed::<K>(
             read,
             write,

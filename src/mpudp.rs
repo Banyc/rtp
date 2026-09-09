@@ -11,7 +11,7 @@ use crate::{
     transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
         AcceptConfig, ConnectConfig, HarmfulPaddingPolicy, LogConfig, Mss, MssConfig,
-        wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
+        validate_padding_against_mss, wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
 
@@ -147,6 +147,7 @@ async fn convert_conn(
     // Resolve the DPI-hiding policy: the wrapper's padding settings and
     // the write half's fitted-ACK-padding toggle (exactly one active).
     let (profile, ack_padding) = tuning.padding.resolve();
+    validate_padding_against_mss(profile, tuning.mss)?;
     let (r, w) = crate::obfuscate::maybe_wrap(
         r,
         w,

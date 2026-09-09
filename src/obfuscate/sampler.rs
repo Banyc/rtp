@@ -67,13 +67,11 @@ impl DataSizeSampler {
         }
     }
 
-    /// Record one sent data-packet size, O(1).
+    /// Record one sent data-packet size, O(1). Sizes saturate at `u16::MAX`:
+    /// the MSS ceiling (`MAX_MSS` = 64 KiB) can exceed `u16::MAX` by one
+    /// byte, and a wrapped size would corrupt the fit.
     pub(crate) fn observe(&mut self, size: usize) {
-        debug_assert!(
-            size < u16::MAX as usize,
-            "a data-packet size larger than u16::MAX cannot be sampled"
-        );
-        self.ring[self.pos] = size as u16;
+        self.ring[self.pos] = size.min(u16::MAX as usize) as u16;
         self.pos = (self.pos + 1) % WINDOW;
         self.count = self.count.saturating_add(1);
     }
@@ -146,7 +144,9 @@ impl DataSizeSampler {
         }
         let u = rand::random_range(0..=spread) as i32;
         let v = rand::random_range(0..=spread) as i32;
-        let draw = (mode as i32 + u - v) as usize;
+        // The triangular draw can go negative (mode - spread); clamp before
+        // the cast so the wrap is never relied on, then into the envelope.
+        let draw = (mode as i32 + u - v).max(0) as usize;
         Some(
             draw.clamp(page_len, observed_max as usize)
                 .min(observed_max as usize),

@@ -496,6 +496,29 @@ impl AcceptSetup {
     }
 }
 
+/// Reject a padding profile whose max target exceeds the (obfuscation-
+/// reduced) MSS: a padded datagram larger than the MSS would fragment or
+/// fail to send. Every transport path (single-path, keyed, mpudp) validates
+/// through this so the check cannot drift.
+pub(crate) fn validate_padding_against_mss(
+    profile: Option<crate::obfuscate::padding::PaddingSettings>,
+    mss: crate::mss::Mss,
+) -> std::io::Result<()> {
+    if let Some(profile) = profile
+        && profile.max() > mss.get()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "padding profile max {} exceeds the reduced MSS {}",
+                profile.max(),
+                mss.get()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn accept(
     accepted: IdentityConn,
     raw_fd: MaybeRawFd,
@@ -546,18 +569,7 @@ async fn accept(
     } else {
         mss
     };
-    if let Some(profile) = profile
-        && profile.max() > mss.get()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "padding profile max {} exceeds the reduced MSS {}",
-                profile.max(),
-                mss.get()
-            ),
-        ));
-    }
+    validate_padding_against_mss(profile, mss)?;
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         read,
         write,
@@ -907,18 +919,7 @@ async fn connect_bound(
     } else {
         mss
     };
-    if let Some(profile) = profile
-        && profile.max() > mss.get()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "padding profile max {} exceeds the reduced MSS {}",
-                profile.max(),
-                mss.get()
-            ),
-        ));
-    }
+    validate_padding_against_mss(profile, mss)?;
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         Box::new(filtered_read),
         write,
