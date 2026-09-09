@@ -36,6 +36,42 @@ pub enum PayloadSized {
     Dynamic,
 }
 
+/// The DPI-hiding padding policy for the obfuscation layer: how datagrams
+/// are padded to hide the protocol's shape from a passive observer. One
+/// three-variant choice replaces the old `padding_profile` + `ack_padding`
+/// pair, so the invalid combinations (a profile AND fitted ACK padding at
+/// once) are unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaddingPolicy {
+    /// No padding: every datagram goes out at its natural size.
+    #[default]
+    None,
+    /// Pad every datagram (data and ACK) to a fixed plaintext size.
+    AllFixed(usize),
+    /// Pad standalone ACK datagrams to a triangular-random target fitted
+    /// from recent sent data-packet sizes, hiding them among data packets.
+    /// Data packets stay at their natural size.
+    AckMimicsData,
+}
+
+impl PaddingPolicy {
+    /// Resolve the policy into its two consumers: the obfuscation wrapper's
+    /// padding settings (the profile it pads every datagram with) and the
+    /// write half's fitted-ACK-padding toggle. Exactly one of the two is
+    /// ever active: `AllFixed` sets the profile, `AckMimicsData` sets the
+    /// toggle, `None` sets neither.
+    pub(crate) fn resolve(self) -> (Option<PaddingSettings>, bool) {
+        match self {
+            PaddingPolicy::None => (None, false),
+            PaddingPolicy::AllFixed(size) => (
+                Some(PaddingSettings::dynamic_target(TargetKind::Fixed(size))),
+                false,
+            ),
+            PaddingPolicy::AckMimicsData => (None, true),
+        }
+    }
+}
+
 /// The padding settings for one encode/decode: the target policy and the
 /// payload-sized mode. The fields are private: the payload-sized mode is a
 /// per-channel invariant (the data channel's receiver never knows the

@@ -10,7 +10,7 @@ use crate::{
     traffic_shaping::redundancy::{RetransmissionArmorConfig, fec_tuning::FecTuning},
     transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
-        AcceptConfig, ConnectConfig, LogConfig, Mss, MssConfig,
+        AcceptConfig, ConnectConfig, LogConfig, Mss, MssConfig, PaddingPolicy,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
@@ -66,10 +66,10 @@ struct LayerTuning {
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
     obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// Fitted ACK-padding toggle, resolved from the config: a padding
-    /// profile wins (the write half never mixes profile padding with
-    /// fitted ACK padding).
-    ack_padding: bool,
+    /// The DPI-hiding padding policy, resolved from the config into the
+    /// wrapper's padding settings and the write half's fitted-ACK-padding
+    /// toggle at [`convert_conn`] (exactly one is ever active).
+    padding: PaddingPolicy,
 }
 
 impl LayerTuning {
@@ -83,7 +83,7 @@ impl LayerTuning {
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
             obfuscation_key: config.obfuscation_key,
-            ack_padding: config.ack_padding && config.padding_profile.is_none(),
+            padding: config.padding,
         })
     }
 
@@ -100,7 +100,7 @@ impl LayerTuning {
                 instream_group_fec: config.instream_group_fec,
                 metrics_observer: config.metrics_observer,
                 obfuscation_key: config.obfuscation_key,
-                ack_padding: config.ack_padding && config.padding_profile.is_none(),
+                padding: config.padding,
             },
         ))
     }
@@ -144,6 +144,9 @@ async fn convert_conn(
     // Datagram obfuscation (when a key is configured): every datagram is
     // prefixed with a 24-byte random nonce and the rest is chacha20-
     // encrypted, exactly like the single-path udp constructors.
+    // Resolve the DPI-hiding policy: the wrapper's padding settings and
+    // the write half's fitted-ACK-padding toggle (exactly one active).
+    let (profile, ack_padding) = tuning.padding.resolve();
     let (r, w) = crate::obfuscate::maybe_wrap(
         r,
         w,
@@ -151,7 +154,7 @@ async fn convert_conn(
             .obfuscation_key
             .map(|key| crate::obfuscate::Obfuscation {
                 key,
-                settings: None,
+                settings: profile,
             }),
     );
     let mut unreliable_layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
@@ -165,9 +168,9 @@ async fn convert_conn(
     unreliable_layer.retransmission_armor = tuning.retransmission_armor;
     unreliable_layer.instream_group_fec = tuning.instream_group_fec;
     unreliable_layer.metrics_observer = tuning.metrics_observer;
-    // Fitted ACK padding lives in the write half (resolved from the
-    // connect/accept config; a profile wins).
-    unreliable_layer.ack_padding = tuning.ack_padding;
+    // Fitted ACK padding lives in the write half; the policy resolution
+    // guarantees it never coexists with a padding profile.
+    unreliable_layer.ack_padding = ack_padding;
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,

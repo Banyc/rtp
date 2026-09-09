@@ -31,7 +31,7 @@ use crate::{
     },
 };
 
-pub use crate::obfuscate::padding::{PaddingSettings, PayloadSized, TargetKind};
+pub use crate::obfuscate::padding::{PaddingPolicy, PaddingSettings, PayloadSized, TargetKind};
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
@@ -136,22 +136,14 @@ pub struct ListenerConfig {
     /// The peer must use the same key. `None` (the default) sends datagrams
     /// in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// When set (with an obfuscation key), every datagram is padded to a
-    /// target size chosen by these settings: a fixed size
-    /// ([`PaddingSettings::target`] = [`TargetKind::Fixed`]) or a random
-    /// draw ([`TargetKind::Uniform`] / [`TargetKind::Triangular`]). The
-    /// peer must use the same settings. `None` (the default) sends
-    /// datagrams unpadded.
-    pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
-    /// When true and no padding_profile is set,
-    /// standalone ACK datagrams are padded to a triangular-random target
-    /// fitted from recent sent data-packet sizes, hiding ACKs among data
-    /// packets from a passive DPI observer. Data packets are unpadded. The
-    /// netem_test A/B (rtp_padding_bench) showed bulk throughput dropped
-    /// 15-45% on rate-limited links, so the default is opt-in (`false`);
-    /// interactive latency was not observably affected. Both peers must
-    /// agree.
-    pub ack_padding: bool,
+    /// The DPI-hiding padding policy for this listener, fixed at
+    /// construction (see [`ListenerConfig`]): `None` sends datagrams at
+    /// their natural size, [`PaddingPolicy::AllFixed`] pads every datagram
+    /// (data and ACK) to a fixed size, and [`PaddingPolicy::AckMimicsData`]
+    /// pads standalone ACK datagrams to a target fitted from the recent
+    /// sent data-packet sizes. The peer must use the same policy. `None`
+    /// (the default) sends datagrams unpadded.
+    pub padding: PaddingPolicy,
 }
 
 #[derive(Debug)]
@@ -165,15 +157,11 @@ pub struct Listener {
     /// connections (which never decrypt again), and answers probes with the
     /// same key; the accepted connections' write halves encrypt with it.
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// The padding profile for this listener, fixed at construction (see
-    /// [`ListenerConfig`]); the accepted connections' write halves pad with
-    /// it.
-    profile: Option<crate::obfuscate::padding::PaddingSettings>,
-    /// The fitted ACK-padding toggle for this listener, fixed at
+    /// The DPI-hiding padding policy for this listener, fixed at
     /// construction (see [`ListenerConfig`]); the accepted connections'
-    /// write halves pad standalone ACKs with it. The listener READ side
-    /// needs no flag: the fitted-ack demux is content-based.
-    ack_padding: bool,
+    /// write halves pad with it. The listener READ side needs no fitted-ack
+    /// flag: the codec's zero-tail rule is content-based.
+    policy: PaddingPolicy,
 }
 
 impl Listener {
@@ -184,18 +172,22 @@ impl Listener {
     ) -> std::io::Result<Self> {
         let ListenerConfig {
             obfuscation_key: key,
-            padding_profile: profile,
-            ack_padding,
+            padding,
         } = config;
 
         let udp = bind_udp(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
+        // The listener dispatch strips the data channel's padding with the
+        // resolved profile (the wrapper settings half of the policy); the
+        // fitted-ACK half lives in the write half and needs no dispatch flag
+        // (the codec's zero-tail rule is content-based).
+        let (data_settings, _) = padding.resolve();
         let responder = crate::probe::ProbeResponder::new(
             probe_echo_socket(&udp),
             key,
             crate::probe::probe_settings(),
-            profile,
+            data_settings,
         );
         let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
             Arc::new(move |addr: &SocketAddr, mut packet: Packet| {
@@ -216,7 +208,7 @@ impl Listener {
             });
         let listener = UtpListener::new(
             udp,
-            NonZeroUsize::new(DISPATCHER_BUF_SIZE + profile.map_or(0, |p| p.max())).unwrap(),
+            NonZeroUsize::new(DISPATCHER_BUF_SIZE + data_settings.map_or(0, |p| p.max())).unwrap(),
             dispatch,
         );
         Ok(Self {
@@ -224,8 +216,7 @@ impl Listener {
             local_addr,
             raw_fd,
             key,
-            profile,
-            ack_padding,
+            policy: padding,
         })
     }
 
@@ -255,16 +246,14 @@ impl Listener {
         let accepted = self.listener.poll_next_conn().await?;
         let raw_fd = self.raw_fd;
         let key = self.key;
-        let profile = self.profile;
-        let ack_padding = self.ack_padding;
+        let policy = self.policy;
         Ok(Box::pin(async move {
             accept(
                 accepted,
                 raw_fd,
                 AcceptSetup::from_config(true, config)?,
                 key,
-                profile,
-                ack_padding,
+                policy,
             )
             .await
         }))
@@ -282,8 +271,7 @@ impl Listener {
             self.raw_fd,
             AcceptSetup::from_config(false, config)?,
             self.key,
-            self.profile,
-            self.ack_padding,
+            self.policy,
         )
         .await
     }
@@ -323,8 +311,7 @@ impl Listener {
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
         let key = self.key;
-        let profile = self.profile;
-        let ack_padding = self.ack_padding;
+        let policy = self.policy;
         Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
@@ -332,8 +319,7 @@ impl Listener {
                 AcceptSetup::from_config(handshake, config)?
                     .with_frame_delivery(FrameMode::enabled()),
                 key,
-                profile,
-                ack_padding,
+                policy,
             )
             .await?;
             let Accepted {
@@ -388,22 +374,15 @@ pub struct AcceptConfig {
     /// [`ListenerConfig`], and the listener decrypts every datagram once at
     /// the dispatch.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// Padding settings for the [`crate::keyed_udp`] and [`crate::mpudp`]
-    /// accept paths (the single-path [`Listener`] takes its settings at
-    /// [`Listener::bind`]). When set (with an obfuscation key), every
-    /// datagram is padded to a target size chosen by these settings: a
-    /// fixed size ([`TargetKind::Fixed`]) or a random draw
-    /// ([`TargetKind::Uniform`] / [`TargetKind::Triangular`]).
-    pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
-    /// When true and no padding_profile is set,
-    /// standalone ACK datagrams are padded to a triangular-random target
-    /// fitted from recent sent data-packet sizes, hiding ACKs among data
-    /// packets from a passive DPI observer. Data packets are unpadded. The
-    /// netem_test A/B (rtp_padding_bench) showed bulk throughput dropped
-    /// 15-45% on rate-limited links, so the default is opt-in (`false`);
-    /// interactive latency was not observably affected. Both peers must
-    /// agree.
-    pub ack_padding: bool,
+    /// The DPI-hiding padding policy for the [`crate::keyed_udp`] and
+    /// [`crate::mpudp`] accept paths (the single-path [`Listener`] takes
+    /// its policy at [`Listener::bind`]): `None` sends datagrams at their
+    /// natural size, [`PaddingPolicy::AllFixed`] pads every datagram (data
+    /// and ACK) to a fixed size, and [`PaddingPolicy::AckMimicsData`] pads
+    /// standalone ACK datagrams to a target fitted from the recent sent
+    /// data-packet sizes. The peer must use the same policy. `None` (the
+    /// default) sends datagrams unpadded.
+    pub padding: PaddingPolicy,
 }
 
 impl Default for AcceptConfig {
@@ -417,8 +396,7 @@ impl Default for AcceptConfig {
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
             obfuscation_key: None,
-            padding_profile: None,
-            ack_padding: false,
+            padding: PaddingPolicy::None,
         }
     }
 }
@@ -444,21 +422,15 @@ pub struct ConnectConfig<'a> {
     /// this key. Both peers must use the same key; `None` (the default)
     /// sends datagrams in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    /// Padding settings: when set (with an obfuscation key), every datagram
-    /// is padded to a target size chosen by these settings: a fixed size
-    /// ([`TargetKind::Fixed`]) or a random draw ([`TargetKind::Uniform`] /
-    /// [`TargetKind::Triangular`]). Both peers must use the same settings;
-    /// `None` (the default) sends datagrams unpadded.
-    pub padding_profile: Option<crate::obfuscate::padding::PaddingSettings>,
-    /// When true and no padding_profile is set,
-    /// standalone ACK datagrams are padded to a triangular-random target
-    /// fitted from recent sent data-packet sizes, hiding ACKs among data
-    /// packets from a passive DPI observer. Data packets are unpadded. The
-    /// netem_test A/B (rtp_padding_bench) showed bulk throughput dropped
-    /// 15-45% on rate-limited links, so the default is opt-in (`false`);
-    /// interactive latency was not observably affected. Both peers must
-    /// agree.
-    pub ack_padding: bool,
+    /// The DPI-hiding padding policy: `None` sends datagrams at their
+    /// natural size, [`PaddingPolicy::AllFixed`] pads every datagram (data
+    /// and ACK) to a fixed size, and [`PaddingPolicy::AckMimicsData`] pads
+    /// standalone ACK datagrams to a target fitted from the recent sent
+    /// data-packet sizes. The netem_test A/B (rtp_padding_bench) showed
+    /// bulk throughput dropped 15-45% on rate-limited links with
+    /// `AckMimicsData`, so the default is `None`; interactive latency was
+    /// not observably affected. Both peers must use the same policy.
+    pub padding: PaddingPolicy,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -475,8 +447,7 @@ impl<'a> Default for ConnectConfig<'a> {
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
             obfuscation_key: None,
-            padding_profile: None,
-            ack_padding: false,
+            padding: PaddingPolicy::None,
         }
     }
 }
@@ -528,9 +499,12 @@ async fn accept(
     raw_fd: MaybeRawFd,
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    profile: Option<crate::obfuscate::padding::PaddingSettings>,
-    ack_padding: bool,
+    policy: PaddingPolicy,
 ) -> std::io::Result<Accepted> {
+    // Resolve the DPI-hiding policy into its two consumers: the wrapper's
+    // padding settings (the profile every datagram is padded to) and the
+    // write half's fitted-ACK-padding toggle. Exactly one is ever active.
+    let (profile, ack_padding) = policy.resolve();
     let AcceptSetup {
         handshake,
         fec,
@@ -593,9 +567,9 @@ async fn accept(
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
-    // Fitted ACK padding lives in the write half; a padding profile wins
-    // (the write half never mixes profile padding with fitted ACK padding).
-    unreliable_layer.ack_padding = ack_padding && profile.is_none();
+    // Fitted ACK padding lives in the write half; the policy resolution
+    // guarantees it never coexists with a padding profile.
+    unreliable_layer.ack_padding = ack_padding;
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -887,8 +861,7 @@ async fn connect_bound(
         instream_group_fec,
         watchdog,
         obfuscation_key,
-        padding_profile,
-        ack_padding,
+        padding,
     } = config;
 
     let local_addr = udp.local_addr()?;
@@ -901,6 +874,10 @@ async fn connect_bound(
         None => None,
     };
     let udp = Arc::new(udp);
+    // Resolve the DPI-hiding policy into its two consumers: the wrapper's
+    // padding settings (the profile every datagram is padded to) and the
+    // write half's fitted-ACK-padding toggle. Exactly one is ever active.
+    let (profile, ack_padding) = padding.resolve();
     // The obfuscation wrapper sits directly on the socket; the probe-echo
     // demux sits AFTER it so it sees decrypted datagrams and can intercept
     // obfuscated probe echoes. The probe tap sends obfuscated probes with
@@ -910,7 +887,7 @@ async fn connect_bound(
         Arc::clone(&udp),
         obfuscation_key.map(|key| crate::obfuscate::Obfuscation {
             key,
-            settings: padding_profile,
+            settings: profile,
         }),
     );
     let (probe_tap, filtered_read) = crate::probe::client_echo_demux(
@@ -928,7 +905,7 @@ async fn connect_bound(
     } else {
         mss
     };
-    if let Some(profile) = padding_profile
+    if let Some(profile) = profile
         && profile.max() > mss.get()
     {
         return Err(std::io::Error::new(
@@ -951,9 +928,9 @@ async fn connect_bound(
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
-    // Fitted ACK padding lives in the write half; a padding profile wins
-    // (the write half never mixes profile padding with fitted ACK padding).
-    unreliable_layer.ack_padding = ack_padding && padding_profile.is_none();
+    // Fitted ACK padding lives in the write half; the policy resolution
+    // guarantees it never coexists with a padding profile.
+    unreliable_layer.ack_padding = ack_padding;
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -1053,8 +1030,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding_profile: None,
-                ack_padding: false,
+                padding: PaddingPolicy::None,
             },
         )
         .await
@@ -1107,8 +1083,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding_profile: None,
-                ack_padding: false,
+                padding: PaddingPolicy::None,
             },
         )
         .await
@@ -1632,8 +1607,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding_profile: None,
-                ack_padding: false,
+                padding: PaddingPolicy::None,
             },
         )
         .await
@@ -1713,8 +1687,7 @@ mod tests {
                 "127.0.0.1:0",
                 ListenerConfig {
                     obfuscation_key: Some(KEY),
-                    padding_profile: None,
-                    ack_padding: false,
+                    padding: PaddingPolicy::None,
                 },
             )
             .await
@@ -1962,8 +1935,7 @@ mod nohandshake_obf {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding_profile: None,
-                ack_padding: false,
+                padding: PaddingPolicy::None,
             },
         )
         .await

@@ -83,6 +83,9 @@ impl<K: DispatchKey> Listener<K> {
         // Datagram obfuscation wraps the PAYLOAD (the dispatch key stays
         // plaintext — the demux needs it to route). The nonce is reserved
         // from the MSS so the wire datagram stays within the configured MSS.
+        // Resolve the DPI-hiding policy: the wrapper's padding settings and
+        // the write half's fitted-ACK-padding toggle (exactly one active).
+        let (profile, ack_padding) = config.padding.resolve();
         let (read, write) = crate::obfuscate::maybe_wrap(
             read,
             write,
@@ -90,7 +93,7 @@ impl<K: DispatchKey> Listener<K> {
                 .obfuscation_key
                 .map(|key| crate::obfuscate::Obfuscation {
                     key,
-                    settings: None,
+                    settings: profile,
                 }),
         );
         let mss = if config.obfuscation_key.is_some() {
@@ -109,9 +112,9 @@ impl<K: DispatchKey> Listener<K> {
         unreliable_layer.retransmission_armor = config.retransmission_armor;
         unreliable_layer.instream_group_fec = config.instream_group_fec;
         unreliable_layer.metrics_observer = config.metrics_observer;
-        // Fitted ACK padding lives in the write half; a padding profile
-        // wins (it is ignored otherwise on this path, matching today).
-        unreliable_layer.ack_padding = config.ack_padding && config.padding_profile.is_none();
+        // Fitted ACK padding lives in the write half; the policy resolution
+        // guarantees it never coexists with a padding profile.
+        unreliable_layer.ack_padding = ack_padding;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Ok(Accepted {
             read,
@@ -170,6 +173,9 @@ impl<K: DispatchKey> Connector<K> {
         // Datagram obfuscation wraps the PAYLOAD (the dispatch key stays
         // plaintext — the demux needs it to route). The nonce is reserved
         // from the MSS so the wire datagram stays within the configured MSS.
+        // Resolve the DPI-hiding policy: the wrapper's padding settings and
+        // the write half's fitted-ACK-padding toggle (exactly one active).
+        let (profile, ack_padding) = config.padding.resolve();
         let (read, write) = crate::obfuscate::maybe_wrap(
             read,
             write,
@@ -177,7 +183,7 @@ impl<K: DispatchKey> Connector<K> {
                 .obfuscation_key
                 .map(|key| crate::obfuscate::Obfuscation {
                     key,
-                    settings: None,
+                    settings: profile,
                 }),
         );
         let mss = if config.obfuscation_key.is_some() {
@@ -197,9 +203,9 @@ impl<K: DispatchKey> Connector<K> {
         unreliable_layer.retransmission_armor = config.retransmission_armor;
         unreliable_layer.instream_group_fec = config.instream_group_fec;
         unreliable_layer.metrics_observer = config.metrics_observer;
-        // Fitted ACK padding lives in the write half; a padding profile
-        // wins (it is ignored otherwise on this path, matching today).
-        unreliable_layer.ack_padding = config.ack_padding && config.padding_profile.is_none();
+        // Fitted ACK padding lives in the write half; the policy resolution
+        // guarantees it never coexists with a padding profile.
+        unreliable_layer.ack_padding = ack_padding;
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
             read,

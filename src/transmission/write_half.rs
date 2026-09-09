@@ -46,12 +46,12 @@ pub struct WriteHalf {
     /// Connection MSS, used to derive the handshake padding bound (see
     /// [`crate::traffic_shaping::control::handshake::padding`]).
     mss: crate::mss::Mss,
-    /// Fitted ACK-padding toggle, from the connect/accept config (see
-    /// [`crate::udp::ConnectConfig::ack_padding`]). When true (and no
-    /// padding profile is set), ACK flush pages are zero-filled to a
-    /// target drawn from the observed data-packet sizes so they are
-    /// indistinguishable from data by wire size; the receiver's codec
-    /// strips the all-zero tail.
+    /// Fitted ACK-padding toggle, resolved from the connect/accept config's
+    /// [`crate::udp::PaddingPolicy`] (see [`crate::obfuscate::padding::PaddingPolicy`]).
+    /// When true, ACK flush pages are zero-filled to a target drawn from the
+    /// observed data-packet sizes so they are indistinguishable from data by
+    /// wire size; the receiver's codec strips the all-zero tail. The policy
+    /// resolution guarantees it never coexists with a padding profile.
     ack_padding: bool,
     /// Sampler over recent sent data-packet sizes feeding fitted ACK
     /// padding (only read when `ack_padding` is true).
