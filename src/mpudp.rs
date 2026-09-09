@@ -10,7 +10,7 @@ use crate::{
     traffic_shaping::redundancy::{RetransmissionArmorConfig, fec_tuning::FecTuning},
     transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
-        AcceptConfig, ConnectConfig, LogConfig, Mss, MssConfig, PaddingPolicy,
+        AcceptConfig, ConnectConfig, HarmfulPaddingPolicy, LogConfig, Mss, MssConfig,
         wrap_fec_with_mss_and_fec_tuning_and_frame_delivery,
     },
 };
@@ -69,7 +69,7 @@ struct LayerTuning {
     /// The DPI-hiding padding policy, resolved from the config into the
     /// wrapper's padding settings and the write half's fitted-ACK-padding
     /// toggle at [`convert_conn`] (exactly one is ever active).
-    padding: PaddingPolicy,
+    padding: HarmfulPaddingPolicy,
 }
 
 impl LayerTuning {

@@ -31,7 +31,9 @@ use crate::{
     },
 };
 
-pub use crate::obfuscate::padding::{PaddingPolicy, PaddingSettings, PayloadSized, TargetKind};
+pub use crate::obfuscate::padding::{
+    HarmfulPaddingPolicy, PaddingSettings, PayloadSized, TargetKind,
+};
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
 
@@ -138,12 +140,12 @@ pub struct ListenerConfig {
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     /// The DPI-hiding padding policy for this listener, fixed at
     /// construction (see [`ListenerConfig`]): `None` sends datagrams at
-    /// their natural size, [`PaddingPolicy::AllFixed`] pads every datagram
-    /// (data and ACK) to a fixed size, and [`PaddingPolicy::AckMimicsData`]
+    /// their natural size, [`HarmfulPaddingPolicy::AllFixed`] pads every datagram
+    /// (data and ACK) to a fixed size, and [`HarmfulPaddingPolicy::AckMimicsData`]
     /// pads standalone ACK datagrams to a target fitted from the recent
     /// sent data-packet sizes. The peer must use the same policy. `None`
     /// (the default) sends datagrams unpadded.
-    pub padding: PaddingPolicy,
+    pub padding: HarmfulPaddingPolicy,
 }
 
 #[derive(Debug)]
@@ -161,7 +163,7 @@ pub struct Listener {
     /// construction (see [`ListenerConfig`]); the accepted connections'
     /// write halves pad with it. The listener READ side needs no fitted-ack
     /// flag: the codec's zero-tail rule is content-based.
-    policy: PaddingPolicy,
+    policy: HarmfulPaddingPolicy,
 }
 
 impl Listener {
@@ -377,12 +379,12 @@ pub struct AcceptConfig {
     /// The DPI-hiding padding policy for the [`crate::keyed_udp`] and
     /// [`crate::mpudp`] accept paths (the single-path [`Listener`] takes
     /// its policy at [`Listener::bind`]): `None` sends datagrams at their
-    /// natural size, [`PaddingPolicy::AllFixed`] pads every datagram (data
-    /// and ACK) to a fixed size, and [`PaddingPolicy::AckMimicsData`] pads
+    /// natural size, [`HarmfulPaddingPolicy::AllFixed`] pads every datagram (data
+    /// and ACK) to a fixed size, and [`HarmfulPaddingPolicy::AckMimicsData`] pads
     /// standalone ACK datagrams to a target fitted from the recent sent
     /// data-packet sizes. The peer must use the same policy. `None` (the
     /// default) sends datagrams unpadded.
-    pub padding: PaddingPolicy,
+    pub padding: HarmfulPaddingPolicy,
 }
 
 impl Default for AcceptConfig {
@@ -396,7 +398,7 @@ impl Default for AcceptConfig {
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
             obfuscation_key: None,
-            padding: PaddingPolicy::None,
+            padding: HarmfulPaddingPolicy::None,
         }
     }
 }
@@ -423,14 +425,14 @@ pub struct ConnectConfig<'a> {
     /// sends datagrams in the clear.
     pub obfuscation_key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     /// The DPI-hiding padding policy: `None` sends datagrams at their
-    /// natural size, [`PaddingPolicy::AllFixed`] pads every datagram (data
-    /// and ACK) to a fixed size, and [`PaddingPolicy::AckMimicsData`] pads
+    /// natural size, [`HarmfulPaddingPolicy::AllFixed`] pads every datagram (data
+    /// and ACK) to a fixed size, and [`HarmfulPaddingPolicy::AckMimicsData`] pads
     /// standalone ACK datagrams to a target fitted from the recent sent
     /// data-packet sizes. The netem_test A/B (rtp_padding_bench) showed
     /// bulk throughput dropped 15-45% on rate-limited links with
     /// `AckMimicsData`, so the default is `None`; interactive latency was
     /// not observably affected. Both peers must use the same policy.
-    pub padding: PaddingPolicy,
+    pub padding: HarmfulPaddingPolicy,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -447,7 +449,7 @@ impl<'a> Default for ConnectConfig<'a> {
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
             obfuscation_key: None,
-            padding: PaddingPolicy::None,
+            padding: HarmfulPaddingPolicy::None,
         }
     }
 }
@@ -499,7 +501,7 @@ async fn accept(
     raw_fd: MaybeRawFd,
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
-    policy: PaddingPolicy,
+    policy: HarmfulPaddingPolicy,
 ) -> std::io::Result<Accepted> {
     // Resolve the DPI-hiding policy into its two consumers: the wrapper's
     // padding settings (the profile every datagram is padded to) and the
@@ -1030,7 +1032,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding: PaddingPolicy::None,
+                padding: HarmfulPaddingPolicy::None,
             },
         )
         .await
@@ -1083,7 +1085,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding: PaddingPolicy::None,
+                padding: HarmfulPaddingPolicy::None,
             },
         )
         .await
@@ -1607,7 +1609,7 @@ mod tests {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding: PaddingPolicy::None,
+                padding: HarmfulPaddingPolicy::None,
             },
         )
         .await
@@ -1687,7 +1689,7 @@ mod tests {
                 "127.0.0.1:0",
                 ListenerConfig {
                     obfuscation_key: Some(KEY),
-                    padding: PaddingPolicy::None,
+                    padding: HarmfulPaddingPolicy::None,
                 },
             )
             .await
@@ -1935,7 +1937,7 @@ mod nohandshake_obf {
             "127.0.0.1:0",
             ListenerConfig {
                 obfuscation_key: Some(KEY),
-                padding: PaddingPolicy::None,
+                padding: HarmfulPaddingPolicy::None,
             },
         )
         .await

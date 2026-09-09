@@ -47,7 +47,7 @@ pub struct WriteHalf {
     /// [`crate::traffic_shaping::control::handshake::padding`]).
     mss: crate::mss::Mss,
     /// Fitted ACK-padding toggle, resolved from the connect/accept config's
-    /// [`crate::udp::PaddingPolicy`] (see [`crate::obfuscate::padding::PaddingPolicy`]).
+    /// [`crate::udp::HarmfulPaddingPolicy`] (see [`crate::obfuscate::padding::HarmfulPaddingPolicy`]).
     /// When true, ACK flush pages are zero-filled to a target drawn from the
     /// observed data-packet sizes so they are indistinguishable from data by
     /// wire size; the receiver's codec strips the all-zero tail. The policy

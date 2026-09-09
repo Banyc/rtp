@@ -42,7 +42,7 @@ pub enum PayloadSized {
 /// pair, so the invalid combinations (a profile AND fitted ACK padding at
 /// once) are unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PaddingPolicy {
+pub enum HarmfulPaddingPolicy {
     /// No padding: every datagram goes out at its natural size.
     #[default]
     None,
@@ -54,7 +54,7 @@ pub enum PaddingPolicy {
     AckMimicsData,
 }
 
-impl PaddingPolicy {
+impl HarmfulPaddingPolicy {
     /// Resolve the policy into its two consumers: the obfuscation wrapper's
     /// padding settings (the profile it pads every datagram with) and the
     /// write half's fitted-ACK-padding toggle. Exactly one of the two is
@@ -62,12 +62,12 @@ impl PaddingPolicy {
     /// toggle, `None` sets neither.
     pub(crate) fn resolve(self) -> (Option<PaddingSettings>, bool) {
         match self {
-            PaddingPolicy::None => (None, false),
-            PaddingPolicy::AllFixed(size) => (
+            HarmfulPaddingPolicy::None => (None, false),
+            HarmfulPaddingPolicy::AllFixed(size) => (
                 Some(PaddingSettings::dynamic_target(TargetKind::Fixed(size))),
                 false,
             ),
-            PaddingPolicy::AckMimicsData => (None, true),
+            HarmfulPaddingPolicy::AckMimicsData => (None, true),
         }
     }
 }
