@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::ack::AckInterval;
 use crate::delivery::frame::FrameMode;
 use crate::io_err::IoErr;
+use crate::obfuscate::padding::AckPaddingMode;
 use crate::sequence::InitialSequences;
 use crate::traffic_shaping::redundancy::{
     RetransmissionArmorConfig, fec::FecState, fec_tuning::FecTuning,
@@ -113,14 +114,16 @@ pub struct UnreliableLayer {
     /// connect/accept config (which reads `RTP_INSTREAM_GROUP_FEC` in
     /// `Default`); the shared session state is seeded from here.
     pub(crate) instream_group_fec: bool,
-    /// Fitted ACK-padding toggle: when true (and no padding profile is
-    /// set), the write half zero-fills standalone ACK datagrams to a target
-    /// drawn from the recent sent data-packet sizes, hiding them among data
-    /// packets from a passive DPI observer. The receiver's codec strips the
-    /// all-zero tail after the ACK command, so padded and unpadded ACKs
-    /// decode identically. Both peers must configure identically; a padding
-    /// profile wins over this flag (profile + fitted padding never mix).
-    pub(crate) ack_padding: bool,
+    /// ACK-padding mode for the write half, resolved from the connect/accept
+    /// config's [`crate::udp::HarmfulPaddingPolicy`]: `Fitted` zero-fills
+    /// standalone ACK datagrams to a target drawn from the recent sent
+    /// data-packet sizes (hiding them among data packets), `Jitter` appends
+    /// a uniform `[0, ACK_INTERVAL_WIRE_SIZE)` pad (de-quantizing the
+    /// 16-byte ack-block slots of natural-size ACKs), `None` adds nothing.
+    /// The receiver's codec strips the all-zero tail after the ACK command,
+    /// so padded and unpadded ACKs decode identically. Both peers must
+    /// configure identically.
+    pub(crate) ack_padding: AckPaddingMode,
 }
 
 #[derive(Debug, Clone)]

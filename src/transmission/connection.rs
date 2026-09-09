@@ -699,6 +699,7 @@ mod tests {
         MetricsEvent, MetricsInterest, MetricsObserver, MetricsSendDriverResumeSource,
         MetricsTerminationCause, SCHEMA_VERSION,
     };
+    use crate::obfuscate::padding::AckPaddingMode;
     use crate::traffic_shaping::core::SendWake;
     use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -722,7 +723,7 @@ mod tests {
             frame_delivery,
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
-            ack_padding: false,
+            ack_padding: AckPaddingMode::None,
         }
     }
 

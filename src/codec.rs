@@ -252,6 +252,13 @@ pub fn decode(
     })
 }
 
+/// The wire size of one ACK interval (selective block): an 8-byte start
+/// plus an 8-byte size. ACK content grows in these 16-byte slots, so a
+/// size-slot analysis of ACK datagrams would see 16-byte quantization;
+/// the fitted-ack padding's extra jitter is drawn from `[0, this)` to
+/// de-quantize the slots.
+pub(crate) const ACK_INTERVAL_WIRE_SIZE: usize = 8 + 8;
+
 fn encode_ack(wtr: &mut io::Cursor<&mut [u8]>, ack: AckInterval) -> Result<(), EncodeError> {
     wtr.write_u64::<BigEndian>(ack.start.to_wire())
         .pipe(wrap_insufficient_buffer_size_err)?;

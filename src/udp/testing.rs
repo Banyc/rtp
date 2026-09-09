@@ -13,6 +13,7 @@ use std::sync::{
 };
 
 use super::*;
+use crate::obfuscate::padding::AckPaddingMode;
 
 /// A toggable rate in basis points (0–10_000), owned by a single test
 /// and shared (via `Arc`) between the read and write wrappers of one
@@ -208,7 +209,7 @@ where
         frame_delivery: FrameMode::default(),
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
-        ack_padding: false,
+        ack_padding: AckPaddingMode::None,
     }
 }
 
@@ -276,6 +277,6 @@ where
         frame_delivery: FrameMode::default(),
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
-        ack_padding: false,
+        ack_padding: AckPaddingMode::None,
     }
 }

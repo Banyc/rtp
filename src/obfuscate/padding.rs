@@ -43,7 +43,10 @@ pub enum PayloadSized {
 /// once) are unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HarmfulPaddingPolicy {
-    /// No padding: every datagram goes out at its natural size.
+    /// No profile padding: data packets go out at their natural size, and
+    /// standalone ACK datagrams get a uniform random pad in
+    /// `[0, ACK_INTERVAL_WIRE_SIZE)` so a size-slot analysis cannot read
+    /// the 16-byte ack-block quantization of their natural sizes.
     #[default]
     None,
     /// Pad every datagram (data and ACK) to a fixed plaintext size.
@@ -54,20 +57,38 @@ pub enum HarmfulPaddingPolicy {
     AckMimicsData,
 }
 
+/// How the write half pads standalone ACK flush pages, resolved from the
+/// [`HarmfulPaddingPolicy`]. Exactly one mode is active per connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckPaddingMode {
+    /// No padding: ACK pages go out at their natural size (the `AllFixed`
+    /// policy — the wrapper pads every datagram to the fixed size, so the
+    /// write half adds nothing).
+    None,
+    /// Append a uniform random pad in `[0, ACK_INTERVAL_WIRE_SIZE)` so a
+    /// size-slot analysis cannot read the 16-byte ack-block quantization of
+    /// natural-size ACK datagrams (the `None` policy).
+    Jitter,
+    /// Zero-fill to a target drawn from the fitted data-size distribution
+    /// (the `AckMimicsData` policy).
+    Fitted,
+}
+
 impl HarmfulPaddingPolicy {
     /// Resolve the policy into its two consumers: the obfuscation wrapper's
     /// padding settings (the profile it pads every datagram with) and the
-    /// write half's fitted-ACK-padding toggle. Exactly one of the two is
-    /// ever active: `AllFixed` sets the profile, `AckMimicsData` sets the
-    /// toggle, `None` sets neither.
-    pub(crate) fn resolve(self) -> (Option<PaddingSettings>, bool) {
+    /// write half's ACK-padding mode. Exactly one of the two is ever
+    /// active: `AllFixed` sets the profile, `AckMimicsData` sets the fitted
+    /// mode, `None` sets the jitter mode (natural-size ACKs get a small
+    /// random pad so their 16-byte block slots are not readable).
+    pub(crate) fn resolve(self) -> (Option<PaddingSettings>, AckPaddingMode) {
         match self {
-            HarmfulPaddingPolicy::None => (None, false),
+            HarmfulPaddingPolicy::None => (None, AckPaddingMode::Jitter),
             HarmfulPaddingPolicy::AllFixed(size) => (
                 Some(PaddingSettings::dynamic_target(TargetKind::Fixed(size))),
-                false,
+                AckPaddingMode::None,
             ),
-            HarmfulPaddingPolicy::AckMimicsData => (None, true),
+            HarmfulPaddingPolicy::AckMimicsData => (None, AckPaddingMode::Fitted),
         }
     }
 }

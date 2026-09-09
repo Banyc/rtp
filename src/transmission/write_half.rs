@@ -11,6 +11,7 @@ use crate::ack::EncodeAck;
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsEvent, MetricsTerminationCause};
+use crate::obfuscate::padding::AckPaddingMode;
 use crate::obfuscate::sampler::DataSizeSampler;
 use crate::traffic_shaping::control::handshake::padding::pad_handshake;
 use crate::traffic_shaping::core::{SendPacer, SendWake};
@@ -46,15 +47,16 @@ pub struct WriteHalf {
     /// Connection MSS, used to derive the handshake padding bound (see
     /// [`crate::traffic_shaping::control::handshake::padding`]).
     mss: crate::mss::Mss,
-    /// Fitted ACK-padding toggle, resolved from the connect/accept config's
-    /// [`crate::udp::HarmfulPaddingPolicy`] (see [`crate::obfuscate::padding::HarmfulPaddingPolicy`]).
-    /// When true, ACK flush pages are zero-filled to a target drawn from the
-    /// observed data-packet sizes so they are indistinguishable from data by
-    /// wire size; the receiver's codec strips the all-zero tail. The policy
-    /// resolution guarantees it never coexists with a padding profile.
-    ack_padding: bool,
+    /// ACK-padding mode, resolved from the connect/accept config's
+    /// [`crate::udp::HarmfulPaddingPolicy`]: `Fitted` zero-fills ACK flush
+    /// pages to a target drawn from the observed data-packet sizes so they
+    /// are indistinguishable from data by wire size; `Jitter` appends a
+    /// uniform `[0, ACK_INTERVAL_WIRE_SIZE)` pad so natural-size ACKs are
+    /// not readable by size-slot analysis; `None` adds nothing. The
+    /// receiver's codec strips the all-zero tail after the ACK command.
+    ack_padding: AckPaddingMode,
     /// Sampler over recent sent data-packet sizes feeding fitted ACK
-    /// padding (only read when `ack_padding` is true).
+    /// padding (only read in `Fitted` mode).
     data_size_sampler: DataSizeSampler,
 }
 
@@ -68,8 +70,8 @@ pub(super) struct WriteHalfSettings {
     /// Connection MSS, used to derive the handshake padding bound (see
     /// [`crate::traffic_shaping::control::handshake::padding`]).
     pub(super) mss: crate::mss::Mss,
-    /// Fitted ACK-padding toggle (see [`crate::transmission::transmission_layer::UnreliableLayer`]).
-    pub(super) ack_padding: bool,
+    /// ACK-padding mode (see [`crate::transmission::transmission_layer::UnreliableLayer`]).
+    pub(super) ack_padding: AckPaddingMode,
 }
 
 impl WriteHalf {
@@ -293,7 +295,7 @@ impl WriteHalf {
                     .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
             });
             let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
-            if self.ack_padding {
+            if self.ack_padding == AckPaddingMode::Fitted {
                 // Sample the DATA path only: the encoded codec packet length
                 // (before FEC/obfuscation envelopes, which padded ACKs add
                 // identically) is the wire-size distribution ACKs must
@@ -586,30 +588,38 @@ impl WriteHalf {
                 continue;
             };
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
-            // Fitted ACK padding: when enabled, draw a target from the
-            // observed data-packet sizes and zero-fill the page tail up to
-            // it IN PLACE (the page buffers are BUF_SIZE-sized, so there is
-            // headroom; the target never exceeds the largest observed data
-            // packet). The padding rides INSIDE the FEC envelope when FEC
-            // is on and is stripped by the codec's zero-tail rule at the
-            // receiver, so padded and unpadded ACKs decode identically. On
-            // `None` (no fit yet, or the data envelope too small) the page
-            // goes out unpadded exactly as before.
+            // ACK-page padding, resolved from the HarmfulPaddingPolicy:
+            // `Fitted` draws a target from the observed data-packet sizes and
+            // zero-fills the page tail up to it; `Jitter` appends a uniform
+            // `[0, ACK_INTERVAL_WIRE_SIZE)` pad so natural-size ACKs are not
+            // readable by size-slot analysis; `None` adds nothing. The pad
+            // rides INSIDE the FEC envelope when FEC is on and is stripped
+            // by the codec's zero-tail rule at the receiver, so padded and
+            // unpadded ACKs decode identically. The page buffers are
+            // BUF_SIZE-sized, so there is headroom for the fill.
             let page_buf = if index == 0 { codec_pkt } else { payload };
-            let page_len = if self.ack_padding {
-                match self
-                    .data_size_sampler
-                    .draw_target(written_bytes, Instant::now())
-                {
-                    Some(target) => {
-                        let target = target.min(page_buf.len());
-                        page_buf[written_bytes..target].fill(0);
-                        target
+            let page_len = match self.ack_padding {
+                AckPaddingMode::Fitted => {
+                    match self
+                        .data_size_sampler
+                        .draw_target(written_bytes, Instant::now())
+                    {
+                        Some(target) => {
+                            let target = target.min(page_buf.len());
+                            page_buf[written_bytes..target].fill(0);
+                            target
+                        }
+                        // No fit yet, or the data envelope too small: the
+                        // page goes out unpadded exactly as before.
+                        None => written_bytes,
                     }
-                    None => written_bytes,
                 }
-            } else {
-                written_bytes
+                AckPaddingMode::Jitter => {
+                    let pad = rand::random_range(0..crate::codec::ACK_INTERVAL_WIRE_SIZE);
+                    page_buf[written_bytes..written_bytes + pad].fill(0);
+                    written_bytes + pad
+                }
+                AckPaddingMode::None => written_bytes,
             };
             let encoded_page = &page_buf[..page_len];
             match self.send_with_fec(encoded_page, wire_pkt).await {
@@ -669,6 +679,7 @@ impl WriteHalf {
 mod tests {
     use crate::delivery::frame::FrameMode;
     use crate::metrics::{MetricsEvent, MetricsObserver, MetricsTerminationCause};
+    use crate::obfuscate::padding::AckPaddingMode;
     use crate::traffic_shaping::recovery::liveness::PeerLiveness;
     use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
     use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -778,7 +789,7 @@ mod tests {
             frame_delivery: FrameMode::default(),
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
-            ack_padding: false,
+            ack_padding: AckPaddingMode::None,
         };
         let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let (shared, write_half, _read_half, _reaper) =

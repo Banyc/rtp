@@ -50,6 +50,7 @@ impl TransmissionLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obfuscate::padding::AckPaddingMode;
     use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
     use crate::transmission::test_doubles::BlockingWrite;
     use std::sync::{
@@ -325,13 +326,13 @@ mod tests {
         enabled: bool,
         tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
-        harness_with_tuning_and_ack_padding(fec, enabled, tuning, false)
+        harness_with_tuning_and_ack_padding(fec, enabled, tuning, AckPaddingMode::None)
     }
     fn harness_with_tuning_and_ack_padding(
         fec: bool,
         enabled: bool,
         tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
-        ack_padding: bool,
+        ack_padding: AckPaddingMode,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
@@ -1055,7 +1056,7 @@ mod tests {
             false,
             false,
             crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
-            true,
+            AckPaddingMode::Fitted,
         );
         let now = Instant::now();
         // Populate the sampler with >= MIN_SAMPLES data packets (each ~111 B
@@ -1112,6 +1113,66 @@ mod tests {
             ack_wire.len() >= 100,
             "the padded ACK must be data-sized, got {} bytes",
             ack_wire.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn jitter_ack_padding_dequantizes_ack_sizes() {
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        let (mut transmission, recorder) = harness_with_tuning_and_ack_padding(
+            false,
+            false,
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            AckPaddingMode::Jitter,
+        );
+        // A small recv history so each flush has a claimable page with the
+        // same content (the only per-flush variation is the jitter pad).
+        {
+            let mut reliable = transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap();
+            for seq in [2u64, 4, 6] {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
+            }
+        }
+        let mut send_bufs = SendBufs::new();
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            transmission
+                .shared_for_test()
+                .ack_feedback_for_test()
+                .record(ReceivedAckWork {
+                    pending_acks: 1,
+                    fin_ack: false,
+                    echo_ts: None,
+                });
+            transmission.flush_acks(&mut send_bufs).await.unwrap();
+            let sent = recorder.lock().unwrap().datagrams();
+            let wire = sent.last().expect("the flush must send the jittered ACK");
+            // The jittered ACK decodes (the codec strips the zero tail) and
+            // stays at its natural size plus the [0, 16) pad — never
+            // fitted-padded to the data band.
+            let mut acks = Vec::new();
+            let decoded = crate::codec::decode(wire, &mut acks, None).unwrap();
+            assert!(
+                decoded.ack_next.is_some(),
+                "the jittered ACK must decode, got {wire:?}"
+            );
+            assert!(
+                wire.len() < 200,
+                "the jittered ACK must stay small, got {} bytes",
+                wire.len()
+            );
+            sizes.push(wire.len());
+        }
+        // The uniform [0, 16) pad de-quantizes the 16-byte ack-block slots:
+        // identical ack content must produce varying wire sizes.
+        let distinct: std::collections::HashSet<usize> = sizes.iter().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "the jitter must vary the ACK wire size, got {sizes:?}"
         );
     }
 

@@ -7,6 +7,7 @@ use crate::mss::MAX_MSS;
 use super::NO_FEC_MSS;
 use crate::delivery::frame::FrameMode;
 use crate::mss::{Mss, MssError};
+use crate::obfuscate::padding::AckPaddingMode;
 use crate::traffic_shaping::redundancy::{
     RetransmissionArmorConfig,
     fec::{FecConfig, FecState},
@@ -54,7 +55,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         frame_delivery,
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
-        ack_padding: false,
+        ack_padding: AckPaddingMode::None,
     })
 }
 
