@@ -125,9 +125,13 @@ impl PktRecvSpace {
             &mut self.slots,
             &mut self.reused_buf,
             &mut self.scan_start,
-        )?;
+        );
+        // Collapse the head-tombstone prefix whether or not a frame was
+        // found: the scan may have tombstoned abandoned frames (a hostile
+        // peer's overlapping frames) with no complete frame to return, and
+        // the cursor must still advance past them or the receiver wedges.
         self.collapse_tombstone_prefix();
-        Some(frame_bytes)
+        frame_bytes
     }
 
     /// Advance `next` past contiguous tombstone(s) at the head of the slot
@@ -369,6 +373,71 @@ mod tests {
         // collapse_tombstone_prefix.  The in-order cursor should be at 4.
         assert_eq!(space.next, Some(seq(4)));
         assert_eq!(space.slots.len(), 0);
+    }
+
+    #[test]
+    fn interrupted_frame_does_not_wedge_the_receiver() {
+        let mut space = PktRecvSpace::new();
+        // Frame A (seqs 0-3, frame_len 80) is interrupted by a hostile
+        // frame-start at seq 3 (frame B, seqs 3-6): only A's first three
+        // packets (60 bytes) have arrived, so A is incomplete when B's start
+        // lands inside its range. B completes and is popped (tombstoning
+        // 3-6); A's retransmissions of 3-5 are then swallowed by the
+        // tombstones (occupied slots read as duplicates). The receiver must
+        // tombstone A's collected seqs (0-2) so the in-order cursor advances
+        // instead of wedging on A forever.
+        assert!(space.recv(0, b"AAAAAAAAAAAAAAAAAAAA".to_vec(), Some(80)));
+        assert!(space.recv(1, b"BBBBBBBBBBBBBBBBBBBB".to_vec(), None));
+        assert!(space.recv(2, b"CCCCCCCCCCCCCCCCCCCC".to_vec(), None));
+        assert!(space.recv(3, b"DDDDDDDDDDDDDDDDDDDD".to_vec(), Some(80)));
+        assert!(space.recv(4, b"EEEEEEEEEEEEEEEEEEEE".to_vec(), None));
+        assert!(space.recv(5, b"FFFFFFFFFFFFFFFFFFFF".to_vec(), None));
+        assert!(space.recv(6, b"GGGGGGGGGGGGGGGGGGGG".to_vec(), None));
+        // B completes first (the scan restarts at the colliding frame-start).
+        assert_eq!(
+            space.pop_complete_frame().unwrap(),
+            b"DDDDDDDDDDDDDDDDDDDDEEEEEEEEEEEEEEEEEEEEFFFFFFFFFFFFFFFFFFFFGGGGGGGGGGGGGGGGGGGG"
+        );
+        // A's retransmissions of 3-5 are acked as duplicates (occupied
+        // slots) but never inserted — they cannot repair A.
+        assert!(space.recv(3, b"AAAAAAAAAAAAAAAAAAAA".to_vec(), None));
+        assert!(space.recv(4, b"BBBBBBBBBBBBBBBBBBBB".to_vec(), None));
+        assert!(space.recv(5, b"CCCCCCCCCCCCCCCCCCCC".to_vec(), None));
+        // No complete frame remains, but the abandoned frame A (0-2) is
+        // tombstoned and the cursor advances past 0-6 instead of wedging.
+        assert!(space.pop_complete_frame().is_none());
+        assert_eq!(space.next, Some(seq(7)));
+    }
+
+    #[test]
+    fn legitimate_out_of_order_frames_still_reassemble_after_a_collision() {
+        let mut space = PktRecvSpace::new();
+        // Frame A (seqs 0-3, frame_len 80) and frame B (seqs 4-6, frame_len
+        // 60) are contiguous from the sender's perspective, but B's packets
+        // arrive before A's continuation at seq 3. The scan abandons A at
+        // the collision with B (no tombstone inside A's range), B completes,
+        // and A must still reassemble when its packet arrives at a vacant
+        // slot.
+        assert!(space.recv(0, b"AAAAAAAAAAAAAAAAAAAA".to_vec(), Some(80)));
+        assert!(space.recv(1, b"BBBBBBBBBBBBBBBBBBBB".to_vec(), None));
+        assert!(space.recv(2, b"CCCCCCCCCCCCCCCCCCCC".to_vec(), None));
+        assert!(space.recv(4, b"DDDDDDDDDDDDDDDDDDDD".to_vec(), Some(60)));
+        assert!(space.recv(5, b"EEEEEEEEEEEEEEEEEEEE".to_vec(), None));
+        assert!(space.recv(6, b"FFFFFFFFFFFFFFFFFFFF".to_vec(), None));
+        // B completes first.
+        assert_eq!(
+            space.pop_complete_frame().unwrap(),
+            b"DDDDDDDDDDDDDDDDDDDDEEEEEEEEEEEEEEEEEEEEFFFFFFFFFFFFFFFFFFFF"
+        );
+        // A's continuation arrives at a vacant slot (B never overlapped A).
+        assert!(space.recv(3, b"DDDDDDDDDDDDDDDDDDDD".to_vec(), None));
+        // A reassembles: the tombstone at 4-6 is AFTER A's range, so the
+        // contiguity run 0-3 is intact.
+        assert_eq!(
+            space.pop_complete_frame().unwrap(),
+            b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCCCCCCDDDDDDDDDDDDDDDDDDDD"
+        );
+        assert_eq!(space.next, Some(seq(7)));
     }
 
     #[test]
