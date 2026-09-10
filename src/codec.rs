@@ -294,7 +294,9 @@ fn encode_data(
 ) -> Result<(), EncodeError> {
     wtr.write_u64::<BigEndian>(seq.to_wire())
         .pipe(wrap_insufficient_buffer_size_err)?;
-    wtr.write_u16::<BigEndian>(data.len().try_into().unwrap())
+    let len =
+        u16::try_from(data.len()).map_err(|_| EncodeError::PayloadTooLarge { len: data.len() })?;
+    wtr.write_u16::<BigEndian>(len)
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_all(data)
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -311,7 +313,9 @@ fn encode_data_ts(
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u32::<BigEndian>(send_ts)
         .pipe(wrap_insufficient_buffer_size_err)?;
-    wtr.write_u16::<BigEndian>(data.len().try_into().unwrap())
+    let len =
+        u16::try_from(data.len()).map_err(|_| EncodeError::PayloadTooLarge { len: data.len() })?;
+    wtr.write_u16::<BigEndian>(len)
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_all(data)
         .pipe(wrap_insufficient_buffer_size_err)?;
@@ -377,6 +381,8 @@ fn require_tag(session_tag: Option<u64>, tag_seen: bool) -> Result<(), DecodeErr
 pub enum EncodeError {
     #[error("insufficient buffer size")]
     InsufficientBufferSize,
+    #[error("payload of {len} bytes exceeds the u16 wire length field")]
+    PayloadTooLarge { len: usize },
 }
 
 #[derive(Debug, Clone, Error)]
