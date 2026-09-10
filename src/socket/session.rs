@@ -53,7 +53,23 @@ pub fn socket(
     unreliable_layer: UnreliableLayer,
     log_config: Option<LogConfig>,
 ) -> (ConnReader, ConnWriter, SessionHandle) {
-    build_socket(TransmissionLayer::new(unreliable_layer, log_config))
+    build_socket(TransmissionLayer::new(unreliable_layer, log_config), None)
+}
+
+/// Like [`socket`], but runs `on_exit` exactly once when the session ends
+/// (normal completion or abort). Used by the keyed-udp listener to release a
+/// per-session slot in its connection cap: the callback fires when the
+/// supervisor task's future is dropped, which is exactly when the session
+/// handle resolves.
+pub(crate) fn socket_with_on_exit(
+    unreliable_layer: UnreliableLayer,
+    log_config: Option<LogConfig>,
+    on_exit: impl FnOnce() + Send + 'static,
+) -> (ConnReader, ConnWriter, SessionHandle) {
+    build_socket(
+        TransmissionLayer::new(unreliable_layer, log_config),
+        Some(OnExit::new(on_exit)),
+    )
 }
 
 pub fn socket_with_watchdog_tuning(
@@ -61,11 +77,10 @@ pub fn socket_with_watchdog_tuning(
     log_config: Option<LogConfig>,
     tuning: WatchdogTuning,
 ) -> (ConnReader, ConnWriter, SessionHandle) {
-    build_socket(TransmissionLayer::new_with_watchdog_tuning(
-        unreliable_layer,
-        log_config,
-        tuning,
-    ))
+    build_socket(
+        TransmissionLayer::new_with_watchdog_tuning(unreliable_layer, log_config, tuning),
+        None,
+    )
 }
 
 type SocketParts = (Arc<Connection>, WriteHalf, ReadHalf, TerminationReaper);
@@ -295,6 +310,28 @@ struct SessionSupervisor {
     write_shutdown: tokio_util::sync::CancellationToken,
     stop_drivers: tokio_util::sync::CancellationToken,
     drivers: JoinSet<()>,
+    on_exit: OnExit,
+}
+
+/// Runs a closure exactly once when dropped. Held by the session supervisor
+/// so the callback fires when the session ends — whether the supervisor task
+/// completes normally or is aborted by the caller dropping the session
+/// handle (tokio aborts tasks by dropping their futures, which drops this
+/// guard).
+struct OnExit(Option<Box<dyn FnOnce() + Send>>);
+
+impl OnExit {
+    fn new(f: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(f)))
+    }
+}
+
+impl Drop for OnExit {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 impl SessionSupervisor {
@@ -306,6 +343,7 @@ impl SessionSupervisor {
             write_shutdown,
             stop_drivers,
             mut drivers,
+            on_exit,
         } = self;
         let first_exit = 'session: {
             tokio::select! {
@@ -324,11 +362,18 @@ impl SessionSupervisor {
             }
         };
         stop_drivers.cancel();
-        join_drivers(drivers, first_exit, &shared).await
+        join_drivers(drivers, first_exit, &shared).await;
+        // The on-exit guard drops here, exactly when the session ends (and
+        // also when this future is aborted by the caller dropping the
+        // session handle).
+        drop(on_exit);
     }
 }
 
-fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHandle) {
+fn build_socket(
+    parts: TransmissionLayer,
+    on_exit: Option<OnExit>,
+) -> (ConnReader, ConnWriter, SessionHandle) {
     let (shared, write_half, read_half, termination_reaper) = parts.into_parts();
     let read_shutdown = tokio_util::sync::CancellationToken::new();
     let write_shutdown = tokio_util::sync::CancellationToken::new();
@@ -359,6 +404,7 @@ fn build_socket(parts: TransmissionLayer) -> (ConnReader, ConnWriter, SessionHan
             write_shutdown: write_shutdown.clone(),
             stop_drivers,
             drivers,
+            on_exit: on_exit.unwrap_or_else(|| OnExit::new(|| {})),
         }
         .run(),
     );

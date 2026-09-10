@@ -1,5 +1,8 @@
 use core::{net::SocketAddr, num::NonZeroUsize};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -44,17 +47,61 @@ fn wrap_keyed<K: DispatchKey>(
     )
 }
 
+/// Default cap on concurrently accepted keyed sessions per listener. A
+/// generous bound for legitimate use that stops an unauthenticated datagram
+/// spray (each new key spawns a full 3-task RTP session) from exhausting
+/// memory and task slots on a network-exposed listener.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
 #[derive(Debug)]
 pub struct Listener<K> {
     listener: UtpListener<UdpSocket, K, Packet>,
     local_addr: SocketAddr,
     raw_fd: MaybeRawFd,
+    /// Live accepted-session count, shared with the dispatch closure so a
+    /// datagram for an unknown key is refused (not allocated) once the cap
+    /// is reached. Incremented in [`Self::accept_with`], decremented by the
+    /// session's on-exit hook.
+    session_count: Arc<AtomicUsize>,
 }
 impl<K: DispatchKey> Listener<K> {
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
+        Self::bind_with_max_connections(addr, DEFAULT_MAX_CONNECTIONS).await
+    }
+
+    /// Like [`Self::bind`], but refuse new keyed sessions once `max_connections`
+    /// are concurrently accepted. Datagrams for unknown keys are dropped
+    /// (never allocated) at the cap; datagrams for existing keys still route.
+    pub async fn bind_with_max_connections(
+        addr: impl tokio::net::ToSocketAddrs,
+        max_connections: usize,
+    ) -> std::io::Result<Self> {
         let udp = UdpSocket::bind(addr).await?;
         let local_addr = udp.local_addr()?;
         let raw_fd = maybe_raw_fd(&udp);
+        let session_count = Arc::new(AtomicUsize::new(0));
+        let dispatch = {
+            let session_count = Arc::clone(&session_count);
+            move |_addr: &SocketAddr, mut pkt: Packet| {
+                let (n, key) = K::decode(&pkt)?;
+                pkt.advance(n);
+                // At the cap, refuse unknown keys (ExistingOnly drops the
+                // datagram before any channel/conn-table entry is allocated)
+                // while existing keys keep routing. The count is a soft
+                // bound: it is incremented at accept, so datagrams racing
+                // the accept loop may briefly overshoot.
+                let policy = if session_count.load(Ordering::Relaxed) >= max_connections {
+                    DispatchPolicy::ExistingOnly
+                } else {
+                    DispatchPolicy::Create
+                };
+                Some(Classified {
+                    key,
+                    value: pkt,
+                    policy,
+                })
+            }
+        };
         let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE).unwrap(),
@@ -64,6 +111,7 @@ impl<K: DispatchKey> Listener<K> {
             listener,
             local_addr,
             raw_fd,
+            session_count,
         })
     }
 
@@ -117,7 +165,12 @@ impl<K: DispatchKey> Listener<K> {
         // Fitted ACK padding lives in the write half; the policy resolution
         // guarantees it never coexists with a padding profile.
         unreliable_layer.ack_padding = ack_padding;
-        let (read, write, supervisor) = socket(unreliable_layer, None);
+        let session_count = Arc::clone(&self.session_count);
+        session_count.fetch_add(1, Ordering::SeqCst);
+        let (read, write, supervisor) =
+            crate::socket::session::socket_with_on_exit(unreliable_layer, None, move || {
+                session_count.fetch_sub(1, Ordering::SeqCst);
+            });
         Ok(Accepted {
             read,
             write,
