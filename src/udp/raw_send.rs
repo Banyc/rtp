@@ -121,8 +121,10 @@ pub(crate) async fn raw_sendto_fallback(
                 Err(err) => {
                     let kind = err.kind();
                     match kind {
-                        std::io::ErrorKind::Interrupted => continue,
-                        std::io::ErrorKind::WouldBlock => {
+                        // EINTR is retried with the same backoff budget as
+                        // WouldBlock so a signal storm cannot spin the loop
+                        // without yielding or ever exhausting the budget.
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => {
                             if attempt >= BACKOFFS_US.len() {
                                 return Err(std::io::ErrorKind::WouldBlock.into());
                             }
