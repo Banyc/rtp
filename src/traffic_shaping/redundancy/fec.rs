@@ -469,10 +469,25 @@ impl FecEncoderState {
         if data_count == 0 {
             return vec![];
         }
-        // Single-symbol interactive exception first: it bypasses the budget
-        // gate and the threshold/instream skips below.
+        // Single-symbol interactive exception first: it bypasses the 1/3
+        // spare-budget gate (a single symbol's parity is negligible), but the
+        // burst must still be paced — cap the depth by the currently-available
+        // tokens so a large configured depth cannot emit an unpaced burst many
+        // times the data size. At least one parity is always attempted (the
+        // floor), so the interactive tail-latency benefit survives a
+        // near-empty bucket.
         if data_count == 1 && self.small_group_parity_count > 1 {
-            let depth = self.small_group_parity_count;
+            let configured_depth = usize::from(self.small_group_parity_count);
+            let available_tokens = send_rate_limiter.gen_tokens(now);
+            let depth = configured_depth.min(available_tokens.max(1));
+            if !send_rate_limiter.take_exact_tokens(depth, now) {
+                self.stats
+                    .groups_skipped_no_surplus_tokens
+                    .fetch_add(1, Ordering::Relaxed);
+                inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
+                self.encoder.skip_group();
+                return vec![];
+            }
             if FEC_DEBUG {
                 eprintln!(
                     "FEC: flushing {depth} parities for single-symbol group (interactive, budget bypassed)"
@@ -480,7 +495,7 @@ impl FecEncoderState {
             }
             self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
             inc_hist(&self.stats.group_size_flushed, data_count);
-            let mut parity_encoder = self.encoder.flush_parities(depth);
+            let mut parity_encoder = self.encoder.flush_parities(depth as u8);
             let mut pkts = vec![];
             while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
                 pkts.push(self.enc_buf[..n].to_vec());
@@ -867,7 +882,7 @@ mod tests {
     /// exactly 3 parity copies, bypassing the spare-token budget gate even
     /// when the bucket is empty.
     #[test]
-    fn single_symbol_group_emits_depth_parities_bypassing_budget() {
+    fn single_symbol_group_parity_is_paced_by_the_token_budget() {
         let now = Instant::now();
         let mut fec = fec_state(8192 - 11, 3);
         let mut tb = empty_bucket(now);
@@ -878,11 +893,29 @@ mod tests {
         let _n = fec.encoder.encode_data(data, &mut sym_buf, false);
         assert_eq!(fec.encoder.encoder.group_data_count(), 1);
 
+        // An empty bucket paces the burst: the floor of one parity cannot be
+        // taken, so the group is skipped instead of emitting an unpaced
+        // burst many times the data size.
         let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
+            0,
+            "single-symbol group with an empty bucket must be skipped (paced), got {}",
+            pkts.len()
+        );
+        assert_eq!(fec.encoder.parity_sent(), 0);
+
+        // With tokens available, the configured depth is emitted (capped by
+        // the available tokens).
+        let mut fec = fec_state(8192 - 11, 3);
+        let (mut tb, later) = unlimited_bucket(now);
+        let _n = fec.encoder.encode_data(data, &mut sym_buf, false);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 1);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, later, false);
+        assert_eq!(
+            pkts.len(),
             3,
-            "single-symbol group at depth 3 must emit 3 parity copies, got {}",
+            "single-symbol group at depth 3 with tokens must emit 3 parity copies, got {}",
             pkts.len()
         );
         assert_eq!(fec.encoder.parity_sent(), 3);
