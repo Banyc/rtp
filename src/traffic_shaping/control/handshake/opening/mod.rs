@@ -36,6 +36,13 @@ fn mix(nonce: u64, domain: u64) -> u64 {
 /// data-plane traffic does not reveal the recovery-handshake nonce.  Both
 /// peers compute the same value from the same nonce; an off-path attacker
 /// never sees the nonce and therefore cannot forge a tag.
+///
+/// **Limitation:** the tag is only as secret as the nonce.  When datagram
+/// obfuscation is disabled the handshake nonce travels in clear, so any
+/// party that can observe the handshake (a passive on-path observer) can
+/// derive the tag and forge `KILL`/`ACK`/`ECHO_TS` commands from a spoofed
+/// source address.  The tag's value is blocking blind off-path injection
+/// without sniffing; the obfuscation key is the real secret.
 const SESSION_TAG_DOMAIN: u64 = 0x9e37_79b9_7f4a_7c15;
 /// Domain for the client-to-server directional sequence start (`rtp-c2s!`).
 const CLIENT_TO_SERVER_DOMAIN: u64 = 0x7274_702d_6332_7321;
