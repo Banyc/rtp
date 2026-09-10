@@ -13,6 +13,7 @@ use crate::io_err::IoErr;
 use crate::metrics::{MetricsEvent, MetricsTerminationCause};
 use crate::obfuscate::padding::AckPaddingMode;
 use crate::obfuscate::sampler::DataSizeSampler;
+use crate::reliable::reliable_layer::DataPkt;
 use crate::traffic_shaping::control::handshake::padding::pad_handshake;
 use crate::traffic_shaping::core::{SendPacer, SendWake};
 use crate::traffic_shaping::redundancy::{
@@ -106,49 +107,97 @@ impl WriteHalf {
         encode_ack_data(self.shared.session_tag(), Some(ack), echo, data, output).unwrap()
     }
 
-    /// Claim a due ACK and encode it piggybacked on the data packet: page 0
-    /// rides in `codec_pkt` ahead of the data (one ACK_CMD per datagram, so
-    /// at most one page piggybacks). Returns the combined datagram length
-    /// and the piggyback (None when no ACK is due or none is claimable — the
-    /// datagram is then data-only, exactly as before).
+    /// Claim a due ACK for piggybacking, size the data payload to leave room
+    /// for it, and encode the ACK + data in one pass under the reliable-layer
+    /// lock (so the ACK size and the encode use the same history). Returns
+    /// the data packet and the piggyback: `None` when no ACK is due or
+    /// claimable, when the data packet is a retransmission too large to fit
+    /// alongside the ACK, or when no packet was produced — the claim is
+    /// released in those cases and the datagram is data-only, exactly as
+    /// before. The combined datagram never exceeds the FEC symbol / MSS.
     fn claim_piggyback_ack(
         &self,
         now: Instant,
+        wire_ts: u32,
+        payload: &mut [u8],
         codec_pkt: &mut [u8],
-        data: EncodeData<'_>,
-    ) -> (usize, Option<PiggybackAck>) {
-        let (n, claimed) = self.shared.with_reliable_layer(|reliable_layer| {
+    ) -> (Option<DataPkt>, Option<(usize, PiggybackAck)>) {
+        self.shared.with_reliable_layer_mut(|reliable_layer| {
             let history = reliable_layer.pkt_recv_space().ack_history();
-            if !self.ack_feedback.schedule(now).is_due() {
-                return (
-                    encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
-                    None,
-                );
-            }
-            let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
-                return (
-                    encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
-                    None,
-                );
+            let claim = if self.ack_feedback.schedule(now).is_due() {
+                self.ack_feedback.claim(now, history.len())
+            } else {
+                None
             };
+            let reserved = claim
+                .as_ref()
+                .map(|c| {
+                    let page0 = c.pages()[0].expect("a claim always carries page 0");
+                    let ack = EncodeAck {
+                        queue: history,
+                        first_block_index: page0.first_block_index,
+                        max_blocks: page0.max_blocks,
+                    };
+                    // Measure the encoded page-0 size (no data yet) so the
+                    // data payload can be sized to leave room for it. The
+                    // echo is peeked, not consumed — the final encode below
+                    // consumes it.
+                    encode_ack_data(
+                        self.shared.session_tag(),
+                        Some(ack),
+                        c.peek_echo(),
+                        None,
+                        codec_pkt,
+                    )
+                    .unwrap()
+                })
+                .unwrap_or(0);
+            let res = reliable_layer.send_data_pkt_bounded(payload, now, reserved);
+            let Some(p) = res.as_ref() else {
+                // No packet to send: release the claim (if any) so the
+                // standalone flush can pick up the ACK work.
+                if let Some(claim) = claim {
+                    self.ack_feedback
+                        .complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 0 });
+                }
+                return (res, None);
+            };
+            let data_written = match &p.data_written {
+                crate::reliable::reliable_layer::DataPktPayload::Data(data_written) => {
+                    data_written.get()
+                }
+                crate::reliable::reliable_layer::DataPktPayload::Fin => 0,
+            };
+            let Some(claim) = claim else {
+                return (res, None);
+            };
+            if reserved + data_written > self.mss.max_data_size_per_pkt() {
+                // The data packet (a retransmission) is too large to fit
+                // alongside the ACK: release the claim and send the data
+                // alone.
+                self.ack_feedback
+                    .complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 0 });
+                return (res, None);
+            }
+            // Re-read the history for the encode: the reliable-layer lock is
+            // held for the whole closure, so the history is unchanged since
+            // the claim and the size were computed.
+            let history = reliable_layer.pkt_recv_space().ack_history();
+            // Encode the ACK + data: page 0 rides ahead of the data (one
+            // ACK_CMD per datagram, so at most one page piggybacks); page 1,
+            // if any, is sent standalone after the data packet.
+            let data = EncodeData {
+                seq: p.seq,
+                send_ts: Some(wire_ts),
+                frame_len: p.frame_len,
+                data: &payload[..data_written],
+            };
+            let mut claim = claim;
             let page0 = claim.pages()[0].expect("a claim always carries page 0");
             let n = self.encode_ack_page(&mut claim, history, page0, Some(data), codec_pkt);
             let page1 = claim.pages()[1];
-            (n, Some((claim, page1)))
-        });
-        let Some((claim, page1)) = claimed else {
-            return (n, None);
-        };
-        // A successful transactional claim names why it became due; the
-        // observation is emitted before the datagram is sent so the claim
-        // event is never confused with the resume wake that rearmed us.
-        // `log_at` snapshots the reliable layer, so it must run outside the
-        // `with_reliable_layer` lock above (the same discipline `flush_acks`
-        // follows) — calling it inside would deadlock on the non-reentrant
-        // mutex whenever observability is enabled.
-        self.shared
-            .log_at(MetricsEvent::AckFlush(claim.reason()), now);
-        (n, Some(PiggybackAck { claim, page1 }))
+            (res, Some((n, PiggybackAck { claim, page1 })))
+        })
     }
 
     /// Apply the resolved ack-padding mode to an encoded ACK page in place:
@@ -419,9 +468,20 @@ impl WriteHalf {
                 self.return_error_after_requested_kill(bufs).await?;
             }
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
-            let res = self.shared.with_reliable_layer_mut(|reliable_layer| {
-                reliable_layer.send_data_pkt(payload, now)
-            });
+            // Claim a due ACK for piggybacking BEFORE the payload is filled,
+            // so the data can be sized to leave room for the ACK (the
+            // combined datagram must stay within the FEC symbol / MSS). The
+            // claim, the size, and the encode share one reliable-layer lock,
+            // so the ACK size and the encode use the same history.
+            let (res, piggyback) = if !piggyback_attempted {
+                piggyback_attempted = true;
+                self.claim_piggyback_ack(now, wire_ts, payload, codec_pkt)
+            } else {
+                let res = self.shared.with_reliable_layer_mut(|reliable_layer| {
+                    reliable_layer.send_data_pkt(payload, now)
+                });
+                (res, None)
+            };
             if std::env::var("RTP_DEBUG_SEND").is_ok() {
                 eprintln!(
                     "[sdp-res] conn={:x} result={}",
@@ -439,6 +499,18 @@ impl WriteHalf {
                     now,
                     snapshot,
                 );
+            }
+            if let Some((_, piggyback)) = &piggyback {
+                // A successful transactional claim names why it became due;
+                // the observation is emitted before the datagram is sent so
+                // the claim event is never confused with the resume wake
+                // that rearmed us. `log_at` snapshots the reliable layer, so
+                // it must run outside the `with_reliable_layer` lock above
+                // (the same discipline `flush_acks` follows) — calling it
+                // inside would deadlock on the non-reentrant mutex whenever
+                // observability is enabled.
+                self.shared
+                    .log_at(MetricsEvent::AckFlush(piggyback.claim.reason()), now);
             }
             let Some(p) = res else {
                 if FEC_DEBUG {
@@ -471,19 +543,19 @@ impl WriteHalf {
                 self.shared
                     .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
             });
-            // On the first data packet of the pass, piggyback a due ACK on
-            // the data datagram (page 0 rides ahead of the data; page 1, if
-            // any, is sent standalone after). This hides ACKs among data
-            // packets at zero wire cost — no standalone ACK datagram — and
-            // the wire format already carries ack+data in one datagram.
-            let (n, piggyback) = if !piggyback_attempted {
-                piggyback_attempted = true;
-                self.claim_piggyback_ack(now, codec_pkt, data)
-            } else {
-                (
+            // The first data packet of the pass piggybacks a due ACK on the
+            // data datagram (page 0 rides ahead of the data; page 1, if any,
+            // is sent standalone after). This hides ACKs among data packets
+            // at zero wire cost — no standalone ACK datagram — and the wire
+            // format already carries ack+data in one datagram. The claim was
+            // made (and the data sized) before the payload was filled; when
+            // no ACK was due or claimable, the datagram is data-only.
+            let (n, piggyback) = match piggyback {
+                Some((n, piggyback)) => (n, Some(piggyback)),
+                None => (
                     encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
                     None,
-                )
+                ),
             };
             if self.ack_padding == AckPaddingMode::Fitted {
                 // Sample the DATA path only: the encoded codec packet length

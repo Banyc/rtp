@@ -39,6 +39,11 @@ impl AckClaim {
     pub(crate) fn take_echo(&mut self) -> Option<u32> {
         self.echo_ts.take()
     }
+
+    /// Whether the claim carries a peer echo-timestamp (peek, non-consuming).
+    pub(crate) fn peek_echo(&self) -> Option<u32> {
+        self.echo_ts
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

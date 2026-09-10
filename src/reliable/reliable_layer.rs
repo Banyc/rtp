@@ -543,6 +543,21 @@ impl ReliableLayer {
 
     /// Move data from inner data buffer to inner packet space and return one of the packets if possible
     pub fn send_data_pkt(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
+        self.send_data_pkt_bounded(pkt, now, 0)
+    }
+
+    /// Like [`Self::send_data_pkt`], but reserves `reserved_bytes` of the
+    /// per-packet budget for a piggybacked ACK: the combined datagram (ACK +
+    /// data) must stay within the FEC symbol / MSS. Retransmissions and tail
+    /// probes keep their original size (copied into the full `pkt` buffer);
+    /// only NEW packets are sized down. The caller uses this to leave room
+    /// for the ACK it will prepend to the data packet.
+    pub fn send_data_pkt_bounded(
+        &mut self,
+        pkt: &mut [u8],
+        now: Instant,
+        reserved_bytes: usize,
+    ) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
         if std::env::var("RTP_DEBUG_SEND").is_ok() {
             eprintln!(
@@ -629,12 +644,12 @@ impl ReliableLayer {
         }
 
         if self.frame_delivery.enabled {
-            return self.send_data_pkt_frame(pkt, now, no_packets_in_flight);
+            return self.send_data_pkt_frame(pkt, now, no_packets_in_flight, reserved_bytes);
         }
 
         let pkt_bytes = pkt
             .len()
-            .min(self.max_data_size_per_pkt())
+            .min(self.max_data_size_per_pkt().saturating_sub(reserved_bytes))
             .min(self.send_data_buf.len());
         let pkt_bytes = match (NonZeroUsize::new(pkt_bytes), &self.send_fin_buf) {
             (Some(x), _) => x.get(),
@@ -692,13 +707,15 @@ impl ReliableLayer {
         pkt: &mut [u8],
         now: Instant,
         no_packets_in_flight: bool,
+        reserved_bytes: usize,
     ) -> Option<DataPkt> {
-        let normal_max_payload = self.max_data_size_per_pkt();
+        let normal_max_payload = self.max_data_size_per_pkt().saturating_sub(reserved_bytes);
         let first_pkt_max_payload = self
             .mss
             .get()
             .checked_sub(crate::delivery::frame::wire::frame_data_overhead())
-            .unwrap();
+            .unwrap()
+            .saturating_sub(reserved_bytes);
 
         let chunk = match self
             .frame_send_stage

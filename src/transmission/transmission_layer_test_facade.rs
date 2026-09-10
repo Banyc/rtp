@@ -72,6 +72,9 @@ mod tests {
         fn datagrams(&self) -> Vec<Vec<u8>> {
             self.sent.lock().unwrap().clone()
         }
+        fn clear(&self) {
+            self.sent.lock().unwrap().clear();
+        }
     }
 
     #[derive(Debug)]
@@ -1173,6 +1176,130 @@ mod tests {
         assert!(
             distinct.len() > 1,
             "the jitter must vary the ACK wire size, got {sizes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn piggybacked_ack_fits_within_the_fec_symbol() {
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        let (mut transmission, recorder) = harness(true, false);
+        let now = Instant::now();
+        // Stage a FULL-SIZE data packet (the piggyback carrier).
+        let mss = crate::udp::NO_FEC_MSS;
+        let post_fec_mss = mss - 11 - 2;
+        let payload_len = post_fec_mss - crate::codec::data_overhead();
+        transmission
+            .shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .send_data_buf(&vec![0u8; payload_len], now)
+            .unwrap();
+        // A recv history plus pending ack work makes the claim due.
+        {
+            let mut reliable = transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap();
+            for seq in [2u64, 4, 6] {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
+            }
+        }
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
+        let mut send_bufs = SendBufs::new();
+        transmission.send_pkts(&mut send_bufs).await.unwrap();
+        let sent = recorder.lock().unwrap().datagrams();
+        // The piggybacked data datagram must stay within the MSS (and the
+        // FEC symbol): the data packet was sized to leave room for the ACK,
+        // so the combined datagram never exceeds the MSS.
+        assert!(
+            sent.iter().all(|d| d.len() <= mss),
+            "wire datagrams must not exceed the MSS: {:?}",
+            sent.iter().map(|d| d.len()).collect::<Vec<_>>()
+        );
+        // The first datagram is the piggybacked data: it decodes as ack +
+        // data. (Strip the 10-byte FEC data header: group_id 8 + symbol_id
+        // 1 + parity flag 1.)
+        let mut acks = Vec::new();
+        let decoded = crate::codec::decode(&sent[0][10..], &mut acks, None).unwrap();
+        assert!(
+            decoded.ack_next.is_some() && decoded.data.is_some(),
+            "the first datagram must carry ack + data, got {:?}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn full_size_retransmission_skips_the_piggyback_claim() {
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        let (mut transmission, recorder) = harness(true, false);
+        settle_rtt(&transmission, Duration::from_millis(1), 5);
+        // Send a full-size packet so it is in flight; after the RTO it
+        // becomes a full-size retransmission.
+        let mss = crate::udp::NO_FEC_MSS;
+        let post_fec_mss = mss - 11 - 2;
+        let payload_len = post_fec_mss - crate::codec::data_overhead();
+        {
+            let rl = transmission.shared_for_test().reliable_layer_for_test();
+            let mut rl = rl.lock().unwrap();
+            rl.send_data_buf(&vec![0u8; payload_len], Instant::now())
+                .unwrap();
+        }
+        let mut send_bufs = SendBufs::new();
+        transmission.send_pkts(&mut send_bufs).await.unwrap();
+        recorder.lock().unwrap().clear();
+        wait_for_rtx_window().await;
+        // A pending ACK makes the piggyback claim due, but the retransmitted
+        // packet is full-size: the claim must be released and the data go out
+        // alone (no oversized datagram, no stuck claim).
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
+        transmission.send_pkts(&mut send_bufs).await.unwrap();
+        let sent = recorder.lock().unwrap().datagrams();
+        assert!(
+            sent.iter().all(|d| d.len() <= mss),
+            "wire datagrams must not exceed the MSS: {:?}",
+            sent.iter().map(|d| d.len()).collect::<Vec<_>>()
+        );
+        // The retransmission goes out data-only (the ACK could not fit
+        // alongside the full-size retransmission), and the released claim's
+        // work is drained by the standalone flush at the end of the pass.
+        let mut acks = Vec::new();
+        let decoded = crate::codec::decode(&sent[0][10..], &mut acks, None).unwrap();
+        assert!(
+            decoded.ack_next.is_none() && decoded.data.is_some(),
+            "the retransmission must be data-only, got {:?}",
+            sent[0]
+        );
+        assert!(
+            sent.len() >= 2,
+            "the released claim's ACK must go out standalone, got {} datagrams",
+            sent.len()
+        );
+        let mut acks2 = Vec::new();
+        let decoded2 = crate::codec::decode(&sent[1][10..], &mut acks2, None).unwrap();
+        assert!(
+            decoded2.ack_next.is_some() && decoded2.data.is_none(),
+            "the second datagram must be a standalone ACK, got {:?}",
+            sent[1]
+        );
+        assert!(
+            !transmission.has_pending_acks(),
+            "the standalone flush must drain the released claim's work"
         );
     }
 
