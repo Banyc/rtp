@@ -593,6 +593,13 @@ impl FecDecoderState {
     ///   data symbols are queued in `self.recovered` and should be drained via
     ///   `pop_recovered` before reading the next raw packet.
     pub fn decode(&mut self, pkt: &[u8]) -> Option<Vec<u8>> {
+        if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            eprintln!(
+                "[fec-decode] pkt_len={} encodable={}",
+                pkt.len(),
+                encodable_wire_pkt(pkt, self.symbol_size)
+            );
+        }
         if !encodable_wire_pkt(pkt, self.symbol_size) {
             self.stats
                 .dropped_malformed_pkts

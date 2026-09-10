@@ -1177,6 +1177,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn due_ack_rides_on_the_first_data_packet_of_a_pass() {
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        let (mut transmission, recorder) = harness(false, false);
+        let now = Instant::now();
+        // Stage one data packet; the pass's first data packet is the
+        // piggyback carrier.
+        transmission
+            .shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .send_data_buf(&[0u8; 100], now)
+            .unwrap();
+        // A small recv history plus pending ack work makes the claim due
+        // (Initial) at the moment the data packet is sent.
+        {
+            let mut reliable = transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap();
+            for seq in [2u64, 4, 6] {
+                reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(seq), None, b"x");
+            }
+        }
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
+        let mut send_bufs = SendBufs::new();
+        transmission.send_pkts(&mut send_bufs).await.unwrap();
+        let sent = recorder.lock().unwrap().datagrams();
+        // Exactly one datagram: the data packet carrying the piggybacked ACK.
+        // A standalone ACK flush would have produced a second datagram.
+        assert_eq!(
+            sent.len(),
+            1,
+            "the due ACK must ride on the data packet, got {} datagrams",
+            sent.len()
+        );
+        // The single datagram decodes as ack + data.
+        let mut acks = Vec::new();
+        let decoded = crate::codec::decode(&sent[0], &mut acks, None).unwrap();
+        assert!(
+            decoded.ack_next.is_some(),
+            "the piggybacked ACK must decode, got {:?}",
+            sent[0]
+        );
+        assert!(
+            decoded.data.is_some(),
+            "the data must decode alongside the ACK, got {:?}",
+            sent[0]
+        );
+        // The claim is drained: no pending ack work remains for a later flush.
+        assert!(
+            !transmission.has_pending_acks(),
+            "the piggyback must complete the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_history_piggyback_sends_page_one_standalone() {
+        use crate::transmission::ack_feedback::ReceivedAckWork;
+        use crate::transmission::transmission_layer::MAX_NUM_ACK;
+        let (mut transmission, recorder) = harness(false, false);
+        let now = Instant::now();
+        // Stage one data packet (the piggyback carrier).
+        transmission
+            .shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .send_data_buf(&[0u8; 100], now)
+            .unwrap();
+        // A history deeper than one page: page 0 rides on the data packet,
+        // page 1 must go out standalone after it.
+        {
+            let mut reliable = transmission
+                .shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap();
+            for seq in (2..=(2 * MAX_NUM_ACK + 2)).step_by(2) {
+                reliable.recv_data_pkt(
+                    crate::sequence::SequenceNumber::from_wire(seq as u64),
+                    None,
+                    b"x",
+                );
+            }
+        }
+        transmission
+            .shared_for_test()
+            .ack_feedback_for_test()
+            .record(ReceivedAckWork {
+                pending_acks: 1,
+                fin_ack: false,
+                echo_ts: None,
+            });
+        let mut send_bufs = SendBufs::new();
+        transmission.send_pkts(&mut send_bufs).await.unwrap();
+        let sent = recorder.lock().unwrap().datagrams();
+        // Two datagrams: the data packet with page 0 piggybacked, then the
+        // standalone page 1.
+        assert_eq!(
+            sent.len(),
+            2,
+            "page 1 must go out standalone after the piggybacked page 0, got {} datagrams",
+            sent.len()
+        );
+        // The first datagram carries both the ACK (page 0) and the data.
+        let mut acks = Vec::new();
+        let decoded = crate::codec::decode(&sent[0], &mut acks, None).unwrap();
+        assert!(
+            decoded.ack_next.is_some() && decoded.data.is_some(),
+            "the first datagram must carry ack + data, got {:?}",
+            sent[0]
+        );
+        // The second datagram is a standalone ACK page (no data).
+        let mut acks2 = Vec::new();
+        let decoded2 = crate::codec::decode(&sent[1], &mut acks2, None).unwrap();
+        assert!(
+            decoded2.ack_next.is_some() && decoded2.data.is_none(),
+            "the second datagram must be a standalone ACK page, got {:?}",
+            sent[1]
+        );
+        assert!(
+            !transmission.has_pending_acks(),
+            "the piggyback must complete the claim"
+        );
+    }
+
+    #[tokio::test]
     async fn ack_flush_emits_the_reason_of_the_transactional_claim() {
         use crate::metrics::{MetricsAckFlushReason, MetricsEvent, MetricsObserver};
         use crate::transmission::ack_feedback::ReceivedAckWork;

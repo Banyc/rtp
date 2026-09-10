@@ -161,6 +161,14 @@ impl WriteDriver {
                 Err(_) => return,
             };
             let next_wake = pass.wake;
+            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                eprintln!(
+                    "[wake] conn={:x} next_wake={:?} ack_schedule={:?}",
+                    self.write_half.debug_conn_id(),
+                    next_wake,
+                    self.write_half.ack_schedule(Instant::now())
+                );
+            }
             loop {
                 let resume_send = self.write_half.resume_send().notified();
                 let ack_schedule_changed = self.write_half.ack_schedule_changed().notified();
@@ -260,6 +268,14 @@ impl ReadDriver {
                     return;
                 }
             };
+            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                eprintln!(
+                    "[read-loop] batch: ack={} payload={} fin={}",
+                    recv_pkts.num_ack_segments,
+                    recv_pkts.num_payload_segments,
+                    recv_pkts.num_fin_segments
+                );
+            }
             if read_closed && 0 < recv_pkts.num_payload_segments {
                 self.shared
                     .request_kill_and_abort(MetricsTerminationCause::UnreadPayloadAfterReadClose);

@@ -544,6 +544,16 @@ impl ReliableLayer {
     /// Move data from inner data buffer to inner packet space and return one of the packets if possible
     pub fn send_data_pkt(&mut self, pkt: &mut [u8], now: Instant) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
+        if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            eprintln!(
+                "[sdp] in_flight={} cwnd={} send_buf={} rtx_due={} rate={:.1}",
+                self.pkt_send_space.num_in_flight_pkts(),
+                self.pkt_send_space.cwnd(),
+                self.send_data_buf.len(),
+                self.pkt_send_space.has_rtx(now),
+                self.send_rate.get()
+            );
+        }
 
         if LINEAR_BACKOFF {
             self.backoff_on_huge_data_loss_linear(now);

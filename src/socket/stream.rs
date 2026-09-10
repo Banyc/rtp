@@ -595,10 +595,19 @@ mod tests {
         let mut server_tasks = tokio::task::JoinSet::new();
         server_tasks.spawn(async move {
             let mut buf = vec![0u8; msg_len];
-            for expected in &sent_for_server {
-                let n = b_r.recv(&mut buf).await.unwrap();
+            for (idx, expected) in sent_for_server.iter().enumerate() {
+                let n = tokio::time::timeout(std::time::Duration::from_secs(5), b_r.recv(&mut buf))
+                    .await
+                    .expect("b recv timed out")
+                    .unwrap();
                 assert_eq!(&buf[..n], expected.as_slice());
+                if std::env::var("RTP_DEBUG_SEND").is_ok() && idx % 50 == 0 {
+                    eprintln!("[debug] b recv {idx}/{}", sent_for_server.len());
+                }
                 b_w.send(&buf[..n]).await.unwrap();
+                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                    eprintln!("[debug] b echoed {idx}");
+                }
             }
             b_r.fec_recovered_symbols()
         });
@@ -675,20 +684,35 @@ mod tests {
         let mut server_tasks = tokio::task::JoinSet::new();
         server_tasks.spawn(async move {
             let mut buf = vec![0u8; msg_len];
-            for expected in &sent_for_server {
-                let n = b_r.recv(&mut buf).await.unwrap();
+            for (idx, expected) in sent_for_server.iter().enumerate() {
+                let n = tokio::time::timeout(std::time::Duration::from_secs(5), b_r.recv(&mut buf))
+                    .await
+                    .expect("b recv timed out")
+                    .unwrap();
                 assert_eq!(&buf[..n], expected.as_slice());
+                if std::env::var("RTP_DEBUG_SEND").is_ok() && idx % 50 == 0 {
+                    eprintln!("[debug] b recv {idx}/{}", sent_for_server.len());
+                }
                 b_w.send(&buf[..n]).await.unwrap();
+                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                    eprintln!("[debug] b echoed {idx}");
+                }
             }
             b_r.fec_recovered_symbols()
         });
         // Keep the sender's connection handle so the observed sender-side
         // parity counter can be read after the transfer completes.
         let sender = Arc::clone(&a_w.transmission_layer);
-        for m in &sent {
+        for (idx, m) in sent.iter().enumerate() {
+            if std::env::var("RTP_DEBUG_SEND").is_ok() && idx % 50 == 0 {
+                eprintln!("[debug] a sent {idx}/{}", sent.len());
+            }
             a_w.send(m).await.unwrap();
             let mut echo = vec![0u8; m.len()];
-            let n = a_r.recv(&mut echo).await.unwrap();
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), a_r.recv(&mut echo))
+                .await
+                .expect("echo recv timed out")
+                .unwrap();
             assert_eq!(&echo[..n], m.as_slice());
         }
         drop(a_w);

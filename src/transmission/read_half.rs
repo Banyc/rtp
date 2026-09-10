@@ -124,6 +124,13 @@ impl ReadHalf {
             }
             let mut end_of_acks = false;
             for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
+                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                    eprintln!(
+                        "[read] codec_pkt len={} first_bytes={:02x?}",
+                        pkt.len(),
+                        &pkt[..pkt.len().min(8)]
+                    );
+                }
                 bufs.ack_from_peer.clear();
                 let data = match decode(pkt, &mut bufs.ack_from_peer, shared.session_tag()) {
                     Ok(x) => x,
@@ -175,6 +182,12 @@ impl ReadHalf {
                                     data.frame_len,
                                     &pkt[data.buf_range.clone()],
                                 );
+                                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                                    eprintln!(
+                                        "[recv-data] seq={} disp={:?} buf_range={:?}",
+                                        data.seq, disposition, data.buf_range
+                                    );
+                                }
                                 if FEC_DEBUG {
                                     eprintln!(
                                         "recv_data_pkt seq={} empty={} ack={}",

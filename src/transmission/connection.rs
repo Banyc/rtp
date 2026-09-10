@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,6 +21,41 @@ use crate::reliable::reliable_layer::ReliableLayer;
 use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenVerdict};
 use crate::traffic_shaping::core::SendWake;
 use crate::traffic_shaping::redundancy::fec::FecStatsHandle;
+
+// Set while the current thread holds the reliable-layer lock inside
+// `Connection::with_reliable_layer` / `Connection::with_reliable_layer_mut`.
+// `Connection::log_enabled_at` asserts this is clear: logging re-locks the
+// reliable layer to capture the metrics snapshot, and the mutex is not
+// reentrant — calling it under the lock deadlocks whenever observability is
+// enabled. The flag turns that hang into an immediate, test-caught panic.
+thread_local! {
+    static IN_RELIABLE_LAYER_LOCK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that marks the current thread as holding the reliable-layer
+/// lock for the duration of a `with_reliable_layer` closure. Also asserts the
+/// lock is not already held (a nested `with_reliable_layer` would deadlock on
+/// the non-reentrant mutex before the closure ever ran).
+struct ReliableLayerLockGuard;
+
+impl ReliableLayerLockGuard {
+    fn enter() -> Self {
+        IN_RELIABLE_LAYER_LOCK.with(|flag| {
+            assert!(
+                !flag.get(),
+                "nested with_reliable_layer: the reliable-layer mutex is not reentrant"
+            );
+            flag.set(true);
+        });
+        Self
+    }
+}
+
+impl Drop for ReliableLayerLockGuard {
+    fn drop(&mut self) {
+        IN_RELIABLE_LAYER_LOCK.with(|flag| flag.set(false));
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceivedBatch {
@@ -169,17 +205,23 @@ impl Connection {
     }
 
     /// Run `use_layer` against the reliable layer under its lock; the guard never
-    /// escapes the closure, so it cannot survive an await.
+    /// escapes the closure, so it cannot survive an await. The thread-local
+    /// lock flag makes `log_at`/`log` under this lock a panic instead of a
+    /// deadlock (see [`IN_RELIABLE_LAYER_LOCK`]).
     pub(super) fn with_reliable_layer<R>(&self, use_layer: impl FnOnce(&ReliableLayer) -> R) -> R {
+        let _guard = ReliableLayerLockGuard::enter();
         use_layer(&self.reliable_layer.lock().unwrap())
     }
 
     /// Run `use_layer` against the reliable layer under its lock; the guard never
-    /// escapes the closure, so it cannot survive an await.
+    /// escapes the closure, so it cannot survive an await. The thread-local
+    /// lock flag makes `log_at`/`log` under this lock a panic instead of a
+    /// deadlock (see [`IN_RELIABLE_LAYER_LOCK`]).
     pub(super) fn with_reliable_layer_mut<R>(
         &self,
         use_layer: impl FnOnce(&mut ReliableLayer) -> R,
     ) -> R {
+        let _guard = ReliableLayerLockGuard::enter();
         use_layer(&mut self.reliable_layer.lock().unwrap())
     }
 
@@ -328,6 +370,14 @@ impl Connection {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let stage_was_empty = reliable_layer.is_send_buf_empty();
                 let written_bytes = reliable_layer.send_data_buf(data, now)?;
+                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                    eprintln!(
+                        "[app-send] conn={:x} written={} data_len={}",
+                        self as *const Connection as usize,
+                        written_bytes,
+                        data.len()
+                    );
+                }
                 (written_bytes, stage_was_empty && written_bytes > 0)
             };
             self.log(MetricsEvent::SendDataBuffer);
@@ -554,6 +604,12 @@ impl Connection {
             let (read_bytes, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let read_bytes = reliable_layer.recv_data_buf(data);
+                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                    eprintln!(
+                        "[app-recv] conn={:x} read_bytes={}",
+                        self as *const Connection as usize, read_bytes
+                    );
+                }
                 (read_bytes, reliable_layer.recv_eof_ready())
             };
             self.publish_recv_eof(recv_eof);
@@ -661,6 +717,21 @@ impl Connection {
     }
 
     fn log_enabled_at(&self, event: MetricsEvent, now: Instant) {
+        // Logging re-locks the reliable layer for the metrics snapshot below;
+        // the mutex is not reentrant, so calling this while the lock is held
+        // (inside a `with_reliable_layer` closure) deadlocks whenever
+        // observability is enabled. The thread-local flag turns that hang
+        // into an immediate panic — capture the snapshot outside the lock
+        // instead (the same discipline `flush_acks` and the piggyback claim
+        // follow).
+        IN_RELIABLE_LAYER_LOCK.with(|flag| {
+            assert!(
+                !flag.get(),
+                "log_at/log called while the reliable-layer lock is held: it re-locks \
+                 the reliable layer for the metrics snapshot and the mutex is not \
+                 reentrant (deadlock). Capture the snapshot outside the lock."
+            );
+        });
         let elapsed = self.observability.elapsed_since(now);
         let observer_interest = self.observability.interest(event, elapsed);
         if observer_interest == MetricsInterest::Skip && !self.observability.has_logger() {
@@ -878,6 +949,42 @@ mod tests {
         assert_eq!(observations[0].elapsed, std::time::Duration::from_millis(7));
         assert_eq!(observations[0].event, MetricsEvent::SendDataPacketAttempt);
         assert_eq!(observations[0].snapshot, None);
+    }
+
+    #[test]
+    fn log_at_under_the_reliable_layer_lock_panics_instead_of_deadlocking() {
+        // The deadlock this guards against: `log_at` re-locks the reliable
+        // layer for the metrics snapshot, and the mutex is not reentrant, so
+        // calling it inside a `with_reliable_layer` closure hangs forever
+        // whenever observability is enabled. The thread-local lock flag must
+        // turn that into an immediate panic.
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::selective(
+                |_, _| MetricsInterest::Snapshot,
+                move |observation| observations.lock().unwrap().push(observation),
+            )
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared.with_reliable_layer(|_| {
+                shared.log_at(MetricsEvent::SendDataPacketAttempt, Instant::now());
+            });
+        }));
+        assert!(
+            result.is_err(),
+            "log_at under the reliable-layer lock must panic, not deadlock"
+        );
+        // The guard must be cleared even after the panic (Drop ran), so a
+        // fresh connection's with_reliable_layer does not trip the
+        // nested-lock assert. (The panicked connection's own mutex is
+        // poisoned, so it cannot be reused.)
+        let (shared2, _write_half2, _read_half2, _reaper2) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        shared2.with_reliable_layer(|_| {});
     }
 
     #[test]

@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::ack_feedback::{AckFeedback, AckFlushOutcome, AckSchedule};
+use super::ack_feedback::{AckClaim, AckFeedback, AckFlushOutcome, AckPage, AckSchedule};
 use super::connection::Connection;
 use super::termination::{KillPolicy, TerminationWriter};
 use super::transmission_layer::{
     FEC_DEBUG, PRINT_DEBUG_MSGS, ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
-use crate::ack::EncodeAck;
+use crate::ack::{AckHistory, EncodeAck};
 use crate::codec::{EncodeData, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsEvent, MetricsTerminationCause};
@@ -74,7 +74,163 @@ pub(super) struct WriteHalfSettings {
     pub(super) ack_padding: AckPaddingMode,
 }
 
+/// A due ACK claimed for piggybacking on a data packet: page 0 rides on the
+/// data datagram (encoded ahead of the data), page 1 (if any) is sent
+/// standalone after the data packet.
+struct PiggybackAck {
+    claim: AckClaim,
+    page1: Option<AckPage>,
+}
+
 impl WriteHalf {
+    /// Encode one ACK page into `output`, optionally with piggybacked data
+    /// appended after the ACK command (one ACK_CMD per datagram). Consumes
+    /// the claim's pending echo on the first page. Returns the encoded
+    /// length. Shared by the standalone flush and the piggyback paths so the
+    /// page-encode shape (history → EncodeAck → echo → wire bytes) lives in
+    /// exactly one place.
+    fn encode_ack_page(
+        &self,
+        claim: &mut AckClaim,
+        history: &AckHistory,
+        page: AckPage,
+        data: Option<EncodeData<'_>>,
+        output: &mut [u8],
+    ) -> usize {
+        let ack = EncodeAck {
+            queue: history,
+            first_block_index: page.first_block_index,
+            max_blocks: page.max_blocks,
+        };
+        let echo = claim.take_echo();
+        encode_ack_data(self.shared.session_tag(), Some(ack), echo, data, output).unwrap()
+    }
+
+    /// Claim a due ACK and encode it piggybacked on the data packet: page 0
+    /// rides in `codec_pkt` ahead of the data (one ACK_CMD per datagram, so
+    /// at most one page piggybacks). Returns the combined datagram length
+    /// and the piggyback (None when no ACK is due or none is claimable — the
+    /// datagram is then data-only, exactly as before).
+    fn claim_piggyback_ack(
+        &self,
+        now: Instant,
+        codec_pkt: &mut [u8],
+        data: EncodeData<'_>,
+    ) -> (usize, Option<PiggybackAck>) {
+        let (n, claimed) = self.shared.with_reliable_layer(|reliable_layer| {
+            let history = reliable_layer.pkt_recv_space().ack_history();
+            if !self.ack_feedback.schedule(now).is_due() {
+                return (
+                    encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
+                    None,
+                );
+            }
+            let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
+                return (
+                    encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
+                    None,
+                );
+            };
+            let page0 = claim.pages()[0].expect("a claim always carries page 0");
+            let n = self.encode_ack_page(&mut claim, history, page0, Some(data), codec_pkt);
+            let page1 = claim.pages()[1];
+            (n, Some((claim, page1)))
+        });
+        let Some((claim, page1)) = claimed else {
+            return (n, None);
+        };
+        // A successful transactional claim names why it became due; the
+        // observation is emitted before the datagram is sent so the claim
+        // event is never confused with the resume wake that rearmed us.
+        // `log_at` snapshots the reliable layer, so it must run outside the
+        // `with_reliable_layer` lock above (the same discipline `flush_acks`
+        // follows) — calling it inside would deadlock on the non-reentrant
+        // mutex whenever observability is enabled.
+        self.shared
+            .log_at(MetricsEvent::AckFlush(claim.reason()), now);
+        (n, Some(PiggybackAck { claim, page1 }))
+    }
+
+    /// Apply the resolved ack-padding mode to an encoded ACK page in place:
+    /// `Fitted` zero-fills to a target drawn from the observed data-packet
+    /// sizes, `Jitter` appends a uniform `[0, ACK_INTERVAL_WIRE_SIZE)` pad,
+    /// `None` adds nothing. Returns the padded page length.
+    fn pad_ack_page(&mut self, page_buf: &mut [u8], written_bytes: usize) -> usize {
+        match self.ack_padding {
+            AckPaddingMode::Fitted => {
+                match self
+                    .data_size_sampler
+                    .draw_target(written_bytes, Instant::now())
+                {
+                    Some(target) => {
+                        let target = target.min(page_buf.len());
+                        page_buf[written_bytes..target].fill(0);
+                        target
+                    }
+                    // No fit yet, or the data envelope too small: the page
+                    // goes out unpadded exactly as before.
+                    None => written_bytes,
+                }
+            }
+            AckPaddingMode::Jitter => {
+                let pad = rand::random_range(0..crate::codec::ACK_INTERVAL_WIRE_SIZE);
+                page_buf[written_bytes..written_bytes + pad].fill(0);
+                written_bytes + pad
+            }
+            AckPaddingMode::None => written_bytes,
+        }
+    }
+
+    /// Finish a piggybacked ACK claim: send page 1 (if any) standalone with
+    /// the ack-padding mode, then complete the claim. Page 0 was already
+    /// delivered on the data datagram.
+    async fn finish_piggyback_claim(
+        &mut self,
+        piggyback: PiggybackAck,
+        bufs: &mut SendBufs,
+    ) -> Result<(), IoErr> {
+        let PiggybackAck { mut claim, page1 } = piggyback;
+        let Some(page1) = page1 else {
+            self.ack_feedback
+                .complete(claim, AckFlushOutcome::Sent { pages_sent: 1 });
+            self.shared.notify_session_outbound_progress();
+            return Ok(());
+        };
+        // Re-encode page 1 with the current history (the claim's page params
+        // are fixed; the queue may have grown, which is harmless for a
+        // selective ack).
+        let page1_len = self.shared.with_reliable_layer(|reliable_layer| {
+            let history = reliable_layer.pkt_recv_space().ack_history();
+            let (payload, _codec_pkt, _wire_pkt) = bufs.parts_mut();
+            self.encode_ack_page(&mut claim, history, page1, None, payload)
+        });
+        let (payload, _codec_pkt, wire_pkt) = bufs.parts_mut();
+        let page_len = self.pad_ack_page(payload, page1_len);
+        match self.send_with_fec(&payload[..page_len], wire_pkt).await {
+            Ok(_) => {
+                self.ack_feedback
+                    .complete(claim, AckFlushOutcome::Sent { pages_sent: 2 });
+                self.shared.notify_session_outbound_progress();
+                Ok(())
+            }
+            Err(error) if error == std::io::ErrorKind::WouldBlock => {
+                // Page 0 (piggybacked) was delivered; page 1's work remains
+                // for a later flush.
+                self.ack_feedback
+                    .complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 1 });
+                self.shared.notify_session_outbound_progress();
+                Ok(())
+            }
+            Err(error) => {
+                self.ack_feedback
+                    .complete(claim, AckFlushOutcome::Fatal { pages_sent: 1 });
+                self.shared
+                    .press_error(error, MetricsTerminationCause::AckWrite);
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn new(
         utp_write: Box<dyn UnreliableWrite>,
         fec: Option<FecEncoderState>,
@@ -232,6 +388,10 @@ impl WriteHalf {
         self.ack_feedback.schedule(now)
     }
 
+    pub(crate) fn debug_conn_id(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
+    }
+
     async fn send_pkts_inner(
         &mut self,
         bufs: &mut SendBufs,
@@ -253,6 +413,7 @@ impl WriteHalf {
         let wire_ts = self.shared.wire_ts(now);
         let mut written_bytes = 0;
         let mut written_fin = false;
+        let mut piggyback_attempted = false;
         loop {
             if self.shared.has_error() {
                 self.return_error_after_requested_kill(bufs).await?;
@@ -261,6 +422,13 @@ impl WriteHalf {
             let res = self.shared.with_reliable_layer_mut(|reliable_layer| {
                 reliable_layer.send_data_pkt(payload, now)
             });
+            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                eprintln!(
+                    "[sdp-res] conn={:x} result={}",
+                    Arc::as_ptr(&self.shared) as usize,
+                    if res.is_some() { "pkt" } else { "none" }
+                );
+            }
             self.shared
                 .log_at(crate::metrics::MetricsEvent::SendDataPacketAttempt, now);
             let Some(p) = res else {
@@ -294,7 +462,20 @@ impl WriteHalf {
                 self.shared
                     .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
             });
-            let n = encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap();
+            // On the first data packet of the pass, piggyback a due ACK on
+            // the data datagram (page 0 rides ahead of the data; page 1, if
+            // any, is sent standalone after). This hides ACKs among data
+            // packets at zero wire cost — no standalone ACK datagram — and
+            // the wire format already carries ack+data in one datagram.
+            let (n, piggyback) = if !piggyback_attempted {
+                piggyback_attempted = true;
+                self.claim_piggyback_ack(now, codec_pkt, data)
+            } else {
+                (
+                    encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
+                    None,
+                )
+            };
             if self.ack_padding == AckPaddingMode::Fitted {
                 // Sample the DATA path only: the encoded codec packet length
                 // (before FEC/obfuscation envelopes, which padded ACKs add
@@ -310,7 +491,24 @@ impl WriteHalf {
                 }
                 None => utp_pkt,
             };
+            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                eprintln!(
+                    "[send] conn={:x} seq={} len={} recovery={} piggyback={}",
+                    Arc::as_ptr(&self.shared) as usize,
+                    p.seq.to_wire(),
+                    n,
+                    is_recovery,
+                    piggyback.is_some()
+                );
+            }
             let primary_res = self.utp_write.send(send_buf).await;
+            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                eprintln!(
+                    "[send-res] seq={} result={:?}",
+                    p.seq.to_wire(),
+                    primary_res.as_ref().map(|_| "ok").map_err(|e| e.kind())
+                );
+            }
             match primary_res {
                 Ok(_) => {
                     self.fec_gate.record_data_send(is_recovery);
@@ -331,6 +529,17 @@ impl WriteHalf {
                                     }
                                 }
                                 Err(e) => {
+                                    // The primary data send (with the
+                                    // piggybacked ACK) already succeeded, but
+                                    // the armor duplicate failed fatally:
+                                    // abandon the claim so the next flush is
+                                    // not blocked by a stuck in-flight claim.
+                                    if let Some(piggyback) = piggyback {
+                                        self.ack_feedback.complete(
+                                            piggyback.claim,
+                                            AckFlushOutcome::Fatal { pages_sent: 1 },
+                                        );
+                                    }
                                     self.shared
                                         .press_error(e, MetricsTerminationCause::DataWrite);
                                     return Err(e);
@@ -338,9 +547,23 @@ impl WriteHalf {
                             }
                         }
                     }
+                    // The piggybacked ACK rode on the data datagram; finish
+                    // the claim (send page 1 standalone if any) now that the
+                    // data send and its duplicate are done.
+                    if let Some(piggyback) = piggyback {
+                        self.finish_piggyback_claim(piggyback, bufs).await?;
+                    }
                     continue;
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
+                    // A piggybacked ACK was not delivered: restore its work
+                    // for a later flush and retry the data packet without it.
+                    if let Some(piggyback) = piggyback {
+                        self.ack_feedback.complete(
+                            piggyback.claim,
+                            AckFlushOutcome::WouldBlock { pages_sent: 0 },
+                        );
+                    }
                     let blocked_at = Instant::now();
                     self.shared
                         .log_at(crate::metrics::MetricsEvent::DataSendWouldBlock, blocked_at);
@@ -354,6 +577,14 @@ impl WriteHalf {
                     continue;
                 }
                 Err(e) => {
+                    // The data send failed fatally before the piggybacked ACK
+                    // could be delivered: abandon the claim (restores the
+                    // echo, clears in-flight) so a later flush is not blocked
+                    // by a stuck claim.
+                    if let Some(piggyback) = piggyback {
+                        self.ack_feedback
+                            .complete(piggyback.claim, AckFlushOutcome::Fatal { pages_sent: 0 });
+                    }
                     self.shared
                         .press_error(e, MetricsTerminationCause::DataWrite);
                     return Err(e);
@@ -446,6 +677,9 @@ impl WriteHalf {
         };
         let parity_pkts =
             send_pacer.with_token_bucket(|bucket| fec.maybe_flush_parities(bucket, now, instream));
+        if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            eprintln!("[fec] flush_parities: {} pkts", parity_pkts.len());
+        }
         for pkt in parity_pkts {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
@@ -553,21 +787,8 @@ impl WriteHalf {
                     } else {
                         &mut payload[..]
                     };
-                    let ack = EncodeAck {
-                        queue: history,
-                        first_block_index: page.first_block_index,
-                        max_blocks: page.max_blocks,
-                    };
-                    encoded_page_lengths[index] = Some(
-                        encode_ack_data(
-                            self.shared.session_tag(),
-                            Some(ack),
-                            claim.take_echo(),
-                            None,
-                            output,
-                        )
-                        .unwrap(),
-                    );
+                    encoded_page_lengths[index] =
+                        Some(self.encode_ack_page(&mut claim, history, page, None, output));
                 }
                 (Some(claim), encoded_page_lengths)
             });
@@ -588,39 +809,12 @@ impl WriteHalf {
                 continue;
             };
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
-            // ACK-page padding, resolved from the HarmfulPaddingPolicy:
-            // `Fitted` draws a target from the observed data-packet sizes and
-            // zero-fills the page tail up to it; `Jitter` appends a uniform
-            // `[0, ACK_INTERVAL_WIRE_SIZE)` pad so natural-size ACKs are not
-            // readable by size-slot analysis; `None` adds nothing. The pad
-            // rides INSIDE the FEC envelope when FEC is on and is stripped
-            // by the codec's zero-tail rule at the receiver, so padded and
-            // unpadded ACKs decode identically. The page buffers are
-            // BUF_SIZE-sized, so there is headroom for the fill.
+            // ACK-page padding, resolved from the HarmfulPaddingPolicy (see
+            // [`Self::pad_ack_page`]): the pad rides INSIDE the FEC envelope
+            // when FEC is on and is stripped by the codec's zero-tail rule at
+            // the receiver, so padded and unpadded ACKs decode identically.
             let page_buf = if index == 0 { codec_pkt } else { payload };
-            let page_len = match self.ack_padding {
-                AckPaddingMode::Fitted => {
-                    match self
-                        .data_size_sampler
-                        .draw_target(written_bytes, Instant::now())
-                    {
-                        Some(target) => {
-                            let target = target.min(page_buf.len());
-                            page_buf[written_bytes..target].fill(0);
-                            target
-                        }
-                        // No fit yet, or the data envelope too small: the
-                        // page goes out unpadded exactly as before.
-                        None => written_bytes,
-                    }
-                }
-                AckPaddingMode::Jitter => {
-                    let pad = rand::random_range(0..crate::codec::ACK_INTERVAL_WIRE_SIZE);
-                    page_buf[written_bytes..written_bytes + pad].fill(0);
-                    written_bytes + pad
-                }
-                AckPaddingMode::None => written_bytes,
-            };
+            let page_len = self.pad_ack_page(page_buf, written_bytes);
             let encoded_page = &page_buf[..page_len];
             match self.send_with_fec(encoded_page, wire_pkt).await {
                 Ok(_) => {
