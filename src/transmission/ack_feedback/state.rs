@@ -48,16 +48,31 @@ impl AckClaim {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AckFlushOutcome {
-    Sent { pages_sent: usize },
-    WouldBlock { pages_sent: usize },
-    Fatal { pages_sent: usize },
+    Sent {
+        pages_sent: usize,
+    },
+    /// The underlay refused the ACK datagram. `rearm` names whether the
+    /// flush schedule must be rearmed so the write driver parks for
+    /// `ACK_FLUSH_AGE` instead of busy-looping on an immediately-due
+    /// schedule: `true` for a blocked underlay flush (the datagram could not
+    /// be sent, so retrying instantly is futile), `false` for a piggyback
+    /// claim release (no packet to ride on / retransmission too large — the
+    /// standalone flush at the end of the pass should pick the work up
+    /// immediately).
+    WouldBlock {
+        pages_sent: usize,
+        rearm: bool,
+    },
+    Fatal {
+        pages_sent: usize,
+    },
 }
 
 impl AckFlushOutcome {
     fn pages_sent(self) -> usize {
         match self {
             Self::Sent { pages_sent }
-            | Self::WouldBlock { pages_sent }
+            | Self::WouldBlock { pages_sent, .. }
             | Self::Fatal { pages_sent } => pages_sent,
         }
     }
@@ -159,11 +174,21 @@ impl State {
                 self.complete_claim(claim.pending_acks, claim.fin_pending);
                 self.last_ack_flush = Some(claim.flush_started_at);
             }
-            AckFlushOutcome::WouldBlock { .. } => {
+            AckFlushOutcome::WouldBlock { rearm, .. } => {
                 if let Some(echo_ts) = claim.echo_backup {
                     self.ts_echo.restore(echo_ts);
                 }
                 self.complete_claim(pages_sent * MAX_NUM_ACK, false);
+                if rearm {
+                    // A blocked underlay flush leaves the pending work
+                    // untouched, so without a rearm the schedule would stay
+                    // immediately due and the write driver would spin on
+                    // re-claim/re-encode/re-send without ever parking on the
+                    // stop token. Rearm from NOW (the WouldBlock time, not
+                    // the claim start — a blocked send may have consumed
+                    // real time) so the next wake is `ACK_FLUSH_AGE` away.
+                    self.last_ack_flush = Some(Instant::now());
+                }
             }
             AckFlushOutcome::Fatal { .. } => {
                 if let Some(echo_ts) = claim.echo_backup {
@@ -297,7 +322,13 @@ mod tests {
         );
         // The claim consumed the echo; it must come back on WouldBlock.
         assert_eq!(state.ts_echo.take(), None);
-        state.complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 1 });
+        state.complete(
+            claim,
+            AckFlushOutcome::WouldBlock {
+                pages_sent: 1,
+                rearm: false,
+            },
+        );
         assert_eq!(
             state.pending_acks,
             100 - MAX_NUM_ACK,
@@ -312,6 +343,52 @@ mod tests {
             Some(1234),
             "the claimed echo must be restored for the next flush"
         );
+        assert!(state.has_pending(), "unsent work must remain pending");
+    }
+
+    #[test]
+    fn wouldblock_rearm_parks_the_schedule_instead_of_staying_due() {
+        let mut state = State::new();
+        let now = Instant::now();
+        // A piggyback claim release (rearm: false) leaves the schedule due so
+        // the standalone flush at the end of the pass picks the work up
+        // immediately — no added ACK latency on the happy path.
+        state.record(ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        let claim = state.claim(now, 0).expect("pending work must claim");
+        state.complete(
+            claim,
+            AckFlushOutcome::WouldBlock {
+                pages_sent: 0,
+                rearm: false,
+            },
+        );
+        assert!(
+            state.schedule(now).is_due(),
+            "a piggyback release must keep the flush due"
+        );
+        // A blocked underlay flush (rearm: true) must rearm the schedule so
+        // the write driver parks for ACK_FLUSH_AGE instead of busy-looping
+        // on an immediately-due schedule (which would never observe the stop
+        // token and would hang graceful shutdown).
+        let claim = state.claim(now, 0).expect("pending work must claim");
+        state.complete(
+            claim,
+            AckFlushOutcome::WouldBlock {
+                pages_sent: 0,
+                rearm: true,
+            },
+        );
+        match state.schedule(now) {
+            AckSchedule::At(deadline) => assert!(
+                deadline > now,
+                "a rearmed deadline must be in the future, got {deadline:?}"
+            ),
+            other => panic!("a blocked flush must rearm the schedule, got {other:?}"),
+        }
         assert!(state.has_pending(), "unsent work must remain pending");
     }
 

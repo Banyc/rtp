@@ -157,8 +157,13 @@ impl WriteHalf {
                 // No packet to send: release the claim (if any) so the
                 // standalone flush can pick up the ACK work.
                 if let Some(claim) = claim {
-                    self.ack_feedback
-                        .complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 0 });
+                    self.ack_feedback.complete(
+                        claim,
+                        AckFlushOutcome::WouldBlock {
+                            pages_sent: 0,
+                            rearm: false,
+                        },
+                    );
                 }
                 return (res, None);
             };
@@ -171,12 +176,28 @@ impl WriteHalf {
             let Some(claim) = claim else {
                 return (res, None);
             };
-            if reserved + data_written > self.mss.max_data_size_per_pkt() {
+            // The combined datagram must stay within the MSS: the data
+            // packet's own wire overhead is `data_overhead()` for a stock
+            // packet but `frame_data_overhead()` (4 bytes more) for a
+            // first-frame packet, so the release check must use the packet's
+            // actual overhead — the stock bound would let a retransmitted
+            // first-frame packet exceed the MSS by up to 4 bytes.
+            let overhead = if p.frame_len.is_some() {
+                crate::delivery::frame::wire::frame_data_overhead()
+            } else {
+                crate::codec::data_overhead()
+            };
+            if reserved + data_written > self.mss.get().saturating_sub(overhead) {
                 // The data packet (a retransmission) is too large to fit
                 // alongside the ACK: release the claim and send the data
                 // alone.
-                self.ack_feedback
-                    .complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 0 });
+                self.ack_feedback.complete(
+                    claim,
+                    AckFlushOutcome::WouldBlock {
+                        pages_sent: 0,
+                        rearm: false,
+                    },
+                );
                 return (res, None);
             }
             // Re-read the history for the encode: the reliable-layer lock is
@@ -265,8 +286,13 @@ impl WriteHalf {
             Err(error) if error == std::io::ErrorKind::WouldBlock => {
                 // Page 0 (piggybacked) was delivered; page 1's work remains
                 // for a later flush.
-                self.ack_feedback
-                    .complete(claim, AckFlushOutcome::WouldBlock { pages_sent: 1 });
+                self.ack_feedback.complete(
+                    claim,
+                    AckFlushOutcome::WouldBlock {
+                        pages_sent: 1,
+                        rearm: false,
+                    },
+                );
                 self.shared.notify_session_outbound_progress();
                 Ok(())
             }
@@ -538,7 +564,12 @@ impl WriteHalf {
             if FEC_DEBUG {
                 eprintln!("send_data_pkt seq={} data_len={}", p.seq, data_written);
             }
-            let instream = self.instream_group_fec_enabled;
+            // The loss-gated method (not the raw field): while the condition
+            // gate is closed (no loss evidence), the in-stream path must not
+            // accumulate full groups — `encode_data` force-skips groups past
+            // PARITY_DATA_THRESHOLD when `instream` is false, matching the
+            // flush paths' gated decisions.
+            let instream = self.instream_group_fec_enabled();
             let armor_decision = self.retransmission_armor.decide(is_recovery, || {
                 self.shared
                     .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
@@ -593,8 +624,23 @@ impl WriteHalf {
             match primary_res {
                 Ok(_) => {
                     self.fec_gate.record_data_send(is_recovery);
-                    if self.fec.is_some() && instream {
-                        self.maybe_flush_full_fec_group(now).await?;
+                    if self.fec.is_some()
+                        && instream
+                        && let Err(error) = self.maybe_flush_full_fec_group(now).await
+                    {
+                        // The data send (with the piggybacked ACK) already
+                        // succeeded, but the FEC flush failed fatally:
+                        // abandon the claim so the ACK state machine is
+                        // not left with a stuck in-flight claim (a later
+                        // claim would panic on the in-flight assert). The
+                        // error is already pressed by the flush path.
+                        if let Some(piggyback) = piggyback {
+                            self.ack_feedback.complete(
+                                piggyback.claim,
+                                AckFlushOutcome::Fatal { pages_sent: 1 },
+                            );
+                        }
+                        return Err(error);
                     }
                     if armor_decision == ArmorDecision::Duplicate {
                         let token_taken = self.send_pacer.take_exact_tokens(1, now);
@@ -642,7 +688,10 @@ impl WriteHalf {
                     if let Some(piggyback) = piggyback {
                         self.ack_feedback.complete(
                             piggyback.claim,
-                            AckFlushOutcome::WouldBlock { pages_sent: 0 },
+                            AckFlushOutcome::WouldBlock {
+                                pages_sent: 0,
+                                rearm: false,
+                            },
                         );
                     }
                     let blocked_at = Instant::now();
@@ -914,8 +963,17 @@ impl WriteHalf {
                     }
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
-                    self.ack_feedback
-                        .complete(claim, AckFlushOutcome::WouldBlock { pages_sent });
+                    // The underlay refused the ACK datagram: rearm the flush
+                    // schedule so the write driver parks for ACK_FLUSH_AGE
+                    // instead of busy-looping on an immediately-due schedule
+                    // (a WouldBlock flush leaves the pending work untouched).
+                    self.ack_feedback.complete(
+                        claim,
+                        AckFlushOutcome::WouldBlock {
+                            pages_sent,
+                            rearm: true,
+                        },
+                    );
                     self.shared.notify_session_outbound_progress();
                     return Ok(());
                 }

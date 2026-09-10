@@ -1184,13 +1184,12 @@ mod tests {
         let now = Instant::now();
         // Stage a FULL-SIZE data packet (the piggyback carrier).
         let mss = crate::udp::NO_FEC_MSS;
-        let payload_len = {
+        {
             let rl = transmission.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             let payload_len = rl.max_data_size_per_pkt();
             rl.send_data_buf(&vec![0u8; payload_len], now).unwrap();
-            payload_len
-        };
+        }
         // A recv history plus pending ack work makes the claim due.
         {
             let mut reliable = transmission
@@ -1241,14 +1240,13 @@ mod tests {
         // Send a full-size packet so it is in flight; after the RTO it
         // becomes a full-size retransmission.
         let mss = crate::udp::NO_FEC_MSS;
-        let payload_len = {
+        {
             let rl = transmission.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
             let payload_len = rl.max_data_size_per_pkt();
             rl.send_data_buf(&vec![0u8; payload_len], Instant::now())
                 .unwrap();
-            payload_len
-        };
+        }
         let mut send_bufs = SendBufs::new();
         transmission.send_pkts(&mut send_bufs).await.unwrap();
         recorder.lock().unwrap().clear();
