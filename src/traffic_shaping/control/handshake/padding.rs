@@ -15,9 +15,10 @@ use crate::mss::Mss;
 use crate::obfuscate::padding::{self, PaddingSettings, TargetKind};
 
 /// Largest padding tail for an MSS: the padded packet may reach a full
-/// MSS-sized datagram.
+/// MSS-sized datagram minus the truncated-datagram detection headroom (see
+/// [`crate::mss::Mss::max_datagram_size`]).
 pub(crate) const fn max_handshake_pad(mss: Mss) -> usize {
-    mss.get().saturating_sub(PACKET_LEN)
+    mss.max_datagram_size().saturating_sub(PACKET_LEN)
 }
 
 /// The handshake's padding settings for an MSS: uniform random over the
@@ -118,9 +119,13 @@ mod tests {
 
     #[test]
     fn pad_lengths_follow_the_uniform_draw() {
-        const MAX_PAD: usize = 200;
-        const SAMPLES: usize = 201_000;
-        let mss = Mss::try_new(PACKET_LEN + MAX_PAD).unwrap();
+        // The padded packet may reach `max_datagram_size` (the MSS minus the
+        // truncated-datagram detection headroom), so the MSS must be one
+        // byte larger than `PACKET_LEN + MAX_PAD` for the pad range to span
+        // `[0, MAX_PAD]`.
+        const MAX_PAD: usize = 199;
+        const SAMPLES: usize = 200_000;
+        let mss = Mss::try_new(PACKET_LEN + MAX_PAD + 1).unwrap();
         let mut counts = [0usize; MAX_PAD + 1];
         let core = core();
         let mut out = vec![0u8; mss.get()];
@@ -139,7 +144,7 @@ mod tests {
             .sum();
         assert!(
             chi2 < 300.0,
-            "pad lengths are not uniform: chi2 = {chi2:.1} (expected < 300 for 201 dof)"
+            "pad lengths are not uniform: chi2 = {chi2:.1} (expected < 300 for 200 dof)"
         );
     }
 
@@ -147,7 +152,8 @@ mod tests {
     fn max_pad_tracks_mss() {
         assert_eq!(max_handshake_pad(Mss::try_new(17).unwrap()), 0);
         assert_eq!(max_handshake_pad(Mss::try_new(18).unwrap()), 0);
-        assert_eq!(max_handshake_pad(Mss::try_new(19).unwrap()), 1);
-        assert_eq!(max_handshake_pad(Mss::try_new(1424).unwrap()), 1406);
+        assert_eq!(max_handshake_pad(Mss::try_new(19).unwrap()), 0);
+        assert_eq!(max_handshake_pad(Mss::try_new(20).unwrap()), 1);
+        assert_eq!(max_handshake_pad(Mss::try_new(1424).unwrap()), 1405);
     }
 }

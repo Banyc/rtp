@@ -766,7 +766,9 @@ mod tests {
         let (_a_r, a_w, _a_supervisor) = socket(a, None);
         let write_stream = a_w.into_async_write();
         let max_write_bytes = write_stream.max_write_bytes();
-        let per_packet_payload = mss - crate::codec::data_overhead();
+        let per_packet_payload = crate::udp::Mss::try_new(mss)
+            .unwrap()
+            .max_data_size_per_pkt();
         assert_eq!(
             max_write_bytes % per_packet_payload,
             0,

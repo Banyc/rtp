@@ -5,17 +5,19 @@ use primitive::{
     queue::cap_queue::CapVecQueue,
 };
 
-use crate::codec::data_overhead;
+use crate::mss::Mss;
 
 pub(crate) const SEND_DATA_BUF_LEN: usize = 8 * 1024;
 pub(crate) const MAX_SEND_DATA_BUF_LEN: usize = 64 * 1024;
 
-/// Send staging buffer size for a given MSS.
-pub(crate) fn send_data_buf_len(mss: usize) -> usize {
-    if mss <= crate::udp::NO_FEC_MSS {
+/// Send staging buffer size for a given MSS: whole packets of the actual
+/// per-packet payload (the truncated-datagram detection headroom and the
+/// codec overhead are deducted inside [`Mss::max_data_size_per_pkt`]).
+pub(crate) fn send_data_buf_len(mss: Mss) -> usize {
+    if mss.get() <= crate::udp::NO_FEC_MSS {
         return SEND_DATA_BUF_LEN;
     }
-    let payload = mss - data_overhead();
+    let payload = mss.max_data_size_per_pkt();
     let pkts = MAX_SEND_DATA_BUF_LEN / payload;
     pkts * payload
 }
@@ -27,7 +29,7 @@ pub(crate) struct StockSendStage {
 }
 
 impl StockSendStage {
-    pub(crate) fn new(mss: usize) -> Self {
+    pub(crate) fn new(mss: Mss) -> Self {
         Self {
             buf: CapVecQueue::new_vec(send_data_buf_len(mss)),
         }

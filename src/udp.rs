@@ -54,7 +54,7 @@ mod raw_send;
 #[cfg(test)]
 pub mod testing;
 
-pub use crate::mss::{MAX_MSS, Mss, MssError};
+pub use crate::mss::{MAX_MSS, Mss, MssError, TRUNCATION_DETECTION_BYTES};
 pub const NO_FEC_MSS: usize = 1424;
 pub(crate) const DISPATCHER_BUF_SIZE: usize = 1024;
 

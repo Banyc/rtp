@@ -617,11 +617,9 @@ mod tests {
     }
 
     fn stage_n_packets(tl: &TransmissionLayer, n: usize) -> usize {
-        let mss = 8192usize;
-        let post_fec_mss = mss - 11 - 2;
-        let payload_len = post_fec_mss - crate::codec::data_overhead();
         let rl = tl.shared_for_test().reliable_layer_for_test();
         let mut rl = rl.lock().unwrap();
+        let payload_len = rl.max_data_size_per_pkt();
         for _ in 0..n {
             let payload = vec![0u8; payload_len];
             rl.enqueue_send_data_for_test(&payload);
@@ -1186,15 +1184,13 @@ mod tests {
         let now = Instant::now();
         // Stage a FULL-SIZE data packet (the piggyback carrier).
         let mss = crate::udp::NO_FEC_MSS;
-        let post_fec_mss = mss - 11 - 2;
-        let payload_len = post_fec_mss - crate::codec::data_overhead();
-        transmission
-            .shared_for_test()
-            .reliable_layer_for_test()
-            .lock()
-            .unwrap()
-            .send_data_buf(&vec![0u8; payload_len], now)
-            .unwrap();
+        let payload_len = {
+            let rl = transmission.shared_for_test().reliable_layer_for_test();
+            let mut rl = rl.lock().unwrap();
+            let payload_len = rl.max_data_size_per_pkt();
+            rl.send_data_buf(&vec![0u8; payload_len], now).unwrap();
+            payload_len
+        };
         // A recv history plus pending ack work makes the claim due.
         {
             let mut reliable = transmission
@@ -1245,14 +1241,14 @@ mod tests {
         // Send a full-size packet so it is in flight; after the RTO it
         // becomes a full-size retransmission.
         let mss = crate::udp::NO_FEC_MSS;
-        let post_fec_mss = mss - 11 - 2;
-        let payload_len = post_fec_mss - crate::codec::data_overhead();
-        {
+        let payload_len = {
             let rl = transmission.shared_for_test().reliable_layer_for_test();
             let mut rl = rl.lock().unwrap();
+            let payload_len = rl.max_data_size_per_pkt();
             rl.send_data_buf(&vec![0u8; payload_len], Instant::now())
                 .unwrap();
-        }
+            payload_len
+        };
         let mut send_bufs = SendBufs::new();
         transmission.send_pkts(&mut send_bufs).await.unwrap();
         recorder.lock().unwrap().clear();

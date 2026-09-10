@@ -7,8 +7,20 @@ use thiserror::Error;
 
 use crate::codec;
 
-/// The largest MSS the transport accepts: the datagram ceiling.
+/// The largest MSS the transport accepts: the datagram ceiling. The
+/// truncated-datagram detection headroom is deducted by the calculation
+/// methods (see [`Mss::max_datagram_size`] and
+/// [`Mss::max_data_size_per_pkt`]), so a full-size datagram is never
+/// exactly the receive buffer size.
 pub const MAX_MSS: usize = 64 * 1024;
+
+/// The headroom the MSS must leave below the datagram ceiling so a
+/// full-size datagram is never exactly the receive buffer size: the
+/// receiver drops datagrams of exactly the buffer size (they may be
+/// truncated), so the largest datagram the transport produces must be at
+/// most [`MAX_MSS`] minus this headroom. Every size derived from the MSS
+/// deducts this headroom.
+pub const TRUNCATION_DETECTION_BYTES: usize = 1;
 
 /// A maximum segment size, validated against the datagram ceiling and the
 /// codec payload overhead. Construction is fallible; every downstream layer
@@ -47,11 +59,22 @@ impl Mss {
         self.0
     }
 
-    /// The maximum payload bytes per data packet: `mss - data_overhead()`.
-    /// Guaranteed non-negative by [`Mss::try_new`], which rejects an MSS
-    /// with no room for the codec payload.
+    /// The largest datagram the transport may produce: the MSS minus the
+    /// truncated-datagram detection headroom, so a full-size datagram is
+    /// never exactly the receive buffer size. Every producer (data, FEC
+    /// parity, handshake) bounds its wire datagram by this.
+    pub const fn max_datagram_size(&self) -> usize {
+        self.0 - TRUNCATION_DETECTION_BYTES
+    }
+
+    /// The maximum payload bytes per data packet: `mss - data_overhead()`,
+    /// minus the truncated-datagram detection headroom so the wire datagram
+    /// is always at least one byte below the MSS (and therefore never
+    /// exactly the receive buffer size). Guaranteed non-negative by
+    /// [`Mss::try_new`], which rejects an MSS with no room for the codec
+    /// payload.
     pub fn max_data_size_per_pkt(&self) -> usize {
-        self.0 - codec::data_overhead()
+        self.0 - TRUNCATION_DETECTION_BYTES - codec::data_overhead()
     }
 }
 
@@ -74,5 +97,50 @@ pub enum MssError {
 impl From<MssError> for std::io::Error {
     fn from(error: MssError) -> Self {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ceiling_and_headroom_keep_the_max_datagram_below_the_buffer() {
+        // The receive path reads into a 64 KiB buffer and drops datagrams
+        // of exactly that size (they may be a truncated larger datagram), so
+        // the largest datagram the transport produces must be one byte below
+        // the ceiling.
+        assert_eq!(MAX_MSS, 64 * 1024);
+        assert_eq!(TRUNCATION_DETECTION_BYTES, 1);
+        assert!(
+            Mss::try_new(MAX_MSS).is_ok(),
+            "the ceiling MSS must be valid"
+        );
+        assert!(matches!(
+            Mss::try_new(MAX_MSS + 1),
+            Err(MssError::ExceedsDatagramCeiling { .. })
+        ));
+        assert_eq!(
+            Mss::try_new(MAX_MSS).unwrap().max_datagram_size(),
+            MAX_MSS - TRUNCATION_DETECTION_BYTES,
+            "the max datagram must be one byte below the ceiling"
+        );
+    }
+
+    #[test]
+    fn max_data_size_per_pkt_deducts_the_detection_headroom() {
+        // The wire datagram is `data_overhead + payload`; the headroom keeps
+        // it at least one byte below the MSS (and therefore never exactly
+        // the receive buffer size).
+        let mss = Mss::try_new(1_424).unwrap();
+        assert_eq!(
+            mss.max_data_size_per_pkt(),
+            1_424 - TRUNCATION_DETECTION_BYTES - codec::data_overhead()
+        );
+        assert_eq!(
+            mss.max_data_size_per_pkt() + codec::data_overhead(),
+            1_424 - TRUNCATION_DETECTION_BYTES,
+            "the codec packet must stay one byte below the MSS"
+        );
     }
 }

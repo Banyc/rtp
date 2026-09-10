@@ -234,7 +234,7 @@ impl ReliableLayer {
         let this = Self {
             mss,
             max_data_size_per_pkt,
-            send_data_buf: StockSendStage::new(mss.get()),
+            send_data_buf: StockSendStage::new(mss),
             send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
@@ -277,7 +277,7 @@ impl ReliableLayer {
         let this = Self {
             mss,
             max_data_size_per_pkt,
-            send_data_buf: StockSendStage::new(mss.get()),
+            send_data_buf: StockSendStage::new(mss),
             send_fin_buf: FinState::None,
             recv_data_buf: StockRecvStage::new(),
             recv_fin_buf: false,
@@ -1215,7 +1215,7 @@ impl ReliableLayer {
             .max(Duration::from_millis(5))
     }
 
-    fn max_data_size_per_pkt(&self) -> usize {
+    pub(crate) fn max_data_size_per_pkt(&self) -> usize {
         self.max_data_size_per_pkt
     }
 
@@ -1543,7 +1543,6 @@ mod tests {
     const TEST_MSS: usize = 1200;
     use crate::{
         ack::{AckBlocks, AckInterval},
-        codec::data_overhead,
         delivery::byte_stream::send::SEND_DATA_BUF_LEN,
         udp::NO_FEC_MSS,
     };
@@ -1630,33 +1629,41 @@ mod tests {
 
     #[test]
     fn send_data_buf_len_keeps_default_at_8_kib() {
-        assert_eq!(send_data_buf_len(NO_FEC_MSS), SEND_DATA_BUF_LEN);
+        assert_eq!(
+            send_data_buf_len(crate::mss::Mss::try_new(NO_FEC_MSS).unwrap()),
+            SEND_DATA_BUF_LEN
+        );
     }
 
     #[test]
     fn send_data_buf_len_scales_to_whole_packets_above_default() {
-        let mss = 8192;
+        let mss = crate::mss::Mss::try_new(8192).unwrap();
         let len = send_data_buf_len(mss);
-        let payload = mss - data_overhead();
+        let payload = mss.max_data_size_per_pkt();
         let expected = (MAX_SEND_DATA_BUF_LEN / payload) * payload;
         assert_eq!(len, expected);
         assert!(len > SEND_DATA_BUF_LEN);
         assert!(len <= MAX_SEND_DATA_BUF_LEN);
 
         // Spot checks for the larger-overhead wire format.
-        let payload_2015 = 2015 - data_overhead();
+        let mss_2015 = crate::mss::Mss::try_new(2015).unwrap();
+        let payload_2015 = mss_2015.max_data_size_per_pkt();
         assert_eq!(
-            send_data_buf_len(2015),
+            send_data_buf_len(mss_2015),
             (MAX_SEND_DATA_BUF_LEN / payload_2015) * payload_2015
         );
-        let payload_9000 = 9000 - data_overhead();
+        let mss_9000 = crate::mss::Mss::try_new(9000).unwrap();
+        let payload_9000 = mss_9000.max_data_size_per_pkt();
         assert_eq!(
-            send_data_buf_len(9000),
+            send_data_buf_len(mss_9000),
             (MAX_SEND_DATA_BUF_LEN / payload_9000) * payload_9000
         );
 
         // Sanity check for the default-MSS path.
-        assert_eq!(send_data_buf_len(NO_FEC_MSS), SEND_DATA_BUF_LEN);
+        assert_eq!(
+            send_data_buf_len(crate::mss::Mss::try_new(NO_FEC_MSS).unwrap()),
+            SEND_DATA_BUF_LEN
+        );
     }
 
     fn test_layer(now: Instant) -> super::ReliableLayer {

@@ -68,8 +68,8 @@ impl DataSizeSampler {
     }
 
     /// Record one sent data-packet size, O(1). Sizes saturate at `u16::MAX`:
-    /// the MSS ceiling (`MAX_MSS` = 64 KiB) can exceed `u16::MAX` by one
-    /// byte, and a wrapped size would corrupt the fit.
+    /// the MSS ceiling (`MAX_MSS`) is at most `u16::MAX`, but a wrapped size
+    /// would corrupt the fit, so the saturation is defensive.
     pub(crate) fn observe(&mut self, size: usize) {
         self.ring[self.pos] = size.min(u16::MAX as usize) as u16;
         self.pos = (self.pos + 1) % WINDOW;

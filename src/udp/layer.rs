@@ -67,7 +67,13 @@ pub(crate) fn checked_mss_and_fec(
 ) -> Result<(Mss, Option<FecState>, FecTuning), MssError> {
     let mss = mss.get();
     let fec_state = if fec {
-        let symbol_size = symbol_size(mss).ok_or(MssError::TooSmallForFec { mss })?;
+        // The parity symbol is `symbol_size` bytes and the parity wire adds
+        // the 11-byte header, so the symbol size must leave the
+        // truncated-datagram detection headroom: the largest parity
+        // datagram is `symbol_size + 11 = mss - 1`, never exactly the
+        // receive buffer size.
+        let symbol_size = symbol_size(mss - crate::mss::TRUNCATION_DETECTION_BYTES)
+            .ok_or(MssError::TooSmallForFec { mss })?;
         Some(FecState::new(FecConfig {
             symbol_size,
             small_group_parity_count: tuning.small_group_parity_count,
@@ -217,9 +223,10 @@ mod tests {
             "the obfuscation nonce must be reserved from the MSS"
         );
         // The wire datagram (segment payload + codec overhead + nonce) still
-        // fits in the configured MSS: the payload is `mss - data_overhead`,
-        // so the wire is `(mss - data_overhead) + data_overhead + nonce` =
-        // `mss + nonce` = the configured MSS.
+        // fits in the configured MSS: the payload is `mss - data_overhead`
+        // minus the truncated-datagram detection headroom, so the wire is
+        // `(mss - 1 - data_overhead) + data_overhead + nonce` = `mss - 1 +
+        // nonce` = the configured MSS minus the headroom.
         assert_eq!(
             mss.get() + crate::obfuscate::NONCE_LEN,
             crate::udp::NO_FEC_MSS,
