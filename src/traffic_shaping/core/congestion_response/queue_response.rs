@@ -39,8 +39,11 @@ pub(super) struct QueueResponse {
 
 impl QueueResponse {
     pub(super) fn decide_drain(&mut self, input: DrainInput) -> CongestionDecision {
-        let base = (input.peak_delivery * DRAIN_FLOOR_PEAK_FRACTION)
-            .clamp(input.minimum_rate, input.initial_rate);
+        // Clamp over the ordered range so a misconfigured minimum above the
+        // initial rate cannot panic `f64::clamp` (which requires min <= max).
+        let lo = input.minimum_rate.min(input.initial_rate);
+        let hi = input.minimum_rate.max(input.initial_rate);
+        let base = (input.peak_delivery * DRAIN_FLOOR_PEAK_FRACTION).clamp(lo, hi);
         let binding = input.delivery_rate * input.drain_fraction < base;
         if binding {
             self.floor_binding_since.get_or_insert(input.now);
@@ -59,8 +62,14 @@ impl QueueResponse {
                 base
             } else {
                 let pinned = pinned_for.unwrap();
-                let excess_rtts =
-                    (pinned.as_secs_f64() - grace.as_secs_f64()) / input.control_rtt.as_secs_f64();
+                // Guard the division: a zero control RTT (no measurement yet)
+                // means no decay — the floor stays at `base`.
+                let rtt = input.control_rtt.as_secs_f64();
+                let excess_rtts = if rtt > 0.0 {
+                    (pinned.as_secs_f64() - grace.as_secs_f64()) / rtt
+                } else {
+                    0.0
+                };
                 (base * 0.5f64.powf(excess_rtts)).max(input.minimum_rate)
             };
         let target = (input.delivery_rate * input.drain_fraction)

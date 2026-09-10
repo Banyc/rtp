@@ -958,7 +958,9 @@ impl PktSendSpace {
         let previous_cwnd = self.cwnd;
         let cwnd = self.rtt_stats.smooth_rtt().as_secs_f64() * send_rate.get();
         let cwnd = cwnd.round() as usize;
-        let cwnd = cwnd * CWND_SEND_RATE_SCALE;
+        // Saturating: a pathological rate/RTT product must not wrap the cwnd
+        // (a debug panic or a release wrap to a tiny window).
+        let cwnd = cwnd.saturating_mul(CWND_SEND_RATE_SCALE);
         let cwnd = 1.max(cwnd);
         // While an outage-recovery epoch is open, clamp cwnd to
         // OUTAGE_RECOVERY_CWND so a just-restored path is not flooded before

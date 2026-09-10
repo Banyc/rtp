@@ -18,7 +18,12 @@ pub(super) fn decide(
     initial_rate: f64,
 ) -> CongestionDecision {
     let floor = (peak_delivery * LOSS_BACKOFF_PEAK_FRACTION)
-        .clamp(minimum_rate, initial_rate)
+        // Clamp over the ordered range so a misconfigured minimum above the
+        // initial rate cannot panic `f64::clamp` (which requires min <= max).
+        .clamp(
+            minimum_rate.min(initial_rate),
+            minimum_rate.max(initial_rate),
+        )
         .min(current);
     let raw = delivery_rate.min(current).max(minimum_rate);
     CongestionDecision::LossBackoff {
