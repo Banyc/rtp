@@ -368,8 +368,15 @@ impl ProbeResponder {
                     }
                 }
                 None => {
+                    // Copy only the 32-byte core: a raw probe may carry a
+                    // padding tail (up to MAX_PROBE_PLAINTEXT bytes), and
+                    // copying the whole datagram into the 32-byte reply
+                    // would panic — a crafted padded probe was a remote DoS
+                    // on the no-key listener. The tail is dropped, exactly
+                    // like the obfuscated path drops a malformed probe's
+                    // extra tail.
                     let mut reply = [0; PROBE_LEN];
-                    reply.copy_from_slice(&datagram[..probe_len]);
+                    reply.copy_from_slice(&datagram[..PROBE_LEN]);
                     reply[DIR_OFFSET] = DIR_ECHO;
                     if echo.send_to(&reply, from).is_err() {
                         self.send_error_count.fetch_add(1, Ordering::Relaxed);
@@ -766,5 +773,38 @@ mod tests {
         );
         assert_eq!(responder.send_error_count(), 1);
         std::mem::forget(responder);
+    }
+
+    #[test]
+    fn responder_echoes_only_the_core_of_a_padded_raw_probe() {
+        // A raw probe with a padding tail (33..=MAX_PROBE_PLAINTEXT bytes)
+        // is a valid probe packet: the decoder ignores the tail. The echo
+        // must copy only the 32-byte core — copying the whole datagram into
+        // the 32-byte reply would panic, and a crafted padded probe was a
+        // remote DoS on the no-key listener.
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responder = ProbeResponder::new(Some(echo), None, probe_settings(), None);
+        let prober = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let from = prober.local_addr().unwrap();
+        let probe = ProbeEcho {
+            nonce: 0xDEAD_BEEF,
+            timestamp_micros: 12345,
+        };
+        let mut padded = encode_probe(probe).to_vec();
+        padded.extend_from_slice(&[0xAB; 64]); // a padding tail
+        assert_eq!(
+            responder.observe(&from, &mut padded),
+            Observe::Consumed,
+            "a padded raw probe must be consumed (echoed), not panic"
+        );
+        // The echo is exactly the 32-byte core with the direction flipped.
+        let mut buf = [0u8; 1024];
+        let (n, _) = prober.recv_from(&mut buf).unwrap();
+        assert_eq!(n, PROBE_LEN, "the echo must be the 32-byte core");
+        assert_eq!(
+            decode_echo(&buf[..n]),
+            Some(probe),
+            "the echo must decode back to the probe"
+        );
     }
 }
