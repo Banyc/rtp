@@ -93,8 +93,13 @@ pub(crate) fn checked_mss_and_fec(
     // 4-byte frame-length header (FRAME_DATA_TS), so the MSS must leave
     // room for `frame_data_overhead()` (data_overhead + 4), not just
     // `data_overhead()`.  A too-small MSS would yield 0-byte-payload first
-    // packets.
-    if frame_delivery.enabled && crate::delivery::frame::wire::frame_data_overhead() >= mss {
+    // packets.  The truncated-datagram detection headroom is also required:
+    // the largest wire datagram must stay one byte below the MSS.
+    if frame_delivery.enabled
+        && crate::delivery::frame::wire::frame_data_overhead()
+            + crate::mss::TRUNCATION_DETECTION_BYTES
+            >= mss
+    {
         return Err(MssError::NoRoomForFirstFrameHeader { mss });
     }
     // FEC off → depth is irrelevant; normalise to the default so the field is
@@ -164,6 +169,14 @@ mod tests {
         MssError::NoRoomForFirstFrameHeader { .. },
         false,
         crate::codec::data_overhead() + 1,
+        FrameMode::enabled()
+    );
+    checked_mss_and_fec_error_case!(
+        frame_delivery_mss_without_the_truncation_headroom_fails,
+        MssError::NoRoomForFirstFrameHeader { .. },
+        false,
+        crate::delivery::frame::wire::frame_data_overhead()
+            + crate::mss::TRUNCATION_DETECTION_BYTES,
         FrameMode::enabled()
     );
 

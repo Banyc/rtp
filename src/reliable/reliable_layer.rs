@@ -528,6 +528,17 @@ impl ReliableLayer {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
         self.ensure_write_open()?;
+        // The MSS must leave room for the first-frame header (FRAME_DATA_TS)
+        // plus the truncated-datagram detection headroom plus at least one
+        // payload byte; otherwise no first packet can be produced and the
+        // frame would stall forever (or, before the saturating sizing, panic).
+        if self.mss.get()
+            < crate::delivery::frame::wire::frame_data_overhead()
+                + crate::mss::TRUNCATION_DETECTION_BYTES
+                + 1
+        {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         crate::delivery::frame::send::validate_frame(frame)?;
         self.detect_application_limited_phases(now);
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
@@ -710,12 +721,23 @@ impl ReliableLayer {
         reserved_bytes: usize,
     ) -> Option<DataPkt> {
         let normal_max_payload = self.max_data_size_per_pkt().saturating_sub(reserved_bytes);
+        // The first packet of a frame carries the 4-byte frame-length header
+        // on top of the stock overhead, and every datagram must stay one byte
+        // below the MSS (the truncated-datagram detection headroom), so the
+        // first-packet payload is `mss - frame_data_overhead - headroom`.
+        // `saturating_sub` (not `checked_sub().unwrap()`) so a too-small MSS
+        // degrades to "no packet" instead of panicking.
         let first_pkt_max_payload = self
             .mss
             .get()
-            .checked_sub(crate::delivery::frame::wire::frame_data_overhead())
-            .unwrap()
+            .saturating_sub(crate::delivery::frame::wire::frame_data_overhead())
+            .saturating_sub(crate::mss::TRUNCATION_DETECTION_BYTES)
             .saturating_sub(reserved_bytes);
+        if first_pkt_max_payload == 0 {
+            // The MSS cannot carry a first-frame packet (frame header +
+            // headroom + the reserved ACK): no packet can be produced.
+            return None;
+        }
 
         let chunk = match self
             .frame_send_stage
@@ -2521,8 +2543,8 @@ mod tests {
         // The on-wire size of the first packet = frame_data_overhead + payload.
         let on_wire_first = crate::delivery::frame::wire::frame_data_overhead() + payload_len;
         assert!(
-            on_wire_first <= mss,
-            "first frame packet on-wire size {on_wire_first} must be <= MSS {mss}"
+            on_wire_first <= mss - crate::mss::TRUNCATION_DETECTION_BYTES,
+            "first frame packet on-wire size {on_wire_first} must stay below the MSS (truncated-datagram detection headroom), mss={mss}"
         );
     }
 
