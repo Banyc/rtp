@@ -429,8 +429,17 @@ impl WriteHalf {
                     if res.is_some() { "pkt" } else { "none" }
                 );
             }
-            self.shared
-                .log_at(crate::metrics::MetricsEvent::SendDataPacketAttempt, now);
+            if self
+                .shared
+                .wants_snapshot(crate::metrics::MetricsEvent::SendDataPacketAttempt, now)
+            {
+                let snapshot = self.shared.capture_snapshot(now);
+                self.shared.log_at_with_snapshot(
+                    crate::metrics::MetricsEvent::SendDataPacketAttempt,
+                    now,
+                    snapshot,
+                );
+            }
             let Some(p) = res else {
                 if FEC_DEBUG {
                     eprintln!("send_data_pkt: no pkt to send (rtx=None, cwnd full or no tokens)");

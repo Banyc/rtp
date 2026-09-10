@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -21,41 +20,6 @@ use crate::reliable::reliable_layer::ReliableLayer;
 use crate::traffic_shaping::control::handshake::{DueResponse, PostOpenVerdict};
 use crate::traffic_shaping::core::SendWake;
 use crate::traffic_shaping::redundancy::fec::FecStatsHandle;
-
-// Set while the current thread holds the reliable-layer lock inside
-// `Connection::with_reliable_layer` / `Connection::with_reliable_layer_mut`.
-// `Connection::log_enabled_at` asserts this is clear: logging re-locks the
-// reliable layer to capture the metrics snapshot, and the mutex is not
-// reentrant — calling it under the lock deadlocks whenever observability is
-// enabled. The flag turns that hang into an immediate, test-caught panic.
-thread_local! {
-    static IN_RELIABLE_LAYER_LOCK: Cell<bool> = const { Cell::new(false) };
-}
-
-/// RAII guard that marks the current thread as holding the reliable-layer
-/// lock for the duration of a `with_reliable_layer` closure. Also asserts the
-/// lock is not already held (a nested `with_reliable_layer` would deadlock on
-/// the non-reentrant mutex before the closure ever ran).
-struct ReliableLayerLockGuard;
-
-impl ReliableLayerLockGuard {
-    fn enter() -> Self {
-        IN_RELIABLE_LAYER_LOCK.with(|flag| {
-            assert!(
-                !flag.get(),
-                "nested with_reliable_layer: the reliable-layer mutex is not reentrant"
-            );
-            flag.set(true);
-        });
-        Self
-    }
-}
-
-impl Drop for ReliableLayerLockGuard {
-    fn drop(&mut self) {
-        IN_RELIABLE_LAYER_LOCK.with(|flag| flag.set(false));
-    }
-}
 
 #[derive(Debug, Default)]
 pub(crate) struct ReceivedBatch {
@@ -205,23 +169,21 @@ impl Connection {
     }
 
     /// Run `use_layer` against the reliable layer under its lock; the guard never
-    /// escapes the closure, so it cannot survive an await. The thread-local
-    /// lock flag makes `log_at`/`log` under this lock a panic instead of a
-    /// deadlock (see [`IN_RELIABLE_LAYER_LOCK`]).
+    /// escapes the closure, so it cannot survive an await. Logging never locks
+    /// the reliable layer (see [`Self::log_at`]), so it is safe to call from
+    /// inside this closure.
     pub(super) fn with_reliable_layer<R>(&self, use_layer: impl FnOnce(&ReliableLayer) -> R) -> R {
-        let _guard = ReliableLayerLockGuard::enter();
         use_layer(&self.reliable_layer.lock().unwrap())
     }
 
     /// Run `use_layer` against the reliable layer under its lock; the guard never
-    /// escapes the closure, so it cannot survive an await. The thread-local
-    /// lock flag makes `log_at`/`log` under this lock a panic instead of a
-    /// deadlock (see [`IN_RELIABLE_LAYER_LOCK`]).
+    /// escapes the closure, so it cannot survive an await. Logging never locks
+    /// the reliable layer (see [`Self::log_at`]), so it is safe to call from
+    /// inside this closure.
     pub(super) fn with_reliable_layer_mut<R>(
         &self,
         use_layer: impl FnOnce(&mut ReliableLayer) -> R,
     ) -> R {
-        let _guard = ReliableLayerLockGuard::enter();
         use_layer(&mut self.reliable_layer.lock().unwrap())
     }
 
@@ -318,11 +280,16 @@ impl Connection {
     pub(crate) fn press_error(&self, error: IoErr, cause: MetricsTerminationCause) -> bool {
         let inserted = self.termination.press_error(error);
         if inserted {
-            self.log(MetricsEvent::SessionTermination(MetricsTermination {
+            let now = Instant::now();
+            let event = MetricsEvent::SessionTermination(MetricsTermination {
                 cause,
                 error_kind: error.kind(),
                 raw_os_error: error.raw_os_error(),
-            }));
+            });
+            if self.wants_snapshot(event, now) {
+                let snapshot = self.capture_snapshot(now);
+                self.log_at_with_snapshot(event, now, snapshot);
+            }
         }
         inserted
     }
@@ -335,11 +302,16 @@ impl Connection {
     ) -> bool {
         let inserted = self.termination.press_broken_pipe(policy, context);
         if inserted {
-            self.log(MetricsEvent::SessionTermination(MetricsTermination {
+            let now = Instant::now();
+            let event = MetricsEvent::SessionTermination(MetricsTermination {
                 cause,
                 error_kind: std::io::ErrorKind::BrokenPipe,
                 raw_os_error: None,
-            }));
+            });
+            if self.wants_snapshot(event, now) {
+                let snapshot = self.capture_snapshot(now);
+                self.log_at_with_snapshot(event, now, snapshot);
+            }
         }
         inserted
     }
@@ -380,7 +352,11 @@ impl Connection {
                 }
                 (written_bytes, stage_was_empty && written_bytes > 0)
             };
-            self.log(MetricsEvent::SendDataBuffer);
+            let now = Instant::now();
+            if self.wants_snapshot(MetricsEvent::SendDataBuffer, now) {
+                let snapshot = self.capture_snapshot(now);
+                self.log_at_with_snapshot(MetricsEvent::SendDataBuffer, now, snapshot);
+            }
             if 0 < written_bytes {
                 if should_resume_send {
                     self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationData);
@@ -420,7 +396,11 @@ impl Connection {
             };
             match result {
                 Ok(()) => {
-                    self.log(MetricsEvent::SendFrameBuffer);
+                    let now = Instant::now();
+                    if self.wants_snapshot(MetricsEvent::SendFrameBuffer, now) {
+                        let snapshot = self.capture_snapshot(now);
+                        self.log_at_with_snapshot(MetricsEvent::SendFrameBuffer, now, snapshot);
+                    }
                     self.request_send_driver_resume(
                         MetricsSendDriverResumeSource::ApplicationFrame,
                     );
@@ -613,7 +593,11 @@ impl Connection {
                 (read_bytes, reliable_layer.recv_eof_ready())
             };
             self.publish_recv_eof(recv_eof);
-            self.log(MetricsEvent::ReceiveDataBuffer);
+            let now = Instant::now();
+            if self.wants_snapshot(MetricsEvent::ReceiveDataBuffer, now) {
+                let snapshot = self.capture_snapshot(now);
+                self.log_at_with_snapshot(MetricsEvent::ReceiveDataBuffer, now, snapshot);
+            }
             if PRINT_DEBUG_MSGS {
                 println!("recv: data: {read_bytes}");
             }
@@ -644,7 +628,11 @@ impl Connection {
             self.publish_recv_eof(recv_eof);
             match res {
                 Ok(Some(frame)) => {
-                    self.log(MetricsEvent::ReceiveFrameBuffer);
+                    let now = Instant::now();
+                    if self.wants_snapshot(MetricsEvent::ReceiveFrameBuffer, now) {
+                        let snapshot = self.capture_snapshot(now);
+                        self.log_at_with_snapshot(MetricsEvent::ReceiveFrameBuffer, now, snapshot);
+                    }
                     return Ok(Some(frame));
                 }
                 Ok(None) => {
@@ -699,54 +687,103 @@ impl Connection {
     }
 
     pub(crate) fn log(&self, event: MetricsEvent) {
-        if !self.observability.enabled() {
-            return;
-        }
-        self.log_enabled_at(event, Instant::now());
+        self.log_at(event, Instant::now());
     }
 
     /// Log an event against a caller-supplied decision time: the clock is
     /// never re-sampled for a decision already made at the pass time, so
     /// `elapsed` (and every deadline derived from it) matches the moment the
     /// decision was made, not the moment the metrics call happened to run.
+    ///
+    /// Never locks the reliable layer: the metrics snapshot is caller-supplied
+    /// (see [`Self::log_at_with_snapshot`]), so this is safe to call from
+    /// inside a `with_reliable_layer` closure. The deadlock class where
+    /// logging re-locked the reliable layer is eliminated by construction.
     pub(crate) fn log_at(&self, event: MetricsEvent, now: Instant) {
+        self.publish_event(event, now, None);
+    }
+
+    /// Whether `event` at `now` warrants a reliable-layer snapshot. Consults
+    /// the observer's filter exactly once (its event counters and
+    /// state-sample claim are side effects) and claims the state-sample slot
+    /// if one is due. Returns true iff the caller should capture a snapshot
+    /// and publish it via [`Self::log_at_with_snapshot`].
+    ///
+    /// Never locks the reliable layer, so this is safe to call from inside a
+    /// `with_reliable_layer` closure. The snapshot itself is captured by the
+    /// caller (from the held `&ReliableLayer` inside the lock, or via
+    /// [`Self::capture_snapshot`] outside it).
+    pub(crate) fn wants_snapshot(&self, event: MetricsEvent, now: Instant) -> bool {
+        if !self.observability.enabled() {
+            return false;
+        }
+        let elapsed = self.observability.elapsed_since(now);
+        self.observability.wants_snapshot(event, elapsed)
+    }
+
+    /// Publish a metrics event with a caller-supplied reliable-layer snapshot.
+    /// Never locks the reliable layer, so it is safe to call from inside a
+    /// `with_reliable_layer` closure — the caller captures the snapshot from
+    /// the `&ReliableLayer` it already holds (or via [`Self::capture_snapshot`]
+    /// when outside the lock).
+    pub(crate) fn log_at_with_snapshot(
+        &self,
+        event: MetricsEvent,
+        now: Instant,
+        snapshot: crate::metrics::MetricsSnapshot,
+    ) {
+        self.publish_event(event, now, Some(snapshot));
+    }
+
+    /// Capture a reliable-layer metrics snapshot at `now`. Locks the reliable
+    /// layer — call this only OUTSIDE a `with_reliable_layer` closure (inside
+    /// the lock, capture from the held `&ReliableLayer` via
+    /// [`Self::metrics_snapshot`] instead).
+    pub(crate) fn capture_snapshot(&self, now: Instant) -> crate::metrics::MetricsSnapshot {
+        let reliable_layer = self.reliable_layer.lock().unwrap();
+        self.metrics_snapshot(&reliable_layer, now)
+    }
+
+    fn publish_event(
+        &self,
+        event: MetricsEvent,
+        now: Instant,
+        snapshot: Option<crate::metrics::MetricsSnapshot>,
+    ) {
         if !self.observability.enabled() {
             return;
         }
-        self.log_enabled_at(event, now);
-    }
-
-    fn log_enabled_at(&self, event: MetricsEvent, now: Instant) {
-        // Logging re-locks the reliable layer for the metrics snapshot below;
-        // the mutex is not reentrant, so calling this while the lock is held
-        // (inside a `with_reliable_layer` closure) deadlocks whenever
-        // observability is enabled. The thread-local flag turns that hang
-        // into an immediate panic — capture the snapshot outside the lock
-        // instead (the same discipline `flush_acks` and the piggyback claim
-        // follow).
-        IN_RELIABLE_LAYER_LOCK.with(|flag| {
-            assert!(
-                !flag.get(),
-                "log_at/log called while the reliable-layer lock is held: it re-locks \
-                 the reliable layer for the metrics snapshot and the mutex is not \
-                 reentrant (deadlock). Capture the snapshot outside the lock."
-            );
-        });
         let elapsed = self.observability.elapsed_since(now);
-        let observer_interest = self.observability.interest(event, elapsed);
+        let observer_interest = if snapshot.is_some() {
+            // The caller captured a snapshot because the observer or logger
+            // wanted one; the observer's filter was already consulted (via
+            // [`Self::wants_snapshot`]), so do not re-consult it — that would
+            // re-claim the observer's state-sample slot and double-count its
+            // event counters.
+            MetricsInterest::Snapshot
+        } else {
+            let interest = self.observability.interest(event, elapsed);
+            if interest == MetricsInterest::Snapshot {
+                // The observer wants a snapshot but none was supplied: the
+                // logging path never locks, so one cannot be conjured here.
+                // Downgrade to event-only rather than drop the event.
+                MetricsInterest::EventOnly
+            } else {
+                interest
+            }
+        };
         if observer_interest == MetricsInterest::Skip && !self.observability.has_logger() {
             return;
         }
-        let capture_snapshot =
-            observer_interest == MetricsInterest::Snapshot || self.observability.has_logger();
-        let (event_index, snapshot) = if capture_snapshot {
-            let reliable_layer = self.reliable_layer.lock().unwrap();
-            let snapshot = self.metrics_snapshot(&reliable_layer, now);
-            let event_index = self.observability.next_event_index();
-            (event_index, Some(snapshot))
-        } else {
-            (self.observability.next_event_index(), None)
-        };
+        if snapshot.is_none() && self.observability.has_logger() {
+            // The CSV logger needs a snapshot for every row, and the logging
+            // path never locks, so one cannot be conjured here. Drop the
+            // event rather than panic the logger; snapshot-worthy call sites
+            // capture via [`Self::wants_snapshot`] + [`Self::capture_snapshot`]
+            // and publish through [`Self::log_at_with_snapshot`].
+            return;
+        }
+        let event_index = self.observability.next_event_index();
         self.observability.publish(
             event_index,
             event,
@@ -952,12 +989,13 @@ mod tests {
     }
 
     #[test]
-    fn log_at_under_the_reliable_layer_lock_panics_instead_of_deadlocking() {
-        // The deadlock this guards against: `log_at` re-locks the reliable
-        // layer for the metrics snapshot, and the mutex is not reentrant, so
-        // calling it inside a `with_reliable_layer` closure hangs forever
-        // whenever observability is enabled. The thread-local lock flag must
-        // turn that into an immediate panic.
+    fn log_at_inside_the_reliable_layer_lock_never_deadlocks() {
+        // The deadlock this guards against: `log_at` used to re-lock the
+        // reliable layer for the metrics snapshot, and the mutex is not
+        // reentrant, so calling it inside a `with_reliable_layer` closure
+        // hung forever whenever observability was enabled. The structural
+        // fix removed the lock from the logging path entirely: `log_at` and
+        // `log_at_with_snapshot` never lock, so this call completes.
         let observations = Arc::new(Mutex::new(Vec::new()));
         let observer = {
             let observations = Arc::clone(&observations);
@@ -969,22 +1007,29 @@ mod tests {
         let mut layer = pending_layer(FrameMode::default());
         layer.metrics_observer = Some(observer);
         let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared.with_reliable_layer(|_| {
-                shared.log_at(MetricsEvent::SendDataPacketAttempt, Instant::now());
-            });
-        }));
-        assert!(
-            result.is_err(),
-            "log_at under the reliable-layer lock must panic, not deadlock"
+        let now = Instant::now();
+        // Event-only logging inside the lock: completes, publishes without a
+        // snapshot.
+        shared.with_reliable_layer(|_| {
+            shared.log_at(MetricsEvent::SendDataPacketAttempt, now);
+        });
+        // Snapshot logging inside the lock: the caller captures the snapshot
+        // from the `&ReliableLayer` it already holds and passes it in — no
+        // re-lock, so this also completes.
+        shared.with_reliable_layer(|reliable_layer| {
+            let snapshot = shared.metrics_snapshot(reliable_layer, now);
+            shared.log_at_with_snapshot(MetricsEvent::SendDataPacketAttempt, now, snapshot);
+        });
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.len(),
+            2,
+            "both log calls inside the lock must publish"
         );
-        // The guard must be cleared even after the panic (Drop ran), so a
-        // fresh connection's with_reliable_layer does not trip the
-        // nested-lock assert. (The panicked connection's own mutex is
-        // poisoned, so it cannot be reused.)
-        let (shared2, _write_half2, _read_half2, _reaper2) =
-            new_connection(pending_layer(FrameMode::default()), None);
-        shared2.with_reliable_layer(|_| {});
+        assert!(
+            observations[1].snapshot.is_some(),
+            "the caller-supplied snapshot must be published"
+        );
     }
 
     #[test]

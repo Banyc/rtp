@@ -69,6 +69,19 @@ impl ConnectionObservability {
             .unwrap_or(MetricsInterest::Skip)
     }
 
+    /// Whether `event` at `elapsed` warrants a reliable-layer snapshot: the
+    /// observer's filter wants one (consulted exactly once — its counters and
+    /// state-sample claim are side effects) or a CSV logger is attached (the
+    /// logger needs a snapshot for every row).
+    pub(super) fn wants_snapshot(&self, event: MetricsEvent, elapsed: std::time::Duration) -> bool {
+        let observer_wants = self
+            .observer
+            .as_ref()
+            .map(|observer| observer.wants_snapshot(event, elapsed))
+            .unwrap_or(false);
+        observer_wants || self.logger.is_some()
+    }
+
     /// Allocate the next monotonic event index.
     pub(super) fn next_event_index(&self) -> u64 {
         self.next_event_index.fetch_add(1, Ordering::Relaxed)

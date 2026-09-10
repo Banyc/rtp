@@ -227,7 +227,15 @@ impl ReadHalf {
                     shared.request_send_driver_resume(MetricsSendDriverResumeSource::PeerAck);
                 }
                 let Some(data) = data.data else {
-                    shared.log(crate::metrics::MetricsEvent::ReceiveAckPacket);
+                    let now = Instant::now();
+                    if shared.wants_snapshot(crate::metrics::MetricsEvent::ReceiveAckPacket, now) {
+                        let snapshot = shared.capture_snapshot(now);
+                        shared.log_at_with_snapshot(
+                            crate::metrics::MetricsEvent::ReceiveAckPacket,
+                            now,
+                            snapshot,
+                        );
+                    }
                     continue;
                 };
                 if is_fin {
@@ -241,7 +249,15 @@ impl ReadHalf {
                 } else {
                     end_of_acks = true;
                 }
-                shared.log(crate::metrics::MetricsEvent::ReceiveDataPacket);
+                let now = Instant::now();
+                if shared.wants_snapshot(crate::metrics::MetricsEvent::ReceiveDataPacket, now) {
+                    let snapshot = shared.capture_snapshot(now);
+                    shared.log_at_with_snapshot(
+                        crate::metrics::MetricsEvent::ReceiveDataPacket,
+                        now,
+                        snapshot,
+                    );
+                }
             }
             if end_of_acks {
                 break;

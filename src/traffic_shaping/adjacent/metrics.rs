@@ -510,6 +510,14 @@ impl MetricsObserver {
         (self.filter)(event, elapsed)
     }
 
+    /// Whether the observer wants a reliable-layer snapshot for `event` at
+    /// `elapsed`. Consults the filter exactly once; the filter's side effects
+    /// (event counters, state-sample claim) run here, so the caller must not
+    /// consult the filter again for the same event.
+    pub(crate) fn wants_snapshot(&self, event: MetricsEvent, elapsed: Duration) -> bool {
+        (self.filter)(event, elapsed) == MetricsInterest::Snapshot
+    }
+
     pub(crate) fn observe(&self, observation: MetricsObservation) {
         (self.callback)(observation);
     }
