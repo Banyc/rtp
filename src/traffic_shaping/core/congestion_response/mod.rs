@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use super::gentle::{GentleExitCause, GentleProbeOutcome};
 use super::{OrdinaryBandwidthProbe, QueueGrowth, WindowedDeliveryMax};
 use decision::{ResponsePath, select_path};
+use loss_backoff::{LossBackoff, LossBackoffInput};
 use queue_response::{DrainInput, QueueResponse};
 
 mod decision;
@@ -55,6 +56,7 @@ pub(crate) struct CongestionResponse {
     delivery_peak: WindowedDeliveryMax,
     bandwidth_probe: OrdinaryBandwidthProbe,
     queue_response: QueueResponse,
+    loss_backoff: LossBackoff,
 }
 
 impl CongestionResponse {
@@ -64,6 +66,7 @@ impl CongestionResponse {
             delivery_peak: WindowedDeliveryMax::new(now),
             bandwidth_probe: OrdinaryBandwidthProbe::new(),
             queue_response: QueueResponse::default(),
+            loss_backoff: LossBackoff::default(),
         }
     }
 
@@ -72,6 +75,7 @@ impl CongestionResponse {
         self.delivery_peak = WindowedDeliveryMax::new(now);
         self.bandwidth_probe.reset();
         self.queue_response.reset();
+        self.loss_backoff.reset();
         gentle_exit
     }
 
@@ -113,6 +117,9 @@ impl CongestionResponse {
         if path != ResponsePath::Probe {
             self.queue_growth.clear_gate_open();
         }
+        if path != ResponsePath::LossBackoff {
+            self.loss_backoff.reset();
+        }
         let mut gentle_exit = observation.gentle_exit;
         match path {
             ResponsePath::Probe => {
@@ -123,6 +130,7 @@ impl CongestionResponse {
                     input.control_rtt,
                     input.smooth_rtt,
                     input.now,
+                    input.loss_event_rate,
                 ) {
                     GentleProbeOutcome::Apply(target) => CongestionOutcome::new(
                         CongestionDecision::Probe { target },
@@ -161,13 +169,15 @@ impl CongestionResponse {
                 CongestionOutcome::new(decision, None, guard_exit.or(gentle_exit))
             }
             ResponsePath::LossBackoff => CongestionOutcome::new(
-                loss_backoff::decide(
-                    input.current_rate,
-                    input.delivery_rate,
-                    observation.peak_delivery,
-                    input.minimum_rate,
-                    input.initial_rate,
-                ),
+                self.loss_backoff.decide(LossBackoffInput {
+                    current_rate: input.current_rate,
+                    delivery_rate: input.delivery_rate,
+                    peak_delivery: observation.peak_delivery,
+                    minimum_rate: input.minimum_rate,
+                    initial_rate: input.initial_rate,
+                    control_rtt: input.control_rtt,
+                    now: input.now,
+                }),
                 None,
                 gentle_exit,
             ),
@@ -195,8 +205,8 @@ impl CongestionResponse {
     }
 
     /// Ordinary (non-gentle) probe target for a delivery-rate sample.
-    pub(crate) fn proposed_probe_rate(delivery_rate: f64) -> f64 {
-        OrdinaryBandwidthProbe::proposed_rate(delivery_rate)
+    pub(crate) fn proposed_probe_rate(delivery_rate: f64, loss_event_rate: Option<f64>) -> f64 {
+        OrdinaryBandwidthProbe::proposed_rate(delivery_rate, loss_event_rate)
     }
 
     /// Ordinary bandwidth-probe decision after the gentle sub-controller
@@ -209,6 +219,7 @@ impl CongestionResponse {
         let target = self.bandwidth_probe.target(
             input.current_rate,
             input.delivery_rate,
+            input.loss_event_rate,
             input.control_rtt,
             input.now,
         );

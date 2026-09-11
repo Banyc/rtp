@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use super::bandwidth_probe::loss_scaled_gain;
+
 // Gentle-mode parameters for the delay-gated congestion controller.  These are
 // intentionally conservative: they let a bulk flow drain a self-inflicted
 // droptail bottleneck without driving the delay gate so hard that interactive
@@ -160,6 +162,7 @@ impl GentleMode {
         control_rtt: Duration,
         open_threshold: Duration,
         now: Instant,
+        loss_event_rate: Option<f64>,
     ) -> GentleProbeOutcome {
         if !self.gentle_mode {
             return GentleProbeOutcome::Inactive;
@@ -176,7 +179,11 @@ impl GentleMode {
             self.gentle_gate_open_since = None;
             GentleProbeOutcome::Exit(GentleExitCause::GateOpen)
         } else {
-            let probed = delivery_rate * (1. + GENTLE_BW_PROBE_GAIN);
+            // Scale the multiplicative gain by the survival fraction so a
+            // loss-suppressed delivery rate does not compound the full
+            // gentle gain either.  At zero loss the historical 1.2x holds.
+            let probed =
+                delivery_rate * (1.0 + loss_scaled_gain(GENTLE_BW_PROBE_GAIN, loss_event_rate));
             let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
             let target = (probed + additive).max(send_rate);
             GentleProbeOutcome::Apply(target)
@@ -301,11 +308,38 @@ mod tests {
             control_rtt,
             Duration::from_secs(1),
             t0 + GENTLE_ENTER_MIN,
+            Some(0.0),
         ) else {
             panic!("gentle mode should probe before the open threshold");
         };
         assert_eq!(GENTLE_BW_PROBE_GAIN, 0.20);
         assert_eq!(target, 160.0);
+    }
+
+    #[test]
+    fn gentle_probe_gain_shrinks_with_loss() {
+        let t0 = Instant::now();
+        let mut gentle = GentleMode::new();
+        let control_rtt = Duration::from_millis(100);
+        let _ = gentle.update_mode(
+            Some(GENTLE_ENTER_MIN),
+            Some(0.0),
+            t0 + GENTLE_ENTER_MIN,
+            control_rtt,
+        );
+        // 10% loss scales the 1.2x gain down to 1.18x: probed = 118,
+        // + additive 4/0.1 s = 40 -> 158 instead of the zero-loss 160.
+        let GentleProbeOutcome::Apply(target) = gentle.probe(
+            100.0,
+            100.0,
+            control_rtt,
+            Duration::from_secs(1),
+            t0 + GENTLE_ENTER_MIN,
+            Some(0.1),
+        ) else {
+            panic!("gentle mode should probe before the open threshold");
+        };
+        assert_eq!(target, 158.0);
     }
 
     #[test]
@@ -431,11 +465,25 @@ mod tests {
         let mut gate = GentleMode::new();
         let _ = gate.update_mode(Some(GENTLE_ENTER_MIN), Some(0.0), entered_at, control_rtt);
         assert!(matches!(
-            gate.probe(100.0, 100.0, control_rtt, Duration::ZERO, entered_at),
+            gate.probe(
+                100.0,
+                100.0,
+                control_rtt,
+                Duration::ZERO,
+                entered_at,
+                Some(0.0),
+            ),
             GentleProbeOutcome::Exit(GentleExitCause::GateOpen)
         ));
         assert_eq!(
-            gate.probe(100.0, 100.0, control_rtt, Duration::ZERO, entered_at),
+            gate.probe(
+                100.0,
+                100.0,
+                control_rtt,
+                Duration::ZERO,
+                entered_at,
+                Some(0.0),
+            ),
             GentleProbeOutcome::Inactive
         );
 

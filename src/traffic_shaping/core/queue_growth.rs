@@ -165,13 +165,19 @@ impl QueueGrowth {
         control_rtt: Duration,
         smooth_rtt: Duration,
         now: Instant,
+        loss_event_rate: Option<f64>,
     ) -> GentleProbeOutcome {
         let was_gentle = self.gentle.gentle_mode();
         let open_threshold =
             RTT_MIN_BUCKET.max(smooth_rtt.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
-        let target = self
-            .gentle
-            .probe(delivery_rate, send_rate, control_rtt, open_threshold, now);
+        let target = self.gentle.probe(
+            delivery_rate,
+            send_rate,
+            control_rtt,
+            open_threshold,
+            now,
+            loss_event_rate,
+        );
         self.clear_persistence_after_gentle_exit(was_gentle);
         target
     }

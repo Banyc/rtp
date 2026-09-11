@@ -934,7 +934,8 @@ impl ReliableLayer {
             observation.peak_delivery,
         );
         if self.slow_start {
-            let probed = CongestionResponse::proposed_probe_rate(sr.delivery_rate());
+            let probed =
+                CongestionResponse::proposed_probe_rate(sr.delivery_rate(), loss_event_rate);
             let caught_up = self.send_rate.get() <= probed;
             if observation.loss_blocks_delay_control
                 || observation.queue_building
