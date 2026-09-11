@@ -228,6 +228,14 @@ impl Connection {
         self.reliable_layer.lock().unwrap().write_unit_capacity()
     }
 
+    /// Whether the bounded receive window is at capacity; delegates to the
+    /// reliable layer's recv-space occupancy predicate. The read-closed
+    /// session half uses this as the memory-saturation signal: it keeps
+    /// buffering and ACKing until the window fills, then terminates.
+    pub(crate) fn recv_window_full(&self) -> bool {
+        self.reliable_layer.lock().unwrap().recv_window_full()
+    }
+
     #[cfg(test)]
     pub(crate) fn send_data_buf_capacity_for_test(&self) -> usize {
         self.reliable_layer.lock().unwrap().send_data_buf_capacity()
@@ -271,6 +279,15 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn terminal_is_cancelled(&self) -> bool {
         self.termination.terminal().is_cancelled()
+    }
+
+    /// The terminal cancellation token: fires exactly when the first
+    /// terminal error is pressed. Lets the socket-level session supervisor
+    /// distinguish "no terminal event yet" (park indefinitely, a healthy
+    /// session) from "terminal event, only the best-effort KILL datagram
+    /// outstanding on possibly-stuck underlay" (bound the remaining wait).
+    pub(crate) fn terminal(&self) -> &tokio_util::sync::CancellationToken {
+        self.termination.terminal()
     }
 
     pub(crate) fn request_kill_and_abort(&self, cause: MetricsTerminationCause) {

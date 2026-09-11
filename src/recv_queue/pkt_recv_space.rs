@@ -65,6 +65,18 @@ impl PktRecvSpace {
         self.slots.len()
     }
 
+    /// Whether the bounded receive window is at capacity: every in-window
+    /// sequence slot is occupied (Data or Tombstone), so a newly arriving
+    /// in-window packet is necessarily a duplicate (acked, not buffered)
+    /// and a beyond-window packet is rejected — no further payload memory
+    /// can be committed. The slot map's occupancy is bounded by
+    /// [`MAX_NUM_RECVING_PKTS`] (insertions outside the live window are
+    /// rejected), so this is exactly the memory-saturation point once the
+    /// application has stopped draining.
+    pub fn is_full(&self) -> bool {
+        self.slots.len() >= MAX_NUM_RECVING_PKTS
+    }
+
     pub fn reused_buf(&mut self) -> &mut ObjPool<Vec<u8>> {
         &mut self.reused_buf
     }

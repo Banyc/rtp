@@ -1,5 +1,10 @@
 use std::sync::Arc;
-use std::{future::Future, pin::Pin, task::Poll, time::Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use tokio::task::{JoinError, JoinSet};
 
@@ -16,6 +21,17 @@ use crate::transmission::{
     watchdog_tuning::WatchdogTuning,
     write_half::WriteHalf,
 };
+
+/// Hard ceiling on the session supervisor's shutdown phase. By the time the
+/// supervisor is joining its drivers, the graceful-close budget
+/// (GRACEFUL_CLOSE_TIMEOUT, 675s) has already elapsed — a driver still
+/// blocked inside an unreliable send/recv await cannot observe the stop
+/// token, so an unbounded join would hang the session handle forever on a
+/// stuck underlay. A few seconds give any in-flight datagram every chance to
+/// finish while still bounding the resolution of the session handle. The
+/// same bound caps the reaper's post-terminal wait for the best-effort KILL
+/// datagram (the kill is best-effort on a stuck underlay).
+const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 #[must_use = "the RTP session handle must be retained and awaited"]
@@ -291,7 +307,12 @@ impl ReadDriver {
                     recv_pkts.num_fin_segments
                 );
             }
-            if read_closed && 0 < recv_pkts.num_payload_segments {
+            if read_closed && self.shared.recv_window_full() {
+                // TCP-like half-close: keep receiving and ACKing into the
+                // bounded receive window so the peer does not
+                // retransmit-storm; only when the window is actually full
+                // (a new payload could no longer be buffered — the memory
+                // saturation point) does the session request the KILL.
                 self.shared
                     .request_kill_and_abort(MetricsTerminationCause::UnreadPayloadAfterReadClose);
                 return;
@@ -348,12 +369,12 @@ impl SessionSupervisor {
         let first_exit = 'session: {
             tokio::select! {
                 () = write_shutdown.cancelled() => shared.send_fin_buf(),
-                () = termination_reaper.ready() => break 'session None,
+                () = reaper_ready(&termination_reaper, &shared) => break 'session None,
                 result = next_driver_exit(&mut drivers) => break 'session Some(result),
             }
             tokio::select! {
                 () = read_shutdown.cancelled() => (),
-                () = termination_reaper.ready() => break 'session None,
+                () = reaper_ready(&termination_reaper, &shared) => break 'session None,
                 result = next_driver_exit(&mut drivers) => break 'session Some(result),
             }
             tokio::select! {
@@ -367,6 +388,23 @@ impl SessionSupervisor {
         // also when this future is aborted by the caller dropping the
         // session handle).
         drop(on_exit);
+    }
+}
+
+/// [`TerminationReaper::ready`], but with the post-terminal KILL tail
+/// bounded. Once a terminal error is pressed this wait is parked only on the
+/// best-effort KILL datagram, which a stuck underlay may never emit — so
+/// give that tail `DRIVER_JOIN_TIMEOUT` and then resolve with the pressed
+/// error instead of parking forever. While no terminal error is pressed the
+/// wait stays unbounded: a healthy session legitimately parks here
+/// indefinitely.
+async fn reaper_ready(reaper: &TerminationReaper, shared: &Connection) {
+    let mut ready = Box::pin(reaper.ready());
+    tokio::select! {
+        () = &mut ready => (),
+        () = shared.terminal().cancelled() => {
+            let _ = tokio::time::timeout(DRIVER_JOIN_TIMEOUT, &mut ready).await;
+        }
     }
 }
 
@@ -418,6 +456,13 @@ async fn next_driver_exit(drivers: &mut JoinSet<()>) -> Result<(), JoinError> {
     drivers.join_next().await.unwrap_or(Ok(()))
 }
 
+/// Join every driver child, but never for longer than `DRIVER_JOIN_TIMEOUT`
+/// without progress: a driver parked inside an unreliable send/recv await
+/// cannot observe the stop token, so on a stuck underlay the remaining
+/// children are aborted and the session resolves instead of hanging forever.
+/// The caller's `first_exit` (a driver that completed before the shutdown
+/// phase) and every subsequent result are unwrapped so a child panic is
+/// observed and re-raised in the supervisor.
 async fn join_drivers(
     mut drivers: JoinSet<()>,
     first_exit: Option<Result<(), JoinError>>,
@@ -425,14 +470,27 @@ async fn join_drivers(
 ) {
     let unexpected_clean_exit =
         first_exit.as_ref().is_some_and(Result::is_ok) && !shared.has_error();
-    let mut result = first_exit;
+    let mut pending = first_exit;
     loop {
-        if let Some(result) = result.take() {
+        if let Some(result) = pending.take() {
             result.unwrap();
         }
-        result = drivers.join_next().await;
-        if result.is_none() {
-            break;
+        match tokio::time::timeout(DRIVER_JOIN_TIMEOUT, drivers.join_next()).await {
+            Ok(Some(result)) => result.unwrap(),
+            Ok(None) => break,
+            Err(_) => {
+                // The underlay is stuck: a driver is parked inside an await
+                // where it cannot observe the stop token. Abort the
+                // remaining children so the session handle resolves; only a
+                // child panic is still re-raised so it stays observable.
+                drivers.abort_all();
+                while let Some(result) = drivers.join_next().await {
+                    if result.as_ref().is_err_and(JoinError::is_panic) {
+                        result.unwrap();
+                    }
+                }
+                break;
+            }
         }
     }
     assert!(
@@ -798,7 +856,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_payload_after_read_drop_resets_rtp_session() {
+    async fn read_drop_keeps_session_alive_until_recv_window_saturates() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
@@ -809,17 +867,39 @@ mod tests {
             socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         drop(a_read);
         tokio::task::yield_now().await;
+        // A single late payload is buffered (and ACKed) inside the bounded
+        // receive window, not treated as a reset: the session stays alive
+        // and the still-open write half keeps working (TCP-like half-close).
         assert_eq!(b_write.send(b"late payload").await.unwrap(), 12);
         let mut buf = [0; 64];
-        let peer_error = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
+        assert_eq!(a_write.send(b"still alive").await.unwrap(), 11);
+        let response_len = tokio::time::timeout(Duration::from_secs(2), b_read.recv(&mut buf))
             .await
-            .expect("peer did not receive RTP KILL")
-            .expect_err("post-close payload must reset the RTP session");
+            .expect("response receive timed out")
+            .expect("a late payload after read drop falsely reset the RTP write half");
+        assert_eq!(&buf[..response_len], b"still alive");
+        // Saturate the receive window: a full window of buffered payloads
+        // with no reader is the memory-saturation point, and only there does
+        // the read-closed session request the KILL.
+        let flood_len = (crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS + 64) * 1400;
+        let flood = vec![0x5au8; flood_len];
+        let mut sent = 0;
+        while sent < flood.len() {
+            match b_write.send(&flood[sent..]).await {
+                Ok(0) => break,
+                Ok(n) => sent += n,
+                Err(_) => break, // the session was killed at saturation
+            }
+        }
+        let peer_error = tokio::time::timeout(Duration::from_secs(60), b_read.recv(&mut buf))
+            .await
+            .expect("peer did not receive RTP KILL after the recv window saturated")
+            .expect_err("a saturated recv window after read close must reset the RTP session");
         assert_eq!(peer_error, std::io::ErrorKind::BrokenPipe);
         let local_error = a_write
             .send(b"after reset")
             .await
-            .expect_err("the RTP KILL sender must also be locally aborted");
+            .expect_err("the read-closed half must abort locally once the recv window saturates");
         assert_eq!(local_error, std::io::ErrorKind::BrokenPipe);
     }
 

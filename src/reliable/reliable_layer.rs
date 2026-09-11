@@ -419,6 +419,16 @@ impl ReliableLayer {
         &self.pkt_recv_space
     }
 
+    /// Whether the bounded receive window is at capacity (every in-window
+    /// sequence slot is occupied), so a freshly-arriving payload can no
+    /// longer be buffered. The read-closed session half treats this as the
+    /// memory-saturation point: it keeps receiving and ACKing into the
+    /// bounded window (so the peer does not retransmit-storm) until this
+    /// flips, and only then terminates.
+    pub fn recv_window_full(&self) -> bool {
+        self.pkt_recv_space.is_full()
+    }
+
     /// Whether the delivery-rate congestion controller currently considers the
     /// bottleneck queue to be building (smooth RTT above the floor plus the
     /// gate tolerance).  Used by the transmission layer to suppress
