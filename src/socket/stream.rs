@@ -58,12 +58,28 @@ impl tokio::io::AsyncWrite for AsyncWriteAdapter {
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         let max_write_bytes = self.max_write_bytes;
-        let buf = if buf.len() > max_write_bytes {
-            &buf[..max_write_bytes]
+        if buf.len() > max_write_bytes {
+            if self.abort_session.frame_delivery_enabled() {
+                // In frame-delivery mode a write is exactly one wire frame;
+                // truncating would silently split one logical frame into
+                // several, corrupting message boundaries on the receiver.
+                // Mirror `validate_frame`, which rejects any frame above
+                // `MAX_FRAME_LEN` with `InvalidInput`.
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "frame-delivery write of {} bytes exceeds the maximum frame size of {max_write_bytes} bytes",
+                        buf.len()
+                    ),
+                )));
+            }
+            // Stock byte-stream mode: a partial write is correct; the
+            // caller's write_all loop consumes the remainder on later polls.
+            let buf = &buf[..max_write_bytes];
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
         } else {
-            buf
-        };
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
     }
 
     fn poll_flush(
@@ -271,9 +287,25 @@ impl ConnReader {
         }
     }
 
-    pub async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, IoErr> {
-        self.frame_buf.clear();
-        self.transmission_layer.recv_frame().await
+    pub async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, std::io::Error> {
+        if !self.frame_buf.is_empty() {
+            // A previous frame was partially consumed byte-wise through
+            // `recv`; silently clearing it would discard the remainder and
+            // corrupt message boundaries. Mixing byte reads and frame reads
+            // on one stream is a caller error, so surface it instead of
+            // losing bytes.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot read a frame: {} bytes of the previous frame are still buffered from a byte-wise read; mixing byte reads and frame reads on one stream is not allowed",
+                    self.frame_buf.len()
+                ),
+            ));
+        }
+        self.transmission_layer
+            .recv_frame()
+            .await
+            .map_err(|kind| self.transmission_layer.io_error(kind))
     }
 
     pub fn into_async_read(self) -> AsyncReadAdapter {
@@ -314,10 +346,22 @@ impl ConnWriter {
         self.transmission_layer.is_send_buf_empty()
     }
 
+    /// Waits until the send staging buffer is empty: no staged application
+    /// bytes remain and no FIN is pending. This is a local staging
+    /// guarantee, NOT "everything is on the wire or acknowledged" — the
+    /// reliable layer may still hold the data in the send window or in
+    /// flight. To wait for full outbound drain (all data packetized,
+    /// acknowledged, and nothing left to send), use
+    /// [`ConnWriter::all_sent_data_acked`], which waits on
+    /// `Connection::no_data_to_send`.
     pub async fn send_buf_empty(&self) -> Result<(), IoErr> {
         self.transmission_layer.send_buf_empty().await
     }
 
+    /// Waits until there is no data left to send: the staging buffer is
+    /// empty, the send window holds no in-flight packets, and every sent
+    /// packet has been acknowledged. This is the full-drain counterpart of
+    /// [`ConnWriter::send_buf_empty`].
     pub(crate) async fn all_sent_data_acked(&self) -> Result<(), IoErr> {
         self.transmission_layer.no_data_to_send().await
     }
@@ -381,9 +425,24 @@ impl AsyncAsyncWrite for ConnWriter {
             .map_err(|kind| self.transmission_layer.io_error(kind))
     }
 
+    /// Flush is an honest barrier: it returns only once the send staging
+    /// buffer has drained into the reliable layer — the send driver has
+    /// consumed every staged byte (and any pending FIN) out of the staging
+    /// buffer and packetized it. It does NOT wait for the data to be
+    /// acknowledged on the wire; for full drain use
+    /// [`ConnWriter::all_sent_data_acked`].
     async fn flush(&mut self) -> std::io::Result<()> {
         self.transmission_layer
             .check_error()
+            .map_err(|kind| self.transmission_layer.io_error(kind))?;
+        // Wait for the staging buffer to drain. `send_buf_empty` arms the
+        // sent-data notification before inspecting the buffer (the same
+        // pattern the send loops in `transmission/connection.rs` use), so a
+        // wake between the check and the await is never lost; the driver
+        // publishes that signal whenever it consumes staged bytes.
+        self.transmission_layer
+            .send_buf_empty()
+            .await
             .map_err(|kind| self.transmission_layer.io_error(kind))?;
         Ok(())
     }
@@ -872,6 +931,110 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn frame_mode_oversized_write_errors_instead_of_splitting() {
+        use crate::delivery::frame::FrameMode;
+        use tokio::io::AsyncWriteExt;
+        let fec = false;
+        let mss = crate::udp::NO_FEC_MSS;
+        let fd = FrameMode::enabled();
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(a.clone()),
+            Box::new(a),
+            fec,
+            crate::udp::Mss::try_new(mss).unwrap(),
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            fd,
+        )
+        .unwrap();
+        let b_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(b.clone()),
+            Box::new(b),
+            fec,
+            crate::udp::Mss::try_new(mss).unwrap(),
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            fd,
+        )
+        .unwrap();
+        let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
+        let (_b_r, _b_w, _b_supervisor) = socket(b_layer, None);
+        let mut a_stream = a_w.into_async_write();
+        let oversize = vec![0u8; a_stream.max_write_bytes() + 1];
+        let error = a_stream
+            .write(&oversize)
+            .await
+            .expect_err("an oversized frame-mode write must not be silently truncated");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("exceeds the maximum frame size"),
+            "the error should explain the frame-size limit, got: {error}"
+        );
+        // A write within the limit still works (one write = one frame).
+        assert_eq!(a_stream.write(b"ok").await.unwrap(), 2);
+        drop(a_r);
+        drop(a_stream);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_waits_until_the_staging_buffer_drains() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt;
+        #[derive(Debug)]
+        struct WriteState {
+            calls: AtomicUsize,
+            first_started: tokio::sync::Notify,
+            release_first: tokio::sync::Notify,
+        }
+        #[derive(Debug)]
+        struct BlockingFirstWrite(Arc<WriteState>);
+        #[async_trait::async_trait]
+        impl crate::transmission::transmission_layer::UnreliableWrite for BlockingFirstWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+                if self.0.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.0.first_started.notify_one();
+                    self.0.release_first.notified().await;
+                }
+                Ok(buf.len())
+            }
+        }
+        let state = Arc::new(WriteState {
+            calls: AtomicUsize::new(0),
+            first_started: tokio::sync::Notify::new(),
+            release_first: tokio::sync::Notify::new(),
+        });
+        let layer = wrap_fec(
+            Box::new(PendingRead),
+            Box::new(BlockingFirstWrite(Arc::clone(&state))),
+            false,
+        );
+        let (_read, write, _supervisor) = socket(layer, None);
+        let mut write_stream = write.into_async_write();
+        // Stage a full staging buffer's worth of bytes. The driver picks the
+        // staged bytes up and parks in its first underlay send after
+        // consuming at most one packet, leaving the rest staged.
+        let payload = vec![7u8; write_stream.max_write_bytes()];
+        assert!(write_stream.write(&payload).await.unwrap() > 0);
+        tokio::time::timeout(Duration::from_secs(1), state.first_started.notified())
+            .await
+            .expect("the driver must start its first unreliable send");
+        // flush is a barrier: it must stay pending while staged bytes remain.
+        let mut flush = Box::pin(write_stream.flush());
+        tokio::select! {
+            result = &mut flush => panic!("flush must wait for the stage to drain, returned {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => (),
+        }
+        // Release the driver: it drains the stage, and flush proceeds.
+        state.release_first.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), &mut flush)
+            .await
+            .expect("flush must complete once the driver drains the stage")
+            .expect("flush failed after the drain");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn frame_delivery_io_conversion_rejects_stock_mode() {
         let fec = false;
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -991,7 +1154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_frame_discards_a_partially_consumed_frame_tail() {
+    async fn recv_frame_rejects_a_partially_consumed_frame_tail() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
@@ -1022,16 +1185,30 @@ mod tests {
         let mut prefix = [0; 2];
         assert_eq!(a_read.recv(&mut prefix).await.unwrap(), 2);
         assert_eq!(&prefix, b"ab");
-        let next = tokio::time::timeout(Duration::from_secs(2), a_read.recv_frame())
+        // A frame read while the previous frame's tail is still buffered
+        // must be surfaced as an error, not silently discard the tail.
+        let error = a_read.recv_frame().await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("still buffered"),
+            "the error should explain the mixed read modes, got: {error}"
+        );
+        // The tail is preserved: byte reads keep delivering the remainder,
+        // then the next frame, byte-wise.
+        let mut tail = [0; 4];
+        assert_eq!(a_read.recv(&mut tail).await.unwrap(), 4);
+        assert_eq!(&tail, b"cdef");
+        let mut next = [0; 3];
+        assert_eq!(a_read.recv(&mut next).await.unwrap(), 3);
+        assert_eq!(&next, b"XYZ");
+        // Once the tail is drained, frame reads work again.
+        assert_eq!(b_write.send_frame(b"next").await.unwrap(), 4);
+        let frame = tokio::time::timeout(Duration::from_secs(2), a_read.recv_frame())
             .await
-            .expect("next frame receive timed out")
+            .expect("frame receive timed out")
             .expect("frame receive failed")
             .expect("unexpected EOF");
-        assert_eq!(next, b"XYZ");
-        assert_eq!(b_write.send_frame(b"next").await.unwrap(), 4);
-        let mut next = [0; 4];
-        assert_eq!(a_read.recv(&mut next).await.unwrap(), 4);
-        assert_eq!(&next, b"next");
+        assert_eq!(frame, b"next");
     }
 
     #[tokio::test(flavor = "multi_thread")]
