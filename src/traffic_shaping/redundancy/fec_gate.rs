@@ -10,7 +10,10 @@
 //!    (hysteresis).
 //! 2. **Genuinely spare capacity** — decided by the reliable layer
 //!    (`can_send_tail_fec` plus zero application write waiters and no
-//!    queue-building signal), not merely pacer tokens.
+//!    queue-building signal), not merely pacer tokens.  A closed capacity
+//!    gate DEFERS the open group (holds it open, never destroys it) so a
+//!    pending tail probe cannot wipe the tail group's parity; the deferred
+//!    flush fires once capacity is spare again.
 //! 3. **A tail/full-group policy request** — the caller (data-burst tail,
 //!    in-stream full group, ACK/kill tail) must actually be asking for a
 //!    flush.
@@ -41,7 +44,10 @@ pub(crate) enum FecGateDecision {
     LossNotWarranted,
     /// Loss warrants recovery but the capacity is not genuinely spare
     /// (queued/waiting application work, queue growth, cwnd pressure,
-    /// retransmission, or a pending tail probe).
+    /// retransmission, or a pending tail probe).  The caller DEFERS the open
+    /// group — holds it open so its parity survives the capacity-closed
+    /// window and flushes once capacity is spare again — rather than
+    /// destroying it.
     NoSpareCapacity,
     /// Loss and capacity both hold, but this burst did not request a
     /// tail/full-group flush.

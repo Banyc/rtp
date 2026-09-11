@@ -106,6 +106,18 @@ pub(crate) struct FecEncoderState {
     enc_buf: Vec<u8>,
     small_group_parity_count: u8,
     stats: Arc<Stats>,
+    /// Whether the open group's parity flush is currently deferred by the
+    /// no-spare-capacity gate (queued work, cwnd pressure, or a pending tail
+    /// probe).  The group is HELD OPEN — never destroyed — so the parity
+    /// survives the gate-closed window and the next budgeted flush emits it.
+    /// Guards against re-recording the same group's wait on repeated
+    /// gate-closed passes.
+    deferred_no_spare_capacity: bool,
+    /// Parity packets already encoded by a forced flush at
+    /// `MAX_DATA_PER_GROUP` (see `encode_data`), waiting for the next
+    /// budgeted `maybe_flush_parities`.  Bounded: at most
+    /// `MAX_PARITY_PER_GROUP` packets per capped group.
+    pending_cap_parity: VecDeque<Vec<u8>>,
 }
 
 /// Read-actor FEC state: decodes incoming symbols and drains recovered
@@ -302,6 +314,8 @@ impl FecState {
                     .small_group_parity_count
                     .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
                 stats: Arc::clone(&stats),
+                deferred_no_spare_capacity: false,
+                pending_cap_parity: VecDeque::new(),
             },
             decoder: FecDecoderState {
                 decoder: FecDecoder::builder()
@@ -344,6 +358,7 @@ impl FecEncoderState {
             .parity_groups_skipped_burst_end
             .fetch_add(1, Ordering::Relaxed);
         inc_hist(&self.stats.group_size_skipped_burst_end, data_count);
+        self.deferred_no_spare_capacity = false;
         self.encoder.skip_group();
     }
 
@@ -359,24 +374,42 @@ impl FecEncoderState {
             .groups_skipped_loss_gate
             .fetch_add(1, Ordering::Relaxed);
         inc_hist(&self.stats.group_size_skipped_loss_gate, data_count);
+        self.deferred_no_spare_capacity = false;
         self.encoder.skip_group();
     }
 
-    /// Skip the currently-open FEC group, recording it in the no-spare-
-    /// capacity skip stats. No-op when no group is open. Called at burst
-    /// boundaries where the condition gate is closed on capacity evidence
-    /// (queued/waiting application work, queue growth, cwnd pressure,
-    /// retransmission, or a pending tail probe).
+    /// Hold the currently-open FEC group open when the condition gate is
+    /// closed on capacity evidence (queued/waiting application work, queue
+    /// growth, cwnd pressure, retransmission, or a pending tail probe),
+    /// recording the deferral in the no-spare-capacity stats. No-op when no
+    /// group is open.
+    ///
+    /// Unlike the loss-gate and burst-end skips this is a DEFERRAL, not a
+    /// destruction: the group's already-accumulated data must not lose its
+    /// parity the moment a tail-loss probe becomes due.  `can_send_tail_fec`
+    /// closes while `has_tail_probe` is true, and clearing the group here
+    /// would permanently cost the old tail group its parity after the probe
+    /// outcome — they would recover at RTO speed despite a healthy spare
+    /// budget.  Instead the group stays open and the next budgeted flush
+    /// (after the probe is acked or its timeout elapses and capacity is
+    /// genuinely spare again) emits its parity.  A group that is genuinely
+    /// superseded by more data is closed by `encode_data`'s force-skip at
+    /// `PARITY_DATA_THRESHOLD` / the `MAX_DATA_PER_GROUP` cap flush.
     pub fn skip_open_group_no_spare_capacity(&mut self) {
         let data_count = self.encoder.group_data_count();
-        if data_count == 0 {
+        if data_count == 0 || self.deferred_no_spare_capacity {
+            // No group, or a group already held from a previous gate-closed
+            // pass (the tail probe is still pending): keep holding without
+            // re-recording the same group's wait.
             return;
         }
         self.stats
             .groups_skipped_no_spare_capacity
             .fetch_add(1, Ordering::Relaxed);
         inc_hist(&self.stats.group_size_skipped_no_spare_capacity, data_count);
-        self.encoder.skip_group();
+        // Leave the group open: the next flush pass (after the probe resolves
+        // or capacity frees) emits its parity.
+        self.deferred_no_spare_capacity = true;
     }
 
     /// Wrap an outgoing codec packet with a FEC data-symbol header and return
@@ -401,11 +434,47 @@ impl FecEncoderState {
     /// `group_data_full`), instead of waiting for the burst tail.  Stock path
     /// passes `false` and keeps the force-skip, so behaviour is byte-identical
     /// when the toggle is off.
+    ///
+    /// **Hard cap on the open group:** `MAX_DATA_PER_GROUP` (documented as a
+    /// forced-flush point but previously unenforced) is enforced HERE.  A
+    /// group that already holds `MAX_DATA_PER_GROUP` data symbols when the
+    /// next symbol arrives — e.g. the transmission layer's per-pass close
+    /// discipline failed to flush it, or an error path leaked the open group
+    /// — is force-flushed (its stock-ratio parity is encoded now and queued
+    /// for the budgeted delivery via `force_flush_capped_group`) and the new
+    /// symbol starts a fresh group.  `symbol_id` therefore never climbs past
+    /// the peer's decoder max, and no error path can leak an oversized open
+    /// group.
     pub fn encode_data(&mut self, data: &[u8], out: &mut [u8], instream: bool) -> usize {
         if !instream && self.encoder.group_data_count() >= PARITY_DATA_THRESHOLD {
             self.encoder.skip_group();
+            self.deferred_no_spare_capacity = false;
+        }
+        if self.encoder.group_data_count() >= MAX_DATA_PER_GROUP {
+            self.force_flush_capped_group();
         }
         self.encoder.encode_data(data, out)
+    }
+
+    /// Encode and queue parity for a group that reached `MAX_DATA_PER_GROUP`
+    /// data symbols, then close it.  `flush_parities` computes the stock-ratio
+    /// parity (`MAX_PARITY_PER_GROUP` packets — 20 data + 5 parity fits the
+    /// shared decoder `MAX_GROUP_SIZE`) and clears the group in one call, the
+    /// clean reset the encoder API offers, so the encoded packets are queued
+    /// here for the next budgeted `maybe_flush_parities` instead of being
+    /// dropped.  Any pending no-spare-capacity deferral is superseded by this
+    /// close.
+    fn force_flush_capped_group(&mut self) {
+        let data_count = self.encoder.group_data_count();
+        debug_assert_eq!(data_count, MAX_DATA_PER_GROUP);
+        self.deferred_no_spare_capacity = false;
+        let parity_count = MAX_PARITY_PER_GROUP as u8;
+        let mut parity_encoder = self.encoder.flush_parities(parity_count);
+        let mut pkts = vec![];
+        while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
+            pkts.push(self.enc_buf[..n].to_vec());
+        }
+        self.pending_cap_parity.extend(pkts);
     }
 
     /// Whether the open FEC group is a full in-stream group ready for an inline
@@ -426,6 +495,12 @@ impl FecEncoderState {
     /// spare-bandwidth-only and must not compete with data traffic. Groups
     /// larger than `PARITY_DATA_THRESHOLD` are also skipped (stock path).
     ///
+    /// A cap-forced full-group parity stash (see `encode_data` and
+    /// `MAX_DATA_PER_GROUP`) is drained first through the same budget gate;
+    /// on a tight budget it HOLDS for the next pass instead of being dropped
+    /// (the group is already closed, so this is its only chance to be
+    /// protected).
+    ///
     /// **In-stream group FEC:** when `instream` is `true`, any multi-symbol
     /// group (`data_count >= 2`) emits `INSTREAM_PARITY_PER_GROUP` parity
     /// symbols, gated on the spare-token budget (ungated parity on a bulk
@@ -439,14 +514,19 @@ impl FecEncoderState {
     ///
     /// **Single-symbol interactive exception:** when the open group has
     /// exactly one data symbol and `small_group_parity_count > 1`, the group
-    /// emits up to `small_group_parity_count` parity copies **bypassing the
-    /// spare-token budget gate**.  Multi-symbol groups always keep the stock
-    /// 1:4 ratio and the budget gate regardless of the configured depth —
-    /// ungated depth > 1 on bulk would add ~75% overhead and defeat the
+    /// emits up to `small_group_parity_count` parity copies, bypassing the
+    /// stock skip-on-tight-budget gate.  Multi-symbol groups always keep the
+    /// stock 1:4 ratio and the budget gate regardless of the configured depth
+    /// — ungated depth > 1 on bulk would add ~75% overhead and defeat the
     /// point.  The single-symbol group is exactly the case where the stock
     /// depth-1 parity is no better than a retransmit (one independent loss
     /// draw for the whole message), so the deeper parity buys tail latency
-    /// for negligible bytes on a large-MSS path.
+    /// for negligible bytes on a large-MSS path.  The burst is still paced:
+    /// the depth is capped at the same 1/3 spare-budget share the stock path
+    /// uses (`PARITY_BUDGET_DEN`), so a large configured depth never drains
+    /// the whole bucket in one unpaced multi-token burst, and on a
+    /// near-empty bucket the group is HELD open (never destroyed) so the next
+    /// send pass after the token refill emits the interactive floor parity.
     ///
     /// Note: "interactive" here is defined purely by symbol count at the
     /// FEC Layer. It is intentionally independent of any upper-layer
@@ -456,41 +536,77 @@ impl FecEncoderState {
     ///
     /// Reed-Solomon needs the complete parity set to reconstruct, so the full
     /// `parity_count` tokens are reserved atomically before encoding any
-    /// (the stock path only; the single-symbol bypass skips the budget
-    /// check).  Parity must fit within 1/3 of the currently-available send
-    /// budget (`PARITY_BUDGET_DEN`), leaving the rest for data traffic.
+    /// (the stock and in-stream paths; the single-symbol bypass is capped by
+    /// the same budget share rather than skipped).  Parity must fit within
+    /// 1/3 of the currently-available send budget (`PARITY_BUDGET_DEN`),
+    /// leaving the rest for data traffic.
     pub fn maybe_flush_parities(
         &mut self,
         send_rate_limiter: &mut TokenBucket,
         now: Instant,
         instream: bool,
     ) -> Vec<Vec<u8>> {
+        // A cap-forced full-group parity stash (see `encode_data` and
+        // `MAX_DATA_PER_GROUP`) is delivered first, through the same
+        // token-budget gate as any other parity burst: on a tight budget the
+        // stash HOLDS for the next pass instead of being dropped (the group
+        // is already closed, so this is its only chance to be protected).
+        if !self.pending_cap_parity.is_empty() {
+            let need = self.pending_cap_parity.len();
+            let available_tokens = send_rate_limiter.gen_tokens(now);
+            let parity_budget = available_tokens / PARITY_BUDGET_DEN;
+            if need > parity_budget {
+                return vec![];
+            }
+            assert!(send_rate_limiter.take_exact_tokens(need, now));
+            self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
+            inc_hist(&self.stats.group_size_flushed, MAX_DATA_PER_GROUP);
+            let pkts: Vec<Vec<u8>> = std::mem::take(&mut self.pending_cap_parity)
+                .into_iter()
+                .collect();
+            self.stats
+                .parity_sent
+                .fetch_add(pkts.len(), Ordering::Relaxed);
+            return pkts;
+        }
+        // Any no-spare-capacity deferral is resolved by this flush attempt:
+        // the group is flushed below or closed by one of the skip paths, so
+        // the next deferral records a fresh group.
+        self.deferred_no_spare_capacity = false;
         let data_count = self.encoder.group_data_count();
         if data_count == 0 {
             return vec![];
         }
-        // Single-symbol interactive exception first: it bypasses the 1/3
-        // spare-budget gate (a single symbol's parity is negligible), but the
-        // burst must still be paced — cap the depth by the currently-available
-        // tokens so a large configured depth cannot emit an unpaced burst many
-        // times the data size. At least one parity is always attempted (the
-        // floor), so the interactive tail-latency benefit survives a
-        // near-empty bucket.
+        // Single-symbol interactive exception first: it bypasses the stock
+        // skip-on-tight-budget gate (a single symbol's parity is negligible),
+        // but the burst must still be paced — cap the depth by the same 1/3
+        // spare-budget share the stock path uses, so a large configured depth
+        // cannot emit an unpaced multi-token burst many times the data size.
+        // On a near-empty bucket the group is HELD open (never destroyed), so
+        // the interactive tail-latency benefit survives the drained pacer: it
+        // is emitted on the next send pass after the token refill.
         if data_count == 1 && self.small_group_parity_count > 1 {
             let configured_depth = usize::from(self.small_group_parity_count);
             let available_tokens = send_rate_limiter.gen_tokens(now);
-            let depth = configured_depth.min(available_tokens.max(1));
+            let parity_budget = available_tokens / PARITY_BUDGET_DEN;
+            if parity_budget == 0 {
+                // The pacer is typically drained right after the data burst —
+                // exactly the moment the interactive tail needs protection.
+                // Hold the group open for the next pass (never skip it).
+                return vec![];
+            }
+            // With at least `PARITY_BUDGET_DEN` tokens the floor of one
+            // parity is always affordable; depth is capped at the 1/3 share
+            // so the remaining 2/3 of tokens stay for data.
+            let depth = configured_depth.min(parity_budget);
             if !send_rate_limiter.take_exact_tokens(depth, now) {
-                self.stats
-                    .groups_skipped_no_surplus_tokens
-                    .fetch_add(1, Ordering::Relaxed);
-                inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
-                self.encoder.skip_group();
+                // Defensive: the token accounting changed between the gen and
+                // the take.  Never destroy the group — hold for the next pass.
                 return vec![];
             }
             if FEC_DEBUG {
                 eprintln!(
-                    "FEC: flushing {depth} parities for single-symbol group (interactive, budget bypassed)"
+                    "FEC: flushing {depth} parities for single-symbol group (interactive, budget-capped)"
                 );
             }
             self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
@@ -821,11 +937,31 @@ mod tests {
         tb
     }
 
-    /// The three condition-gate skip reasons must each be observable with the
-    /// group size that was skipped: the loss gate, the no-spare-capacity gate,
-    /// and the burst-end tail gate record into distinct counters and distinct
-    /// group-size histograms; a successful flush records into the flushed
-    /// histogram.
+    /// A `TokenBucket` pre-filled with `rate` tokens (1 second at the given
+    /// rate), for exercising the interactive-depth budget cap against a
+    /// small-but-nonzero bucket.  Returns `(bucket, now)` so the caller
+    /// queries the bucket at the same instant it was filled at.
+    fn bucket_with_tokens(rate: f64, max_tokens: usize, now: Instant) -> (TokenBucket, Instant) {
+        use core::num::NonZeroUsize;
+        use core::time::Duration;
+        use primitive::ops::float::PosR;
+        let tb = TokenBucket::new(
+            PosR::new(rate).unwrap(),
+            NonZeroUsize::new(max_tokens).unwrap(),
+            now,
+        );
+        let later = now + Duration::from_secs(1);
+        let mut tb = tb;
+        let _ = tb.gen_tokens(later);
+        (tb, later)
+    }
+
+    /// The three condition-gate skip reasons must each be observable with
+    /// the group size that was affected: the loss gate and the burst-end tail
+    /// gate record destructive skips, the no-spare-capacity gate records a
+    /// DEFERRAL (the group is held open so the parity survives a pending tail
+    /// probe and flushes once capacity is spare); a successful flush records
+    /// the flushed histogram.
     #[test]
     fn condition_gate_skip_reasons_are_observable_with_group_sizes() {
         let mut fec = fec_state(8192 - 11, 1);
@@ -842,7 +978,10 @@ mod tests {
             "the loss-gate skip must record the 1-symbol group size"
         );
 
-        // A two-symbol group skipped by the no-spare-capacity gate.
+        // A two-symbol group deferred by the no-spare-capacity gate: the
+        // deferral is recorded, but the group is NOT destroyed — it stays
+        // open so the budgeted flush emits its parity once capacity is
+        // genuinely spare (e.g. a pending tail probe resolves).
         fec.encoder.encode_data(data, &mut sym_buf, false);
         fec.encoder.encode_data(data, &mut sym_buf, false);
         fec.encoder.skip_open_group_no_spare_capacity();
@@ -850,10 +989,24 @@ mod tests {
         assert_eq!(snapshot.groups_skipped_no_spare_capacity, 1);
         assert_eq!(
             snapshot.group_size_skipped_no_spare_capacity[2], 1,
-            "the no-spare-capacity skip must record the 2-symbol group size"
+            "the no-spare-capacity deferral must record the 2-symbol group size"
+        );
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            2,
+            "the no-spare-capacity gate must defer (hold) the group, not skip it"
         );
 
-        // A three-symbol group skipped by the burst-end tail gate.
+        // The deferred group is flushed by the budgeted path once capacity is
+        // available; a three-symbol group is then skipped by the burst-end
+        // tail gate.
+        let (mut tb, now) = unlimited_bucket(Instant::now());
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
+        assert_eq!(
+            pkts.len(),
+            1,
+            "the deferred 2-symbol group must flush 1 parity"
+        );
         for _ in 0..3 {
             fec.encoder.encode_data(data, &mut sym_buf, false);
         }
@@ -866,12 +1019,11 @@ mod tests {
         );
 
         // A successful single-symbol flush records the flushed histogram.
-        let (mut tb, now) = unlimited_bucket(Instant::now());
         fec.encoder.encode_data(data, &mut sym_buf, false);
         let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(pkts.len(), 1, "a 1-symbol group must emit 1 parity");
         let snapshot = fec.encoder.stats.snapshot();
-        assert_eq!(snapshot.groups_flushed, 1);
+        assert_eq!(snapshot.groups_flushed, 2);
         assert_eq!(
             snapshot.group_size_flushed[1], 1,
             "the flush must record the 1-symbol group size"
@@ -879,8 +1031,12 @@ mod tests {
     }
 
     /// A single-symbol group with `small_group_parity_count = 3` must emit
-    /// exactly 3 parity copies, bypassing the spare-token budget gate even
-    /// when the bucket is empty.
+    /// exactly 3 parity copies once the token budget allows, and must never
+    /// be destroyed by an empty bucket: on a near-empty bucket the group is
+    /// HELD open (0 parity this pass) so the next send pass after the token
+    /// refill emits the interactive parity; a plentiful bucket caps the depth
+    /// at the stock 1/3 spare-budget share so a large configured depth never
+    /// drains the bucket in one unpaced burst.
     #[test]
     fn single_symbol_group_parity_is_paced_by_the_token_budget() {
         let now = Instant::now();
@@ -893,32 +1049,146 @@ mod tests {
         let _n = fec.encoder.encode_data(data, &mut sym_buf, false);
         assert_eq!(fec.encoder.encoder.group_data_count(), 1);
 
-        // An empty bucket paces the burst: the floor of one parity cannot be
-        // taken, so the group is skipped instead of emitting an unpaced
-        // burst many times the data size.
+        // An empty bucket must HOLD the group, not destroy it: the floor
+        // parity cannot be taken, so the group stays open and the next send
+        // pass (after the token refill) emits it.
         let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
         assert_eq!(
             pkts.len(),
             0,
-            "single-symbol group with an empty bucket must be skipped (paced), got {}",
+            "single-symbol group with an empty bucket must emit no parity this pass, got {}",
             pkts.len()
         );
         assert_eq!(fec.encoder.parity_sent(), 0);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            1,
+            "an empty bucket must hold the single-symbol group open, not skip it"
+        );
 
-        // With tokens available, the configured depth is emitted (capped by
-        // the available tokens).
-        let mut fec = fec_state(8192 - 11, 3);
-        let (mut tb, later) = unlimited_bucket(now);
-        let _n = fec.encoder.encode_data(data, &mut sym_buf, false);
-        assert_eq!(fec.encoder.encoder.group_data_count(), 1);
+        // Token refill (rate is 1 token/sec): the held group now flushes the
+        // configured depth (capped by the 1/3 spare-budget share).
+        let later = now + core::time::Duration::from_secs(1000);
         let pkts = fec.encoder.maybe_flush_parities(&mut tb, later, false);
         assert_eq!(
             pkts.len(),
             3,
-            "single-symbol group at depth 3 with tokens must emit 3 parity copies, got {}",
+            "single-symbol group at depth 3 must emit 3 parity copies after the refill, got {}",
             pkts.len()
         );
         assert_eq!(fec.encoder.parity_sent(), 3);
+
+        // A large configured depth is capped by the 1/3 spare-budget share:
+        // with only 9 available tokens the burst is 9/3 = 3 parities, never
+        // the full depth and never the whole bucket (6 tokens stay for data).
+        let mut fec = fec_state(8192 - 11, MAX_INTERACTIVE_PARITY_DEPTH);
+        let (mut tb, now) = bucket_with_tokens(9.0, usize::MAX, now);
+        let _n = fec.encoder.encode_data(data, &mut sym_buf, false);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
+        assert_eq!(
+            pkts.len(),
+            3,
+            "depth must be capped at available/3 = 3 on a 9-token bucket, got {}",
+            pkts.len()
+        );
+        assert_eq!(
+            tb.gen_tokens(now),
+            6,
+            "the capped burst must leave the remaining 2/3 of tokens for data"
+        );
+    }
+
+    /// A gate-closed no-spare-capacity flush (e.g. a pending tail-loss probe
+    /// blocking `can_send_tail_fec`) must DEFER the open group's parity, not
+    /// destroy it: after the gate reopens (the probe is acked or its timeout
+    /// elapses), the same group's parity is still emitted by the budgeted
+    /// flush path.
+    #[test]
+    fn a_pending_tail_probe_defers_instead_of_destroying_the_group_parity() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let data = b"tail members";
+        let mut sym_buf = vec![0u8; 8192];
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        assert_eq!(fec.encoder.encoder.group_data_count(), 2);
+
+        // The gate is closed (pending tail probe): the group must stay open.
+        fec.encoder.skip_open_group_no_spare_capacity();
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            2,
+            "the pending probe must defer the group, not destroy it"
+        );
+        assert_eq!(
+            fec.encoder.parity_sent(),
+            0,
+            "nothing must be emitted while the probe is pending"
+        );
+        let snapshot = fec.encoder.stats.snapshot();
+        assert_eq!(
+            snapshot.groups_skipped_no_spare_capacity, 1,
+            "the deferral must be recorded once"
+        );
+
+        // The probe resolves: capacity is spare again, the next flush attempt
+        // emits the still-open group's parity.
+        let (mut tb, later) = unlimited_bucket(now);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, later, false);
+        assert_eq!(
+            pkts.len(),
+            1,
+            "the deferred 2-symbol group must flush its stock parity after the probe resolves, got {}",
+            pkts.len()
+        );
+        assert_eq!(fec.encoder.parity_sent(), 1);
+    }
+
+    /// The open group's data-symbol cap (`MAX_DATA_PER_GROUP`, documented as
+    /// a forced-flush point but previously unenforced) is enforced inside
+    /// `encode_data`: once a group reaches the cap (the transmission layer's
+    /// per-pass close discipline failed to flush it), the group is
+    /// force-flushed — its stock-ratio parity is queued for the budgeted
+    /// delivery — and the next symbol starts a fresh group, so `symbol_id`
+    /// never climbs past the peer's decoder max.
+    #[test]
+    fn encode_data_force_flushes_at_max_data_per_group() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+
+        // instream=true so the PARITY_DATA_THRESHOLD force-skip is suppressed
+        // and the group can legitimately accumulate to the cap.
+        for _ in 0..MAX_DATA_PER_GROUP {
+            fec.encoder.encode_data(data, &mut sym_buf, true);
+        }
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            MAX_DATA_PER_GROUP,
+            "the group must reach the cap before the forced flush"
+        );
+
+        // The next symbol triggers the forced flush: its parity is queued for
+        // the budgeted delivery and the new symbol starts a fresh group.
+        fec.encoder.encode_data(data, &mut sym_buf, true);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            1,
+            "the symbol after the cap must start a fresh group, got {}",
+            fec.encoder.encoder.group_data_count()
+        );
+
+        // The capped group's parity (stock ratio: MAX_PARITY_PER_GROUP) is
+        // delivered by the normal budgeted flush path.
+        let (mut tb, later) = unlimited_bucket(now);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, later, true);
+        assert_eq!(
+            pkts.len(),
+            MAX_PARITY_PER_GROUP,
+            "the capped {MAX_DATA_PER_GROUP}-symbol group must flush {MAX_PARITY_PER_GROUP} parities, got {}",
+            pkts.len()
+        );
     }
 
     /// A multi-symbol group must keep the stock budget gate regardless of the
