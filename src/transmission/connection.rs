@@ -933,6 +933,21 @@ mod tests {
         );
     }
 
+    /// A staged write always produces a pacing timer, so the send driver can
+    /// never park on `Event` while data is staged: the `Event` + pending-work
+    /// state guarded by [`super::apply_send_park_safety`] is unreachable.
+    #[tokio::test]
+    async fn staged_data_never_yields_an_event_wake() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        shared.send(b"hello").await.unwrap();
+        let now = Instant::now();
+        assert!(
+            matches!(shared.next_send_wake(now), SendWake::Pacing(_)),
+            "a staged write must produce a pacing timer, not an Event park"
+        );
+    }
+
     /// The receive hot path reads `max_data_size_per_pkt` once per payload.
     /// It must not take the reliable-layer lock for a value fixed at
     /// construction.  Hold the lock on this thread and call the accessor from
