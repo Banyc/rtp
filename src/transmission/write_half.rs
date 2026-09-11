@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,9 +9,10 @@ use super::transmission_layer::{
     FEC_DEBUG, PRINT_DEBUG_MSGS, ProactiveTerminationContext, SendBufs, UnreliableWrite,
 };
 use crate::ack::{AckHistory, EncodeAck};
-use crate::codec::{EncodeData, encode_ack_data, encode_kill};
+use crate::codec::{EncodeData, EncodeError, encode_ack_data, encode_kill};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsEvent, MetricsTerminationCause};
+use crate::mss::TRUNCATION_DETECTION_BYTES;
 use crate::obfuscate::padding::AckPaddingMode;
 use crate::obfuscate::sampler::DataSizeSampler;
 use crate::reliable::reliable_layer::DataPkt;
@@ -83,11 +85,27 @@ struct PiggybackAck {
     page1: Option<AckPage>,
 }
 
+/// A blocked underlay must not become a send-pass spin: after this many
+/// consecutive WouldBlocked data sends the pass breaks so the write driver
+/// parks on the next wake (resume signal / pacing / protocol deadline)
+/// instead of re-minting packets that never traverse the wire.
+const MAX_CONSECUTIVE_WOULD_BLOCK: u32 = 16;
+
+/// Convert a codec [`EncodeError`] into the session [`IoErr`] surfaced by the
+/// terminal-error paths. An encode failure is a wire-format invariant
+/// violation (an oversized payload or an undersized envelope) and reads
+/// `InvalidData`.
+fn encode_to_io(error: EncodeError) -> IoErr {
+    IoErr::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 impl WriteHalf {
     /// Encode one ACK page into `output`, optionally with piggybacked data
     /// appended after the ACK command (one ACK_CMD per datagram). Consumes
     /// the claim's pending echo on the first page. Returns the encoded
-    /// length. Shared by the standalone flush and the piggyback paths so the
+    /// length, or the codec error when the page cannot fit its envelope (a
+    /// sizing-invariant violation — the caller must surface it, never
+    /// panic). Shared by the standalone flush and the piggyback paths so the
     /// page-encode shape (history → EncodeAck → echo → wire bytes) lives in
     /// exactly one place.
     fn encode_ack_page(
@@ -97,14 +115,14 @@ impl WriteHalf {
         page: AckPage,
         data: Option<EncodeData<'_>>,
         output: &mut [u8],
-    ) -> usize {
+    ) -> Result<usize, EncodeError> {
         let ack = EncodeAck {
             queue: history,
             first_block_index: page.first_block_index,
             max_blocks: page.max_blocks,
         };
         let echo = claim.take_echo();
-        encode_ack_data(self.shared.session_tag(), Some(ack), echo, data, output).unwrap()
+        encode_ack_data(self.shared.session_tag(), Some(ack), echo, data, output)
     }
 
     /// Claim a due ACK for piggybacking, size the data payload to leave room
@@ -129,29 +147,32 @@ impl WriteHalf {
             } else {
                 None
             };
-            let reserved = claim
-                .as_ref()
-                .map(|c| {
-                    let page0 = c.pages()[0].expect("a claim always carries page 0");
-                    let ack = EncodeAck {
-                        queue: history,
-                        first_block_index: page0.first_block_index,
-                        max_blocks: page0.max_blocks,
-                    };
-                    // Measure the encoded page-0 size (no data yet) so the
-                    // data payload can be sized to leave room for it. The
-                    // echo is peeked, not consumed — the final encode below
-                    // consumes it.
-                    encode_ack_data(
-                        self.shared.session_tag(),
-                        Some(ack),
-                        c.peek_echo(),
-                        None,
-                        codec_pkt,
-                    )
-                    .unwrap()
-                })
-                .unwrap_or(0);
+            // Measure the encoded page-0 size (no data yet) so the data
+            // payload can be sized to leave room for it. The echo is peeked,
+            // not consumed — the final encode below consumes it. A failed
+            // measure must never panic or fabricate a size: release the
+            // claim and continue with a data-only datagram (the standalone
+            // flush at the end of the pass retries the ACK work).
+            let mut reserved = 0;
+            let mut measure_failed = false;
+            if let Some(c) = claim.as_ref() {
+                let page0 = c.pages()[0].expect("a claim always carries page 0");
+                let ack = EncodeAck {
+                    queue: history,
+                    first_block_index: page0.first_block_index,
+                    max_blocks: page0.max_blocks,
+                };
+                match encode_ack_data(
+                    self.shared.session_tag(),
+                    Some(ack),
+                    c.peek_echo(),
+                    None,
+                    codec_pkt,
+                ) {
+                    Ok(encoded) => reserved = encoded,
+                    Err(_) => measure_failed = true,
+                }
+            }
             let res = reliable_layer.send_data_pkt_bounded(payload, now, reserved);
             let Some(p) = res.as_ref() else {
                 // No packet to send: release the claim (if any) so the
@@ -176,18 +197,43 @@ impl WriteHalf {
             let Some(claim) = claim else {
                 return (res, None);
             };
+            if measure_failed {
+                // The ACK page could not be encoded into the codec envelope
+                // (unreachable with an MSS-sized buffer): release the claim so
+                // the flush path keeps the ACK work and send the datagram
+                // data-only — no piggyback, no fabricated size.
+                self.ack_feedback.complete(
+                    claim,
+                    AckFlushOutcome::WouldBlock {
+                        pages_sent: 0,
+                        rearm: false,
+                    },
+                );
+                return (res, None);
+            }
             // The combined datagram must stay within the MSS: the data
             // packet's own wire overhead is `data_overhead()` for a stock
             // packet but `frame_data_overhead()` (4 bytes more) for a
             // first-frame packet, so the release check must use the packet's
             // actual overhead — the stock bound would let a retransmitted
-            // first-frame packet exceed the MSS by up to 4 bytes.
+            // first-frame packet exceed the MSS. The check also deducts the
+            // truncated-datagram detection headroom (matching
+            // `Mss::max_data_size_per_pkt()`), so the combined datagram can
+            // never be exactly the MSS — a full-size datagram would be
+            // indistinguishable from a truncated larger one at the receiver
+            // (and would exceed the FEC symbol ceiling).
             let overhead = if p.frame_len.is_some() {
                 crate::delivery::frame::wire::frame_data_overhead()
             } else {
                 crate::codec::data_overhead()
             };
-            if reserved + data_written > self.mss.get().saturating_sub(overhead) {
+            if reserved + data_written
+                > self
+                    .mss
+                    .get()
+                    .saturating_sub(TRUNCATION_DETECTION_BYTES)
+                    .saturating_sub(overhead)
+            {
                 // The data packet (a retransmission) is too large to fit
                 // alongside the ACK: release the claim and send the data
                 // alone.
@@ -215,7 +261,21 @@ impl WriteHalf {
             };
             let mut claim = claim;
             let page0 = claim.pages()[0].expect("a claim always carries page 0");
-            let n = self.encode_ack_page(&mut claim, history, page0, Some(data), codec_pkt);
+            let n = match self.encode_ack_page(&mut claim, history, page0, Some(data), codec_pkt) {
+                Ok(n) => n,
+                // Unreachable with the sizing check above, but never panic:
+                // release the claim and send the datagram data-only.
+                Err(_) => {
+                    self.ack_feedback.complete(
+                        claim,
+                        AckFlushOutcome::WouldBlock {
+                            pages_sent: 0,
+                            rearm: false,
+                        },
+                    );
+                    return (res, None);
+                }
+            };
             let page1 = claim.pages()[1];
             (res, Some((n, PiggybackAck { claim, page1 })))
         })
@@ -268,12 +328,28 @@ impl WriteHalf {
         };
         // Re-encode page 1 with the current history (the claim's page params
         // are fixed; the queue may have grown, which is harmless for a
-        // selective ack).
-        let page1_len = self.shared.with_reliable_layer(|reliable_layer| {
-            let history = reliable_layer.pkt_recv_space().ack_history();
-            let (payload, _codec_pkt, _wire_pkt) = bufs.parts_mut();
-            self.encode_ack_page(&mut claim, history, page1, None, payload)
-        });
+        // selective ack).  An encode failure abandons the claim (page 0
+        // already rode the data datagram) and surfaces as session-fatal.
+        let (page1_len, page1_encode_error) =
+            match self.shared.with_reliable_layer(|reliable_layer| {
+                let history = reliable_layer.pkt_recv_space().ack_history();
+                let (payload, _codec_pkt, _wire_pkt) = bufs.parts_mut();
+                self.encode_ack_page(&mut claim, history, page1, None, payload)
+            }) {
+                Ok(page1_len) => (page1_len, None),
+                Err(error) => (0, Some(error)),
+            };
+        if let Some(error) = page1_encode_error {
+            // The page-1 encode failed (a sizing-invariant violation): page 0
+            // already rode the data datagram, so abandon the claim and
+            // surface the error as session-fatal — the ACK work is stuck.
+            let error = encode_to_io(error);
+            self.ack_feedback
+                .complete(claim, AckFlushOutcome::Fatal { pages_sent: 1 });
+            self.shared
+                .press_error(error, MetricsTerminationCause::AckWrite);
+            return Err(error);
+        }
         let (payload, _codec_pkt, wire_pkt) = bufs.parts_mut();
         let page_len = self.pad_ack_page(payload, page1_len);
         match self.send_with_fec(&payload[..page_len], wire_pkt).await {
@@ -489,8 +565,27 @@ impl WriteHalf {
         let mut written_bytes = 0;
         let mut written_fin = false;
         let mut piggyback_attempted = false;
+        // FEC symbols are minted into the open group BEFORE the underlay
+        // send, so a WouldBlocked send must not retry via a fresh encode:
+        // the retry re-encodes the same seq into a second group slot (a
+        // phantom symbol that never traversed the wire, which also breaks
+        // the single-symbol interactive classification).  Cache the encoded
+        // wire bytes keyed by seq for the duration of the pass so a retry
+        // reuses the one symbol the group already holds.  The cache is a
+        // local, so it dies when the pass ends (no stale group_id can leak
+        // into a later pass).
+        let mut fec_symbol_cache: HashMap<u64, Vec<u8>> = HashMap::new();
+        // A blocked underlay must not become a spin: after this many
+        // consecutive WouldBlocked sends the pass breaks so the write driver
+        // parks on the next wake (resume signal / pacing / protocol deadline)
+        // instead of re-minting packets that never traverse the wire.
+        let mut consecutive_wouldblock = 0u32;
         loop {
-            if self.shared.has_error() {
+            // Observe the stop/cancel token between packets as well as the
+            // error flag: a kill request cancels the token only after
+            // pressing the error, but checking both keeps the loop responsive
+            // even if the flag races the cancellation.
+            if self.shared.has_error() || self.termination_writer.kill_requested().is_cancelled() {
                 self.return_error_after_requested_kill(bufs).await?;
             }
             let (payload, codec_pkt, wire_pkt) = bufs.parts_mut();
@@ -545,15 +640,20 @@ impl WriteHalf {
                 break;
             };
             let data_written = match p.data_written {
+                // Progress accounting (bytes/FIN) is deferred to the
+                // successful-send arm below: a packet minted but refused by
+                // the underlay never traversed the wire, and the same
+                // retransmission retried on the next iteration must not be
+                // double-counted.
                 crate::reliable::reliable_layer::DataPktPayload::Data(data_written) => {
-                    written_bytes += data_written.get();
                     data_written.get()
                 }
-                crate::reliable::reliable_layer::DataPktPayload::Fin => {
-                    written_fin = true;
-                    0
-                }
+                crate::reliable::reliable_layer::DataPktPayload::Fin => 0,
             };
+            let is_fin = matches!(
+                &p.data_written,
+                crate::reliable::reliable_layer::DataPktPayload::Fin
+            );
             let is_recovery = p.is_recovery;
             let data = EncodeData {
                 seq: p.seq,
@@ -583,10 +683,17 @@ impl WriteHalf {
             // no ACK was due or claimable, the datagram is data-only.
             let (n, piggyback) = match piggyback {
                 Some((n, piggyback)) => (n, Some(piggyback)),
-                None => (
-                    encode_ack_data(None, None, None, Some(data), codec_pkt).unwrap(),
-                    None,
-                ),
+                None => match encode_ack_data(None, None, None, Some(data), codec_pkt) {
+                    Ok(n) => (n, None),
+                    Err(error) => {
+                        // The codec envelope cannot hold this data packet (a
+                        // sizing-invariant violation): session-fatal.  Drop
+                        // the open FEC group so an error return cannot leak
+                        // a group across passes.
+                        self.skip_open_fec_group();
+                        return Err(encode_to_io(error));
+                    }
+                },
             };
             if self.ack_padding == AckPaddingMode::Fitted {
                 // Sample the DATA path only: the encoded codec packet length
@@ -596,10 +703,29 @@ impl WriteHalf {
                 self.data_size_sampler.observe(n);
             }
             let utp_pkt = &codec_pkt[..n];
+            // Encode the FEC symbol exactly once per seq per pass: a
+            // WouldBlocked send retries the same seq on the next iteration,
+            // and the cache below reuses the encoded wire bytes instead of
+            // re-encoding a second slot with identical bytes — the phantom
+            // symbol that never traversed the wire (and that would break the
+            // single-symbol interactive classification).  Every symbol_id in
+            // the open group therefore corresponds to a packet actually
+            // handed to the underlay in this pass.
             let send_buf: &[u8] = match self.fec.as_mut() {
                 Some(fec) => {
-                    let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
-                    &wire_pkt[..fec_n]
+                    let key = p.seq.to_wire();
+                    // The first wire attempt for this seq in this pass mints
+                    // the FEC symbol into the open group exactly once and
+                    // remembers its bytes; a WouldBlocked retry reuses the
+                    // cached symbol instead of encoding a second group slot
+                    // (the phantom symbol that never traversed the wire).
+                    let entry = fec_symbol_cache.entry(key).or_insert_with(|| {
+                        let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
+                        wire_pkt[..fec_n].to_vec()
+                    });
+                    let len = entry.len();
+                    wire_pkt[..len].copy_from_slice(entry);
+                    &wire_pkt[..len]
                 }
                 None => utp_pkt,
             };
@@ -623,6 +749,15 @@ impl WriteHalf {
             }
             match primary_res {
                 Ok(_) => {
+                    // The send succeeded: only now does the packet's bytes
+                    // (or FIN) count as progress, and the WouldBlock streak
+                    // resets.
+                    if is_fin {
+                        written_fin = true;
+                    } else {
+                        written_bytes += data_written;
+                    }
+                    consecutive_wouldblock = 0;
                     self.fec_gate.record_data_send(is_recovery);
                     if self.fec.is_some()
                         && instream
@@ -633,13 +768,16 @@ impl WriteHalf {
                         // abandon the claim so the ACK state machine is
                         // not left with a stuck in-flight claim (a later
                         // claim would panic on the in-flight assert). The
-                        // error is already pressed by the flush path.
+                        // error is already pressed by the flush path; drop
+                        // any open group so the error return cannot leak it
+                        // into the next pass.
                         if let Some(piggyback) = piggyback {
                             self.ack_feedback.complete(
                                 piggyback.claim,
                                 AckFlushOutcome::Fatal { pages_sent: 1 },
                             );
                         }
+                        self.skip_open_fec_group();
                         return Err(error);
                     }
                     if armor_decision == ArmorDecision::Duplicate {
@@ -669,6 +807,9 @@ impl WriteHalf {
                                     }
                                     self.shared
                                         .press_error(e, MetricsTerminationCause::DataWrite);
+                                    // Do not leak the open FEC group on the
+                                    // error return.
+                                    self.skip_open_fec_group();
                                     return Err(e);
                                 }
                             }
@@ -676,9 +817,14 @@ impl WriteHalf {
                     }
                     // The piggybacked ACK rode on the data datagram; finish
                     // the claim (send page 1 standalone if any) now that the
-                    // data send and its duplicate are done.
-                    if let Some(piggyback) = piggyback {
-                        self.finish_piggyback_claim(piggyback, bufs).await?;
+                    // data send and its duplicate are done.  Any error path
+                    // drops the open FEC group (the flush paths may have
+                    // re-opened it for the standalone page).
+                    if let Some(piggyback) = piggyback
+                        && let Err(error) = self.finish_piggyback_claim(piggyback, bufs).await
+                    {
+                        self.skip_open_fec_group();
+                        return Err(error);
                     }
                     continue;
                 }
@@ -704,6 +850,16 @@ impl WriteHalf {
                     // refresh the clock so the next pacing/token decision is
                     // computed against the fresh instant.
                     now = blocked_at;
+                    // Bound the spin: a persistently-blocked underlay must
+                    // not keep re-minting packets that never traverse the
+                    // wire.  Break so the driver parks on the next wake; the
+                    // open FEC group is closed at the bottom of the pass.
+                    // (The cache keeps the retried seq's symbol minted once,
+                    // so the group never holds a phantom duplicate.)
+                    consecutive_wouldblock += 1;
+                    if consecutive_wouldblock >= MAX_CONSECUTIVE_WOULD_BLOCK {
+                        break;
+                    }
                     continue;
                 }
                 Err(e) => {
@@ -717,6 +873,8 @@ impl WriteHalf {
                     }
                     self.shared
                         .press_error(e, MetricsTerminationCause::DataWrite);
+                    // Do not leak the open FEC group on the error return.
+                    self.skip_open_fec_group();
                     return Err(e);
                 }
             }
@@ -858,9 +1016,13 @@ impl WriteHalf {
     }
 
     async fn send_kill_data_pkt(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
-        // Session tag prefix (9 bytes) + KILL_CMD byte, when a tag exists.
+        // The kill buffer `[1+1+8]` (KILL_CMD + optional TAG_CMD/tag prefix)
+        // is exactly `encode_kill`'s maximum footprint (9 tag bytes + 1 kill
+        // byte when tagged, 1 byte otherwise), so the encode cannot fail —
+        // but never unwrap a Result blindly: name the sizing invariant.
         let mut buf = [0; 1 + 1 + 8];
-        let n = encode_kill(self.shared.session_tag(), &mut buf).unwrap();
+        let n = encode_kill(self.shared.session_tag(), &mut buf)
+            .expect("the [1+1+8] kill buffer exactly fits TAG+tag (9 bytes) + KILL_CMD (1 byte)");
         let fec_enabled = self.fec.is_some();
         let res = self.send_with_fec(&buf[..n], bufs.wire_pkt_mut()).await;
         if res.is_err() && fec_enabled {
@@ -901,30 +1063,49 @@ impl WriteHalf {
         self.refresh_fec_loss_mode();
         let now = Instant::now();
         let (claim, encoded_page_lengths) = {
-            let (claim, encoded_page_lengths) = self.shared.with_reliable_layer(|reliable_layer| {
-                let history = reliable_layer.pkt_recv_space().ack_history();
-                let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
-                    return (None, [None; 2]);
-                };
-                let (payload, codec_pkt, _) = bufs.parts_mut();
-                let mut encoded_page_lengths = [None; 2];
-                for (index, page) in claim.pages().into_iter().enumerate() {
-                    let Some(page) = page else {
-                        continue;
+            let (claim, encoded_page_lengths, encode_error) =
+                self.shared.with_reliable_layer(|reliable_layer| {
+                    let history = reliable_layer.pkt_recv_space().ack_history();
+                    let Some(mut claim) = self.ack_feedback.claim(now, history.len()) else {
+                        return (None, [None; 2], None);
                     };
-                    let output = if index == 0 {
-                        &mut codec_pkt[..]
-                    } else {
-                        &mut payload[..]
-                    };
-                    encoded_page_lengths[index] =
-                        Some(self.encode_ack_page(&mut claim, history, page, None, output));
-                }
-                (Some(claim), encoded_page_lengths)
-            });
+                    let (payload, codec_pkt, _) = bufs.parts_mut();
+                    let mut encoded_page_lengths = [None; 2];
+                    let mut encode_error = None;
+                    for (index, page) in claim.pages().into_iter().enumerate() {
+                        let Some(page) = page else {
+                            continue;
+                        };
+                        let output = if index == 0 {
+                            &mut codec_pkt[..]
+                        } else {
+                            &mut payload[..]
+                        };
+                        match self.encode_ack_page(&mut claim, history, page, None, output) {
+                            Ok(len) => encoded_page_lengths[index] = Some(len),
+                            Err(error) => {
+                                encode_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    (Some(claim), encoded_page_lengths, encode_error)
+                });
             let Some(claim) = claim else {
                 return Ok(());
             };
+            if let Some(error) = encode_error {
+                // The ACK page cannot be encoded (a sizing-invariant
+                // violation): abandon the claim so the ACK state machine is
+                // not left with a stuck in-flight claim, and surface the
+                // error as session-fatal.
+                let error = encode_to_io(error);
+                self.ack_feedback
+                    .complete(claim, AckFlushOutcome::Fatal { pages_sent: 0 });
+                self.shared
+                    .press_error(error, MetricsTerminationCause::AckWrite);
+                return Err(error);
+            }
             // A successful transactional claim names why it became due; the
             // observation is emitted before any page is sent so the claim
             // event is never confused with the resume wake that rearmed us.
@@ -982,6 +1163,10 @@ impl WriteHalf {
                         .complete(claim, AckFlushOutcome::Fatal { pages_sent });
                     self.shared
                         .press_error(error, MetricsTerminationCause::AckWrite);
+                    // The ACK symbol was already encoded into the open group
+                    // by `send_with_fec`; drop the group so a fatal return
+                    // cannot leak it into the next pass.
+                    self.skip_open_fec_group();
                     return Err(error);
                 }
             }

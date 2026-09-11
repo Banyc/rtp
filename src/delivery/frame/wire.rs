@@ -39,7 +39,9 @@ pub(crate) fn encode_frame_data_ts(
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_u32::<BigEndian>(frame_len)
         .pipe(wrap_insufficient_buffer_size_err)?;
-    wtr.write_u16::<BigEndian>(data.len().try_into().unwrap())
+    let len =
+        u16::try_from(data.len()).map_err(|_| EncodeError::PayloadTooLarge { len: data.len() })?;
+    wtr.write_u16::<BigEndian>(len)
         .pipe(wrap_insufficient_buffer_size_err)?;
     wtr.write_all(data)
         .pipe(wrap_insufficient_buffer_size_err)?;
