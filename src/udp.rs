@@ -1,5 +1,11 @@
 use core::{net::SocketAddr, num::NonZeroUsize};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -57,6 +63,16 @@ pub mod testing;
 pub use crate::mss::{MAX_MSS, Mss, MssError, TRUNCATION_DETECTION_BYTES};
 pub const NO_FEC_MSS: usize = 1424;
 pub(crate) const DISPATCHER_BUF_SIZE: usize = 1024;
+
+/// Default cap on concurrently accepted sessions per plain [`Listener`]. A
+/// generous bound for legitimate use that stops an unauthenticated datagram
+/// spray (each new source address allocates a conn-table entry, a
+/// dispatcher channel, and a spawned 3-task RTP session held by the opening
+/// handshake) from exhausting memory and task slots on a network-exposed
+/// listener. Mirrors the keyed listener's
+/// [`crate::keyed_udp::DEFAULT_MAX_CONNECTIONS`]; see
+/// [`ListenerConfig::max_connections`] for the per-listener override.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MssConfig {
@@ -128,8 +144,9 @@ async fn connect_udp(
 
 pub type AcceptTask = std::pin::Pin<Box<dyn Future<Output = std::io::Result<Accepted>> + Send>>;
 
-/// Settings for [`Listener::bind`]: the datagram-obfuscation key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Settings for [`Listener::bind`]: the datagram-obfuscation key and the
+/// concurrent-session admission cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerConfig {
     /// When set, every datagram is prefixed with a 24-byte random nonce and
     /// chacha20-encrypted with this key. The listener decrypts each datagram
@@ -146,6 +163,22 @@ pub struct ListenerConfig {
     /// sent data-packet sizes. The peer must use the same policy. `None`
     /// (the default) sends datagrams unpadded.
     pub padding: HarmfulPaddingPolicy,
+    /// Cap on concurrently accepted sessions (soft: the dispatch admits
+    /// datagrams that race the accept loop, so the live count may overshoot
+    /// by the accept-queue depth). The default is
+    /// [`DEFAULT_MAX_CONNECTIONS`]; `0` refuses every new session, mirroring
+    /// the keyed listener's `bind_with_max_connections` semantics.
+    pub max_connections: usize,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            obfuscation_key: None,
+            padding: HarmfulPaddingPolicy::None,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +197,13 @@ pub struct Listener {
     /// write halves pad with it. The listener READ side needs no fitted-ack
     /// flag: the codec's zero-tail rule is content-based.
     policy: HarmfulPaddingPolicy,
+    /// Live accepted-session count, shared with the dispatch closure so a
+    /// datagram from an unknown source is refused (not allocated) once
+    /// `max_connections` is reached. Incremented at accept, decremented by
+    /// the session's on-exit hook. The bound is soft: the count only moves
+    /// at accept, so datagrams racing the accept loop may briefly overshoot
+    /// by the accept-queue depth.
+    session_count: Arc<AtomicUsize>,
 }
 
 impl Listener {
@@ -175,6 +215,7 @@ impl Listener {
         let ListenerConfig {
             obfuscation_key: key,
             padding,
+            max_connections,
         } = config;
 
         let udp = bind_udp(addr).await?;
@@ -191,7 +232,9 @@ impl Listener {
             crate::probe::probe_settings(),
             data_settings,
         );
-        let dispatch: Classify<SocketAddr, SocketAddr, Packet> =
+        let session_count = Arc::new(AtomicUsize::new(0));
+        let dispatch: Classify<SocketAddr, SocketAddr, Packet> = {
+            let session_count = Arc::clone(&session_count);
             Arc::new(move |addr: &SocketAddr, mut packet: Packet| {
                 match responder.observe(addr, packet.as_mut()) {
                     crate::probe::Observe::Consumed | crate::probe::Observe::Dropped => None,
@@ -200,14 +243,26 @@ impl Listener {
                         // a key is set); truncate the packet to the
                         // plaintext so the connection reads plaintext.
                         packet.truncate(len);
+                        // At the cap, refuse unknown sources (ExistingOnly
+                        // drops the datagram before any channel/conn-table
+                        // entry is allocated) while existing sources keep
+                        // routing. The count is a soft bound: it is
+                        // incremented at accept, so datagrams racing the
+                        // accept loop may briefly overshoot.
+                        let policy = if session_count.load(Ordering::Relaxed) >= max_connections {
+                            DispatchPolicy::ExistingOnly
+                        } else {
+                            DispatchPolicy::Create
+                        };
                         Some(Classified {
                             key: *addr,
                             value: packet,
-                            policy: DispatchPolicy::Create,
+                            policy,
                         })
                     }
                 }
-            });
+            })
+        };
         let listener = UtpListener::new(
             udp,
             NonZeroUsize::new(DISPATCHER_BUF_SIZE + data_settings.map_or(0, |p| p.max())).unwrap(),
@@ -219,6 +274,7 @@ impl Listener {
             raw_fd,
             key,
             policy: padding,
+            session_count,
         })
     }
 
@@ -249,6 +305,7 @@ impl Listener {
         let raw_fd = self.raw_fd;
         let key = self.key;
         let policy = self.policy;
+        let session_count = Arc::clone(&self.session_count);
         Ok(Box::pin(async move {
             accept(
                 accepted,
@@ -256,6 +313,7 @@ impl Listener {
                 AcceptSetup::from_config(true, config)?,
                 key,
                 policy,
+                session_count,
             )
             .await
         }))
@@ -274,6 +332,7 @@ impl Listener {
             AcceptSetup::from_config(false, config)?,
             self.key,
             self.policy,
+            Arc::clone(&self.session_count),
         )
         .await
     }
@@ -314,6 +373,7 @@ impl Listener {
         let local_addr = self.local_addr;
         let key = self.key;
         let policy = self.policy;
+        let session_count = Arc::clone(&self.session_count);
         Ok(Box::pin(async move {
             let accepted = accept(
                 accepted,
@@ -322,6 +382,7 @@ impl Listener {
                     .with_frame_delivery(FrameMode::enabled()),
                 key,
                 policy,
+                session_count,
             )
             .await?;
             let Accepted {
@@ -525,6 +586,7 @@ async fn accept(
     setup: AcceptSetup,
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     policy: HarmfulPaddingPolicy,
+    session_count: Arc<AtomicUsize>,
 ) -> std::io::Result<Accepted> {
     // Resolve the DPI-hiding policy into its two consumers: the wrapper's
     // padding settings (the profile every datagram is padded to) and the
@@ -587,7 +649,17 @@ async fn accept(
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
-    let (read, write, supervisor) = socket(unreliable_layer, None);
+    // Occupy a cap slot only when the accept succeeds (past the handshake, so
+    // failed handshakes never consume a slot); the session's on-exit hook
+    // releases it when the supervisor task ends.
+    session_count.fetch_add(1, Ordering::SeqCst);
+    let (read, write, supervisor) =
+        crate::socket::session::socket_with_on_exit(unreliable_layer, None, {
+            let session_count = Arc::clone(&session_count);
+            move || {
+                session_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
     Ok(Accepted {
         read,
         write,
@@ -1034,6 +1106,7 @@ mod tests {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding: HarmfulPaddingPolicy::None,
+                ..ListenerConfig::default()
             },
         )
         .await
@@ -1087,6 +1160,7 @@ mod tests {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding: HarmfulPaddingPolicy::None,
+                ..ListenerConfig::default()
             },
         )
         .await
@@ -1611,6 +1685,7 @@ mod tests {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding: HarmfulPaddingPolicy::None,
+                ..ListenerConfig::default()
             },
         )
         .await
@@ -1691,6 +1766,7 @@ mod tests {
                 ListenerConfig {
                     obfuscation_key: Some(KEY),
                     padding: HarmfulPaddingPolicy::None,
+                    ..ListenerConfig::default()
                 },
             )
             .await
@@ -1926,6 +2002,167 @@ mod tests {
         let n = connected.read.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
+
+    /// The plain listener's concurrent-session cap (mirroring the keyed
+    /// listener's `session_count` admission policy): once `max_connections`
+    /// sessions are live, a datagram from a NEW source is dropped at dispatch
+    /// (no conn-table entry, channel, or spawned session is allocated — the
+    /// udp_listener `connections_opened` counter proves it), established
+    /// sessions keep routing, and when a session exits its slot frees so a
+    /// new source can connect again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_listener_caps_concurrent_sessions() {
+        const MAX: usize = 2;
+        let listener = Arc::new(
+            Listener::bind(
+                "127.0.0.1:0",
+                ListenerConfig {
+                    max_connections: MAX,
+                    ..ListenerConfig::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let addr = listener.local_addr();
+
+        // Open MAX sessions from distinct source sockets and hold each one so
+        // its cap slot stays occupied.
+        let mut accepted = Vec::new();
+        let mut sources = Vec::new();
+        for _ in 0..MAX {
+            let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            source.connect(addr).await.unwrap();
+            source.send(b"open").await.unwrap();
+            accepted.push(
+                listener
+                    .accept_without_handshake_with(AcceptConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            sources.push(source);
+        }
+        assert_eq!(
+            listener.session_count.load(Ordering::Relaxed),
+            MAX,
+            "each accepted session must occupy a cap slot"
+        );
+
+        // Keep the dispatch loop reading while the cap is hit.
+        let drainer_listener = Arc::clone(&listener);
+        let mut drainer = tokio::task::JoinSet::new();
+        drainer.spawn(async move {
+            loop {
+                if drainer_listener.accept_without_handshake().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Spray datagrams from NEW sources: past the cap they are dropped at
+        // dispatch (counted as existing-only drops), never allocated.
+        for _ in 0..16 {
+            let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            source.connect(addr).await.unwrap();
+            source.send(b"spam").await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if listener
+                    .listener
+                    .stats()
+                    .packets_dropped_existing_only
+                    .load(Ordering::Relaxed)
+                    >= 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the over-cap spray was never dropped as existing-only");
+        assert_eq!(
+            listener
+                .listener
+                .stats()
+                .connections_opened
+                .load(Ordering::Relaxed),
+            u64::try_from(MAX).unwrap(),
+            "spraying new sources past the cap must not open connections"
+        );
+
+        // Established sessions keep routing past the cap: send from one of the
+        // accepted sources and read from the session bound to that address
+        // (kernel delivery order decides which accept is paired with which
+        // source, so match by peer address rather than index).
+        // Established sessions keep routing past the cap: a datagram from an
+        // existing source is DISPATCHED to its connection, never dropped.
+        // Verified at the dispatch layer (the source is a raw UDP socket, so
+        // the datagram is not a valid RTP codec packet and routing is what
+        // matters): the still-alive datagram bumps `packets_dispatched` from
+        // the two opens to three, while the existing-only drop count stays at
+        // exactly the 16 sprayed new sources.
+        sources[0].send(b"still-alive").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if listener
+                    .listener
+                    .stats()
+                    .packets_dispatched
+                    .load(Ordering::Relaxed)
+                    > u64::try_from(MAX).unwrap()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an established source's datagram was never routed at the cap");
+        assert_eq!(
+            listener
+                .listener
+                .stats()
+                .packets_dropped_existing_only
+                .load(Ordering::Relaxed),
+            16,
+            "an established source's datagram must route, not be dropped at the cap"
+        );
+
+        // Stop the drainer, then release one session: its on-exit hook frees
+        // the slot (scheduled by the runtime when the supervisor task is
+        // aborted), after which a NEW source connects again.
+        drainer.abort_all();
+        drop(accepted.pop().unwrap());
+        drop(sources.pop().unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if listener.session_count.load(Ordering::Relaxed) == MAX - 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exited session's cap slot was never released");
+        let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        source.connect(addr).await.unwrap();
+        source.send(b"after-free").await.unwrap();
+        let new_accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listener.accept_without_handshake_with(AcceptConfig::default()),
+        )
+        .await
+        .expect("a new source could not connect after the slot freed")
+        .unwrap();
+        assert_eq!(
+            listener.session_count.load(Ordering::Relaxed),
+            MAX,
+            "the new session must reoccupy the freed slot"
+        );
+        drop(new_accepted);
+    }
 }
 
 #[cfg(test)]
@@ -1939,6 +2176,7 @@ mod nohandshake_obf {
             ListenerConfig {
                 obfuscation_key: Some(KEY),
                 padding: HarmfulPaddingPolicy::None,
+                ..ListenerConfig::default()
             },
         )
         .await
