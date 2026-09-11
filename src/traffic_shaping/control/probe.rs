@@ -123,7 +123,8 @@ pub fn encode_probe_obfuscated(
         &core,
         &mut out[crate::obfuscate::NONCE_LEN..],
         Some(settings),
-    );
+    )
+    .expect("probe core fits in u16");
     crate::obfuscate::apply_keystream(
         key,
         nonce,
@@ -354,7 +355,8 @@ impl ProbeResponder {
                         Some(PaddingSettings::dynamic_target(TargetKind::Fixed(
                             total - crate::obfuscate::NONCE_LEN,
                         ))),
-                    );
+                    )
+                    .expect("probe core fits in u16");
                     crate::obfuscate::apply_keystream(
                         key,
                         nonce,

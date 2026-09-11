@@ -10,6 +10,9 @@
 //! actions (draw, encode, decode) live here; every user in the crate
 //! passes a [`PaddingSettings`] to the encode/decode functions.
 
+use crate::io_err::IoErr;
+use std::io::ErrorKind;
+
 /// The length-prefix size (u16) inside the obfuscated plaintext.
 pub(crate) const LEN_LEN: usize = 2;
 
@@ -183,7 +186,7 @@ pub(crate) fn encode_plaintext(
     payload: &[u8],
     out: &mut [u8],
     settings: Option<PaddingSettings>,
-) -> usize {
+) -> Result<usize, IoErr> {
     match settings {
         Some(settings) => {
             let target = settings.draw();
@@ -194,11 +197,11 @@ pub(crate) fn encode_plaintext(
             let plaintext_len = target.max(payload.len() + header_len);
             let mut pos = 0;
             if settings.payload_sized == PayloadSized::Dynamic {
-                debug_assert!(
-                    payload.len() <= u16::MAX as usize,
-                    "the u16 length prefix cannot carry a payload larger than 65535 bytes"
-                );
-                out[..LEN_LEN].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+                let len_u16: u16 = payload
+                    .len()
+                    .try_into()
+                    .map_err(|_| IoErr::from(ErrorKind::InvalidInput))?;
+                out[..LEN_LEN].copy_from_slice(&len_u16.to_be_bytes());
                 pos = LEN_LEN;
             }
             out[pos..pos + payload.len()].copy_from_slice(payload);
@@ -206,11 +209,11 @@ pub(crate) fn encode_plaintext(
             // stale bytes from a previous send must not leak into the
             // padding).
             out[pos + payload.len()..plaintext_len].fill(0);
-            plaintext_len
+            Ok(plaintext_len)
         }
         None => {
             out[..payload.len()].copy_from_slice(payload);
-            payload.len()
+            Ok(payload.len())
         }
     }
 }
@@ -319,7 +322,7 @@ mod tests {
             Some(PaddingSettings::static_target(TargetKind::Fixed(300))),
         ] {
             let mut plaintext = vec![0u8; max_plaintext(payload.len(), settings)];
-            let n = encode_plaintext(payload, &mut plaintext, settings);
+            let n = encode_plaintext(payload, &mut plaintext, settings).unwrap();
             // Static mode treats the decode buffer as the payload size, so
             // decode into a buffer of exactly the payload size.
             let mut buf = vec![0u8; payload.len()];
@@ -336,7 +339,7 @@ mod tests {
         let settings = triangular();
         let payload = b"tiny";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
-        let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+        let n = encode_plaintext(payload, &mut plaintext, Some(settings)).unwrap();
         assert!(
             (150..=250).contains(&n),
             "a triangular draw must land in the band, got {n}"
@@ -352,7 +355,7 @@ mod tests {
         // the length prefix) — never shrunk.
         let big = vec![0xAB; 300];
         let mut out = vec![0u8; max_plaintext(big.len(), Some(settings))];
-        let n = encode_plaintext(&big, &mut out, Some(settings));
+        let n = encode_plaintext(&big, &mut out, Some(settings)).unwrap();
         assert_eq!(n, big.len() + LEN_LEN);
     }
 
@@ -362,7 +365,7 @@ mod tests {
         let payload = b"tiny";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
         for _ in 0..16 {
-            let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+            let n = encode_plaintext(payload, &mut plaintext, Some(settings)).unwrap();
             assert_eq!(n, 250, "every datagram must pad to the fixed size");
         }
         assert_eq!(&plaintext[..LEN_LEN], &(payload.len() as u16).to_be_bytes());
@@ -376,7 +379,7 @@ mod tests {
         // (plus the length prefix) — never shrunk.
         let big = vec![0xAB; 300];
         let mut out = vec![0u8; max_plaintext(big.len(), Some(settings))];
-        let n = encode_plaintext(&big, &mut out, Some(settings));
+        let n = encode_plaintext(&big, &mut out, Some(settings)).unwrap();
         assert_eq!(n, big.len() + LEN_LEN);
     }
 
@@ -385,7 +388,7 @@ mod tests {
         let settings = PaddingSettings::static_target(TargetKind::Fixed(250));
         let payload = b"hello";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
-        let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+        let n = encode_plaintext(payload, &mut plaintext, Some(settings)).unwrap();
         assert_eq!(n, 250);
         // The payload is at the front with no length prefix.
         assert_eq!(&plaintext[..payload.len()], payload);
@@ -428,10 +431,30 @@ mod tests {
         let settings = triangular();
         let payload = b"hello";
         let mut plaintext = vec![0u8; max_plaintext(payload.len(), Some(settings))];
-        let n = encode_plaintext(payload, &mut plaintext, Some(settings));
+        let n = encode_plaintext(payload, &mut plaintext, Some(settings)).unwrap();
         let len = decode_plaintext_in_place(&mut plaintext, n, Some(settings)).unwrap();
         assert_eq!(len, payload.len());
         assert_eq!(&plaintext[..len], payload);
+    }
+
+    #[test]
+    fn dynamic_mode_rejects_payload_larger_than_u16() {
+        let settings = PaddingSettings::dynamic_target(TargetKind::Fixed(70000));
+        let payload = vec![0xAB; 65536];
+        let mut out = vec![0u8; max_plaintext(payload.len(), Some(settings))];
+        let err = encode_plaintext(&payload, &mut out, Some(settings)).unwrap_err();
+        assert_eq!(err, std::io::ErrorKind::InvalidInput);
+        // 65535 is the largest that fits.
+        let payload_ok = vec![0xAB; 65535];
+        let mut out_ok = vec![0u8; max_plaintext(payload_ok.len(), Some(settings))];
+        assert!(encode_plaintext(&payload_ok, &mut out_ok, Some(settings)).is_ok());
+        // Static mode has no length prefix, so large payloads are allowed.
+        let static_settings = PaddingSettings::static_target(TargetKind::Fixed(70000));
+        let mut out_static = vec![0u8; max_plaintext(payload.len(), Some(static_settings))];
+        assert!(encode_plaintext(&payload, &mut out_static, Some(static_settings)).is_ok());
+        // No settings also allows large payloads (no prefix).
+        let mut out_none = vec![0u8; payload.len()];
+        assert!(encode_plaintext(&payload, &mut out_none, None).is_ok());
     }
 
     #[test]

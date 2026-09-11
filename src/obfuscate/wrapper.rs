@@ -181,7 +181,7 @@ impl<W: UnreliableWrite> UnreliableWrite for ObfuscatedWrite<W> {
             buf,
             &mut self.scratch[NONCE_LEN..NONCE_LEN + max_plaintext],
             self.settings.settings,
-        );
+        )?;
         apply_keystream(
             self.settings.key,
             nonce,

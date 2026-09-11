@@ -45,6 +45,7 @@ pub(crate) fn pad_handshake(core: &[u8], out: &mut [u8], mss: Mss) -> usize {
     debug_assert_eq!(core.len(), PACKET_LEN);
     debug_assert!(out.len() >= mss.get());
     padding::encode_plaintext(core, out, Some(handshake_settings(mss)))
+        .expect("handshake core fits in u16")
 }
 
 #[cfg(test)]
