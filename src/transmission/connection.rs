@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::ack_feedback::{AckFeedback, ReceivedAckWork};
 use super::coordination::Signals;
@@ -45,6 +45,30 @@ impl ReceivedBatch {
 
     pub(crate) fn record_eof(&mut self, recv_eof: bool) {
         self.recv_eof |= recv_eof;
+    }
+}
+
+/// Upper bound on how long the send driver may park on `SendWake::Event`
+/// while the application still has staged data or is blocked waiting for
+/// stage space.  A lost resume notification would otherwise stall the send
+/// path until some unrelated peer event; re-checking on this timer turns that
+/// into a bounded delay.
+const SEND_PARK_SAFETY: Duration = Duration::from_millis(1);
+
+/// Safety net for [`Connection::next_send_wake`]: the send driver must never
+/// park indefinitely on [`SendWake::Event`] while the application still has
+/// staged data or is blocked for stage space.  If a resume notification were
+/// lost, the driver would sleep until some unrelated peer event and the writer
+/// would stall for as long as that took; re-check on a short timer instead.
+fn apply_send_park_safety(
+    wake: SendWake,
+    pending_application_work: bool,
+    now: Instant,
+) -> SendWake {
+    if matches!(wake, SendWake::Event) && pending_application_work {
+        SendWake::Pacing(now + SEND_PARK_SAFETY)
+    } else {
+        wake
     }
 }
 
@@ -364,9 +388,8 @@ impl Connection {
         loop {
             self.termination.check_error()?;
             sent_data_pkt.as_mut().enable();
-            let (written_bytes, should_resume_send) = {
+            let written_bytes = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
-                let stage_was_empty = reliable_layer.is_send_buf_empty();
                 let written_bytes = reliable_layer.send_data_buf(data, now)?;
                 if crate::debug::debug_send() {
                     eprintln!(
@@ -376,7 +399,7 @@ impl Connection {
                         data.len()
                     );
                 }
-                (written_bytes, stage_was_empty && written_bytes > 0)
+                written_bytes
             };
             let now = Instant::now();
             if self.wants_snapshot(MetricsEvent::SendDataBuffer, now) {
@@ -384,9 +407,12 @@ impl Connection {
                 self.log_at_with_snapshot(MetricsEvent::SendDataBuffer, now, snapshot);
             }
             if 0 < written_bytes {
-                if should_resume_send {
-                    self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationData);
-                }
+                // Always wake the send driver.  The stage-was-empty gate this
+                // replaced could leave a fresh write behind a driver that had
+                // already parked (e.g. between draining the stage and parking
+                // on `Event`), stalling the writer until some unrelated peer
+                // event.  `Notify` coalesces, so a redundant wake is free.
+                self.request_send_driver_resume(MetricsSendDriverResumeSource::ApplicationData);
                 return Ok(written_bytes);
             }
             self.termination.check_error()?;
@@ -490,13 +516,15 @@ impl Connection {
     }
 
     pub(crate) fn next_send_wake(&self, now: Instant) -> SendWake {
-        let (mut protocol_deadline, pacing_deadline) = {
+        let (mut protocol_deadline, pacing_deadline, pending_application_work) = {
             let reliable_layer = self.reliable_layer.lock().unwrap();
             (
                 reliable_layer
                     .pkt_send_space()
                     .next_poll_time(now, reliable_layer.is_send_buf_empty()),
                 reliable_layer.next_pacing_deadline(now),
+                !reliable_layer.is_send_buf_empty()
+                    || reliable_layer.has_application_write_waiters(),
             )
         };
         if let Some(handshake_deadline) = self.post_open_recovery.next_send_time(now) {
@@ -504,7 +532,8 @@ impl Connection {
                 current.min(handshake_deadline)
             }));
         }
-        SendWake::after_send_pass(now, pacing_deadline, protocol_deadline)
+        let wake = SendWake::after_send_pass(now, pacing_deadline, protocol_deadline);
+        apply_send_park_safety(wake, pending_application_work, now)
     }
 
     pub(crate) fn wire_ts(&self, now: Instant) -> u32 {
@@ -871,6 +900,37 @@ mod tests {
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
         }
+    }
+
+    /// The send driver must never park on `Event` while the application still
+    /// has staged data or is blocked for stage space: a lost resume
+    /// notification would otherwise stall the writer until an unrelated peer
+    /// event.  The safety net bounds that park.
+    #[test]
+    fn send_park_safety_bounds_event_wakes_with_pending_work() {
+        let now = Instant::now();
+        assert!(
+            matches!(
+                super::apply_send_park_safety(SendWake::Event, true, now),
+                SendWake::Pacing(t) if t == now + super::SEND_PARK_SAFETY
+            ),
+            "an Event wake with pending application work must be bounded"
+        );
+        assert!(
+            matches!(
+                super::apply_send_park_safety(SendWake::Event, false, now),
+                SendWake::Event
+            ),
+            "an Event wake with no pending work may park indefinitely"
+        );
+        let pacing = now + std::time::Duration::from_millis(3);
+        assert!(
+            matches!(
+                super::apply_send_park_safety(SendWake::Pacing(pacing), true, now),
+                SendWake::Pacing(t) if t == pacing
+            ),
+            "an existing timer must be preserved"
+        );
     }
 
     /// The receive hot path reads `max_data_size_per_pkt` once per payload.
@@ -1253,52 +1313,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn application_data_resumes_only_on_empty_to_nonempty_stage() {
-        let observations = Arc::new(Mutex::new(Vec::new()));
-        let observer = {
-            let observations = Arc::clone(&observations);
-            MetricsObserver::new(move |observation| {
-                observations.lock().unwrap().push(observation);
-            })
-        };
-        let mut layer = pending_layer(FrameMode::default());
-        layer.metrics_observer = Some(observer);
-        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
-        let application_data_requests = || {
-            observations
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|observation| {
-                    matches!(
-                        observation.event,
-                        MetricsEvent::SendDriverResumeRequest(
-                            MetricsSendDriverResumeSource::ApplicationData
-                        )
-                    )
-                })
-                .count()
-        };
-        assert_eq!(shared.send(b"first").await.unwrap(), b"first".len());
-        assert_eq!(
-            application_data_requests(),
-            1,
-            "the empty-to-nonempty stage edge must resume the send driver exactly once"
-        );
-        assert_eq!(shared.send(b"second").await.unwrap(), b"second".len());
-        assert_eq!(
-            application_data_requests(),
-            1,
-            "a write into an already-nonempty stage must not resume the send driver again"
-        );
-        assert_eq!(shared.send(b"third").await.unwrap(), b"third".len());
-        assert_eq!(
-            application_data_requests(),
-            1,
-            "further nonempty-stage writes stay silent on the resume request"
-        );
-    }
 
     #[tokio::test]
     async fn recv_wakes_when_payload_arrives_after_it_starts_waiting() {

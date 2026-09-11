@@ -354,6 +354,13 @@ impl ReliableLayer {
         }
     }
 
+    /// Whether an application writer is currently blocked waiting for send
+    /// stage space.  Used by the send driver's wake computation so it never
+    /// parks indefinitely while a writer is blocked on it.
+    pub(crate) fn has_application_write_waiters(&self) -> bool {
+        self.application_write_waiters.load(Ordering::Relaxed) > 0
+    }
+
     pub(crate) fn next_pacing_deadline(&self, now: Instant) -> Option<Instant> {
         let max_sendable_packets =
             if self.pkt_send_space.in_outage_recovery() && self.pkt_send_space.has_rtx(now) {
