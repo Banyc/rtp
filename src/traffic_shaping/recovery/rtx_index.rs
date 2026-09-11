@@ -524,10 +524,10 @@ impl RetransmissionIndex {
                 .expect("floor deadline must belong to an active packet");
             let effective = entry.effective_rto_deadline(live_rto);
             if effective <= now
-                && !self
+                && self
                     .ready
                     .get(&key.seq)
-                    .is_some_and(|reasons| reasons.rto.is_some())
+                    .is_none_or(|reasons| reasons.rto.is_none())
             {
                 return Some(now);
             }
