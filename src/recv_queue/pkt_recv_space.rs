@@ -6,7 +6,7 @@ use crate::{
     sequence::{SequenceMap, SequenceNumber, SequencePosition, SequenceVacancyError, min},
 };
 
-pub const MAX_NUM_RECVING_PKTS: usize = 2 << 12;
+pub const MAX_NUM_RECVING_PKTS: usize = 2 << 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecvDisposition {

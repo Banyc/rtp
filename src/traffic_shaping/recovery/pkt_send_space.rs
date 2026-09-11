@@ -1026,6 +1026,15 @@ impl PktSendSpace {
         // (a debug panic or a release wrap to a tiny window).
         let cwnd = cwnd.saturating_mul(CWND_SEND_RATE_SCALE);
         let cwnd = 1.max(cwnd);
+        // The in-flight window may never exceed the peer's bounded receive
+        // window: a larger window bursts more payload than the peer can hold,
+        // the peer rejects the excess, and those holes fall outside the
+        // retransmission index (which covers only the `min(in_flight, cwnd)`
+        // prefix), so the send window can never drain -- a permanent writer
+        // stall.  `MAX_NUM_RECVING_PKTS` is the peer's window; it must stay
+        // large enough that this bound does not fall below what the path
+        // delivers (see the crate README).
+        let cwnd = cwnd.min(MAX_NUM_RECVING_PKTS);
         // While an outage-recovery epoch is open, clamp cwnd to
         // OUTAGE_RECOVERY_CWND so a just-restored path is not flooded before
         // fresh RTT samples can seed the congestion state.
@@ -1876,16 +1885,38 @@ mod tests {
         );
 
         // After a fresh sample, cwnd returns to the rate-based formula using the
-        // newly seeded sRTT (200 ms), not the pre-outage 100 ms baseline.
+        // newly seeded sRTT (200 ms), not the pre-outage 100 ms baseline.  The
+        // rate is chosen so the result stays below the receive-window cap, so
+        // this observes the formula rather than the cap.
         space.sample_rtt(ms(200), detect_at + ms(300));
         assert!(!space.in_outage_recovery());
-        space.set_send_rate(PosR::new(1_000_000.0).unwrap());
+        space.set_send_rate(PosR::new(5_000.0).unwrap());
         let expected_cwnd =
-            (ms(200).as_secs_f64() * 1_000_000.0).round() as usize * CWND_SEND_RATE_SCALE;
+            (ms(200).as_secs_f64() * 5_000.0).round() as usize * CWND_SEND_RATE_SCALE;
+        assert!(expected_cwnd < crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS);
         assert_eq!(
             space.cwnd().get(),
             expected_cwnd,
             "cwnd should recompute with fresh sRTT"
+        );
+    }
+
+    /// The in-flight window may never exceed the peer's bounded receive window:
+    /// a larger window bursts more payload than the peer can hold, the peer
+    /// rejects the excess, those holes fall outside the `min(in_flight, cwnd)`
+    /// retransmission index, and the send window can never drain — a permanent
+    /// writer stall. The cap is a hard ceiling no matter how high the 8x
+    /// rate-based estimate climbs.
+    #[test]
+    fn cwnd_is_capped_at_the_receive_window() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        space.set_send_rate(PosR::new(1_000_000.0).unwrap());
+        assert_eq!(
+            space.cwnd().get(),
+            crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
+            "an extreme rate must clamp cwnd to the receive window"
         );
     }
 
