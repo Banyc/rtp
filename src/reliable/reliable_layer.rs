@@ -853,7 +853,7 @@ impl ReliableLayer {
             if self.congestion_metrics_enabled {
                 self.congestion_metrics.clear_decision_gauges();
             }
-            self.slow_start_acked_pkts += self.pkt_stats_buf.len();
+            self.slow_start_acked_pkts += self.pkt_send_space.fresh_acked_count();
             let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
             let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
             self.set_send_rate(ss_rate, now);

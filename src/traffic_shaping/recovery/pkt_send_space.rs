@@ -48,6 +48,11 @@ pub(crate) struct RetransmissionCounters {
 /// the classic dup-ACK threshold of 3.
 pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 
+/// How many current smoothed round trips an observed-reordering fast-loss
+/// disable stays armed before a genuinely clean link re-enables
+/// evidence-gated fast loss ("a few round trips").
+const FAST_LOSS_DISABLE_ROUND_TRIPS: u32 = 3;
+
 /// Whether the jitter-tolerant fast-retransmit ("jitter cap") path is
 /// enabled at process startup.  Reads `RTP_JITTER_CAP` once; `1`/`true`
 /// enables it, anything else preserves stock behaviour byte-for-byte.
@@ -103,13 +108,20 @@ pub struct PktSendSpace {
     /// RTT statistics: smoothed RTT, RTO, and lifetime minimum.
     rtt_stats: RttStats,
 
-    /// Hard-disable flag for evidence-gated fast loss.  Set when reordering
-    /// is actually observed (a fast-loss-retransmitted packet's original
-    /// later arrives - detected by an ACK arriving for such a packet faster
-    /// than the retransmit could have been acknowledged).  Once set it stays
-    /// set for the life of the connection; the structural jitter gate alone
-    /// is not enough to re-arm after a real reordering event.
-    fast_loss_disabled: bool,
+    /// Observed-reordering disable for evidence-gated fast loss: `Some(until)`
+    /// arms a *bounded* disable lasting [`FAST_LOSS_DISABLE_ROUND_TRIPS`]
+    /// smoothed round trips from the moment reordering was observed (an ACK
+    /// for a fast-loss-retransmitted packet arrives faster than the
+    /// retransmit could plausibly have round-tripped, so the original must
+    /// have been delivered).  It is re-armed whenever the check fires and
+    /// cleared once `until` elapses at the next now-bearing state transition,
+    /// so a genuinely clean link re-enables evidence-gated fast loss instead
+    /// of latching a stale disable off for the connection's life.
+    fast_loss_disabled_until: Option<Instant>,
+    /// Packets delivered by the most recent [`Self::ack`] that were never
+    /// retransmitted (see [`InFlightPkt::never_retransmitted`]) — the fresh
+    /// progress evidence that feeds the ACK-clocked slow-start ramp.
+    fresh_acked: usize,
 
     /// Pending deferred loss-event recordings for the jitter-tolerant fast-
     /// retransmit path (`RTP_JITTER_CAP`).  Each entry is a packet that was
@@ -165,7 +177,8 @@ impl PktSendSpace {
             liveness: PeerLiveness::new(),
             outage: OutageEpoch::new(),
             rtt_stats: RttStats::new(),
-            fast_loss_disabled: false,
+            fast_loss_disabled_until: None,
+            fresh_acked: 0,
             deferred_losses: DeferredLossIndex::new(initial_seq),
             jitter_cap: jitter_cap_from_env(),
             rtx_index: RetransmissionIndex::new(initial_seq),
@@ -187,15 +200,42 @@ impl PktSendSpace {
 
     /// Whether the evidence-gated fast-loss path is currently armed.  Arming
     /// requires the structural low-jitter gate (`K*rttvar < srtt/4`) AND no
-    /// observed reordering on the connection.  Always-on when armed; there is
-    /// no env toggle — the structural gate is the safety.
+    /// currently-armed observed-reordering disable.  Always-on when armed;
+    /// there is no env toggle — the structural gate is the safety.  The
+    /// disable is *bounded*: it expires after
+    /// [`FAST_LOSS_DISABLE_ROUND_TRIPS`] smoothed round trips and is cleared
+    /// by the next now-bearing state transition (`ack` / `sample_rtt` /
+    /// retransmit), so a clean link re-enables fast loss.
     pub fn fast_loss_armed(&self) -> bool {
-        !self.fast_loss_disabled && self.rtt_stats.fast_loss_armed()
+        !self.fast_loss_disabled() && self.rtt_stats.fast_loss_armed()
     }
 
-    #[cfg(test)]
-    pub(crate) fn fast_loss_disabled(&self) -> bool {
-        self.fast_loss_disabled
+    /// Whether the observed-reordering disable is currently armed (regardless
+    /// of whether its bound has already elapsed — expiry is cleared at the
+    /// next now-bearing state transition).
+    fn fast_loss_disabled(&self) -> bool {
+        self.fast_loss_disabled_until.is_some()
+    }
+
+    /// Clear the observed-reordering disable once its bound has elapsed, so
+    /// a genuinely clean link re-enables evidence-gated fast loss.  Called at
+    /// the now-bearing state transitions (`ack`, `sample_rtt`, retransmit)
+    /// before their arming snapshots.
+    fn clear_expired_fast_loss_disable(&mut self, now: Instant) {
+        if self
+            .fast_loss_disabled_until
+            .is_some_and(|until| now >= until)
+        {
+            self.fast_loss_disabled_until = None;
+        }
+    }
+
+    /// Number of packets delivered by the most recent [`Self::ack`] that were
+    /// never retransmitted — the only progress evidence that may drive the
+    /// ACK-clocked slow-start ramp (a repaired packet must not re-credit
+    /// slow-start progress on a lossy link).
+    pub fn fresh_acked_count(&self) -> usize {
+        self.fresh_acked
     }
 
     /// Test-only constructor that forces the `RTP_JITTER_CAP` toggle to a
@@ -457,6 +497,10 @@ impl PktSendSpace {
     }
 
     pub fn ack(&mut self, recved: AckBlocks<'_>, acked: &mut Vec<PacketState>, now: Instant) {
+        // A disable whose round-trip bound elapsed is cleared before any
+        // arming snapshot below, so a clean link re-arms fast loss.
+        self.clear_expired_fast_loss_disable(now);
+        self.fresh_acked = 0;
         let send_start = self.send_wnd.start();
         let sent_span = self.send_wnd.len() as u64;
         let previous_out_of_order_seq_end = self.out_of_order_seq_end;
@@ -500,17 +544,24 @@ impl PktSendSpace {
         if delivered > 0 {
             self.tlp.reset();
         }
-        if !self.fast_loss_disabled
-            && let Some(min_rtt) = self.rtt_stats.min_rtt()
+        if !self.fast_loss_disabled()
+            && let Some(reorder_suspicion_window) = self.rtt_stats.recent_min_rtt()
         {
             for &s in &self.ack_buf {
                 let Some(Some(p)) = self.send_wnd.get(&s).map(|o| o.as_ref()) else {
                     continue;
                 };
                 if let Some(rtx_t) = p.fast_loss_rtx_time
-                    && now < rtx_t + min_rtt
+                    && now < rtx_t + reorder_suspicion_window
                 {
-                    self.fast_loss_disabled = true;
+                    // The original must have been delivered (the retransmit
+                    // could not round-trip that fast): observed reordering.
+                    // Re-arm a *bounded* disable — current smoothed-round-trip
+                    // based, so a genuinely clean link re-enables fast loss
+                    // after a few round trips instead of latching it off for
+                    // the connection's life.
+                    self.fast_loss_disabled_until =
+                        Some(now + FAST_LOSS_DISABLE_ROUND_TRIPS * self.rtt_stats.smooth_rtt());
                     break;
                 }
             }
@@ -537,6 +588,9 @@ impl PktSendSpace {
                 cumulative_advance += released;
             }
             self.deferred_losses.cancel(s);
+            if p.never_retransmitted() {
+                self.fresh_acked += 1;
+            }
             self.reused_buf.put(p.data);
             acked.push(p.stats);
         }
@@ -594,6 +648,9 @@ impl PktSendSpace {
     }
 
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) -> bool {
+        // A disable whose round-trip bound elapsed is cleared before the
+        // arming snapshot, so a clean link re-arms fast loss.
+        self.clear_expired_fast_loss_disable(now);
         if self.outage.should_censor_rtt_sample(rtt, now) {
             return false;
         }
@@ -774,13 +831,17 @@ impl PktSendSpace {
     }
 
     pub fn has_rtx(&self, now: Instant) -> bool {
-        self.rtx_index.has_due(now, || {
-            if self.jitter_cap {
-                self.rtt_stats.fast_reorder_window()
-            } else {
-                self.rtt_stats.reorder_window()
-            }
-        })
+        self.rtx_index.has_due(
+            now,
+            || {
+                if self.jitter_cap {
+                    self.rtt_stats.fast_reorder_window()
+                } else {
+                    self.rtt_stats.reorder_window()
+                }
+            },
+            self.rtt_stats.rto_duration(),
+        )
     }
 
     pub fn rtx_with_state(
@@ -788,6 +849,9 @@ impl PktSendSpace {
         now: Instant,
         packet_state: impl FnOnce() -> PacketState,
     ) -> Option<Pkt<'_>> {
+        // A disable whose round-trip bound elapsed is cleared so a clean link
+        // re-arms fast loss on the next evidence sync.
+        self.clear_expired_fast_loss_disable(now);
         let stock_window = self.rtt_stats.reorder_window();
         let rtx_window = if self.jitter_cap {
             self.rtt_stats.fast_reorder_window()
@@ -836,23 +900,23 @@ impl PktSendSpace {
         // loss would - no TLP probe accounting.
         let is_fast_loss_rtx = reasons.fast_loss_at().is_some() && !already_rtxed;
 
-        // Jitter-tolerant fast-retransmit deferred-loss accounting.  If the
-        // jitter-cap toggle is on and this retransmit fired purely on the fast
-        // reorder window (i.e. the stock window has NOT yet expired for
-        // the original send), the CC loss event is deferred to the stock
-        // deadline (`original_sent_time + stock_window`).  If the original
-        // is acked before that deadline the deferred entry is cancelled
-        // (reordering, not loss); otherwise it is recorded exactly once
-        // by `poll_deferred_loss`.  This is what keeps goodput from
-        // collapsing on high-jitter lossy links: the rtx happens early
-        // (recovery) but the loss-rate signal seen by delivery-rate CC
-        // only counts genuine losses.
+        // Deferred loss-event accounting for retransmits that fired before the
+        // stock reorder-window deadline of the ORIGINAL send.  A retransmit
+        // inside that window may be repairing reordering, not loss: the CC
+        // loss event is deferred to the stock deadline (`original_sent_time +
+        // stock_window`) and recorded only if the original is still unacked
+        // then; an ACK before the deadline cancels it (reordering, not loss).
+        // This covers the jitter-tolerant fast-reorder path (`RTP_JITTER_CAP`)
+        // AND evidence-gated fast loss, whose SACK evidence can fire far
+        // before the stock window expires — a merely-reordered packet must not
+        // produce a spurious congestion response (the min-RTT-based check can
+        // only catch fast reordering, never slow reordering).  A retransmit
+        // at or past the stock deadline (RTO expiry, stock reorder-window
+        // expiry) still records its loss event immediately.
         let original_sent_time = p.sent_time;
-        let defer_loss = self.jitter_cap
-            && !already_rtxed
+        let defer_loss = !already_rtxed
             && !pre_outage_loss
             && !tail_probe_loss
-            && !is_fast_loss_rtx
             && now < original_sent_time + stock_window;
         let baseline_deadline_opt = if defer_loss {
             Some(original_sent_time + stock_window)
@@ -1227,13 +1291,17 @@ impl PktSendSpace {
         if min_next_poll_time.is_some_and(|deadline| deadline <= now) {
             return min_next_poll_time;
         }
-        if let Some(t) = self.rtx_index.next_deadline(now, || {
-            if self.jitter_cap {
-                self.rtt_stats.fast_reorder_window()
-            } else {
-                self.rtt_stats.reorder_window()
-            }
-        }) {
+        if let Some(t) = self.rtx_index.next_deadline(
+            now,
+            || {
+                if self.jitter_cap {
+                    self.rtt_stats.fast_reorder_window()
+                } else {
+                    self.rtt_stats.reorder_window()
+                }
+            },
+            self.rtt_stats.rto_duration(),
+        ) {
             min_next_poll_time = Some(min_next_poll_time.map(|min| min.min(t)).unwrap_or(t));
         }
         if min_next_poll_time.is_some_and(|deadline| deadline <= now) {
@@ -1310,8 +1378,9 @@ struct InFlightPkt {
     pub sacked_above: u32,
     /// `Some(t)` if this packet was retransmitted by the evidence-gated
     /// fast-loss path at time `t`.  Used to detect observed reordering: if an
-    /// ACK for this packet arrives before `t + min_rtt` could plausibly have
-    /// elapsed, the original (not the retransmit) must have been delivered.
+    /// ACK for this packet arrives before `t + <current estimator floor>` could
+    /// plausibly have elapsed, the original (not the retransmit) must have
+    /// been delivered.
     pub fast_loss_rtx_time: Option<Instant>,
     /// `Some(t)` if this packet was retransmitted at time `t` by the
     /// jitter-tolerant fast-retransmit path (`RTP_JITTER_CAP`).  The
@@ -1342,6 +1411,15 @@ impl InFlightPkt {
     pub fn is_fast_loss(&self) -> bool {
         !self.rtxed && self.sacked_above >= FAST_LOSS_SACK_THRESHOLD
     }
+
+    /// Whether this packet was delivered without ever being retransmitted —
+    /// the only progress evidence that counts for the ACK-clocked slow-start
+    /// ramp.  A packet repaired by ANY recovery path (full retransmission,
+    /// evidence-gated fast-loss retransmit, or a tail-loss probe of the
+    /// packet) must not re-credit fresh progress on a lossy link.
+    pub fn never_retransmitted(&self) -> bool {
+        !self.rtxed && self.fast_loss_rtx_time.is_none() && !self.rto_from_tail_probe
+    }
 }
 
 /// A pending deferred CC loss-event recording for the jitter-tolerant fast-
@@ -1368,8 +1446,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CWND_SEND_RATE_SCALE, INIT_CWND, LOSS_RATE_MIN_SAMPLES, MAX_ACK_BLOCKS,
-        OUTAGE_RECOVERY_CWND, PktSendSpace,
+        CWND_SEND_RATE_SCALE, FAST_LOSS_DISABLE_ROUND_TRIPS, INIT_CWND, LOSS_RATE_MIN_SAMPLES,
+        MAX_ACK_BLOCKS, OUTAGE_RECOVERY_CWND, PktSendSpace,
     };
     use crate::sequence::SequenceNumber;
     use primitive::ops::float::{PosR, UnitR};
@@ -2223,7 +2301,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_reordering_hard_disables_fast_loss() {
+    fn observed_reordering_bounded_disable_re_arms_fast_loss() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
@@ -2259,16 +2337,17 @@ mod tests {
         );
 
         // The original (not the retransmit) arrives: an ACK for seq 0 lands
-        // at rtx_t + 1 ms, which is before rtx_t + min_rtt (100 ms) — the
-        // retransmit could not have made a round trip that fast, so the peer
-        // must have received the original.  Reordering is observed: hard-
-        // disable fast loss for the rest of the connection.
+        // at rtx_t + 1 ms, which is before rtx_t + the recent-min suspicion
+        // window (100 ms) — the retransmit could not have made a round trip
+        // that fast, so the peer must have received the original.  Reordering
+        // is observed: fast loss is disarmed for a *bounded* window (a few
+        // smoothed round trips), not for the connection's life.
         let original_arrives = rtx_t + ms(1);
-        assert!(original_arrives < rtx_t + space.min_rtt().unwrap());
+        assert!(original_arrives < rtx_t + space.rtt_stats.recent_min_rtt().unwrap());
         ack_one(&mut space, 0, original_arrives);
         assert!(
             space.fast_loss_disabled(),
-            "observed reordering must hard-disable fast loss"
+            "observed reordering must arm the fast-loss disable"
         );
         assert!(
             !space.fast_loss_armed(),
@@ -2292,16 +2371,31 @@ mod tests {
         let early2 = original_arrives + ms(9);
         assert!(
             !space.has_rtx(early2),
-            "fast loss must not fire after observed reordering disabled it"
+            "fast loss must not fire while the observed-reordering disable is armed"
         );
         assert!(
             space.rtx(early2).is_none(),
-            "no fast-loss retransmit after observed reordering"
+            "no fast-loss retransmit during the disable window"
+        );
+
+        // The disable is NOT a permanent latch: once its bound (a few
+        // smoothed round trips from the reordering observation) elapses, the
+        // next now-bearing transition clears it and a clean link re-enables
+        // evidence-gated fast loss.
+        let re_arm_at = original_arrives + ms(400);
+        assert!(
+            re_arm_at > original_arrives + FAST_LOSS_DISABLE_ROUND_TRIPS * space.smooth_rtt(),
+            "re-arm time must exceed the disable bound"
+        );
+        space.sample_rtt(ms(100), re_arm_at);
+        assert!(
+            space.fast_loss_armed(),
+            "a clean link must re-enable fast loss once the bounded disable expires"
         );
     }
 
     #[test]
-    fn fast_loss_rtx_records_loss_event_without_tlp_probe_accounting() {
+    fn fast_loss_rtx_defers_its_loss_event_to_the_stock_reorder_deadline() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
@@ -2322,17 +2416,34 @@ mod tests {
             "no loss event before the fast-loss rtx"
         );
 
+        let stock_window = space.rtt_stats.reorder_window();
         let rtx_t = t0 + ms(30);
+        assert!(
+            rtx_t < t0 + stock_window,
+            "test requires the fast-loss rtx before the stock reorder deadline"
+        );
         let rtx = space.rtx(rtx_t).expect("fast loss should fire for seq 0");
         assert_eq!(rtx.seq, sq(0));
 
-        // A fast-loss retransmit is a genuine loss declaration, not a TLP
-        // probe, so it must record a congestion loss event exactly as a
-        // window-expiry loss would — feeding delivery-rate CC the true loss
-        // rate.
+        // The loss event is DEFERRED to the stock reorder-window deadline of
+        // the ORIGINAL send: the SACK evidence fired well before that deadline,
+        // so the packet may merely be reordering — recording a CC loss event at
+        // retransmit time would feed delivery-rate CC a spurious loss.  The
+        // min-RTT-based fast-reordering check cannot catch slow reordering,
+        // so the deferral is what disambiguates.
         assert!(
-            space.loss_event_window.raw_has_loss_event(),
-            "fast-loss rtx must record a loss event for CC"
+            !space.loss_event_window.raw_has_loss_event(),
+            "fast-loss rtx must NOT record a loss event at rtx time (deferred)"
+        );
+        assert_eq!(
+            space.deferred_losses.len(),
+            1,
+            "one deferred loss entry must be pending"
+        );
+        assert_eq!(
+            space.deferred_losses.deadline(sq(0)),
+            Some(t0 + stock_window),
+            "deferral baseline must be original send time + stock reorder window"
         );
 
         // And it must not be accounted as a tail-loss probe: the retransmitted
@@ -2351,6 +2462,31 @@ mod tests {
             p.fast_loss_rtx_time,
             Some(rtx_t),
             "fast-loss rtx must stamp fast_loss_rtx_time"
+        );
+        assert_eq!(
+            p.deferred_loss_baseline_deadline,
+            Some(t0 + stock_window),
+            "fast-loss rtx must carry the deferred-loss baseline"
+        );
+
+        // Still before the stock deadline the packet is unacked: no event yet.
+        space.poll_deferred_loss(t0 + stock_window - ms(10));
+        assert!(
+            !space.loss_event_window.raw_has_loss_event(),
+            "no loss event before the stock reorder deadline"
+        );
+
+        // At the stock deadline the packet is still unacked (genuine loss):
+        // the deferred loss event is recorded exactly once.
+        space.poll_deferred_loss(t0 + stock_window + ms(1));
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "deferred fast-loss loss event must record at the stock deadline"
+        );
+        assert_eq!(
+            space.deferred_losses.len(),
+            0,
+            "deferred entry cleared after recording"
         );
     }
 
@@ -3322,6 +3458,91 @@ mod tests {
         assert!(
             space.loss_event_window.raw_has_loss_event(),
             "the postponed loss is classified at the live deadline"
+        );
+    }
+
+    #[test]
+    fn live_rto_clear_re_arms_a_latched_stale_deadline_and_repairs_at_the_true_deadline() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let stored_rto = space.rto_duration();
+        send_packet(&mut space, t0); // seq 0, floor-eligible.
+        // Grow rttvar so the live estimator's RTO exceeds the stored deadline.
+        for i in 0..10 {
+            space.sample_rtt(ms(100), t0 + ms(2000) + ms(i * 2));
+            space.sample_rtt(ms(900), t0 + ms(2000) + ms(i * 2 + 1));
+        }
+        let live_rto = space.rto_duration();
+        assert!(live_rto > stored_rto, "test requires live RTO growth");
+        // The stored deadline wakes the poll, but the live floor postpones
+        // (latches the stored key up to sent_at + live_rto).
+        assert!(space.has_rtx(t0 + stored_rto));
+        assert!(space.rtx(t0 + stored_rto).is_none());
+        assert_eq!(space.rto_deadline_postponements, 1);
+
+        // The estimator clears back to the settled (MIN_RTO-floored) value:
+        // the true deadline sent_at + max(packet_rto, live_rto) == the
+        // original stored deadline, already passed, while the latched key is
+        // still ~live_rto in the future.
+        for i in 0..20 {
+            space.sample_rtt(ms(100), t0 + ms(2000) + ms(1000) + ms(i));
+        }
+        let cleared_rto = space.rto_duration();
+        assert!(
+            cleared_rto < live_rto,
+            "estimator must clear after the spike"
+        );
+        let due_now = t0 + stored_rto + ms(500);
+        assert!(
+            due_now < t0 + live_rto,
+            "now must fall between the true and the latched deadline"
+        );
+        // The index must agree with the estimator-driven scans (which evaluate
+        // max(packet_rto, live_rto) live) instead of withholding repair until
+        // the stale latched instant.
+        assert!(
+            space.has_rtx(due_now),
+            "a cleared live RTO must not withhold repair behind a latched key"
+        );
+        assert!(
+            !space.cwnd_stats(due_now).all_lost_pkts_rtxed,
+            "the still-unrepaired due packet must be visible to cwnd_stats"
+        );
+        let p = space
+            .rtx(due_now)
+            .expect("repair must fire at the true dynamic deadline");
+        assert_eq!(p.seq, sq(0));
+    }
+
+    #[test]
+    fn fresh_acked_count_excludes_retransmitted_packets() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        send_packet(&mut space, t0); // seq 0 — will be RTO-retransmitted.
+        let rto = space.rto_duration();
+        let rtx = space
+            .rtx(t0 + rto + ms(1))
+            .expect("the RTO must fire for seq 0");
+        assert_eq!(rtx.seq, sq(0));
+        // The cumulative ACK delivers the repaired packet: it must NOT count
+        // as fresh ACK-clocked progress for the slow-start ramp.
+        assert_eq!(ack_one(&mut space, 0, t0 + rto + ms(2)), 1);
+        assert_eq!(
+            space.fresh_acked_count(),
+            0,
+            "a repaired packet must not count as fresh progress"
+        );
+        // The counter is per-ack: a later ACK re-counts only that ack's
+        // never-retransmitted deliveries.
+        send_packet(&mut space, t0 + rto + ms(10)); // seq 1 — fresh.
+        send_packet(&mut space, t0 + rto + ms(11)); // seq 2 — fresh.
+        assert_eq!(ack_one(&mut space, 2u64, t0 + rto + ms(20)), 2);
+        assert_eq!(
+            space.fresh_acked_count(),
+            2,
+            "both never-retransmitted packets count as fresh"
         );
     }
 

@@ -34,10 +34,36 @@ use crate::sequence::{HALF_SEQUENCE_SPACE, SequenceMap, SequenceNumber, Sequence
 /// `reorder_sent` (so `deactivate` can remove it without rescanning).
 #[derive(Debug, Clone, Copy)]
 struct ActiveEntry {
+    /// The stored/latched RTO deadline: the RTO deadline as of the last
+    /// activation or postpone.  For floor-eligible packets this is only a
+    /// *scheduling hint* — readiness is re-validated live against the current
+    /// estimator via [`ActiveEntry::effective_rto_deadline`] — while for
+    /// tail-probe-derived RTOs it is the exact deadline.
     rto_at: Instant,
+    /// The packet's own RTO deadline offset at activation (`rto_at -
+    /// sent_at`), never latched up by the live-estimator floor: the true
+    /// dynamic deadline for a floor-eligible packet is
+    /// `sent_at + max(packet_rto, live_rto)`, recomputed at query time so a
+    /// stale latched instant cannot diverge from the live estimator.
+    packet_rto: std::time::Duration,
     sent_at: Instant,
     apply_live_rto_floor: bool,
     reorder_indexed: bool,
+}
+
+impl ActiveEntry {
+    /// The effective RTO deadline of an active packet, evaluated against the
+    /// *current* live estimator: for a floor-eligible packet the true
+    /// dynamic deadline `sent_at + max(packet_rto, live_rto)` (never a stale
+    /// latched instant); for a tail-probe-derived RTO the exact stored
+    /// deadline.
+    fn effective_rto_deadline(&self, live_rto: std::time::Duration) -> Instant {
+        if self.apply_live_rto_floor {
+            self.sent_at + self.packet_rto.max(live_rto)
+        } else {
+            self.rto_at
+        }
+    }
 }
 
 /// Everything needed to add a packet to the active set.  Carried as one
@@ -229,6 +255,12 @@ pub(super) enum ReadyReason {
 pub(super) struct RetransmissionIndex {
     active: SequenceMap<ActiveEntry>,
     rto_deadlines: BTreeSet<DeadlineKey>,
+    /// Active floor-eligible (`apply_live_rto_floor`) entries keyed by their
+    /// original send time, so the live-estimator bound
+    /// `sent_at + live_rto <= now` — the shrunk-estimator case where a
+    /// latched-up stored key is still in the future — can be found without
+    /// rescanning the deadline set.
+    floor_sent: BTreeSet<DeadlineKey>,
     reorder_sent: BTreeSet<DeadlineKey>,
     ready: SequenceMap<ReadyReasons>,
     ready_deadlines: BTreeSet<DeadlineKey>,
@@ -243,6 +275,7 @@ impl RetransmissionIndex {
         Self {
             active: SequenceMap::new(anchor, HALF_SEQUENCE_SPACE - 1),
             rto_deadlines: BTreeSet::new(),
+            floor_sent: BTreeSet::new(),
             reorder_sent: BTreeSet::new(),
             ready: SequenceMap::new(anchor, HALF_SEQUENCE_SPACE - 1),
             ready_deadlines: BTreeSet::new(),
@@ -269,6 +302,7 @@ impl RetransmissionIndex {
         } = activation;
         match self.active.insert_vacant_with(seq, || ActiveEntry {
             rto_at,
+            packet_rto: rto_at - sent_at,
             sent_at,
             apply_live_rto_floor,
             reorder_indexed: reorder_eligible,
@@ -282,6 +316,9 @@ impl RetransmissionIndex {
             }
         }
         self.rto_deadlines.insert(DeadlineKey { at: rto_at, seq });
+        if apply_live_rto_floor {
+            self.floor_sent.insert(DeadlineKey { at: sent_at, seq });
+        }
         if reorder_eligible {
             self.reorder_sent.insert(DeadlineKey { at: sent_at, seq });
         }
@@ -305,6 +342,12 @@ impl RetransmissionIndex {
             at: entry.rto_at,
             seq,
         });
+        if entry.apply_live_rto_floor {
+            self.floor_sent.remove(&DeadlineKey {
+                at: entry.sent_at,
+                seq,
+            });
+        }
         if entry.reorder_indexed {
             self.reorder_sent.remove(&DeadlineKey {
                 at: entry.sent_at,
@@ -316,13 +359,21 @@ impl RetransmissionIndex {
     }
 
     /// Promote active packets whose time-based deadlines have elapsed:
-    /// first every RTO deadline with `at <= now` (setting the RTO reason -
-    /// but lazily postponing stale non-tail-probe deadlines below the live
-    /// estimator floor to `sent_at + live_rto`), then every reorder send
-    /// time with `sent_at + reorder_window <= now` (setting the reorder
-    /// reason).  Each reason is set independently, so a packet can become
-    /// ready for both.  Returns the number of RTO deadlines postponed by
-    /// the live floor.
+    /// first every RTO deadline with `at <= now` (setting the RTO reason,
+    /// lazily postponing stale non-tail-probe deadlines below the live
+    /// estimator floor to the current effective deadline `sent_at +
+    /// max(packet_rto, live_rto)`), then every reorder send time with
+    /// `sent_at + reorder_window <= now` (setting the reorder reason).
+    /// Each reason is set independently, so a packet can become ready for
+    /// both.
+    ///
+    /// The stored RTO deadline is only a *scheduling hint*: every promotion
+    /// decision is re-validated against the current live estimator.  A
+    /// floor-eligible packet whose live deadline passed while a latched-up
+    /// stored key (an earlier RTT spike postponed it) is still in the future
+    /// is promoted here too — at its true dynamic deadline — so the index
+    /// never withholds retransmission past what the estimator says is lost.
+    /// Returns the number of RTO deadlines postponed by the live floor.
     pub(super) fn promote_due(
         &mut self,
         now: Instant,
@@ -330,6 +381,9 @@ impl RetransmissionIndex {
         live_rto: std::time::Duration,
     ) -> usize {
         let mut rto_deadline_postponements = 0;
+        // Stored-deadline prefix: a key that elapses is ready at its
+        // *effective* deadline — re-validated now against the live estimator —
+        // or postponed (lazily) when the estimator grew past it.
         while let Some(&deadline) = self.rto_deadlines.first() {
             if now < deadline.at {
                 break;
@@ -338,19 +392,53 @@ impl RetransmissionIndex {
                 .active
                 .get_mut(&deadline.seq)
                 .expect("RTO deadline must belong to an active packet");
-            let live_deadline = entry.sent_at + live_rto;
-            if entry.apply_live_rto_floor && deadline.at < live_deadline {
+            let effective = entry.effective_rto_deadline(live_rto);
+            if effective > now {
                 self.rto_deadlines.remove(&deadline);
-                entry.rto_at = live_deadline;
+                entry.rto_at = effective;
                 self.rto_deadlines.insert(DeadlineKey {
-                    at: live_deadline,
+                    at: effective,
                     seq: deadline.seq,
                 });
                 rto_deadline_postponements += 1;
                 continue;
             }
             self.rto_deadlines.remove(&deadline);
-            self.update_ready(deadline.seq, |reasons| reasons.rto = Some(deadline.at));
+            self.update_ready(deadline.seq, |reasons| reasons.rto = Some(effective));
+        }
+        // Shrunk-estimator floor entries: a latched-up stored key is still in
+        // the future, but the *live* deadline has passed (the estimator
+        // cleared after an RTT spike).  The send-window scans already treat
+        // these as lost; promote them at the true deadline so repair is not
+        // withheld until the stale latched instant.  Iterated in send-time
+        // order (FIFO by sequence), preserving the index's selection order.
+        for key in self
+            .floor_sent
+            .iter()
+            .take_while(|key| key.at <= now && live_rto <= now.duration_since(key.at))
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            let seq = key.seq;
+            if self
+                .ready
+                .get(&seq)
+                .is_some_and(|reasons| reasons.rto.is_some())
+            {
+                continue;
+            }
+            let entry = self
+                .active
+                .get(&seq)
+                .expect("floor deadline must belong to an active packet");
+            let effective = entry.effective_rto_deadline(live_rto);
+            if effective <= now {
+                self.rto_deadlines.remove(&DeadlineKey {
+                    at: entry.rto_at,
+                    seq,
+                });
+                self.update_ready(seq, |reasons| reasons.rto = Some(effective));
+            }
         }
         while let Some(&sent) = self.reorder_sent.first() {
             let deadline = sent.at + reorder_window;
@@ -371,6 +459,7 @@ impl RetransmissionIndex {
         &self,
         now: Instant,
         reorder_window: impl FnOnce() -> std::time::Duration,
+        live_rto: std::time::Duration,
     ) -> bool {
         !self.ready.is_empty()
             || self
@@ -381,18 +470,68 @@ impl RetransmissionIndex {
                 .reorder_sent
                 .first()
                 .is_some_and(|sent| sent.at + reorder_window() <= now)
+            || self.has_stuck_rto_due(now, live_rto)
+    }
+
+    /// Whether any active floor-eligible packet is RTO-due at the *live*
+    /// deadline while its latched stored key is still in the future (the
+    /// estimator cleared after an RTT spike postponed the key).  These are
+    /// exactly the entries whose `sent_at + live_rto <= now`.
+    fn has_stuck_rto_due(&self, now: Instant, live_rto: std::time::Duration) -> bool {
+        self.floor_sent
+            .iter()
+            .take_while(|key| key.at <= now && live_rto <= now.duration_since(key.at))
+            .any(|key| {
+                let entry = self
+                    .active
+                    .get(&key.seq)
+                    .expect("floor deadline must belong to an active packet");
+                entry.effective_rto_deadline(live_rto) <= now
+            })
     }
 
     /// Deadline used only to schedule the next send-loop wake. If one source
     /// is already due, later sources cannot make that wake more immediate.
+    ///
+    /// The stored RTO deadline is a scheduling hint: for a floor-eligible
+    /// packet the *effective* deadline `sent_at + max(packet_rto, live_rto)`
+    /// is evaluated against the current estimator, and a floor packet already
+    /// due at that effective deadline while its latched stored key is still
+    /// in the future wakes the poll immediately (never waiting out a stale
+    /// latched instant).  Every returned wake time is a moment at which
+    /// `promote_due` promotes (or postpones) a real deadline, so the poll
+    /// can never spin on a not-yet-due instant.
     pub(super) fn next_deadline(
         &self,
         now: Instant,
         reorder_window: impl FnOnce() -> std::time::Duration,
+        live_rto: std::time::Duration,
     ) -> Option<Instant> {
         let mut next = self.ready_deadlines.first().map(|entry| entry.at);
         if next.is_some_and(|deadline| deadline <= now) {
             return next;
+        }
+        // Earliest-sent floor entry: the earliest live-estimator bound is
+        // `sent_at + live_rto`, so its effective deadline is the earliest
+        // wake at which `promote_due` can act on a floor packet — exact when
+        // per-packet RTOs are uniform, a safe (never-early) bound otherwise.
+        if let Some(key) = self.floor_sent.first()
+            && key.at <= now
+        {
+            let entry = self
+                .active
+                .get(&key.seq)
+                .expect("floor deadline must belong to an active packet");
+            let effective = entry.effective_rto_deadline(live_rto);
+            if effective <= now
+                && !self
+                    .ready
+                    .get(&key.seq)
+                    .is_some_and(|reasons| reasons.rto.is_some())
+            {
+                return Some(now);
+            }
+            next = Some(next.map_or(effective, |current| current.min(effective)));
         }
         if let Some(deadline) = self.rto_deadlines.first().map(|entry| entry.at) {
             next = Some(next.map_or(deadline, |current| current.min(deadline)));
@@ -567,7 +706,10 @@ impl RetransmissionIndex {
     }
 
     /// Whether any active packet is RTO-ready (promoted) or has an RTO
-    /// deadline that is due now, applying the live-estimator floor lazily.
+    /// deadline that is due now.  A floor-eligible packet is due iff its
+    /// *effective* deadline `sent_at + max(packet_rto, live_rto)` has passed
+    /// — evaluated live, so a latched-up stored key can never make the index
+    /// disagree with the estimator-driven send-window scans.
     pub(super) fn has_rto_due(&self, now: Instant, live_rto: std::time::Duration) -> bool {
         if self.rto_ready_count > 0 {
             return true;
@@ -580,13 +722,9 @@ impl RetransmissionIndex {
                     .active
                     .get(&deadline.seq)
                     .expect("RTO deadline must belong to an active packet");
-                let effective_deadline = if entry.apply_live_rto_floor {
-                    entry.rto_at.max(entry.sent_at + live_rto)
-                } else {
-                    entry.rto_at
-                };
-                effective_deadline <= now
+                entry.effective_rto_deadline(live_rto) <= now
             })
+            || self.has_stuck_rto_due(now, live_rto)
     }
 
     pub(super) fn last_active(&self) -> Option<SequenceNumber> {
@@ -663,7 +801,10 @@ mod tests {
             pre_outage_eligible: false,
         });
         index.set_reason(sq(0), ReadyReason::FastLoss, Some(t0 + ms(50)));
-        assert_eq!(index.next_deadline(t0, || ms(100)), Some(t0 + ms(40)));
+        assert_eq!(
+            index.next_deadline(t0, || ms(100), ms(100)),
+            Some(t0 + ms(40))
+        );
         index.deactivate(sq(0));
         index.activate(RetransmissionActivation {
             seq: sq(1),
@@ -675,9 +816,15 @@ mod tests {
             pre_outage_eligible: false,
         });
         index.set_reason(sq(1), ReadyReason::FastLoss, Some(t0 + ms(50)));
-        assert_eq!(index.next_deadline(t0, || ms(100)), Some(t0 + ms(50)));
+        assert_eq!(
+            index.next_deadline(t0, || ms(100), ms(100)),
+            Some(t0 + ms(50))
+        );
         index.set_reason(sq(1), ReadyReason::FastLoss, None);
-        assert_eq!(index.next_deadline(t0, || ms(100)), Some(t0 + ms(100)));
+        assert_eq!(
+            index.next_deadline(t0, || ms(100), ms(100)),
+            Some(t0 + ms(100))
+        );
     }
 
     #[test]
@@ -723,18 +870,26 @@ mod tests {
         index.set_reason(sq(0), ReadyReason::FastLoss, Some(t0 + ms(50)));
         let reorder_window_read = Cell::new(false);
         assert_eq!(
-            index.next_deadline(t0 + ms(60), || {
-                reorder_window_read.set(true);
+            index.next_deadline(
+                t0 + ms(60),
+                || {
+                    reorder_window_read.set(true);
+                    ms(100)
+                },
                 ms(100)
-            }),
+            ),
             Some(t0 + ms(50))
         );
         assert!(!reorder_window_read.get());
 
-        assert!(index.has_due(t0 + ms(60), || {
-            reorder_window_read.set(true);
+        assert!(index.has_due(
+            t0 + ms(60),
+            || {
+                reorder_window_read.set(true);
+                ms(100)
+            },
             ms(100)
-        }));
+        ));
         assert!(!reorder_window_read.get());
     }
 
@@ -822,19 +977,19 @@ mod tests {
         assert!(index.has_rto_due(t0 + ms(900), ms(900)));
         assert_eq!(index.promote_due(t0 + ms(500), ms(100), ms(900)), 1);
         assert_eq!(index.rto_ready_count, 0);
-        assert!(!index.has_due(t0 + ms(500), || ms(100)));
+        assert!(!index.has_due(t0 + ms(500), || ms(100), ms(900)));
         assert_eq!(
-            index.next_deadline(t0 + ms(500), || ms(100)),
+            index.next_deadline(t0 + ms(500), || ms(100), ms(900)),
             Some(t0 + ms(900))
         );
         // A second promote before the floored deadline is a no-op.
         assert_eq!(index.promote_due(t0 + ms(800), ms(100), ms(900)), 0);
-        assert!(!index.has_due(t0 + ms(800), || ms(100)));
+        assert!(!index.has_due(t0 + ms(800), || ms(100), ms(900)));
         // At the floored deadline the packet becomes RTO-ready.
         assert_eq!(index.promote_due(t0 + ms(900), ms(100), ms(900)), 0);
         assert_eq!(index.rto_ready_count, 1);
         assert!(index.has_rto_due(t0 + ms(900), ms(900)));
-        assert!(index.has_due(t0 + ms(900), || ms(100)));
+        assert!(index.has_due(t0 + ms(900), || ms(100), ms(900)));
         let (seq, _) = index.first_ready().unwrap();
         assert_eq!(seq, sq(0));
 
@@ -855,12 +1010,54 @@ mod tests {
         assert!(tail.has_rto_due(t0 + ms(300), ms(900)));
         assert_eq!(tail.promote_due(t0 + ms(300), ms(100), ms(900)), 0);
         assert_eq!(tail.rto_ready_count, 1);
-        assert!(tail.has_due(t0 + ms(300), || ms(100)));
+        assert!(tail.has_due(t0 + ms(300), || ms(100), ms(900)));
         let (seq, _) = tail.first_ready().unwrap();
         assert_eq!(seq, sq(0));
         tail.deactivate(sq(0));
         assert_eq!(tail.rto_ready_count, 0);
         assert!(!tail.has_rto_due(t0 + ms(300), ms(900)));
+    }
+
+    #[test]
+    fn a_cleared_live_rto_repromotes_a_latched_stale_deadline_at_the_true_deadline() {
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        // A floor-eligible packet with a 500 ms RTO deadline at activation.
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(500),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        // Live estimator grows to 900 ms: the stored deadline is latched up.
+        assert_eq!(index.promote_due(t0 + ms(500), ms(100), ms(900)), 1);
+        assert_eq!(
+            index.next_deadline(t0 + ms(500), || ms(100), ms(900)),
+            Some(t0 + ms(900))
+        );
+        // Now the estimator clears to 200 ms (still below the packet's own
+        // 500 ms RTO): the true deadline is sent_at + max(500, 200) = 500 ms,
+        // already passed, while the latched stored key is at 900 ms.
+        let due_now = t0 + ms(600);
+        assert!(due_now < t0 + ms(900), "test requires now < latched key");
+        // Scans compute max(packet_rto, live_rto) live and declare the packet
+        // lost; the index must agree instead of withholding repair until the
+        // stale latched instant.
+        assert!(index.has_rto_due(due_now, ms(200)));
+        assert!(index.has_due(due_now, || ms(100), ms(200)));
+        // The wake must be immediate, not the stale latched instant.
+        assert_eq!(
+            index.next_deadline(due_now, || ms(100), ms(200)),
+            Some(due_now)
+        );
+        // promote_due at the true deadline arms the RTO reason (no postpone).
+        assert_eq!(index.promote_due(due_now, ms(100), ms(200)), 0);
+        assert_eq!(index.rto_ready_count, 1);
+        let (seq, _) = index.first_ready().unwrap();
+        assert_eq!(seq, sq(0));
     }
 
     #[test]
