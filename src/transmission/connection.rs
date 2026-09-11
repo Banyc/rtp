@@ -1201,6 +1201,58 @@ mod tests {
         assert!(matches!(shared.next_send_wake(now), SendWake::Protocol(_)));
     }
 
+    /// Every application data write must wake the send driver, not only the
+    /// stage's empty -> non-empty edge.  A write arriving while the stage is
+    /// already non-empty (e.g. between the driver draining the stage and
+    /// parking) must still wake the driver; `Notify` coalesces, so the
+    /// redundant wake is free.
+    #[tokio::test]
+    async fn every_application_write_resumes_the_send_driver() {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observer = {
+            let observations = Arc::clone(&observations);
+            MetricsObserver::new(move |observation| {
+                observations.lock().unwrap().push(observation);
+            })
+        };
+        let mut layer = pending_layer(FrameMode::default());
+        layer.metrics_observer = Some(observer);
+        let (shared, _write_half, _read_half, _reaper) = new_connection(layer, None);
+        let application_data_requests = || {
+            observations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|observation| {
+                    matches!(
+                        observation.event,
+                        MetricsEvent::SendDriverResumeRequest(
+                            MetricsSendDriverResumeSource::ApplicationData
+                        )
+                    )
+                })
+                .count()
+        };
+        assert_eq!(shared.send(b"first").await.unwrap(), b"first".len());
+        assert_eq!(
+            application_data_requests(),
+            1,
+            "the first write must resume the send driver"
+        );
+        assert_eq!(shared.send(b"second").await.unwrap(), b"second".len());
+        assert_eq!(
+            application_data_requests(),
+            2,
+            "a write into a nonempty stage must still resume the send driver"
+        );
+        assert_eq!(shared.send(b"third").await.unwrap(), b"third".len());
+        assert_eq!(
+            application_data_requests(),
+            3,
+            "every application write must resume the send driver"
+        );
+    }
+
     #[tokio::test]
     async fn application_data_resumes_only_on_empty_to_nonempty_stage() {
         let observations = Arc::new(Mutex::new(Vec::new()));
