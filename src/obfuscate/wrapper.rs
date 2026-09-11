@@ -34,6 +34,13 @@ use crate::transmission::transmission_layer::{UnreliableRead, UnreliableWrite};
 /// plaintext.
 pub(crate) const OVERSIZE_DETECT_EXTRA: usize = 1;
 
+/// Bound on consecutive invalid datagrams dropped within one `try_recv`
+/// call before yielding back to the caller with `WouldBlock`. Without this
+/// bound a hostile peer spraying garbage at line rate would make the reader
+/// task spin on synchronous `try_recv` calls with no await point, starving
+/// the runtime. The caller re-polls (or re-selects), yielding control.
+const MAX_CONSECUTIVE_INVALID_DATAGRAMS: usize = 64;
+
 /// The obfuscation settings for one transport half: the masking key and the
 /// padding settings (`None` = historical unpadded format).
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +108,7 @@ impl<R> ObfuscatedRead<R> {
 impl<R: UnreliableRead> UnreliableRead for ObfuscatedRead<R> {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
         self.ensure_scratch(buf.len());
+        let mut invalid_count = 0usize;
         loop {
             let n = self.inner.try_recv(&mut self.scratch)?;
             match self.decrypt_into(buf, n) {
@@ -108,7 +116,15 @@ impl<R: UnreliableRead> UnreliableRead for ObfuscatedRead<R> {
                 // Not a valid obfuscated datagram: drop it and read the next.
                 // Surfacing the error would fail the connection on a single
                 // bad datagram (and, on the accept path, kill the listener).
-                Err(error) if error == std::io::ErrorKind::InvalidData => continue,
+                // Bound the consecutive drops so a junk flood cannot spin the
+                // reader without yielding; the caller re-polls/ re-selects.
+                Err(error) if error == std::io::ErrorKind::InvalidData => {
+                    invalid_count += 1;
+                    if invalid_count >= MAX_CONSECUTIVE_INVALID_DATAGRAMS {
+                        return Err(IoErr::from(std::io::ErrorKind::WouldBlock));
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
