@@ -165,6 +165,16 @@ impl<K: DispatchKey> Listener<K> {
         // Fitted ACK padding lives in the write half; the policy resolution
         // guarantees it never coexists with a padding profile.
         unreliable_layer.ack_padding = ack_padding;
+        // Control-plane authentication for no-handshake sessions: while
+        // `session_tag` is `None` the codec's `require_tag` no-ops, so an
+        // untagged spoofed KILL/ACK/ECHO_TS would be honoured. The
+        // obfuscation key is the shared secret both sides hold; derive the
+        // per-session tag from it (plus the dispatch key, so sessions
+        // sharing one key get distinct tags). Without a key there is no
+        // shared secret and the session stays on legacy behaviour (None).
+        unreliable_layer.session_tag = config
+            .obfuscation_key
+            .map(|key| crate::tag::control_plane_tag(key, Some(&dispatch_key_bytes(&conn_key))));
         let session_count = Arc::clone(&self.session_count);
         session_count.fetch_add(1, Ordering::SeqCst);
         let (read, write, supervisor) =
@@ -262,6 +272,13 @@ impl<K: DispatchKey> Connector<K> {
         // Fitted ACK padding lives in the write half; the policy resolution
         // guarantees it never coexists with a padding profile.
         unreliable_layer.ack_padding = ack_padding;
+        // Control-plane authentication for no-handshake sessions: see
+        // [`Listener::accept_with`] — the obfuscation key is the shared
+        // secret, and the dispatch key is mixed in so sessions sharing one
+        // key get distinct tags.
+        unreliable_layer.session_tag = config.obfuscation_key.map(|key| {
+            crate::tag::control_plane_tag(key, Some(&dispatch_key_bytes(&dispatch_key)))
+        });
         let (read, write, supervisor) = socket(unreliable_layer, None);
         Some(Connected {
             read,
@@ -454,6 +471,17 @@ impl DispatchKey for u128 {
     fn max_size() -> usize {
         core::mem::size_of::<Self>()
     }
+}
+
+/// The wire bytes of a dispatch key (the same bytes the listener demuxes
+/// on): folded into the session-tag derivation so each keyed session gets a
+/// tag distinct from every other session sharing the obfuscation key. Both
+/// peers hold the dispatch key, so both encode the same bytes.
+fn dispatch_key_bytes<K: DispatchKey>(key: &K) -> Vec<u8> {
+    let mut buf = vec![0u8; K::max_size()];
+    let n = K::encode(key, &mut buf).unwrap_or(0);
+    buf.truncate(n);
+    buf
 }
 
 fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<Classified<K, Packet>> {
@@ -675,6 +703,190 @@ mod tests {
             let m = &buf[..n];
             assert_eq!(m, msg_1);
         });
+        while let Some(res) = tasks.join_next().await {
+            res.unwrap();
+        }
+    }
+
+    /// Build an obfuscated datagram for a keyed session whose decrypted
+    /// plaintext is `payload`. The dispatch key stays in the clear on the
+    /// wire (the listener demuxes on it); the payload is `[nonce][ciphertext]`.
+    fn obfuscated_keyed_datagram(
+        key: u8,
+        obfuscation_key: [u8; crate::obfuscate::KEY_LEN],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use crate::obfuscate::{NONCE_LEN, apply_keystream};
+        let nonce: [u8; NONCE_LEN] = rand::random();
+        let mut wire = vec![0u8; 1 + NONCE_LEN + payload.len()];
+        wire[0] = key;
+        wire[1..1 + NONCE_LEN].copy_from_slice(&nonce);
+        wire[1 + NONCE_LEN..].copy_from_slice(payload);
+        apply_keystream(obfuscation_key, nonce, &mut wire[1 + NONCE_LEN..]);
+        wire
+    }
+
+    /// Control-plane authenticity for no-handshake sessions with an
+    /// obfuscation key: the session tag derived from the key (plus the
+    /// dispatch key) is `Some`, so (a) a forged UNTAGGED KILL datagram —
+    /// routed to the session by its plaintext dispatch key from a different
+    /// source address — is rejected as `Unauthenticated` and dropped, and
+    /// (b) a valid TAGGED KILL (same derivation, obfuscated with the same
+    /// key) round-trips and terminates the peer's read half.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_obfuscation_key_authenticates_control_plane_against_forged_kills() {
+        use crate::codec::encode_kill;
+        use crate::obfuscate::KEY_LEN;
+        use std::time::Duration;
+
+        const KEY: [u8; KEY_LEN] = [7; KEY_LEN];
+        const KILL_CMD: u8 = 0x02;
+
+        let server = Arc::new(Listener::<u8>::bind("127.0.0.1:0").await.unwrap());
+        let addr = server.local_addr();
+        let key = 42_u8;
+        // The tag both sides derive for this session (obfuscation key +
+        // the dispatch key's wire bytes).
+        let tag = crate::tag::control_plane_tag(KEY, Some(&[key]));
+
+        let session_established = Arc::new(tokio::sync::Notify::new());
+        let forgery_sent = Arc::new(tokio::sync::Notify::new());
+        let msg2_confirmed = Arc::new(tokio::sync::Notify::new());
+        let release_client = Arc::new(tokio::sync::Notify::new());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        // Attacker: a DIFFERENT source socket — the listener demuxes on the
+        // dispatch key and ignores the source address, so the forgery is
+        // routed to the established session.
+        {
+            let session_established = Arc::clone(&session_established);
+            let forgery_sent = Arc::clone(&forgery_sent);
+            let msg2_confirmed = Arc::clone(&msg2_confirmed);
+            tasks.spawn(async move {
+                let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                // (a) forged UNTAGGED kill, once the session exists.
+                session_established.notified().await;
+                let forged = obfuscated_keyed_datagram(key, KEY, &[KILL_CMD]);
+                attacker.send_to(&forged, addr).await.unwrap();
+                forgery_sent.notify_one();
+                // (b) valid TAGGED kill, after the survival of (a) is proven.
+                msg2_confirmed.notified().await;
+                let mut plaintext = vec![0u8; 16];
+                let n = encode_kill(Some(tag), &mut plaintext).unwrap();
+                let tagged = obfuscated_keyed_datagram(key, KEY, &plaintext[..n]);
+                attacker.send_to(&tagged, addr).await.unwrap();
+            });
+        }
+        // Server: accepts the session, proves the forged kill is dropped by
+        // reading real traffic afterwards, then observes the tagged kill.
+        {
+            let server = Arc::clone(&server);
+            let session_established = Arc::clone(&session_established);
+            let msg2_confirmed = Arc::clone(&msg2_confirmed);
+            let release_client = Arc::clone(&release_client);
+            tasks.spawn(async move {
+                let server = Arc::clone(&server);
+                let mut accepted = server
+                    .accept_with(AcceptConfig {
+                        obfuscation_key: Some(KEY),
+                        ..AcceptConfig::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(accepted.dispatch_key, key);
+                let mut keepalive = tokio::task::JoinSet::new();
+                {
+                    let server = Arc::clone(&server);
+                    keepalive.spawn(async move {
+                        loop {
+                            let _ = server
+                                .accept_with(AcceptConfig {
+                                    obfuscation_key: Some(KEY),
+                                    ..AcceptConfig::default()
+                                })
+                                .await;
+                        }
+                    });
+                }
+                let mut buf = vec![0; 1024];
+                let n = tokio::time::timeout(Duration::from_secs(5), accepted.read.recv(&mut buf))
+                    .await
+                    .expect("server: timed out waiting for hello")
+                    .unwrap();
+                assert_eq!(&buf[..n], b"hello");
+                accepted.write.send(b"echo").await.unwrap();
+                accepted.write.send_buf_empty().await.unwrap();
+                session_established.notify_one();
+                // The forged untagged kill has now been sent. If it were
+                // honoured, the session would be torn down and this read would
+                // fail — succeeding proves it was dropped as Unauthenticated.
+                let n = tokio::time::timeout(Duration::from_secs(5), accepted.read.recv(&mut buf))
+                    .await
+                    .expect("server: timed out waiting for the survival probe")
+                    .expect("a forged untagged KILL killed the session");
+                assert_eq!(
+                    &buf[..n],
+                    b"second hello",
+                    "a forged untagged KILL must not kill the session"
+                );
+                msg2_confirmed.notify_one();
+                // The tagged kill round-trips: the session dies.
+                let err =
+                    tokio::time::timeout(Duration::from_secs(5), accepted.read.recv(&mut buf))
+                        .await
+                        .expect("server: timed out waiting for the tagged kill")
+                        .unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+                // Only now may the client drop its session (its teardown traffic
+                // would otherwise race the kill above).
+                release_client.notify_one();
+            });
+        }
+        // Client: a normal keyed session under the same obfuscation key.
+        {
+            let forgery_sent = Arc::clone(&forgery_sent);
+            let release_client = Arc::clone(&release_client);
+            tasks.spawn(async move {
+                let client = Arc::new(
+                    Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+                        .await
+                        .unwrap(),
+                );
+                let mut dispatch = tokio::task::JoinSet::new();
+                {
+                    let client = Arc::clone(&client);
+                    dispatch.spawn(async move {
+                        loop {
+                            client.dispatch().await.unwrap();
+                        }
+                    });
+                }
+                let mut accepted = client
+                    .open_without_handshake_with(
+                        key,
+                        AcceptConfig {
+                            obfuscation_key: Some(KEY),
+                            ..AcceptConfig::default()
+                        },
+                    )
+                    .unwrap();
+                accepted.write.send(b"hello").await.unwrap();
+                // The survival probe goes out only after the forgery is on the
+                // wire, so a vulnerable session would die before reading it.
+                forgery_sent.notified().await;
+                accepted.write.send(b"second hello").await.unwrap();
+                let mut buf = vec![0; 16];
+                let n = tokio::time::timeout(Duration::from_secs(5), accepted.read.recv(&mut buf))
+                    .await
+                    .expect("client: timed out waiting for the echo")
+                    .unwrap();
+                assert_eq!(&buf[..n], b"echo");
+                // Hold the session until the server has observed the tagged kill,
+                // so this session's teardown cannot race the server's BrokenPipe
+                // read (see the server task).
+                release_client.notified().await;
+            });
+        }
         while let Some(res) = tasks.join_next().await {
             res.unwrap();
         }

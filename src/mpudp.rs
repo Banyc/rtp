@@ -172,6 +172,15 @@ async fn convert_conn(
     // Fitted ACK padding lives in the write half; the policy resolution
     // guarantees it never coexists with a padding profile.
     unreliable_layer.ack_padding = ack_padding;
+    // Control-plane authentication for no-handshake sessions: while
+    // `session_tag` is `None` the codec's `require_tag` no-ops, so an
+    // untagged spoofed KILL/ACK/ECHO_TS would be honoured. The obfuscation
+    // key is the shared secret both sides hold; derive the per-session tag
+    // from it. Without a key there is no shared secret and the session
+    // stays on legacy behaviour (None).
+    unreliable_layer.session_tag = tuning
+        .obfuscation_key
+        .map(|key| crate::tag::control_plane_tag(key, None));
     let (read, write, supervisor) = socket(unreliable_layer, log_config);
     let conn = Conn {
         read,
@@ -211,10 +220,16 @@ impl UnreliableRead for MpUdpRead {
 #[async_trait]
 impl UnreliableWrite for MpUdpWrite {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+        // Errors are normalized exactly like the udp/keyed transports:
+        // transient send-buffer exhaustion (ENOBUFS on macOS/Linux) becomes
+        // WouldBlock — a drop-and-retransmit condition — instead of a fatal
+        // data-write error that would tear the session down. The send's
+        // byte count includes the mpudp header, so the caller's byte count
+        // (`buf.len()`) is reported.
         MpUdpWrite::send(self, buf)
             .await
             .map(|_| buf.len())
-            .map_err(IoErr::from)
+            .map_err(crate::udp::normalize_send_err)
     }
 }
 

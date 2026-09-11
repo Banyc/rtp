@@ -12,6 +12,7 @@ mod recv_queue;
 mod reliable;
 mod sequence;
 pub mod socket;
+mod tag;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod traffic_shaping;
