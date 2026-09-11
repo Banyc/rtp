@@ -141,6 +141,22 @@ impl ReadHalf {
                         continue;
                     }
                 };
+                // Bound receive-side byte amplification: legitimate payloads
+                // never exceed the MSS-derived maximum (mss - codec overhead
+                // - TRUNCATION_DETECTION_BYTES). FRAME_DATA_TS first-frame
+                // packets carry a 4-byte frame_len header, so their payload
+                // budget is 4 bytes smaller.
+                if let Some(ref d) = data.data {
+                    let max_payload = shared.max_data_size_per_pkt();
+                    let max_payload = if d.frame_len.is_some() {
+                        max_payload.saturating_sub(4)
+                    } else {
+                        max_payload
+                    };
+                    if d.buf_range.len() > max_payload {
+                        continue;
+                    }
+                }
                 if let Some(echo_ts) = data.echo_ts {
                     let local_ts = shared.wire_ts(now);
                     if recent_echoes.should_sample(echo_ts, now)

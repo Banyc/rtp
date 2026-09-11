@@ -236,6 +236,9 @@ impl Connection {
         self.reliable_layer.lock().unwrap().recv_window_full()
     }
 
+    pub(crate) fn max_data_size_per_pkt(&self) -> usize {
+        self.reliable_layer.lock().unwrap().max_data_size_per_pkt()
+    }
     #[cfg(test)]
     pub(crate) fn send_data_buf_capacity_for_test(&self) -> usize {
         self.reliable_layer.lock().unwrap().send_data_buf_capacity()
