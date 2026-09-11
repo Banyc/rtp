@@ -487,17 +487,21 @@ impl Connection {
     }
 
     pub async fn no_data_to_send(&self) -> Result<(), IoErr> {
-        let mut sent_pkt_acked = self.signals.sent_pkt_acked().notified();
+        let sent_pkt_acked = self.signals.sent_pkt_acked().notified();
+        tokio::pin!(sent_pkt_acked);
         loop {
             self.termination.check_error()?;
+            // Arm the notification before inspecting the send buffer so an
+            // ack between the check and the await is never lost.
+            sent_pkt_acked.as_mut().enable();
             if self.reliable_layer.lock().unwrap().is_no_data_to_send() {
                 return Ok(());
             }
             tokio::select! {
-                () = sent_pkt_acked => (),
+                () = &mut sent_pkt_acked => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            sent_pkt_acked = self.signals.sent_pkt_acked().notified();
+            sent_pkt_acked.set(self.signals.sent_pkt_acked().notified());
         }
     }
 
@@ -575,12 +579,16 @@ impl Connection {
         if self.reliable_layer.lock().unwrap().frame_delivery_enabled() {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        let mut recv_data_pkt = self.signals.recv_data_pkt().notified();
+        let recv_data_pkt = self.signals.recv_data_pkt().notified();
+        tokio::pin!(recv_data_pkt);
         let read_bytes = loop {
             self.termination.check_error()?;
             if self.signals.recv_eof().is_cancelled() {
                 return Ok(0);
             }
+            // Arm the notification before inspecting the receive buffer so
+            // a delivery between the check and the await is never lost.
+            recv_data_pkt.as_mut().enable();
             let (read_bytes, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let read_bytes = reliable_layer.recv_data_buf(data);
@@ -608,18 +616,22 @@ impl Connection {
                 continue;
             }
             tokio::select! {
-                () = recv_data_pkt => (),
+                () = &mut recv_data_pkt => (),
                 () = self.termination.terminal().cancelled() => (),
             }
-            recv_data_pkt = self.signals.recv_data_pkt().notified();
+            recv_data_pkt.set(self.signals.recv_data_pkt().notified());
         };
         Ok(read_bytes)
     }
 
     pub async fn recv_frame(&self) -> Result<Option<Vec<u8>>, IoErr> {
-        let mut recv_data_pkt = self.signals.recv_data_pkt().notified();
+        let recv_data_pkt = self.signals.recv_data_pkt().notified();
+        tokio::pin!(recv_data_pkt);
         loop {
             self.termination.check_error()?;
+            // Arm the notification before inspecting the frame buffer so a
+            // delivery between the check and the await is never lost.
+            recv_data_pkt.as_mut().enable();
             let (res, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let res = reliable_layer.recv_frame_buf();
@@ -640,10 +652,10 @@ impl Connection {
                 }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
                     tokio::select! {
-                        () = recv_data_pkt => (),
+                        () = &mut recv_data_pkt => (),
                         () = self.termination.terminal().cancelled() => (),
                     }
-                    recv_data_pkt = self.signals.recv_data_pkt().notified();
+                    recv_data_pkt.set(self.signals.recv_data_pkt().notified());
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1181,5 +1193,160 @@ mod tests {
             1,
             "further nonempty-stage writes stay silent on the resume request"
         );
+    }
+
+    #[tokio::test]
+    async fn recv_wakes_when_payload_arrives_after_it_starts_waiting() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        let mut buf = [0u8; 64];
+        let mut recv = Box::pin(shared.recv(&mut buf));
+        // First poll: the buffer is empty, so `recv` arms the notification
+        // and parks. (Previously the future was not registered until the
+        // first poll inside the select; a payload published in between the
+        // empty-buffer check and that poll was a lost wakeup.)
+        assert!(
+            tokio::select! {
+                result = &mut recv => panic!("recv returned before any payload: {result:?}"),
+                () = tokio::task::yield_now() => true,
+            },
+            "recv must park on an empty receive buffer"
+        );
+        // The read driver delivers a payload, then publishes the receive
+        // wake (read_half's `publish_data_received`).
+        {
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+            reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(0), None, b"hi");
+        }
+        shared.publish_data_received();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), &mut recv)
+            .await
+            .expect("a published payload must wake the parked receiver")
+            .unwrap();
+        assert_eq!(n, 2);
+        drop(recv);
+        assert_eq!(&buf[..2], b"hi");
+    }
+
+    #[tokio::test]
+    async fn recv_returns_payload_already_buffered_without_waiting() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        {
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+            reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(0), None, b"pre");
+        }
+        let mut buf = [0u8; 64];
+        // No publish at all: the buffer-check-first path must satisfy the
+        // call without any notification.
+        let n = shared.recv(&mut buf).await.unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"pre");
+    }
+
+    #[tokio::test]
+    async fn recv_returns_zero_after_eof_is_published() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        let mut buf = [0u8; 64];
+        let mut recv = Box::pin(shared.recv(&mut buf));
+        assert!(
+            tokio::select! {
+                result = &mut recv => panic!("recv returned before any FIN: {result:?}"),
+                () = tokio::task::yield_now() => true,
+            },
+            "recv must park on an empty receive buffer"
+        );
+        // Deliver the peer FIN (empty payload at the contiguous seq), then
+        // publish the receive wake exactly as the read driver would.
+        {
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+            reliable.recv_data_pkt(crate::sequence::SequenceNumber::from_wire(0), None, b"");
+        }
+        shared.publish_data_received();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), &mut recv)
+            .await
+            .expect("a published FIN must wake the parked receiver");
+        assert_eq!(read.unwrap(), 0, "recv must return Ok(0) at EOF");
+    }
+
+    #[tokio::test]
+    async fn recv_frame_wakes_when_a_frame_arrives_after_it_starts_waiting() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::enabled()), None);
+        let mut recv_frame = Box::pin(shared.recv_frame());
+        assert!(
+            tokio::select! {
+                result = &mut recv_frame => panic!("recv_frame returned before any frame: {result:?}"),
+                () = tokio::task::yield_now() => true,
+            },
+            "recv_frame must park on an empty frame buffer"
+        );
+        // Deliver the whole frame in one packet (frame_len == payload), then
+        // publish the receive wake exactly as the read driver would.
+        {
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+            reliable.recv_data_pkt(
+                crate::sequence::SequenceNumber::from_wire(0),
+                Some(2),
+                b"hi",
+            );
+        }
+        shared.publish_data_received();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), &mut recv_frame)
+            .await
+            .expect("a published frame must wake the parked frame receiver");
+        assert_eq!(frame.unwrap(), Some(b"hi".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn no_data_to_send_wakes_when_the_last_in_flight_packet_is_acked() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        let now = Instant::now();
+        {
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+            assert_eq!(
+                reliable.send_data_buf(&[0u8; 100], now).unwrap(),
+                100,
+                "staging must succeed"
+            );
+            let mut pkt = vec![0u8; crate::udp::NO_FEC_MSS];
+            let sent = reliable
+                .send_data_pkt(&mut pkt, now)
+                .expect("a packet must go out");
+            match sent.data_written {
+                crate::reliable::reliable_layer::DataPktPayload::Data(_) => (),
+                _ => panic!("expected a data packet"),
+            }
+            assert!(
+                !reliable.is_no_data_to_send(),
+                "an in-flight packet must prevent the drain wait from completing"
+            );
+        }
+        let mut drained = Box::pin(shared.no_data_to_send());
+        assert!(
+            tokio::select! {
+                result = &mut drained => panic!("no_data_to_send returned while a packet is in flight: {result:?}"),
+                () = tokio::task::yield_now() => true,
+            },
+            "no_data_to_send must park while a packet is in flight"
+        );
+        // The read driver acks the in-flight packet and publishes the ack
+        // wake exactly as `read_half` does after processing a peer ACK.
+        {
+            let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+            let next_seq = reliable.pkt_send_space().next_seq();
+            let acks = [crate::ack::AckInterval {
+                start: crate::sequence::SequenceNumber::ZERO,
+                size: core::num::NonZeroU64::new(next_seq.to_wire()).unwrap(),
+            }];
+            reliable.recv_ack_pkt(crate::ack::AckBlocks::new(next_seq, &acks), now);
+        }
+        shared.publish_packet_acknowledged();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut drained)
+            .await
+            .expect("an ack must wake the parked drain wait")
+            .expect("no_data_to_send must succeed after the in-flight packet is acked");
     }
 }
