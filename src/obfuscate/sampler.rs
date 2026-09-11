@@ -80,7 +80,7 @@ impl DataSizeSampler {
     /// have been observed. Cheap: copying and sorting at most `WINDOW`
     /// `u16`s, at most once per [`FIT_INTERVAL`].
     fn refit_if_stale(&mut self, now: Instant) {
-        if !self.fit.is_none_or(|fit| now >= fit.refit_at) {
+        if self.fit.is_some_and(|fit| now < fit.refit_at) {
             return;
         }
         if self.count < MIN_SAMPLES {

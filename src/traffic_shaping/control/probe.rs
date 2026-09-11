@@ -9,7 +9,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 const MAGIC: [u8; 8] = [0xf7, b'R', b'T', b'P', b'E', b'X', 1, 0];
 pub const PROBE_LEN: usize = 32;
@@ -194,12 +194,16 @@ struct RateLimiter {
 impl RateLimiter {
     fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
         if !self.buckets.contains_key(&source) && self.buckets.len() >= MAX_TRACKED_SOURCES {
-            self.buckets.retain(|_, bucket| {
-                let elapsed = now.duration_since(bucket.updated).as_secs_f64();
-                (bucket.tokens + elapsed * RATE_PER_SOURCE) < BURST_PER_SOURCE
-            });
-            if self.buckets.len() >= MAX_TRACKED_SOURCES {
-                return false;
+            // Full map: evict a single arbitrary bucket in (amortized)
+            // constant time. The previous full-map `retain` scan could
+            // evict nothing when every bucket was still refilling and ran
+            // once per NEW source — a spoofed-source probe flood cost
+            // O(sources × MAX_TRACKED_SOURCES) bucket work. Any bucket is
+            // a defensible victim: a wrongly evicted live source just
+            // re-enters with a fresh burst on its next probe and stays
+            // rate limited per source.
+            if let Some(victim) = self.buckets.keys().next().copied() {
+                self.buckets.remove(&victim);
             }
         }
         self.buckets
@@ -387,6 +391,44 @@ impl ProbeResponder {
         Observe::Consumed
     }
 }
+/// The nonces of probes in flight on the client: an echo is only accepted
+/// when its nonce matches a probe this client actually sent, so a forging
+/// peer cannot plant a fake RTT sample with an arbitrary nonce. Entries are
+/// pruned by age, so the set stays bounded even when probes are never
+/// answered or the caller rotates nonces.
+#[derive(Debug, Default)]
+struct OutstandingEchoes {
+    sent_at: HashMap<u64, Instant>,
+}
+impl OutstandingEchoes {
+    /// How long a sent probe stays "in flight" before its nonce stops being
+    /// accepted (generous vs. any realistic probe RTT; matches the sender
+    /// having given up on the echo long since).
+    const TTL: Duration = Duration::from_secs(10);
+    /// Hard cap (belt and braces): a pathological sender that floods unique
+    /// nonces cannot grow the set without bound.
+    const MAX: usize = 256;
+
+    fn mark_sent(&mut self, nonce: u64, now: Instant) {
+        self.prune(now);
+        self.sent_at.insert(nonce, now);
+        if self.sent_at.len() > Self::MAX {
+            // Evict one arbitrary outstanding nonce; entries are pruned by
+            // TTL anyway, this only bounds a misbehaving caller.
+            if let Some(victim) = self.sent_at.keys().next().copied() {
+                self.sent_at.remove(&victim);
+            }
+        }
+    }
+    fn is_outstanding(&mut self, nonce: u64, now: Instant) -> bool {
+        self.prune(now);
+        self.sent_at.contains_key(&nonce)
+    }
+    fn prune(&mut self, now: Instant) {
+        self.sent_at
+            .retain(|_, at| now.duration_since(*at) <= Self::TTL);
+    }
+}
 #[derive(Debug)]
 pub struct EchoDemux {
     socket: Arc<tokio_udp::UdpSocket>,
@@ -401,9 +443,18 @@ pub struct EchoDemux {
     settings: PaddingSettings,
     /// Reused scratch for encoding obfuscated probes.
     scratch: Vec<u8>,
+    /// In-flight probe nonces, shared with the read-side filter so an echo
+    /// is only demuxed when it answers a probe this client sent.
+    outstanding: Arc<Mutex<OutstandingEchoes>>,
 }
 impl EchoDemux {
     pub fn send_probe(&mut self, echo: ProbeEcho) -> std::io::Result<()> {
+        // Register the nonce BEFORE the wire write, so an echo that races
+        // back cannot arrive before the demux expects it.
+        self.outstanding
+            .lock()
+            .unwrap()
+            .mark_sent(echo.nonce, Instant::now());
         match self.key {
             Some(key) => {
                 encode_probe_obfuscated(echo, key, self.settings, &mut self.scratch);
@@ -437,11 +488,13 @@ pub(crate) fn client_echo_demux<R: UnreliableRead>(
         .peer_addr()
         .map(|addr| addr.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let outstanding = Arc::new(Mutex::new(OutstandingEchoes::default()));
     let read = EchoInterceptRead {
         inner: read,
         echo_tx,
         dropped_echoes: Arc::clone(&dropped_echoes),
         limiter: Mutex::new(RateLimiter::default()),
+        outstanding: Arc::clone(&outstanding),
         peer_ip,
     };
     (
@@ -452,6 +505,7 @@ pub(crate) fn client_echo_demux<R: UnreliableRead>(
             key,
             settings,
             scratch: Vec::new(),
+            outstanding,
         },
         read,
     )
@@ -462,6 +516,9 @@ pub(crate) struct EchoInterceptRead<R> {
     echo_tx: tokio::sync::mpsc::Sender<ProbeEcho>,
     dropped_echoes: Arc<AtomicUsize>,
     limiter: Mutex<RateLimiter>,
+    /// In-flight probe nonces (shared with the send-side demux); an echo is
+    /// only demuxed when its nonce matches an outstanding probe.
+    outstanding: Arc<Mutex<OutstandingEchoes>>,
     peer_ip: IpAddr,
 }
 impl<R> EchoInterceptRead<R> {
@@ -482,15 +539,32 @@ impl<R> EchoInterceptRead<R> {
         } else {
             return Some(());
         };
-        if let Some(echo) = decode_echo(core) {
-            let now = Instant::now();
-            if self.limiter.lock().unwrap().allow(self.peer_ip, now)
-                && self.echo_tx.try_send(echo).is_ok()
-            {
-                return None;
-            }
-            self.dropped_echoes.fetch_add(1, Ordering::Relaxed);
+        // Only a direction-flipped probe core is an echo candidate; a
+        // datagram that merely carries the probe prefix (data, or a stray
+        // probe) is routed to the data path, not swallowed.
+        let Some(echo) = decode_echo(core) else {
+            return Some(());
+        };
+        // Do not accept echoes for probes this client never sent (or that
+        // aged out): a forging peer with no outstanding nonce cannot plant
+        // a fake RTT sample. Unknown-nonce echoes fall through to the data
+        // path — they are not swallowed, so they cannot black-hole
+        // legitimate data that happens to carry the probe prefix either.
+        let now = Instant::now();
+        if !self
+            .outstanding
+            .lock()
+            .unwrap()
+            .is_outstanding(echo.nonce, now)
+        {
+            return Some(());
         }
+        if self.limiter.lock().unwrap().allow(self.peer_ip, now)
+            && self.echo_tx.try_send(echo).is_ok()
+        {
+            return None;
+        }
+        self.dropped_echoes.fetch_add(1, Ordering::Relaxed);
         None
     }
 }
@@ -675,11 +749,15 @@ mod tests {
             timestamp_micros: 2,
         });
         probe[DIR_OFFSET] = DIR_ECHO;
+        // The echoed nonce must be in flight for the demux to accept it.
+        let outstanding = Arc::new(Mutex::new(OutstandingEchoes::default()));
+        outstanding.lock().unwrap().mark_sent(1, Instant::now());
         let mut read = EchoInterceptRead {
             inner: EchoFeed(vec![probe.to_vec(); 3], 0),
             echo_tx,
             dropped_echoes: Arc::clone(&dropped),
             limiter: Mutex::new(RateLimiter::default()),
+            outstanding,
             peer_ip: "127.0.0.1".parse().unwrap(),
         };
         let mut buf = [0; PROBE_LEN];
@@ -706,6 +784,128 @@ mod tests {
         );
         assert!(echoes.try_recv().is_err());
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn echo_intercept_rejects_forged_echoes_with_unknown_nonces() {
+        let (echo_tx, mut echoes) = tokio::sync::mpsc::channel(4);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        // Only nonce 7 is in flight; every other echo is forged or data.
+        let outstanding = Arc::new(Mutex::new(OutstandingEchoes::default()));
+        outstanding.lock().unwrap().mark_sent(7, Instant::now());
+        let mut legit = encode_probe(ProbeEcho {
+            nonce: 7,
+            timestamp_micros: 2,
+        });
+        legit[DIR_OFFSET] = DIR_ECHO;
+        let mut forged = encode_probe(ProbeEcho {
+            nonce: 0xBAD_BEEF,
+            timestamp_micros: 99,
+        });
+        forged[DIR_OFFSET] = DIR_ECHO;
+        let mut read = EchoInterceptRead {
+            inner: EchoFeed(vec![forged.to_vec(), legit.to_vec(), forged.to_vec()], 0),
+            echo_tx,
+            dropped_echoes: Arc::clone(&dropped),
+            limiter: Mutex::new(RateLimiter::default()),
+            outstanding,
+            peer_ip: "127.0.0.1".parse().unwrap(),
+        };
+        let mut buf = [0; PROBE_LEN];
+        let mut data = Vec::new();
+        loop {
+            match read.try_recv(&mut buf) {
+                Ok(n) => data.push(buf[..n].to_vec()),
+                Err(error) if error == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("mock feed failed: {error:?}"),
+            }
+        }
+        // Forged echoes (unknown nonce) are NOT swallowed as probe echoes:
+        // they fall through to the data path, so attacker timestamps never
+        // reach the tap and probe-prefix data is not black-holed.
+        assert_eq!(data.len(), 2, "forged echoes must fall through");
+        assert_eq!(
+            &data[0][..],
+            &forged[..],
+            "first forged echo is routed as data"
+        );
+        assert_eq!(
+            &data[1][..],
+            &forged[..],
+            "second forged echo is routed as data"
+        );
+        // Exactly the legit echo (outstanding nonce) reaches the tap.
+        assert_eq!(
+            echoes.try_recv(),
+            Ok(ProbeEcho {
+                nonce: 7,
+                timestamp_micros: 2
+            })
+        );
+        assert!(echoes.try_recv().is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn outstanding_nonces_expire_after_the_ttl() {
+        let mut outstanding = OutstandingEchoes::default();
+        let t0 = Instant::now();
+        outstanding.mark_sent(1, t0);
+        assert!(outstanding.is_outstanding(1, t0 + Duration::from_secs(1)));
+        assert!(
+            !outstanding.is_outstanding(1, t0 + OutstandingEchoes::TTL + Duration::from_secs(1)),
+            "a probe that aged out must no longer be accepted"
+        );
+        assert!(
+            !outstanding.is_outstanding(2, t0),
+            "a never-sent nonce is not outstanding"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_new_source_eviction_is_bounded_and_keeps_working() {
+        let mut limiter = RateLimiter::default();
+        let t0 = Instant::now();
+        let src = |net: u8, i: usize| {
+            IpAddr::V4(Ipv4Addr::new(203, net, (i / 256) as u8, (i % 256) as u8))
+        };
+        // Fill the map to the tracking bound with distinct sources.
+        for i in 0..MAX_TRACKED_SOURCES {
+            assert!(limiter.allow(src(0, i), t0));
+        }
+        assert_eq!(limiter.buckets.len(), MAX_TRACKED_SOURCES);
+        // A full-map new source evicts a single arbitrary bucket (constant
+        // time, not a full-map scan) and is served: the map never exceeds
+        // the bound.
+        let newcomer = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        assert!(limiter.allow(newcomer, t0), "new sources are still served");
+        assert_eq!(
+            limiter.buckets.len(),
+            MAX_TRACKED_SOURCES,
+            "the bucket map must never exceed MAX_TRACKED_SOURCES"
+        );
+        assert!(limiter.buckets.contains_key(&newcomer));
+        // A flood of fresh sources rotates the map with bounded size and
+        // keeps the limiter working (the old full-map retain would scan all
+        // 4096 buckets per new source here).
+        for k in 0..10_000 {
+            assert!(limiter.allow(src(1, k), t0));
+            assert_eq!(limiter.buckets.len(), MAX_TRACKED_SOURCES);
+        }
+        // Per-source rate limiting still applies after the churn: a fresh
+        // source's burst drains, and other fresh sources keep a full burst.
+        let tracked = src(1, 10_001);
+        for _ in 0..BURST_PER_SOURCE as usize {
+            assert!(limiter.allow(tracked, t0));
+        }
+        assert!(
+            !limiter.allow(tracked, t0),
+            "a tracked source's burst still drains"
+        );
+        assert!(
+            limiter.allow(src(1, 20_000), t0),
+            "fresh sources still get a full burst"
+        );
     }
 
     #[test]
