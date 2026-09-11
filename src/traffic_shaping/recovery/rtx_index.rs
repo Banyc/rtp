@@ -261,6 +261,11 @@ pub(super) struct RetransmissionIndex {
     /// latched-up stored key is still in the future — can be found without
     /// rescanning the deadline set.
     floor_sent: BTreeSet<DeadlineKey>,
+    /// Scratch buffer for [`Self::promote_due`]'s due-prefix copy. Reused
+    /// across calls so the per-tick promotion pass never allocates: the loop
+    /// body mutates the index, so the due keys cannot be iterated in place
+    /// out of the set.
+    floor_sent_scratch: Vec<DeadlineKey>,
     reorder_sent: BTreeSet<DeadlineKey>,
     ready: SequenceMap<ReadyReasons>,
     ready_deadlines: BTreeSet<DeadlineKey>,
@@ -276,6 +281,7 @@ impl RetransmissionIndex {
             active: SequenceMap::new(anchor, HALF_SEQUENCE_SPACE - 1),
             rto_deadlines: BTreeSet::new(),
             floor_sent: BTreeSet::new(),
+            floor_sent_scratch: Vec::new(),
             reorder_sent: BTreeSet::new(),
             ready: SequenceMap::new(anchor, HALF_SEQUENCE_SPACE - 1),
             ready_deadlines: BTreeSet::new(),
@@ -412,13 +418,15 @@ impl RetransmissionIndex {
         // these as lost; promote them at the true deadline so repair is not
         // withheld until the stale latched instant.  Iterated in send-time
         // order (FIFO by sequence), preserving the index's selection order.
-        for key in self
-            .floor_sent
-            .iter()
-            .take_while(|key| key.at <= now && live_rto <= now.duration_since(key.at))
-            .copied()
-            .collect::<Vec<_>>()
-        {
+        let mut floor_due = std::mem::take(&mut self.floor_sent_scratch);
+        floor_due.clear();
+        floor_due.extend(
+            self.floor_sent
+                .iter()
+                .take_while(|key| key.at <= now && live_rto <= now.duration_since(key.at))
+                .copied(),
+        );
+        for key in floor_due.iter().copied() {
             let seq = key.seq;
             if self
                 .ready
@@ -440,6 +448,7 @@ impl RetransmissionIndex {
                 self.update_ready(seq, |reasons| reasons.rto = Some(effective));
             }
         }
+        self.floor_sent_scratch = floor_due;
         while let Some(&sent) = self.reorder_sent.first() {
             let deadline = sent.at + reorder_window;
             if now < deadline {
@@ -785,6 +794,41 @@ mod tests {
             fast_loss_eligible: false,
             pre_outage_eligible: false,
         }
+    }
+
+    /// `promote_due` runs on every send-loop tick. It must not allocate a
+    /// fresh `Vec` per call: the due-prefix scratch buffer is reused, so a
+    /// second pass with the same due prefix keeps the buffer's capacity (and
+    /// therefore its allocation) unchanged.
+    #[test]
+    fn promote_due_reuses_its_scratch_buffer_across_calls() {
+        let t0 = Instant::now();
+        let live = ms(50);
+        let mut index = RetransmissionIndex::new(sq(0));
+        for i in 0..8u64 {
+            index.activate(RetransmissionActivation {
+                seq: sq(i),
+                rto_at: t0 + ms(30),
+                sent_at: t0,
+                apply_live_rto_floor: true,
+                reorder_eligible: false,
+                fast_loss_eligible: false,
+                pre_outage_eligible: false,
+            });
+        }
+        let now = t0 + live + ms(1);
+        let _ = index.promote_due(now, ms(100), live);
+        let capacity_after_first = index.floor_sent_scratch.capacity();
+        assert!(
+            capacity_after_first >= 8,
+            "the first pass must materialize all 8 due floor keys, got capacity {capacity_after_first}"
+        );
+        let _ = index.promote_due(now, ms(100), live);
+        assert_eq!(
+            index.floor_sent_scratch.capacity(),
+            capacity_after_first,
+            "a second promote_due pass with the same due prefix must reuse the scratch buffer, not allocate"
+        );
     }
 
     #[test]

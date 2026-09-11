@@ -2,6 +2,7 @@
 
 mod ack;
 mod codec;
+mod debug;
 mod delivery;
 pub mod io_err;
 pub mod keyed_udp;

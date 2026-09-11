@@ -660,11 +660,11 @@ mod tests {
                     .expect("b recv timed out")
                     .unwrap();
                 assert_eq!(&buf[..n], expected.as_slice());
-                if std::env::var("RTP_DEBUG_SEND").is_ok() && idx % 50 == 0 {
+                if crate::debug::debug_send() && idx % 50 == 0 {
                     eprintln!("[debug] b recv {idx}/{}", sent_for_server.len());
                 }
                 b_w.send(&buf[..n]).await.unwrap();
-                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                if crate::debug::debug_send() {
                     eprintln!("[debug] b echoed {idx}");
                 }
             }
@@ -749,11 +749,11 @@ mod tests {
                     .expect("b recv timed out")
                     .unwrap();
                 assert_eq!(&buf[..n], expected.as_slice());
-                if std::env::var("RTP_DEBUG_SEND").is_ok() && idx % 50 == 0 {
+                if crate::debug::debug_send() && idx % 50 == 0 {
                     eprintln!("[debug] b recv {idx}/{}", sent_for_server.len());
                 }
                 b_w.send(&buf[..n]).await.unwrap();
-                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                if crate::debug::debug_send() {
                     eprintln!("[debug] b echoed {idx}");
                 }
             }
@@ -763,7 +763,7 @@ mod tests {
         // parity counter can be read after the transfer completes.
         let sender = Arc::clone(&a_w.transmission_layer);
         for (idx, m) in sent.iter().enumerate() {
-            if std::env::var("RTP_DEBUG_SEND").is_ok() && idx % 50 == 0 {
+            if crate::debug::debug_send() && idx % 50 == 0 {
                 eprintln!("[debug] a sent {idx}/{}", sent.len());
             }
             a_w.send(m).await.unwrap();

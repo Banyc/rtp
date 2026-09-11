@@ -99,6 +99,50 @@ fn encode_to_io(error: EncodeError) -> IoErr {
     IoErr::from(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// Per-pass cache of FEC-encoded wire bytes, keyed by sequence.
+///
+/// A WouldBlocked data send retries the same seq within the pass; the retry
+/// must restore the already-minted symbol instead of re-encoding a second
+/// group slot (the phantom symbol that never traversed the wire, which also
+/// breaks the single-symbol interactive classification).  The cache is
+/// populated only when a send actually blocks, so a pass with no
+/// backpressure neither allocates nor copies.
+#[derive(Default)]
+struct FecSymbolCache {
+    by_seq: HashMap<u64, Vec<u8>>,
+}
+
+impl FecSymbolCache {
+    /// Return the wire length for `key`, restoring cached bytes into
+    /// `wire_pkt` when the seq was cached, or minting the symbol in place via
+    /// `encode` on the first attempt.  A miss does not populate the cache.
+    fn restore_or_encode(
+        &self,
+        key: u64,
+        wire_pkt: &mut [u8],
+        encode: impl FnOnce(&mut [u8]) -> usize,
+    ) -> usize {
+        match self.by_seq.get(&key) {
+            Some(cached) => {
+                wire_pkt[..cached.len()].copy_from_slice(cached);
+                cached.len()
+            }
+            None => encode(wire_pkt),
+        }
+    }
+
+    /// Remember the wire bytes for `key` after a WouldBlock so the within-pass
+    /// retry restores them.
+    fn remember(&mut self, key: u64, wire: &[u8]) {
+        self.by_seq.entry(key).or_insert_with(|| wire.to_vec());
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_seq.len()
+    }
+}
+
 impl WriteHalf {
     /// Encode one ACK page into `output`, optionally with piggybacked data
     /// appended after the ACK command (one ACK_CMD per datagram). Consumes
@@ -590,7 +634,7 @@ impl WriteHalf {
         // reuses the one symbol the group already holds.  The cache is a
         // local, so it dies when the pass ends (no stale group_id can leak
         // into a later pass).
-        let mut fec_symbol_cache: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut fec_symbol_cache = FecSymbolCache::default();
         let mut wouldblock_retry_at: Option<Instant> = None;
         // A blocked underlay must not become a spin: after this many
         // consecutive WouldBlocked sends the pass breaks so the write driver
@@ -620,7 +664,7 @@ impl WriteHalf {
                 });
                 (res, None)
             };
-            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            if crate::debug::debug_send() {
                 eprintln!(
                     "[sdp-res] conn={:x} result={}",
                     Arc::as_ptr(&self.shared) as usize,
@@ -720,33 +764,24 @@ impl WriteHalf {
                 self.data_size_sampler.observe(n);
             }
             let utp_pkt = &codec_pkt[..n];
-            // Encode the FEC symbol exactly once per seq per pass: a
-            // WouldBlocked send retries the same seq on the next iteration,
-            // and the cache below reuses the encoded wire bytes instead of
-            // re-encoding a second slot with identical bytes — the phantom
-            // symbol that never traversed the wire (and that would break the
-            // single-symbol interactive classification).  Every symbol_id in
-            // the open group therefore corresponds to a packet actually
-            // handed to the underlay in this pass.
             let send_buf: &[u8] = match self.fec.as_mut() {
                 Some(fec) => {
                     let key = p.seq.to_wire();
-                    // The first wire attempt for this seq in this pass mints
-                    // the FEC symbol into the open group exactly once and
-                    // remembers its bytes; a WouldBlocked retry reuses the
-                    // cached symbol instead of encoding a second group slot
-                    // (the phantom symbol that never traversed the wire).
-                    let entry = fec_symbol_cache.entry(key).or_insert_with(|| {
-                        let fec_n = fec.encode_data(utp_pkt, wire_pkt, instream);
-                        wire_pkt[..fec_n].to_vec()
+                    // Mint the FEC symbol into the open group exactly once
+                    // per seq per pass.  On the first attempt the symbol is
+                    // encoded in place and NOT cached; only a WouldBlock (see
+                    // the send-result arm below) caches the bytes, so the
+                    // happy path neither allocates nor copies.  A retry
+                    // restores the cached symbol instead of re-encoding a
+                    // second group slot.
+                    let len = fec_symbol_cache.restore_or_encode(key, wire_pkt, |buf| {
+                        fec.encode_data(utp_pkt, buf, instream)
                     });
-                    let len = entry.len();
-                    wire_pkt[..len].copy_from_slice(entry);
                     &wire_pkt[..len]
                 }
                 None => utp_pkt,
             };
-            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            if crate::debug::debug_send() {
                 eprintln!(
                     "[send] conn={:x} seq={} len={} recovery={} piggyback={}",
                     Arc::as_ptr(&self.shared) as usize,
@@ -757,7 +792,7 @@ impl WriteHalf {
                 );
             }
             let primary_res = self.utp_write.send(send_buf).await;
-            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            if crate::debug::debug_send() {
                 eprintln!(
                     "[send-res] seq={} result={:?}",
                     p.seq.to_wire(),
@@ -856,6 +891,12 @@ impl WriteHalf {
                                 rearm: false,
                             },
                         );
+                    }
+                    // Cache this seq's already-minted symbol so the within-pass
+                    // retry restores it instead of re-encoding a second group
+                    // slot.  Only a WouldBlock populates the cache.
+                    if self.fec.is_some() {
+                        fec_symbol_cache.remember(p.seq.to_wire(), send_buf);
                     }
                     let blocked_at = Instant::now();
                     self.shared
@@ -989,7 +1030,7 @@ impl WriteHalf {
         };
         let parity_pkts =
             send_pacer.with_token_bucket(|bucket| fec.maybe_flush_parities(bucket, now, instream));
-        if std::env::var("RTP_DEBUG_SEND").is_ok() {
+        if crate::debug::debug_send() {
             eprintln!("[fec] flush_parities: {} pkts", parity_pkts.len());
         }
         for pkt in parity_pkts {
@@ -1232,8 +1273,50 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::FecSymbolCache;
+
     fn term(l: &PeerLiveness, now: Instant, has_in_flight: bool) -> bool {
         l.should_terminate_session(now, has_in_flight)
+    }
+
+    /// The FEC symbol cache must not allocate or copy on the happy path: a
+    /// first attempt mints the symbol in place and caches nothing; only a
+    /// WouldBlock remembers the bytes, and the within-pass retry restores
+    /// them without re-encoding a second group slot.
+    #[test]
+    fn fec_symbol_cache_mints_in_place_and_only_caches_on_would_block() {
+        let mut cache = FecSymbolCache::default();
+        let mut encode_calls = 0;
+        let mut wire = [0u8; 16];
+        let len = cache.restore_or_encode(7, &mut wire, |buf| {
+            encode_calls += 1;
+            buf[..3].copy_from_slice(b"abc");
+            3
+        });
+        assert_eq!(len, 3);
+        assert_eq!(&wire[..3], b"abc");
+        assert_eq!(
+            cache.len(),
+            0,
+            "the first attempt must mint in place and cache nothing (no allocation on the happy path)"
+        );
+
+        // The send would block: remember the bytes for the retry.
+        cache.remember(7, &wire[..len]);
+        assert_eq!(cache.len(), 1);
+
+        // The retry restores the cached symbol without re-encoding.
+        let mut retry_wire = [0u8; 16];
+        let retry_len = cache.restore_or_encode(7, &mut retry_wire, |_| {
+            encode_calls += 1;
+            0
+        });
+        assert_eq!(retry_len, 3);
+        assert_eq!(&retry_wire[..3], b"abc");
+        assert_eq!(
+            encode_calls, 1,
+            "the retry must reuse the cached symbol, not re-encode a second group slot"
+        );
     }
 
     #[test]

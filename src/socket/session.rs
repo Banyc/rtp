@@ -192,7 +192,7 @@ impl WriteDriver {
                 Err(_) => return,
             };
             let next_wake = pass.wake;
-            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            if crate::debug::debug_send() {
                 eprintln!(
                     "[wake] conn={:x} next_wake={:?} ack_schedule={:?}",
                     self.write_half.debug_conn_id(),
@@ -299,7 +299,7 @@ impl ReadDriver {
                     return;
                 }
             };
-            if std::env::var("RTP_DEBUG_SEND").is_ok() {
+            if crate::debug::debug_send() {
                 eprintln!(
                     "[read-loop] batch: ack={} payload={} fin={}",
                     recv_pkts.num_ack_segments,

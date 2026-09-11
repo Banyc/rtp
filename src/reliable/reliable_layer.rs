@@ -580,7 +580,7 @@ impl ReliableLayer {
         reserved_bytes: usize,
     ) -> Option<DataPkt> {
         self.detect_application_limited_phases(now);
-        if std::env::var("RTP_DEBUG_SEND").is_ok() {
+        if crate::debug::debug_send() {
             eprintln!(
                 "[sdp] in_flight={} cwnd={} send_buf={} rtx_due={} rate={:.1}",
                 self.pkt_send_space.num_in_flight_pkts(),

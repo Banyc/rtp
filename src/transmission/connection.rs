@@ -51,6 +51,10 @@ impl ReceivedBatch {
 #[derive(Debug)]
 pub struct Connection {
     reliable_layer: Mutex<ReliableLayer>,
+    /// `ReliableLayer::max_data_size_per_pkt`, captured at construction.  It
+    /// is fixed for the connection's life (derived from the MSS), so the
+    /// receive hot path reads it without taking the reliable-layer lock.
+    max_data_size_per_pkt: usize,
     ack_feedback: Arc<AckFeedback>,
     post_open_recovery: PostOpenRecovery,
     /// Session tag authenticating codec control-plane datagrams; `None` on
@@ -113,11 +117,13 @@ fn new_connection_inner(
     }
     let observability = ConnectionObservability::new(now, log_config, metrics_observer);
     reliable_layer.set_congestion_metrics_enabled(observability.enabled());
+    let max_data_size_per_pkt = reliable_layer.max_data_size_per_pkt();
     let (termination, termination_writer, termination_reaper) = new_termination();
     let post_open_recovery = PostOpenRecovery::new(unreliable_layer.post_open_handshake);
     let ack_feedback = Arc::new(AckFeedback::new());
     let shared = Arc::new(Connection {
         reliable_layer: Mutex::new(reliable_layer),
+        max_data_size_per_pkt,
         ack_feedback: Arc::clone(&ack_feedback),
         post_open_recovery,
         session_tag: unreliable_layer.session_tag,
@@ -237,7 +243,7 @@ impl Connection {
     }
 
     pub(crate) fn max_data_size_per_pkt(&self) -> usize {
-        self.reliable_layer.lock().unwrap().max_data_size_per_pkt()
+        self.max_data_size_per_pkt
     }
     #[cfg(test)]
     pub(crate) fn send_data_buf_capacity_for_test(&self) -> usize {
@@ -362,7 +368,7 @@ impl Connection {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let stage_was_empty = reliable_layer.is_send_buf_empty();
                 let written_bytes = reliable_layer.send_data_buf(data, now)?;
-                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                if crate::debug::debug_send() {
                     eprintln!(
                         "[app-send] conn={:x} written={} data_len={}",
                         self as *const Connection as usize,
@@ -612,7 +618,7 @@ impl Connection {
             let (read_bytes, recv_eof) = {
                 let mut reliable_layer = self.reliable_layer.lock().unwrap();
                 let read_bytes = reliable_layer.recv_data_buf(data);
-                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                if crate::debug::debug_send() {
                     eprintln!(
                         "[app-recv] conn={:x} read_bytes={}",
                         self as *const Connection as usize, read_bytes
@@ -865,6 +871,33 @@ mod tests {
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
         }
+    }
+
+    /// The receive hot path reads `max_data_size_per_pkt` once per payload.
+    /// It must not take the reliable-layer lock for a value fixed at
+    /// construction.  Hold the lock on this thread and call the accessor from
+    /// another thread: the cached read returns, the locking version blocks.
+    #[test]
+    fn max_data_size_per_pkt_reads_without_taking_the_reliable_layer_lock() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        let expected = shared
+            .reliable_layer
+            .lock()
+            .unwrap()
+            .max_data_size_per_pkt();
+        let guard = shared.reliable_layer.lock().unwrap();
+
+        let shared_for_thread = Arc::clone(&shared);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(shared_for_thread.max_data_size_per_pkt());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(2)).expect(
+            "max_data_size_per_pkt must not take the reliable-layer lock on the receive hot path",
+        );
+        assert_eq!(got, expected);
+        drop(guard);
     }
 
     #[test]

@@ -124,7 +124,7 @@ impl ReadHalf {
             }
             let mut end_of_acks = false;
             for pkt in bufs.codec_pkts.iter().map(|p| p.as_slice()).chain(orig_pkt) {
-                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                if crate::debug::debug_send() {
                     eprintln!(
                         "[read] codec_pkt len={} first_bytes={:02x?}",
                         pkt.len(),
@@ -198,7 +198,7 @@ impl ReadHalf {
                                     data.frame_len,
                                     &pkt[data.buf_range.clone()],
                                 );
-                                if std::env::var("RTP_DEBUG_SEND").is_ok() {
+                                if crate::debug::debug_send() {
                                     eprintln!(
                                         "[recv-data] seq={} disp={:?} buf_range={:?}",
                                         data.seq, disposition, data.buf_range
