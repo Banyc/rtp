@@ -170,15 +170,32 @@ impl State {
         match outcome {
             AckFlushOutcome::Sent { .. } => {
                 assert_eq!(pages_sent, claim.pages.len());
-                self.ack_page_cursor = claim.pages.next_cursor();
-                self.complete_claim(claim.pending_acks, claim.fin_pending);
+                self.ack_page_cursor = claim.pages.cursor_after(pages_sent);
+                // Complete only what this flush conveyed: the sum of the sent
+                // pages' block capacities bounds the completion, and the
+                // claim's snapshot clamps it so work recorded during the
+                // send survives. Blocks beyond the conveyed pages stay
+                // pending, keeping the flush due so subsequent flushes walk
+                // the deep tail without waiting for new ACK-eliciting work.
+                let conveyed = claim.pages.conveyed_blocks(pages_sent);
+                self.complete_claim(claim.pending_acks.min(conveyed), claim.fin_pending);
                 self.last_ack_flush = Some(claim.flush_started_at);
             }
             AckFlushOutcome::WouldBlock { rearm, .. } => {
                 if let Some(echo_ts) = claim.echo_backup {
                     self.ts_echo.restore(echo_ts);
                 }
-                self.complete_claim(pages_sent * MAX_NUM_ACK, false);
+                // Advance the deep-walk cursor past the pages that DID go out:
+                // a partial flush (head delivered, deep page blocked) must
+                // not leave the cursor pinned so the next claim re-plans the
+                // same deep slice (and re-sends the head page as a duplicate)
+                // — it plans the next deep page instead. The decrement is the
+                // conveyed block count of the sent pages, not `pages_sent *
+                // MAX_NUM_ACK`, so a short tail page is never billed as a
+                // full page.
+                let conveyed = claim.pages.conveyed_blocks(pages_sent);
+                self.ack_page_cursor = claim.pages.cursor_after(pages_sent);
+                self.complete_claim(claim.pending_acks.min(conveyed), false);
                 if rearm {
                     // A blocked underlay flush leaves the pending work
                     // untouched, so without a rearm the schedule would stay
@@ -215,6 +232,100 @@ impl State {
 mod tests {
     use super::super::schedule::ACK_FLUSH_AGE;
     use super::*;
+
+    #[test]
+    fn sent_completes_only_the_conveyed_pages_and_keeps_the_flush_due() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.record(ReceivedAckWork {
+            pending_acks: 300,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        // History far deeper than the two planned pages: one flush conveys at
+        // most head [0,64) + deep [64,128), so 172 blocks must stay pending
+        // and keep the flush due for the next deep page.
+        let claim = state.claim(now, 400).expect("pending work must claim");
+        assert_eq!(
+            claim.pages().iter().flatten().count(),
+            2,
+            "deep history must claim two pages"
+        );
+        state.complete(claim, AckFlushOutcome::Sent { pages_sent: 2 });
+        assert_eq!(
+            state.pending_acks,
+            300 - 2 * MAX_NUM_ACK,
+            "a flush completes only the blocks its pages conveyed"
+        );
+        assert_eq!(
+            state.schedule(now),
+            AckSchedule::Due(MetricsAckFlushReason::Count),
+            "unconveyed blocks must keep the flush due (count) without new work"
+        );
+        // The next walk picks up where the flushed pages ended, not page 0
+        // again.
+        let next = state.claim(now, 400).expect("remaining work must claim");
+        assert_eq!(
+            next.pages()[1]
+                .expect("deep history must claim a deep page")
+                .first_block_index,
+            2 * MAX_NUM_ACK,
+            "the deep walk must advance past the pages just sent"
+        );
+        state.complete(next, AckFlushOutcome::Sent { pages_sent: 2 });
+        let tail = state.claim(now, 400).expect("remaining work must claim");
+        state.complete(tail, AckFlushOutcome::Sent { pages_sent: 2 });
+        assert!(
+            state.is_drained(),
+            "the deep walk drains the pending blocks"
+        );
+    }
+
+    #[test]
+    fn partial_wouldblock_advances_the_deep_cursor_past_the_sent_page() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.record(ReceivedAckWork {
+            pending_acks: 200,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        let claim = state.claim(now, 400).expect("pending work must claim");
+        assert_eq!(
+            claim.pages()[1]
+                .expect("deep history must claim a deep page")
+                .first_block_index,
+            MAX_NUM_ACK,
+            "the first deep page starts at the initial cursor"
+        );
+        // The head page (page 0) went out on a data datagram; the deep page
+        // was blocked. Only the head page's blocks are completed and the
+        // cursor must move past it.
+        state.complete(
+            claim,
+            AckFlushOutcome::WouldBlock {
+                pages_sent: 1,
+                rearm: false,
+            },
+        );
+        assert_eq!(
+            state.pending_acks,
+            200 - MAX_NUM_ACK,
+            "a partial flush completes only the sent page's blocks"
+        );
+        let next = state.claim(now, 400).expect("remaining work must claim");
+        assert_eq!(
+            next.pages()[1]
+                .expect("deep history must claim a deep page")
+                .first_block_index,
+            2 * MAX_NUM_ACK,
+            "a re-flush must plan the next deep page, not the same slice again"
+        );
+        assert!(
+            state.has_pending(),
+            "blocked deep-page work must remain pending"
+        );
+    }
 
     #[test]
     fn record_wakes_only_when_work_needs_an_earlier_schedule() {

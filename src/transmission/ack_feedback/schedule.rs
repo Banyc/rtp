@@ -26,8 +26,9 @@ impl AckSchedule {
 }
 
 /// Sparse ACK work sends immediately only for the first claim, then coalesces
-/// for `ACK_FLUSH_AGE`; FIN outranks count, count outranks age, and explicit
-/// calls remain identifiable (they claim outside this schedule).
+/// for `ACK_FLUSH_AGE`; a pending FIN outranks count (absent a fresh rearm),
+/// count outranks age, and explicit calls remain identifiable (they claim
+/// outside this schedule).
 pub(super) fn schedule(
     now: Instant,
     pending_acks: usize,
@@ -37,7 +38,20 @@ pub(super) fn schedule(
     if pending_acks == 0 && !fin_pending {
         return AckSchedule::Idle;
     }
+    // A pending FIN must not defeat the rearm. When the last flush within
+    // `ACK_FLUSH_AGE` is the rearm marker left by a WouldBlocked underlay
+    // (see `State::complete`), staying Due(Fin) would spin the write driver
+    // flush → WouldBlock → rearm → Due → flush with no parking and no chance
+    // to observe the stop token. Park for the rearm deadline instead: the
+    // FIN stays pending and goes out as soon as the deadline fires. Without a
+    // fresh rearm marker the FIN still outranks count and age (first time a
+    // FIN is pending the flush is immediately due).
     if fin_pending {
+        if let Some(last) = last_ack_flush
+            && now.duration_since(last) < ACK_FLUSH_AGE
+        {
+            return AckSchedule::At(last + ACK_FLUSH_AGE);
+        }
         return AckSchedule::Due(MetricsAckFlushReason::Fin);
     }
     if ACK_FLUSH_COUNT <= pending_acks {
@@ -73,11 +87,13 @@ mod tests {
             "no pending ACK work is idle even after a prior flush"
         );
 
-        // FIN outranks count and age.
+        // FIN outranks count and age except on a freshly-rearmed (blocked
+        // underlay) flush, where the rearm deadline wins so the driver parks
+        // instead of spinning.
         assert_eq!(
-            schedule(now, ACK_FLUSH_COUNT, true, Some(now)),
+            schedule(now, ACK_FLUSH_COUNT, true, Some(age_ago)),
             AckSchedule::Due(MetricsAckFlushReason::Fin),
-            "a pending FIN outranks the count threshold"
+            "a pending FIN outranks the count threshold once the rearm is stale"
         );
         assert_eq!(
             schedule(now, 1, true, None),
@@ -121,6 +137,44 @@ mod tests {
             schedule(now, 1, false, Some(now)),
             AckSchedule::At(now + ACK_FLUSH_AGE),
             "sparse work is rearmed from the successful flush start"
+        );
+    }
+
+    #[test]
+    fn fin_pending_respects_a_fresh_rearm_deadline() {
+        let now = Instant::now();
+        let stale = now - ACK_FLUSH_AGE;
+
+        // Fresh rearm (a WouldBlocked underlay rearmed within ACK_FLUSH_AGE):
+        // the FIN stays pending but the driver parks until the deadline
+        // instead of spinning flush → WouldBlock → rearm → Due → flush.
+        assert_eq!(
+            schedule(now, 1, true, Some(now)),
+            AckSchedule::At(now + ACK_FLUSH_AGE),
+            "a pending FIN must not defeat a fresh rearm deadline"
+        );
+        assert_eq!(
+            schedule(now, ACK_FLUSH_COUNT, true, Some(now - ACK_FLUSH_AGE / 2)),
+            AckSchedule::At(now - ACK_FLUSH_AGE / 2 + ACK_FLUSH_AGE),
+            "any rearm younger than ACK_FLUSH_AGE parks the pending FIN"
+        );
+
+        // Once the rearm deadline has elapsed the pending FIN goes out
+        // immediately (it still outranks count and the stale age deadline).
+        assert_eq!(
+            schedule(now, 1, true, Some(stale)),
+            AckSchedule::Due(MetricsAckFlushReason::Fin),
+            "a stale rearm lets the pending FIN flush immediately"
+        );
+        assert_eq!(
+            schedule(now, ACK_FLUSH_COUNT, true, Some(stale)),
+            AckSchedule::Due(MetricsAckFlushReason::Fin),
+            "a stale rearm still lets the FIN outrank the count threshold"
+        );
+        assert_eq!(
+            schedule(now, 1, true, None),
+            AckSchedule::Due(MetricsAckFlushReason::Fin),
+            "a FIN pending from the start flushes immediately"
         );
     }
 }
