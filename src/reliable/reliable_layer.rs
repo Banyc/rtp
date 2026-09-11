@@ -2596,6 +2596,57 @@ mod tests {
         );
     }
 
+    /// Head-of-line blocking must never return to frame delivery: an earlier
+    /// frame that is still incomplete (a lost or reordered interior packet)
+    /// must not withhold a later frame that is already complete.  Frame mode
+    /// exists precisely so the receiver can hand up any complete frame past a
+    /// sequence hole, with the mux layer reassembling each stream on top.  If
+    /// the reassembly scan ever aborts on a gap instead of resuming past it,
+    /// this test fails: the complete later frame is gated behind the earlier
+    /// frame's missing packet until retransmission.
+    #[test]
+    fn frame_delivery_never_head_of_line_blocks_on_an_incomplete_earlier_frame() {
+        let now = Instant::now();
+        let mut rl = super::ReliableLayer::new(
+            crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
+            crate::delivery::frame::FrameMode::enabled(),
+            now,
+        )
+        .0;
+        let seq = crate::sequence::SequenceNumber::from_wire;
+
+        // Frame A: four 4-byte packets at seqs 0..=3, declared frame_len 16.
+        // seq 1 is lost, so A cannot reassemble yet.
+        assert!(rl.recv_data_pkt(seq(0), Some(16), b"AAAA").is_new());
+        assert!(rl.recv_data_pkt(seq(2), None, b"CCCC").is_new());
+        assert!(rl.recv_data_pkt(seq(3), None, b"DDDD").is_new());
+
+        // Frame B: two 4-byte packets at seqs 4..=5, declared frame_len 8,
+        // fully received.
+        assert!(rl.recv_data_pkt(seq(4), Some(8), b"EEEE").is_new());
+        assert!(rl.recv_data_pkt(seq(5), None, b"FFFF").is_new());
+
+        // A is incomplete, but B is complete and later.  B must be delivered
+        // now -- not withheld behind A's hole.
+        let frame = rl
+            .recv_frame_buf()
+            .expect("frame delivery must not error")
+            .expect(
+                "a complete later frame must not be head-of-line blocked by an \
+                 incomplete earlier frame",
+            );
+        assert_eq!(frame, b"EEEEFFFF");
+
+        // A's missing packet arrives (retransmission or reordering): A
+        // reassembles and delivers.  Delivering B first dropped nothing.
+        assert!(rl.recv_data_pkt(seq(1), None, b"BBBB").is_new());
+        let frame = rl
+            .recv_frame_buf()
+            .expect("frame delivery must not error")
+            .expect("the earlier frame must still reassemble once its hole is filled");
+        assert_eq!(frame, b"AAAABBBBCCCCDDDD");
+    }
+
     #[test]
     fn outage_recovery_clamps_subsequent_rate_updates_to_init_rate() {
         let t0 = Instant::now();
