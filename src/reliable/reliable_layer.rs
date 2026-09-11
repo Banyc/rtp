@@ -1127,8 +1127,23 @@ impl ReliableLayer {
     /// Return `0` does not mean it is FIN/EOF; you have to ask [`Self::recv_fin_buf()`].
     pub fn recv_data_buf(&mut self, buf: &mut [u8]) -> usize {
         let read_bytes = self.recv_data_buf.read(buf);
+        self.recycle_recv_stage_bufs();
         self.move_recv_data();
         read_bytes
+    }
+
+    /// Return fully consumed recv-stage chunks to the packet-space buffer pool.
+    /// The recv stage holds each payload chunk by ownership, so a drained chunk
+    /// is the same allocation the packet space handed out and can be reused
+    /// instead of dropped.
+    fn recycle_recv_stage_bufs(&mut self) {
+        let Self {
+            recv_data_buf,
+            pkt_recv_space,
+            ..
+        } = self;
+        let pool = pkt_recv_space.reused_buf();
+        recv_data_buf.drain_recycled(|buf| pool.put(buf));
     }
 
     /// Take a pkt from the unreliable layer.
@@ -1184,8 +1199,9 @@ impl ReliableLayer {
                 self.pkt_recv_space.reused_buf().put(p);
                 return;
             }
-            self.recv_data_buf.enqueue(&p);
-            self.pkt_recv_space.reused_buf().put(p);
+            // The recv stage takes ownership of the pooled chunk; it is
+            // returned to the pool after the application has read past it.
+            self.recv_data_buf.enqueue_owned(p);
         }
     }
 

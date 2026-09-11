@@ -1328,7 +1328,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn recv_wakes_when_payload_arrives_after_it_starts_waiting() {
         let (shared, _write_half, _read_half, _reaper) =
