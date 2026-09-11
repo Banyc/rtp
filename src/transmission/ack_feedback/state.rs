@@ -171,14 +171,23 @@ impl State {
             AckFlushOutcome::Sent { .. } => {
                 assert_eq!(pages_sent, claim.pages.len());
                 self.ack_page_cursor = claim.pages.cursor_after(pages_sent);
-                // Complete only what this flush conveyed: the sum of the sent
-                // pages' block capacities bounds the completion, and the
-                // claim's snapshot clamps it so work recorded during the
-                // send survives. Blocks beyond the conveyed pages stay
-                // pending, keeping the flush due so subsequent flushes walk
-                // the deep tail without waiting for new ACK-eliciting work.
-                let conveyed = claim.pages.conveyed_blocks(pages_sent);
-                self.complete_claim(claim.pending_acks.min(conveyed), claim.fin_pending);
+                // A successful flush has conveyed its pages: keep only the
+                // work that arrived DURING the send, and drop the claim's
+                // pre-flush snapshot so a deep unconveyed tail cannot keep
+                // the flush perpetually due.  On a backpressured link a
+                // continuous `Due(Count)` re-flush re-claims and re-encodes
+                // the deep pages in a loop, flooding the reverse path with
+                // ACK datagrams and inflating message latency; the deep
+                // tail is re-walked when fresh receive work arrives (the
+                // peer's retransmissions of its out-of-order data generate
+                // exactly that work).  Work recorded during the send
+                // survives because the decrement is clamped to the claim's
+                // snapshot.
+                let new_work = self.pending_acks.saturating_sub(claim.pending_acks);
+                if claim.fin_pending {
+                    self.fin_pending = false;
+                }
+                self.pending_acks = new_work;
                 self.last_ack_flush = Some(claim.flush_started_at);
             }
             AckFlushOutcome::WouldBlock { rearm, .. } => {
@@ -243,8 +252,11 @@ mod tests {
             echo_ts: None,
         });
         // History far deeper than the two planned pages: one flush conveys at
-        // most head [0,64) + deep [64,128), so 172 blocks must stay pending
-        // and keep the flush due for the next deep page.
+        // most head [0,64) + deep [64,128), so 172 blocks stay pending and
+        // the deep walk needs further flushes.  A successful flush completes
+        // the claim window and returns the schedule: the unconveyed tail is
+        // NOT kept perpetually due (that would flood ACKs on a saturated
+        // link) — it is re-walked when fresh receive work arrives.
         let claim = state.claim(now, 400).expect("pending work must claim");
         assert_eq!(
             claim.pages().iter().flatten().count(),
@@ -253,18 +265,27 @@ mod tests {
         );
         state.complete(claim, AckFlushOutcome::Sent { pages_sent: 2 });
         assert_eq!(
-            state.pending_acks,
-            300 - 2 * MAX_NUM_ACK,
-            "a flush completes only the blocks its pages conveyed"
+            state.pending_acks, 0,
+            "a successful flush keeps only work recorded during the send"
         );
         assert_eq!(
             state.schedule(now),
-            AckSchedule::Due(MetricsAckFlushReason::Count),
-            "unconveyed blocks must keep the flush due (count) without new work"
+            AckSchedule::Idle,
+            "a successful flush returns the schedule; unconveyed blocks are not perpetually due"
         );
-        // The next walk picks up where the flushed pages ended, not page 0
-        // again.
+        // Fresh receive work re-arms the flush, and the deep walk picks up
+        // where the flushed pages ended, not page 0 again.
+        state.record(ReceivedAckWork {
+            pending_acks: 100,
+            fin_ack: false,
+            echo_ts: None,
+        });
         let next = state.claim(now, 400).expect("remaining work must claim");
+        assert_eq!(
+            state.schedule(now),
+            AckSchedule::Due(MetricsAckFlushReason::Count),
+            "new work makes the flush due again"
+        );
         assert_eq!(
             next.pages()[1]
                 .expect("deep history must claim a deep page")
@@ -273,6 +294,11 @@ mod tests {
             "the deep walk must advance past the pages just sent"
         );
         state.complete(next, AckFlushOutcome::Sent { pages_sent: 2 });
+        state.record(ReceivedAckWork {
+            pending_acks: 100,
+            fin_ack: false,
+            echo_ts: None,
+        });
         let tail = state.claim(now, 400).expect("remaining work must claim");
         state.complete(tail, AckFlushOutcome::Sent { pages_sent: 2 });
         assert!(

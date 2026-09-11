@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::ack_feedback::{AckClaim, AckFeedback, AckFlushOutcome, AckPage, AckSchedule};
 use super::connection::Connection;
@@ -528,10 +528,19 @@ impl WriteHalf {
 
     pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendLoopResult, IoErr> {
         let now = Instant::now();
-        let (made_progress, completed_at) = self.send_pkts_inner(bufs, now).await?;
+        let (made_progress, completed_at, wouldblock_retry_at) =
+            self.send_pkts_inner(bufs, now).await?;
+        // A WouldBlock-bounded pass must retry promptly: wake the driver at
+        // the short retry deadline instead of parking until the next peer
+        // event (which on a backpressured link could stall the send path
+        // for up to an RTT and inflate tail latency).
+        let wake = match wouldblock_retry_at {
+            Some(retry_at) => SendWake::Pacing(retry_at),
+            None => self.shared.next_send_wake(completed_at),
+        };
         Ok(SendLoopResult {
             made_progress,
-            wake: self.shared.next_send_wake(completed_at),
+            wake,
         })
     }
 
@@ -543,11 +552,18 @@ impl WriteHalf {
         Arc::as_ptr(&self.shared) as usize
     }
 
+    /// How long the write driver waits after a bounded WouldBlock streak
+    /// before retrying the send pass: long enough to yield the CPU (no busy
+    /// spin on a blocked underlay) yet far below an RTT (so the retry is
+    /// prompt on a rate-limited link instead of parking until the next peer
+    /// event arrives).
+    const WOULDBLOCK_RETRY_DELAY: Duration = Duration::from_millis(1);
+
     async fn send_pkts_inner(
         &mut self,
         bufs: &mut SendBufs,
         mut now: Instant,
-    ) -> Result<(bool, Instant), IoErr> {
+    ) -> Result<(bool, Instant, Option<Instant>), IoErr> {
         if self.try_send_requested_kill(bufs).await.is_some() {
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
@@ -575,6 +591,7 @@ impl WriteHalf {
         // local, so it dies when the pass ends (no stale group_id can leak
         // into a later pass).
         let mut fec_symbol_cache: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut wouldblock_retry_at: Option<Instant> = None;
         // A blocked underlay must not become a spin: after this many
         // consecutive WouldBlocked sends the pass breaks so the write driver
         // parks on the next wake (resume signal / pacing / protocol deadline)
@@ -858,6 +875,13 @@ impl WriteHalf {
                     // so the group never holds a phantom duplicate.)
                     consecutive_wouldblock += 1;
                     if consecutive_wouldblock >= MAX_CONSECUTIVE_WOULD_BLOCK {
+                        // Park for a bounded, RTT-sub-epsilon delay before
+                        // retrying: the driver sleeps until
+                        // `wouldblock_retry_at` (a `Pacing` wake) instead of
+                        // parking until the next peer event, which on a
+                        // backpressured link could stall the send path for
+                        // up to an RTT.
+                        wouldblock_retry_at = Some(blocked_at + Self::WOULDBLOCK_RETRY_DELAY);
                         break;
                     }
                     continue;
@@ -905,7 +929,7 @@ impl WriteHalf {
             self.flush_acks(bufs).await?;
             completed_at = Instant::now();
         }
-        Ok((made_progress, completed_at))
+        Ok((made_progress, completed_at, wouldblock_retry_at))
     }
 
     async fn maybe_flush_full_fec_group(&mut self, now: Instant) -> Result<(), IoErr> {
