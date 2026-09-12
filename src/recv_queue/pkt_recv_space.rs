@@ -2,8 +2,8 @@ use primitive::arena::obj_pool::{ObjPool, buf_pool};
 
 use crate::{
     ack::AckHistory,
-    delivery::frame::recv::{RecvPkt, RecvSlot},
-    sequence::{SequenceMap, SequenceNumber, SequencePosition, SequenceVacancyError, min},
+    delivery::frame::recv::{RecvPkt, RecvSlot, ScanResume},
+    sequence::{SequenceMap, SequenceNumber, SequencePosition, SequenceVacancyError, le, min},
 };
 
 pub const MAX_NUM_RECVING_PKTS: usize = 2 << 14;
@@ -30,6 +30,13 @@ pub struct PktRecvSpace {
     next: Option<SequenceNumber>,
     slots: SequenceMap<RecvSlot>,
     scan_start: SequenceNumber,
+    /// The reassembly scan's persistent end state, valid only while the
+    /// already-scanned slot prefix is unchanged. Every mutation that could
+    /// change that prefix — a newly inserted packet at or before the
+    /// scanned frontier, or any head-tombstone collapse / removal — drops
+    /// it so the next scan re-walks from `scan_start` exactly as a
+    /// stateless scan would (see [`ScanResume`]).
+    scan_resume: Option<ScanResume>,
     reused_buf: ObjPool<Vec<u8>>,
     ack_history: AckHistory,
 }
@@ -48,6 +55,7 @@ impl PktRecvSpace {
             next: Some(initial_seq),
             slots: SequenceMap::new(initial_seq, MAX_NUM_RECVING_PKTS as u64),
             scan_start: initial_seq,
+            scan_resume: None,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             ack_history: AckHistory::new_at(initial_seq),
         }
@@ -128,6 +136,13 @@ impl PktRecvSpace {
             Err(SequenceVacancyError::Outside(_)) => return RecvDisposition::Rejected,
         }
         self.scan_start = min(self.scan_start, seq);
+        // A packet landing at or before the reassembly scan's cached
+        // frontier rewrites the already-scanned prefix (it may fill a
+        // hole or start a new frame mid-run), so the resume state must be
+        // dropped: the next scan re-walks from `scan_start`.
+        if self.scan_resume.is_some_and(|r| le(seq, r.up_to)) {
+            self.scan_resume = None;
+        }
         self.ack_history.insert_in_window(seq);
         RecvDisposition::Inserted
     }
@@ -137,6 +152,7 @@ impl PktRecvSpace {
             &mut self.slots,
             &mut self.reused_buf,
             &mut self.scan_start,
+            &mut self.scan_resume,
         );
         // Collapse the head-tombstone prefix whether or not a frame was
         // found: the scan may have tombstoned abandoned frames (a hostile
@@ -154,11 +170,20 @@ impl PktRecvSpace {
         let Some(mut next) = self.next else {
             return;
         };
+        let mut collapsed = false;
         while let Some(RecvSlot::Tombstone) = self.slots.get(&next) {
             self.slots.remove(&next);
+            collapsed = true;
             next = next.advance(1);
         }
         self.next = Some(next);
+        if collapsed {
+            // Head-tombstone removal (and any anchor advance below)
+            // rewrites the scanned prefix, so a resumed scan would mis-read
+            // it: drop the resume state and let the next scan walk from
+            // scratch.
+            self.scan_resume = None;
+        }
         if self.slots.window().anchor() == next {
             return;
         }
@@ -192,6 +217,9 @@ impl PktRecvSpace {
     }
 
     pub fn pop(&mut self) -> Option<Vec<u8>> {
+        // A stock-mode pop removes a slot the reassembly scan may have
+        // examined already; never resume across it.
+        self.scan_resume = None;
         loop {
             let next = self.next?;
             match self.slots.remove(&next) {
@@ -450,6 +478,96 @@ mod tests {
             b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCCCCCCDDDDDDDDDDDDDDDDDDDD"
         );
         assert_eq!(space.next, Some(seq(7)));
+    }
+
+    #[test]
+    fn single_packet_frame_is_returned_without_reallocation_or_copy() {
+        let mut space = PktRecvSpace::new();
+        // Stage the frame as the pooled payload buffer the receive path
+        // stores in the slot: take a buffer from the pool, fill it, insert
+        // it (frame declares only 4 of the 8 staged bytes as its length,
+        // like `a_frame_is_delivered_at_its_declared_length`).
+        let mut payload = space.reused_buf().take();
+        payload.extend_from_slice(b"ABCDEFGH");
+        let payload_ptr = payload.as_ptr();
+        let payload_cap = payload.capacity();
+        space.slots.insert(
+            seq(0),
+            RecvSlot::Data(RecvPkt {
+                data: payload,
+                frame_len: Some(4),
+            }),
+        );
+        let frame = space.pop_complete_frame().unwrap();
+        assert_eq!(frame, b"ABCD");
+        assert_eq!(
+            frame.as_ptr(),
+            payload_ptr,
+            "a single-packet frame must be handed back as the slot's own \
+             buffer, not copied into a fresh allocation"
+        );
+        assert_eq!(
+            frame.capacity(),
+            payload_cap,
+            "the returned frame must reuse the pooled allocation untouched"
+        );
+    }
+
+    #[test]
+    fn multi_packet_frame_reuses_the_first_slot_buffer_and_is_byte_identical() {
+        let mut space = PktRecvSpace::new();
+        // First packet from the pool, pre-sized so the frame tops up in
+        // place without growing; later packets are ordinary payloads.
+        let mut first = space.reused_buf().take();
+        first.reserve(11);
+        first.extend_from_slice(b"hello ");
+        let first_ptr = first.as_ptr();
+        space.slots.insert(
+            seq(1),
+            RecvSlot::Data(RecvPkt {
+                data: first,
+                frame_len: Some(11),
+            }),
+        );
+        space.slots.insert(
+            seq(2),
+            RecvSlot::Data(RecvPkt {
+                data: b"wor".to_vec(),
+                frame_len: None,
+            }),
+        );
+        space.slots.insert(
+            seq(3),
+            RecvSlot::Data(RecvPkt {
+                data: b"ld".to_vec(),
+                frame_len: None,
+            }),
+        );
+        let frame = space.pop_complete_frame().unwrap();
+        assert_eq!(frame, b"hello world");
+        assert_eq!(
+            frame.as_ptr(),
+            first_ptr,
+            "the frame must extend the first packet's buffer in place, \
+             not allocate a fresh one"
+        );
+    }
+
+    #[test]
+    fn resume_scan_is_dropped_when_a_hole_below_the_scanned_frontier_is_filled() {
+        let mut space = PktRecvSpace::new();
+        // Frame A across seqs 0..=2 with a hole at seq 1: the first scan
+        // examines 0 and 2, resets the run at the hole, and caches its end
+        // state at seq 2.
+        assert!(space.recv(0, b"AA".to_vec(), Some(6)));
+        assert!(space.recv(2, b"BB".to_vec(), None));
+        assert!(space.pop_complete_frame().is_none());
+        // Filling the hole at seq 1 lands at-or-below the cached frontier
+        // (seq 2): it must invalidate the resume state so the next scan
+        // re-walks the frame from its start instead of resuming past it.
+        assert!(space.recv(1, b"CC".to_vec(), None));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"AACCBB");
+        assert_eq!(space.next, Some(seq(3)));
     }
 
     #[test]
