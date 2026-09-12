@@ -1,10 +1,13 @@
 //! Wrap-safe eligibility and deadline index for retransmission.
 //!
 //! Replaces the per-poll send-window scans of `has_rtx` / `rtx` /
-//! `next_poll_time` with one coherent index.  Only the exact
-//! `min(num_in_flight, cwnd)` prefix of the send window is tracked as
-//! *active* entries, each carrying its RTO deadline (`rto_at`) and its
-//! original send time (`sent_at`).  The RTO deadline is indexed directly;
+//! `next_poll_time` with one coherent index.  Every in-flight packet of the
+//! send window is tracked as an *active* entry, each carrying its RTO
+//! deadline (`rto_at`) and its original send time (`sent_at`).  The repair
+//! index is deliberately decoupled from the congestion window: the cwnd
+//! gates NEW packets, while retransmission eligibility spans the whole
+//! in-flight window so a cwnd shrink below the in-flight count can never
+//! strand the tail outside the index.  The RTO deadline is indexed directly;
 //! the reorder-window deadline is derived at query time as
 //! `sent_at + reorder_window` from the `reorder_sent` send-time keys (the
 //! window tracks SRTT and changes over a packet's life).

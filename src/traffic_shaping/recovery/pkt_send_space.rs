@@ -139,9 +139,9 @@ pub struct PktSendSpace {
     jitter_cap: bool,
 
     /// Wrap-safe eligibility and deadline index for retransmission: tracks
-    /// the exact `min(num_in_flight, cwnd)` in-flight prefix and drives
-    /// `has_rtx`, retransmit selection, and the retransmission part of
-    /// `next_poll_time` without per-poll send-window scans.
+    /// every in-flight packet and drives `has_rtx`, retransmit selection,
+    /// and the retransmission part of `next_poll_time` without per-poll
+    /// send-window scans.
     rtx_index: RetransmissionIndex,
 
     // reused buffers
@@ -248,8 +248,8 @@ impl PktSendSpace {
         s
     }
 
-    /// The sequences currently tracked by the retransmission index (the
-    /// exact `min(num_in_flight, cwnd)` in-flight prefix), in logical order.
+    /// The sequences currently tracked by the retransmission index (every
+    /// in-flight packet), in logical order.
     #[cfg(test)]
     pub(crate) fn active_rtx_seqs(&self) -> Vec<SequenceNumber> {
         self.rtx_index.active_entries().collect()
@@ -276,13 +276,13 @@ impl PktSendSpace {
         self.sync_rtx_index_inner(false, reorder_extension);
     }
 
-    /// Resize the retransmission index to the exact
-    /// `min(num_in_flight, cwnd)` in-flight prefix: deactivate active entries
-    /// that fell outside the prefix and activate in-flight packets inside it
-    /// that are not yet active.  Ready reasons of packets that stay active
-    /// are preserved (resize never touches readiness).  Used when the cwnd
-    /// changes and after a plain cumulative-only ACK, where no evidence was
-    /// re-derived.
+    /// Resize the retransmission index to cover every in-flight packet:
+    /// deactivate active entries that were delivered and activate in-flight
+    /// packets that are not yet active (e.g. the tail that fell outside the
+    /// index while the cwnd was below the in-flight count).  Ready reasons
+    /// of packets that stay active are preserved (resize never touches
+    /// readiness).  Used when the cwnd changes and after a plain
+    /// cumulative-only ACK, where no evidence was re-derived.
     fn resize_rtx_index_to_active_target(&mut self) {
         let active_target = self.active_target();
         while self.rtx_index.active_count() > active_target {
@@ -322,11 +322,11 @@ impl PktSendSpace {
         debug_assert_eq!(self.rtx_index.active_count(), active_target);
     }
 
-    /// The plain cumulative-only ACK path: resize the index to the exact
-    /// active prefix (a plain ACK carries no selective evidence and delivers
-    /// no new packets, so nothing else changed), then advance every anchor to
-    /// the send-window front so wrap safety holds even if the window slid
-    /// since the last sync.
+    /// The plain cumulative-only ACK path: resize the index to cover every
+    /// in-flight packet (a plain ACK carries no selective evidence and
+    /// delivers no new packets, so nothing else changed), then advance every
+    /// anchor to the send-window front so wrap safety holds even if the
+    /// window slid since the last sync.
     fn refill_rtx_index_after_plain_ack(&mut self) {
         self.resize_rtx_index_to_active_target();
         let anchor = if self.send_wnd.is_empty() {
@@ -338,9 +338,9 @@ impl PktSendSpace {
         self.deferred_losses.advance_anchor(anchor);
     }
 
-    /// Reconcile the retransmission index with the send window's exact
-    /// `min(num_in_flight, cwnd)` in-flight prefix — or, while an
-    /// outage-recovery epoch is open, the whole pre-outage window.  Centralizes,
+    /// Reconcile the retransmission index with the send window's in-flight
+    /// set — every unacked packet, which during an outage-recovery epoch is
+    /// the whole pre-outage window.  Centralizes,
     /// in one place, active-prefix updates, anchor advancement, reorder-boundary
     /// synchronization, fast-loss gate synchronization, and outage
     /// readiness.  Runs only on state transitions (send/ack/cwnd change/
@@ -807,21 +807,21 @@ impl PktSendSpace {
         self.num_in_flight += 1;
         self.tlp.reset();
 
-        // The new packet is indexed iff it lands inside the exact active
-        // prefix of the send window: the `min(num_in_flight, cwnd)` prefix in
-        // ordinary mode, the whole pre-outage window during outage recovery.
-        if self.num_in_flight <= self.active_target() {
-            let out_of_order = self.out_of_order_seq_end.is_some_and(|end| lt(s, end));
-            self.rtx_index.activate(RetransmissionActivation {
-                seq: s,
-                rto_at: now + rto,
-                sent_at: now,
-                apply_live_rto_floor: true,
-                reorder_eligible: out_of_order,
-                fast_loss_eligible: false,
-                pre_outage_eligible: false,
-            });
-        }
+        // Every in-flight packet is a retransmission candidate, whatever the
+        // cwnd: the cwnd gates NEW packets (`accepts_new_pkt`), never repair
+        // eligibility.  All in-flight packets are indexed with their own RTO
+        // deadline so a cwnd shrink below the in-flight count can never
+        // strand the tail outside the repair index.
+        let out_of_order = self.out_of_order_seq_end.is_some_and(|end| lt(s, end));
+        self.rtx_index.activate(RetransmissionActivation {
+            seq: s,
+            rto_at: now + rto,
+            sent_at: now,
+            apply_live_rto_floor: true,
+            reorder_eligible: out_of_order,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
 
         Pkt {
             seq: s,
@@ -1027,13 +1027,12 @@ impl PktSendSpace {
         let cwnd = cwnd.saturating_mul(CWND_SEND_RATE_SCALE);
         let cwnd = 1.max(cwnd);
         // The in-flight window may never exceed the peer's bounded receive
-        // window: a larger window bursts more payload than the peer can hold,
-        // the peer rejects the excess, and those holes fall outside the
-        // retransmission index (which covers only the `min(in_flight, cwnd)`
-        // prefix), so the send window can never drain -- a permanent writer
-        // stall.  `MAX_NUM_RECVING_PKTS` is the peer's window; it must stay
-        // large enough that this bound does not fall below what the path
-        // delivers (see the crate README).
+        // window: a larger burst is more than the peer can buffer at once,
+        // the peer rejects the excess into holes that then have to be
+        // repaired in order over RTO rounds -- a long drain even though
+        // repair now spans the whole in-flight window.  `MAX_NUM_RECVING_PKTS`
+        // is the peer's window; it must stay large enough that this bound
+        // does not fall below what the path delivers (see the crate README).
         let cwnd = cwnd.min(MAX_NUM_RECVING_PKTS);
         // While an outage-recovery epoch is open, clamp cwnd to
         // OUTAGE_RECOVERY_CWND so a just-restored path is not flooded before
@@ -1048,24 +1047,14 @@ impl PktSendSpace {
             self.resize_rtx_index_to_active_target();
         }
 
-        let last_seq_in_cwnd = if self.outage.in_outage_recovery() {
-            Self::unacked(&self.send_wnd)
-                .map(|(seq, _)| seq)
-                .take(cwnd.saturating_add(1))
-                .last()
-        } else {
-            let active_tail = self.rtx_index.last_active();
-            if self.rtx_index.active_count() == cwnd {
-                active_tail.and_then(|tail| {
-                    self.send_wnd
-                        .iter_from(tail.advance(1))
-                        .find_map(|(seq, packet)| packet.as_ref().map(|_| seq))
-                        .or(Some(tail))
-                })
-            } else {
-                active_tail
-            }
-        };
+        // The loss-accounting pipe boundary is the (cwnd+1)-th in-flight
+        // packet, computed directly from the send window: it must stay
+        // cwnd-bounded independent of the retransmission index, which covers
+        // every in-flight packet and no longer tracks a cwnd prefix.
+        let last_seq_in_cwnd = Self::unacked(&self.send_wnd)
+            .map(|(seq, _)| seq)
+            .take(cwnd.saturating_add(1))
+            .last();
 
         // Retract max sequence in pipe
         if let Some(last) = last_seq_in_cwnd
@@ -1080,15 +1069,15 @@ impl PktSendSpace {
     }
 
     /// Number of in-flight packets eligible for the retransmission index:
-    /// the whole pre-outage window while an outage-recovery epoch is open
-    /// (every in-flight packet may be retransmitted without waiting for ack
-    /// rounds), otherwise the exact `min(num_in_flight, cwnd)` prefix.
+    /// every in-flight packet.  The congestion window is flow control for
+    /// NEW packets (`accepts_new_pkt`); repair eligibility must span the
+    /// whole in-flight window, or a cwnd shrink below the in-flight count
+    /// (loss backoff, delay drain) would strand the tail outside the index:
+    /// it would never be retransmitted, the peer's cumulative ACK would
+    /// stick at the first hole while new sends stay blocked -- a writer
+    /// stall until the 30 s no-progress outage watchdog rescues the session.
     pub fn active_target(&self) -> usize {
-        if self.outage.in_outage_recovery() {
-            self.num_in_flight
-        } else {
-            self.num_in_flight.min(self.cwnd.get())
-        }
+        self.num_in_flight
     }
 
     pub fn num_rtx_active_pkts(&self) -> usize {
@@ -3072,24 +3061,26 @@ mod tests {
     }
 
     #[test]
-    fn retransmit_index_moves_the_exact_cwnd_prefix_after_ack() {
+    fn retransmit_index_tracks_every_in_flight_packet_as_acks_advance() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
 
-        // A full cwnd of packets: the whole window is the indexed prefix.
+        // Every in-flight packet is a retransmission candidate, whatever the
+        // cwnd: the repair index is never a cwnd prefix.
         for i in 0..INIT_CWND * 2 {
             send_packet(&mut space, t0 + ms(i as u64));
         }
         let seqs = space.active_rtx_seqs();
-        assert_eq!(seqs.len(), INIT_CWND);
+        assert_eq!(seqs.len(), INIT_CWND * 2);
         for (i, seq) in seqs.iter().enumerate() {
             assert_eq!(*seq, sq(i as u64));
         }
 
-        // Ack the first half: the prefix must move exactly to the remainder.
+        // Ack the first half: the index trails the window, still covering
+        // every remaining in-flight packet.
         ack_up_to(&mut space, INIT_CWND as u64 / 2 - 1, t0 + ms(1000));
         let seqs = space.active_rtx_seqs();
-        assert_eq!(seqs.len(), INIT_CWND);
+        assert_eq!(seqs.len(), INIT_CWND * 3 / 2);
         for (i, seq) in seqs.iter().enumerate() {
             assert_eq!(*seq, sq((INIT_CWND / 2 + i) as u64));
         }
@@ -3127,10 +3118,12 @@ mod tests {
             1
         );
         assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        // The whole in-flight window stays indexed: two packets were
+        // delivered by the SACKs, so the index holds every remaining one.
         let active = space.active_rtx_seqs();
-        assert_eq!(active.len(), INIT_CWND);
-        assert_eq!(active[INIT_CWND - 2], sq(INIT_CWND as u64));
-        assert_eq!(active[INIT_CWND - 1], sq(INIT_CWND as u64 + 1));
+        assert_eq!(active.len(), INIT_CWND * 2 - 2);
+        assert_eq!(active[active.len() - 2], sq((INIT_CWND * 2 - 2) as u64));
+        assert_eq!(active[active.len() - 1], sq((INIT_CWND * 2 - 1) as u64));
     }
 
     #[test]
@@ -3160,18 +3153,96 @@ mod tests {
         space.set_send_rate(rate_for_cwnd(shrunken));
         assert_eq!(space.cwnd.get(), shrunken);
         assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        let in_flight = (0..(INIT_CWND * 2) as u64)
+            .filter(|&i| i != INIT_CWND as u64 - 1)
+            .map(sq)
+            .collect::<Vec<_>>();
         assert_eq!(
             space.active_rtx_seqs(),
-            (0..shrunken as u64).map(sq).collect::<Vec<_>>()
+            in_flight,
+            "a cwnd shrink below the in-flight count must not deactivate the tail"
         );
         let grown = INIT_CWND - CWND_SEND_RATE_SCALE;
         space.set_send_rate(rate_for_cwnd(grown));
         assert_eq!(space.cwnd.get(), grown);
         assert_eq!(space.rtx_index.first_ready().unwrap().0, sq(0));
+        let in_flight = (0..(INIT_CWND * 2) as u64)
+            .filter(|&i| i != INIT_CWND as u64 - 1)
+            .map(sq)
+            .collect::<Vec<_>>();
         assert_eq!(
             space.active_rtx_seqs(),
-            (0..grown as u64).map(sq).collect::<Vec<_>>()
+            in_flight,
+            "cwnd growth must not change repair coverage either"
         );
+    }
+
+    #[test]
+    fn cwnd_shrink_below_in_flight_keeps_the_tail_repairable() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let sent_at = t0 + ms(1000);
+
+        // A flight well beyond the initial cwnd, then a loss backoff shrinks
+        // cwnd below the in-flight count.
+        for i in 0..(INIT_CWND * 2) as u64 {
+            send_packet(&mut space, sent_at + ms(i));
+        }
+        assert_eq!(space.num_in_flight_pkts(), INIT_CWND * 2);
+        let shrunken = INIT_CWND / 2;
+        let srtt_seconds = space.rtt_stats.smooth_rtt().as_secs_f64();
+        let rate_for_cwnd = |cwnd: usize| {
+            PosR::new(cwnd as f64 / (CWND_SEND_RATE_SCALE as f64 * srtt_seconds)).unwrap()
+        };
+        space.set_send_rate(rate_for_cwnd(shrunken));
+        assert_eq!(space.cwnd().get(), shrunken);
+
+        // The congestion window is the flow-control gate on NEW packets...
+        assert!(!space.accepts_new_pkt());
+        // ...but repair eligibility must span the whole window, tail
+        // included: a cwnd shrink must never strand an in-flight packet.
+        assert_eq!(
+            space.active_rtx_seqs().len(),
+            space.num_in_flight_pkts(),
+            "a cwnd shrink must not deactivate the in-flight tail"
+        );
+        let tail = sq((INIT_CWND * 2 - 1) as u64);
+        assert!(
+            space.active_rtx_seqs().contains(&tail),
+            "the newest in-flight packet must stay a retransmission candidate"
+        );
+
+        // The tail's own RTO deadline must make it retransmission-ready
+        // without any further cwnd growth or ack rounds.
+        let tail_sent = sent_at + ms((INIT_CWND * 2 - 1) as u64);
+        let live_rto = space.rtt_stats.rto_duration();
+        assert!(
+            !space.has_rtx(tail_sent),
+            "deadlines are still in the future at send time"
+        );
+        let due = tail_sent + live_rto;
+        assert!(
+            space.has_rtx(due),
+            "the in-flight tail must become retransmission-ready at its own RTO"
+        );
+        space
+            .rtx_index
+            .promote_due(due, space.rtt_stats.reorder_window(), live_rto);
+        let (seq, reasons) = space.rtx_index.first_ready().unwrap();
+        assert_eq!(
+            seq,
+            sq(0),
+            "RTO readiness stays headed by the oldest packet"
+        );
+        assert!(reasons.has_rto(), "the oldest packet promotes on its RTO");
+        // The tail was promoted by the same pass: it is active with its fresh
+        // RTO reason armed, just later in the deadline order.
+        assert!(
+            space.rtx_index.active_entries().any(|s| s == tail),
+            "the tail stays a retransmission candidate after promotion"
+        );
+        assert_eq!(space.rtx_index.ready_count(), INIT_CWND * 2);
     }
 
     #[test]
