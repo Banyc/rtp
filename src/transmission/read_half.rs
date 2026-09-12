@@ -9,6 +9,7 @@ use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsSendDriverResumeSource, MetricsTerminationCause};
 use crate::traffic_shaping::redundancy::fec::FecDecoderState;
+use crate::udp::is_icmp_artifact;
 use crate::{
     ack::AckBlocks,
     codec::decode,
@@ -86,6 +87,19 @@ impl ReadHalf {
             };
             let read_bytes = match res {
                 Ok(x) => x,
+                // A peer ICMP artifact (connected-UDP port-unreachable, e.g.
+                // macOS errno 61) poisoned this datagram: the datagram is
+                // lost, not the session. Drop it and keep reading. The
+                // socket-level impls already swallow these, but any
+                // `UnreliableRead` may surface one, so the funnel treats it
+                // transient too. Real peer death is the liveness /
+                // broken-pipe watchdog's job, never this per-datagram
+                // error. Yield so a flood of artifacts cannot spin the
+                // reader without an await point.
+                Err(e) if is_icmp_artifact(e.kind()) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Err(e) => {
                     return Err((
                         record_error(e, MetricsTerminationCause::UnreliableRead),

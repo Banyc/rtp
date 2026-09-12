@@ -514,15 +514,17 @@ mod tests {
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        // A genuinely terminal read error (unexpected EOF), not an ICMP
+        // artifact: connection-* kinds are treated as transient lost datagrams.
         #[derive(Debug)]
         struct FailedRead;
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for FailedRead {
             fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::ConnectionReset.into())
+                Err(std::io::ErrorKind::UnexpectedEof.into())
             }
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::ConnectionReset.into())
+                Err(std::io::ErrorKind::UnexpectedEof.into())
             }
         }
         #[derive(Debug)]
@@ -624,7 +626,9 @@ mod tests {
             }
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 self.fail.notified().await;
-                Err(std::io::ErrorKind::ConnectionReset.into())
+                // A genuinely terminal read error (not an ICMP artifact,
+                // which the session must survive), gate it after `fail`.
+                Err(std::io::ErrorKind::UnexpectedEof.into())
             }
         }
         #[derive(Debug)]
@@ -1060,15 +1064,16 @@ mod tests {
 
     #[tokio::test]
     async fn normal_shutdown_drains_all_driver_children() {
+        // A genuinely terminal read error (not an ICMP artifact).
         #[derive(Debug)]
         struct FailedRead;
         #[async_trait::async_trait]
         impl crate::transmission::transmission_layer::UnreliableRead for FailedRead {
             fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::ConnectionReset.into())
+                Err(std::io::ErrorKind::UnexpectedEof.into())
             }
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::ConnectionReset.into())
+                Err(std::io::ErrorKind::UnexpectedEof.into())
             }
         }
         #[derive(Debug)]

@@ -41,7 +41,9 @@ pub use crate::obfuscate::padding::{
     HarmfulPaddingPolicy, PaddingSettings, PayloadSized, TargetKind,
 };
 pub use raw_send::{MaybeRawFd, maybe_raw_fd};
-pub(crate) use raw_send::{normalize_send_err, raw_sendto_fallback, should_wait_after_try_send};
+pub(crate) use raw_send::{
+    is_icmp_artifact, normalize_send_err, raw_sendto_fallback, should_wait_after_try_send,
+};
 
 mod layer;
 pub(crate) use layer::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
@@ -843,11 +845,37 @@ impl UnreliableWrite for RawFdConnWrite {
 #[async_trait]
 impl UnreliableRead for Arc<UdpSocket> {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-        UdpSocket::try_recv(self, buf).map_err(normalize_send_err)
+        match UdpSocket::try_recv(self, buf) {
+            Err(e) if is_icmp_artifact(e.kind()) => {
+                // A peer ICMP port-unreachable poisoned this datagram: treat
+                // it as lost (WouldBlock) rather than session-fatal. The
+                // drain path breaks on WouldBlock; the next batch re-polls.
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            res => res.map_err(normalize_send_err),
+        }
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-        UdpSocket::recv(self, buf).await.map_err(normalize_send_err)
+        loop {
+            match UdpSocket::recv(self, buf).await {
+                Ok(n) => return Ok(n),
+                Err(e) if is_icmp_artifact(e.kind()) => {
+                    // A connected UDP socket surfaces the peer's ICMP
+                    // port-unreachable (macOS errno 61 ECONNREFUSED) as a
+                    // recv error, e.g. when the peer's socket just closed.
+                    // The datagram is lost, not the session: the ICMP error
+                    // is consumed by the failed syscall, so the next attempt
+                    // parks for the next datagram. Real peer death is
+                    // handled by the liveness watchdog (broken-pipe), which
+                    // aborts the read driver via the session stop token —
+                    // the yield keeps a pathological ICMP flood from spinning
+                    // the reader without an await point.
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => return Err(normalize_send_err(e)),
+            }
+        }
     }
 }
 #[async_trait]
@@ -876,13 +904,28 @@ impl UnreliableWrite for Arc<UdpSocket> {
 #[async_trait]
 impl UnreliableRead for std::sync::Arc<tokio_udp::UdpSocket> {
     fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-        tokio_udp::UdpSocket::try_recv(self, buf).map_err(normalize_send_err)
+        match tokio_udp::UdpSocket::try_recv(self, buf) {
+            Err(e) if is_icmp_artifact(e.kind()) => {
+                // See the `Arc<UdpSocket>` impl: treat a peer-ICMP-poisoned
+                // datagram as lost (WouldBlock) instead of session-fatal.
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            res => res.map_err(normalize_send_err),
+        }
     }
 
     async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-        tokio_udp::UdpSocket::recv(self, buf)
-            .await
-            .map_err(normalize_send_err)
+        loop {
+            match tokio_udp::UdpSocket::recv(self, buf).await {
+                Ok(n) => return Ok(n),
+                Err(e) if is_icmp_artifact(e.kind()) => {
+                    // See the `Arc<UdpSocket>` impl: the datagram is lost,
+                    // not the session — retry after the error is consumed.
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => return Err(normalize_send_err(e)),
+            }
+        }
     }
 }
 
@@ -1332,6 +1375,65 @@ mod tests {
         async fn send(&mut self, _buf: &[u8]) -> Result<usize, IoErr> {
             Ok(0)
         }
+    }
+
+    /// A session must survive a peer-ICMP artifact surfaced by its
+    /// `UnreliableRead`: the read half treats `ConnectionRefused` (macOS errno
+    /// 61 after an ICMP port-unreachable on a connected socket) as a lost
+    /// datagram, not a session-fatal underlay error. Real peer death is the
+    /// liveness / broken-pipe watchdog's job.
+    ///
+    /// The harness read fires the artifact exactly once on its first `recv`
+    /// (notifying the test), then parks for the next datagram — modelling a
+    /// real connected socket after the ICMP error was consumed. If the
+    /// artifact were surfaced as fatal, the session would terminate and the
+    /// final liveness assertion (a parked app read, not an error) would fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_survives_icmp_artifact_on_read() {
+        #[derive(Debug)]
+        struct IcmpPoisonedRead {
+            artifact: Option<Arc<tokio::sync::Notify>>,
+        }
+        #[async_trait]
+        impl UnreliableRead for IcmpPoisonedRead {
+            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+            async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
+                if let Some(fired) = self.artifact.take() {
+                    fired.notify_waiters();
+                    return Err(std::io::ErrorKind::ConnectionRefused.into());
+                }
+                // The ICMP error was consumed by the failed syscall: the
+                // socket now parks for the next datagram (none will come
+                // here, so the read driver parks indefinitely).
+                std::future::pending::<Result<usize, IoErr>>().await
+            }
+        }
+        let artifact_fired = Arc::new(tokio::sync::Notify::new());
+        let (mut read, _write, _supervisor) = socket(
+            wrap_fec(
+                Box::new(IcmpPoisonedRead {
+                    artifact: Some(Arc::clone(&artifact_fired)),
+                }),
+                Box::new(Dummy),
+                false,
+            ),
+            None,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), artifact_fired.notified())
+            .await
+            .expect("the read driver never polled the poisoned recv");
+        // The artifact was surfaced to the session and must have been
+        // swallowed: the session is still alive, so the app read parks
+        // (timeout) instead of returning a termination error.
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), read.recv(&mut buf),)
+                .await
+                .is_err(),
+            "the session must survive a read-side ICMP artifact (parked, not terminated)"
+        );
     }
 
     #[test]

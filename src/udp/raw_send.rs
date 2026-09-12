@@ -26,20 +26,50 @@ fn is_enobufs_raw_os_error(code: i32) -> bool {
     }
 }
 
-/// Normalize transient UDP send-buffer exhaustion (ENOBUFS / ENOBUFS-equivalent
-/// OS errors) to [`std::io::ErrorKind::WouldBlock`].
+/// A connected UDP socket surfaces a peer's ICMP port-unreachable / reset as
+/// one of these `ErrorKind`s (an ICMP artifact, not a protocol-level signal):
+/// the peer's socket closed (or an ICMP error was injected) and the OS
+/// reports it on the next syscall on the connected socket.
+///
+/// This is *not* session-fatal: the datagram it poisoned is simply lost, and
+/// reliability lives above this layer (the reliable layer retransmits the
+/// lost packet, and real peer death is handled by the liveness / broken-pipe
+/// watchdog, which kills the session when the peer stops acknowledging).
+pub(crate) fn is_icmp_artifact(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// Normalize transient underlay errors to [`std::io::ErrorKind::WouldBlock`]:
+/// UDP send-buffer exhaustion (ENOBUFS / ENOBUFS-equivalent OS errors) and
+/// ICMP artifacts on a connected socket (see [`is_icmp_artifact`]).
 ///
 /// UDP has no flow control: when the kernel send buffer is full the OS
 /// reports a transient error (macOS errno 55 `ENOBUFS`, Linux errno 105
 /// `ENOBUFS`). These are not fatal — the packet is simply dropped and the
 /// caller should treat it as transient backpressure (equivalent to a loss
-/// event). Reliability is provided above this layer by the reliable layer's
-/// retransmit logic, so dropping an outgoing packet here is recoverable.
+/// event).
+///
+/// The same loss-event treatment applies to ICMP artifacts: a connected UDP
+/// socket returns `ECONNREFUSED` (macOS errno 61) after receiving an ICMP
+/// port-unreachable, e.g. just because the peer's socket closed. It is safe
+/// to swallow: the datagram associated with the failed syscall was already
+/// lost (the reliable layer retransmits it), the ICMP error is consumed by
+/// the failed syscall so the next attempt succeeds, and a peer that is truly
+/// gone is detected by the liveness watchdog rather than by this per-datagram
+/// error. Killing the session here would turn a transient ICMP artifact into
+/// a spurious session failure.
 ///
 /// All other errors are passed through unchanged.
 pub(crate) fn normalize_send_err(e: std::io::Error) -> IoErr {
     let err = IoErr::from(e);
-    match err.raw_os_error().is_some_and(is_enobufs_raw_os_error) {
+    let transient =
+        err.raw_os_error().is_some_and(is_enobufs_raw_os_error) || is_icmp_artifact(err.kind());
+    match transient {
         true => err.with_kind(std::io::ErrorKind::WouldBlock),
         false => err,
     }
@@ -147,6 +177,53 @@ pub(crate) async fn raw_sendto_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icmp_artifacts_are_recognized() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                is_icmp_artifact(kind),
+                "{kind:?} should be an ICMP artifact"
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                !is_icmp_artifact(kind),
+                "{kind:?} must not be an ICMP artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_artifact_kind_normalizes_to_wouldblock() {
+        // A synthesized ConnectionRefused (no raw OS error) must still be
+        // treated as an ICMP artifact by kind.
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let normalized = normalize_send_err(e);
+        assert_eq!(normalized.kind(), std::io::ErrorKind::WouldBlock);
+
+        // The macOS raw form: errno 61 ECONNREFUSED (the errno is different
+        // on other platforms, so the kind-based path is what matters there).
+        // The raw OS error is preserved on normalization so diagnostics
+        // still name it.
+        #[cfg(target_os = "macos")]
+        {
+            let raw = std::io::Error::from_raw_os_error(61);
+            assert!(is_icmp_artifact(raw.kind()));
+            let normalized = normalize_send_err(raw);
+            assert_eq!(normalized.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(normalized.raw_os_error(), Some(61));
+        }
+    }
 
     #[test]
     fn should_wait_after_plain_wouldblock() {
