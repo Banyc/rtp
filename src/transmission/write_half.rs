@@ -473,11 +473,17 @@ impl WriteHalf {
 
     /// Refresh the condition gate's loss evidence from the reliable layer's
     /// latest measured congestion-loss ratio before making any gate decision.
+    ///
+    /// With FEC disabled the gate is never consulted, so skip the reliable-
+    /// layer lock entirely and leave `loss_active` clear.
     fn refresh_fec_loss_mode(&mut self) {
+        if self.fec.is_none() {
+            return;
+        }
         let loss = self
             .shared
             .with_reliable_layer(|layer| layer.congestion_loss_ratio());
-        self.fec_gate.refresh_loss(self.fec.is_some(), loss);
+        self.fec_gate.refresh_loss(true, loss);
     }
 
     /// Evaluate the condition gate for a flush decision at `now`: spare
