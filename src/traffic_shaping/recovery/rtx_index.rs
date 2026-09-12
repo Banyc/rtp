@@ -194,7 +194,7 @@ impl DeferredLossIndex {
 
 /// The independent retransmission reasons that can make a packet ready,
 /// each with the deadline at which it became (or becomes) due.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ReadyReasons {
     /// The packet's RTO deadline once it has expired.
     rto: Option<Instant>,
@@ -510,9 +510,13 @@ impl RetransmissionIndex {
     /// is evaluated against the current estimator, and a floor packet already
     /// due at that effective deadline while its latched stored key is still
     /// in the future wakes the poll immediately (never waiting out a stale
-    /// latched instant).  Every returned wake time is a moment at which
-    /// `promote_due` promotes (or postpones) a real deadline, so the poll
-    /// can never spin on a not-yet-due instant.
+    /// latched instant).  The floor source contributes the minimum of those
+    /// effective deadlines over the whole floor-due prefix (same prefix
+    /// [`Self::has_stuck_rto_due`] evaluates): an early-sent packet can carry
+    /// a larger packet RTO than a later stuck one, whose deadline is the one
+    /// `promote_due` acts on first.  Every returned wake time is a moment at
+    /// which `promote_due` promotes (or postpones) a real deadline, so the
+    /// poll can never spin on a not-yet-due instant.
     pub(super) fn next_deadline(
         &self,
         now: Instant,
@@ -523,12 +527,21 @@ impl RetransmissionIndex {
         if next.is_some_and(|deadline| deadline <= now) {
             return next;
         }
-        // Earliest-sent floor entry: the earliest live-estimator bound is
-        // `sent_at + live_rto`, so its effective deadline is the earliest
-        // wake at which `promote_due` can act on a floor packet — exact when
-        // per-packet RTOs are uniform, a safe (never-early) bound otherwise.
-        if let Some(key) = self.floor_sent.first()
-            && key.at <= now
+        // Floor-due prefix: every floor-eligible packet whose live-estimator
+        // bound (`sent_at + live_rto`) has elapsed, scanned in send-time
+        // order (the same prefix `has_stuck_rto_due` evaluates).  The wake
+        // must be the minimum *effective* deadline over the whole prefix, not
+        // just the earliest-sent entry: an early packet can carry a far
+        // larger packet RTO than a later stuck packet, whose effective
+        // deadline is the one the next `promote_due` actually acts on first.
+        // An entry already due at its effective deadline (not yet RTO-ready)
+        // wakes the poll immediately rather than waiting out a stale latched
+        // instant.
+        let mut floor_wake: Option<Instant> = None;
+        for key in self
+            .floor_sent
+            .iter()
+            .take_while(|key| key.at <= now && live_rto <= now.duration_since(key.at))
         {
             let entry = self
                 .active
@@ -543,6 +556,9 @@ impl RetransmissionIndex {
             {
                 return Some(now);
             }
+            floor_wake = Some(floor_wake.map_or(effective, |current| current.min(effective)));
+        }
+        if let Some(effective) = floor_wake {
             next = Some(next.map_or(effective, |current| current.min(effective)));
         }
         if let Some(deadline) = self.rto_deadlines.first().map(|entry| entry.at) {
@@ -754,6 +770,50 @@ impl RetransmissionIndex {
 
     pub(super) fn active_entries(&self) -> impl Iterator<Item = SequenceNumber> + '_ {
         self.active.iter().map(|(seq, _)| seq)
+    }
+
+    /// The active packets whose transient reorder ready reason is currently
+    /// armed (a past `promote_due` popped their reorder deadline key).  The
+    /// ACK-path re-sync must clear these reasons and re-add the deadline key
+    /// while the packet stays below the reorder boundary, exactly what a
+    /// whole-set re-sync would do.
+    pub(super) fn reorder_ready_seqs(&self) -> impl Iterator<Item = SequenceNumber> + '_ {
+        self.ready
+            .iter()
+            .filter(|(_, reasons)| reasons.reorder.is_some())
+            .map(|(seq, _)| seq)
+    }
+
+    /// Ready reasons of every ready packet, in logical order — the
+    /// equivalence-test snapshot of the readiness state.
+    #[cfg(test)]
+    pub(super) fn ready_snapshot(&self) -> Vec<(SequenceNumber, ReadyReasons)> {
+        self.ready
+            .iter()
+            .map(|(seq, reasons)| (seq, *reasons))
+            .collect()
+    }
+
+    /// Deadline-key sets in iteration order — the equivalence-test snapshot
+    /// of the wake/deadline sources.
+    #[cfg(test)]
+    pub(super) fn rto_deadline_snapshot(&self) -> Vec<(Instant, SequenceNumber)> {
+        self.rto_deadlines.iter().map(|k| (k.at, k.seq)).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reorder_sent_snapshot(&self) -> Vec<(Instant, SequenceNumber)> {
+        self.reorder_sent.iter().map(|k| (k.at, k.seq)).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn floor_sent_snapshot(&self) -> Vec<(Instant, SequenceNumber)> {
+        self.floor_sent.iter().map(|k| (k.at, k.seq)).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn ready_deadline_snapshot(&self) -> Vec<(Instant, SequenceNumber)> {
+        self.ready_deadlines.iter().map(|k| (k.at, k.seq)).collect()
     }
 
     /// Number of packets currently retransmission-ready (any reason armed).
@@ -1105,6 +1165,105 @@ mod tests {
         assert_eq!(index.rto_ready_count, 1);
         let (seq, _) = index.first_ready().unwrap();
         assert_eq!(seq, sq(0));
+    }
+
+    #[test]
+    fn next_deadline_floor_wake_uses_the_minimum_effective_deadline_over_the_floor_prefix() {
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        // Earliest-sent packet A carries a LARGE packet RTO (10 s): its
+        // effective deadline is far in the future even though it fronts the
+        // floor-due prefix.
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(10000),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        // Later-sent packet B has a 500 ms packet RTO; a live-estimator
+        // spike postpones its stored key to t0 + 1 s.
+        index.activate(RetransmissionActivation {
+            seq: sq(1),
+            rto_at: t0 + ms(500),
+            sent_at: t0 + ms(100),
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        // Spike the live estimator to 900 ms: B's stored key (500 ms)
+        // elapses and is lazily postponed to its effective 1 s deadline.
+        assert_eq!(index.promote_due(t0 + ms(500), ms(100), ms(900)), 1);
+        assert_eq!(
+            index.next_deadline(t0 + ms(500), || ms(100), ms(900)),
+            Some(t0 + ms(1000)),
+            "the postponed key itself remains a valid wake while the estimator is high"
+        );
+
+        // Now the estimator clears to 200 ms.  At t0 + 600 ms packet B is
+        // *stuck*: its effective deadline (t0 + 600 ms) has passed and its
+        // latched stored key (t0 + 1 s) is still in the future.  A's
+        // effective deadline (t0 + 10 s) is far later despite A being the
+        // earliest-sent floor entry.  The floor wake must be the minimum
+        // effective deadline over the whole floor-due prefix: an immediate
+        // wake, not A's or B's stale latched instant.
+        let stuck = t0 + ms(600);
+        assert!(index.has_due(stuck, || ms(100), ms(200)));
+        assert!(index.has_rto_due(stuck, ms(200)));
+        assert_eq!(
+            index.rto_ready_count, 0,
+            "no RTO reason is armed yet: the stuck packet is only due at its live effective deadline"
+        );
+        assert_eq!(
+            index.next_deadline(stuck, || ms(100), ms(200)),
+            Some(stuck),
+            "a later stuck packet must wake the poll now even though the earliest-sent packet has a later effective deadline"
+        );
+        // And `promote_due` actually promotes B at that moment (not A).
+        assert_eq!(index.promote_due(stuck, ms(100), ms(200)), 0);
+        assert_eq!(index.first_ready().map(|(seq, _)| seq), Some(sq(1)));
+
+        // A second scenario: B is *not* stuck yet (its shrunken effective
+        // deadline is still in the future), but that true deadline is still
+        // earlier than both A's effective deadline and B's own latched
+        // stored key.  The wake must be the prefix minimum — the moment
+        // packet B is next promotable — not the earliest-sent packet's
+        // effective deadline (which is what the old earliest-entry-only
+        // floor wake would have returned).
+        let mut index = RetransmissionIndex::new(sq(0));
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(10000),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        index.activate(RetransmissionActivation {
+            seq: sq(1),
+            rto_at: t0 + ms(500),
+            sent_at: t0 + ms(100),
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        // Estimator spike postpones B's stored key to its then-effective 1 s
+        // deadline (packet_rto = rto_at - sent_at = 400 ms, so the shrunken
+        // live-estimator true deadline is t0 + 500 ms); then the estimator
+        // clears to 200 ms.
+        assert_eq!(index.promote_due(t0 + ms(500), ms(100), ms(900)), 1);
+        let before_b_due = t0 + ms(400);
+        assert!(!index.has_due(before_b_due, || ms(100), ms(200)));
+        assert_eq!(
+            index.next_deadline(before_b_due, || ms(100), ms(200)),
+            Some(t0 + ms(500)),
+            "the floor wake is the minimum effective deadline over the floor-due prefix, not the earliest-sent entry's"
+        );
     }
 
     #[test]

@@ -150,6 +150,24 @@ pub struct PktSendSpace {
     ack_block_buf: Vec<(u64, u64)>,
     sacked_above_buf: Vec<u32>,
     fast_loss_buf: Vec<SequenceNumber>,
+
+    /// The fast-loss arming flag that the retransmission index's readiness
+    /// state was last synced under (updated at the end of every full-walk or
+    /// scoped ACK-path readiness sync).  When it differs from the current
+    /// [`Self::fast_loss_armed`] at the next ACK-path sync, a global arming
+    /// transition happened between readiness syncs (a disable re-armed after
+    /// its bound elapsed, or a disable armed by observed reordering mid-ACK)
+    /// and every packet's fast-loss eligibility may have changed, so the
+    /// whole active set must be re-synced rather than scoped to per-packet
+    /// evidence.
+    rtx_sync_arm_state: bool,
+
+    /// Test-only: route the ACK-path index sync through the full-walk
+    /// re-sync (the pre-scoping behavior), the reference arm of the
+    /// scoped-sync equivalence test.  Production ack always uses the scoped
+    /// sync (or the whole-set fallback on a global arming transition).
+    #[cfg(test)]
+    full_walk_ack_sync: bool,
 }
 
 impl PktSendSpace {
@@ -187,6 +205,9 @@ impl PktSendSpace {
             ack_block_buf: Vec::with_capacity(MAX_ACK_BLOCKS),
             sacked_above_buf: vec![],
             fast_loss_buf: vec![],
+            rtx_sync_arm_state: false,
+            #[cfg(test)]
+            full_walk_ack_sync: false,
         }
     }
 
@@ -255,6 +276,15 @@ impl PktSendSpace {
         self.rtx_index.active_entries().collect()
     }
 
+    /// Test-only: route the ACK-path index sync through the full-walk
+    /// re-sync (the pre-scoping behavior), the reference arm of the
+    /// scoped-sync equivalence test.  Production ack always uses the scoped
+    /// sync (or the whole-set fallback on a global fast-loss transition).
+    #[cfg(test)]
+    pub(crate) fn force_full_walk_ack_sync(&mut self) {
+        self.full_walk_ack_sync = true;
+    }
+
     pub fn with_watchdog_tuning(mut self, tuning: WatchdogTuning) -> Self {
         self.liveness = PeerLiveness::with_tuning(tuning);
         self
@@ -264,16 +294,134 @@ impl PktSendSpace {
         self.sync_rtx_index_inner(true, None);
     }
 
-    /// The ACK-path form of [`Self::sync_rtx_index`]: the ack delivery loop
-    /// already deactivated delivered entries, so no stale-entries pass runs;
-    /// `reorder_extension` is the `[start, end)` range of sequences the ack's
-    /// selective evidence newly brought below the reorder boundary, and only
-    /// those sequences get a fresh reorder deadline key.
+    /// The ACK-path index sync: the ack delivery loop already deactivated
+    /// delivered entries, so no stale-entries pass runs; `reorder_extension`
+    /// is the `[start, end)` range of sequences the ack's selective evidence
+    /// newly brought below the reorder boundary.  SCOPED to the entries whose
+    /// evidence can actually have changed: the newly-below-boundary range,
+    /// every reorder-ready packet (a transient reorder reason must be cleared
+    /// and its deadline key re-added, exactly as a whole-set re-sync would),
+    /// and the per-packet fast-loss eligibility transitions this ACK
+    /// recorded.  The resulting index state is byte-identical to the full
+    /// per-packet walk — untouched packets were no-ops there, and the caller
+    /// guarantees every in-flight packet is active (asserted below).  A
+    /// global fast-loss arming transition since the last readiness sync is
+    /// handled by the caller: it falls back to the full walk instead of
+    /// scoping to stale evidence.
     fn sync_rtx_index_after_ack(
         &mut self,
         reorder_extension: Option<(SequenceNumber, SequenceNumber)>,
     ) {
-        self.sync_rtx_index_inner(false, reorder_extension);
+        let out_of_order_seq_end = self.out_of_order_seq_end;
+        let fast_loss_armed = self.fast_loss_armed();
+        debug_assert!(
+            self.send_wnd
+                .iter()
+                .filter_map(|(seq, p)| p.as_ref().map(|_| seq))
+                .all(|seq| self.rtx_index.is_active(&seq)),
+            "every in-flight packet must already be active when the scoped ACK-path sync runs"
+        );
+        // `unacked_buf` was pre-seeded by the caller with this ACK's
+        // per-packet fast-loss eligibility transitions; extend it with the
+        // newly-below-boundary reorder range and every reorder-ready entry.
+        if let Some((start, end)) = reorder_extension {
+            // The extension start may have been released by this ACK's
+            // cumulative advance: clamp it to the window front, before which
+            // no in-flight packet exists.
+            let range_start = if lt(self.send_wnd.start(), start) {
+                start
+            } else {
+                self.send_wnd.start()
+            };
+            self.unacked_buf.extend(
+                self.send_wnd
+                    .iter_from(range_start)
+                    .take_while(|(seq, _)| lt(*seq, end))
+                    .filter_map(|(seq, p)| p.as_ref().map(|_| seq)),
+            );
+        }
+        self.unacked_buf.extend(self.rtx_index.reorder_ready_seqs());
+        // Same per-packet re-sync body as the full walk, over the scoped set.
+        // Duplicates across the scopes are harmless: every operation is
+        // idempotent (activation, evidence sync, reorder-candidate insert).
+        self.fast_loss_buf.clear();
+        for &seq in &self.unacked_buf {
+            let Some(Some(p)) = self.send_wnd.get(&seq) else {
+                continue;
+            };
+            let out_of_order = out_of_order_seq_end.is_some_and(|end| lt(seq, end));
+            let preserve_fast_loss = fast_loss_armed && p.is_fast_loss();
+            if preserve_fast_loss {
+                self.fast_loss_buf.push(seq);
+            }
+            let was_active = self.rtx_index.is_active(&seq);
+            if !was_active {
+                self.rtx_index.activate(RetransmissionActivation {
+                    seq,
+                    rto_at: p.sent_time + p.rto,
+                    sent_at: p.sent_time,
+                    apply_live_rto_floor: !p.rto_from_tail_probe,
+                    reorder_eligible: out_of_order,
+                    fast_loss_eligible: false,
+                    pre_outage_eligible: false,
+                });
+            }
+            let pre_outage = self
+                .outage
+                .is_pre_outage_loss(p.sent_time)
+                .then_some(p.sent_time);
+            let rearm_reorder =
+                self.rtx_index
+                    .sync_active_evidence_reasons(seq, preserve_fast_loss, pre_outage);
+            let entered_reorder_range =
+                reorder_extension.is_some_and(|(start, end)| !lt(seq, start) && lt(seq, end));
+            if was_active && out_of_order && (entered_reorder_range || rearm_reorder) {
+                self.rtx_index.add_reorder_candidate(seq, p.sent_time);
+            }
+        }
+        for &seq in &self.fast_loss_buf {
+            let sent_time = self.send_wnd.get(&seq).unwrap().as_ref().unwrap().sent_time;
+            self.rtx_index
+                .set_reason(seq, ReadyReason::FastLoss, Some(sent_time));
+        }
+        // Advance the anchor to the send-window front (or the next sequence
+        // when the window is empty) so wrap safety holds as the window
+        // advances.
+        let anchor = if self.send_wnd.is_empty() {
+            self.send_wnd.next()
+        } else {
+            self.send_wnd.start()
+        };
+        self.rtx_index.advance_anchor(anchor);
+        self.deferred_losses.advance_anchor(anchor);
+        self.rtx_sync_arm_state = fast_loss_armed;
+    }
+
+    /// Route an ACK-path index sync.  Normally the scoped sync: only the
+    /// entries whose evidence could have changed are re-synced.  When the
+    /// fast-loss arming flag differs from the state the index was last synced
+    /// under — a GLOBAL transition since the previous readiness sync (a
+    /// disable armed mid-ACK by observed reordering, or a re-armed flag after
+    /// a disable's bound elapsed) — every packet's fast-loss eligibility may
+    /// have changed and the exact whole-set re-sync runs, so no eligible
+    /// packet is ever left unarmed.  A test-only mode forces the full walk as
+    /// the reference arm of the scoped-sync equivalence test.
+    fn sync_rtx_index_after_ack_dispatch(
+        &mut self,
+        reorder_extension: Option<(SequenceNumber, SequenceNumber)>,
+    ) {
+        #[cfg(test)]
+        {
+            if self.full_walk_ack_sync {
+                self.sync_rtx_index_inner(false, reorder_extension);
+                return;
+            }
+        }
+        if self.rtx_sync_arm_state != self.fast_loss_armed() {
+            self.sync_rtx_index_inner(false, reorder_extension);
+            return;
+        }
+        self.sync_rtx_index_after_ack(reorder_extension);
     }
 
     /// Resize the retransmission index to cover every in-flight packet:
@@ -442,6 +590,11 @@ impl PktSendSpace {
         // advances.
         self.rtx_index.advance_anchor(anchor);
         self.deferred_losses.advance_anchor(anchor);
+        // Record the fast-loss arming flag the readiness state was synced
+        // under, so the ACK path can detect a global transition between
+        // readiness syncs (a disable armed mid-ACK, or a re-armed flag after
+        // a disable's bound elapsed) and fall back to the whole-set re-sync.
+        self.rtx_sync_arm_state = self.fast_loss_armed();
     }
 
     fn unacked(
@@ -611,6 +764,7 @@ impl PktSendSpace {
             self.out_of_order_seq_end = None;
         }
         let mut fast_loss_eligibility_changed = false;
+        self.fast_loss_buf.clear();
         if analysis.has_sack_evidence {
             for (&sequence, &sacked_above) in self.unacked_buf.iter().zip(&self.sacked_above_buf) {
                 let Some(Some(packet)) = self.send_wnd.get_mut(&sequence) else {
@@ -618,7 +772,15 @@ impl PktSendSpace {
                 };
                 let was_fast_loss = packet.is_fast_loss();
                 packet.sacked_above = packet.sacked_above.max(sacked_above);
-                fast_loss_eligibility_changed |= was_fast_loss != packet.is_fast_loss();
+                if was_fast_loss != packet.is_fast_loss() {
+                    // Record the per-packet eligibility transition so the
+                    // scoped ACK-path sync can re-arm exactly the packets
+                    // whose fast-loss readiness could have changed (or drop
+                    // the armed reason when the transition was the other
+                    // way).
+                    self.fast_loss_buf.push(sequence);
+                    fast_loss_eligibility_changed = true;
+                }
             }
         }
         let reorder_extension = match (previous_out_of_order_seq_end, self.out_of_order_seq_end) {
@@ -630,7 +792,13 @@ impl PktSendSpace {
             || fast_loss_was_armed != self.fast_loss_armed()
             || fast_loss_eligibility_changed;
         if evidence_changed {
-            self.sync_rtx_index_after_ack(reorder_extension);
+            // Seed the scoped sync with this ACK's per-packet fast-loss
+            // eligibility transitions; the sync extends the set with the
+            // newly-below-boundary reorder range and every reorder-ready
+            // entry.
+            self.unacked_buf.clear();
+            self.unacked_buf.append(&mut self.fast_loss_buf);
+            self.sync_rtx_index_after_ack_dispatch(reorder_extension);
         } else if delivered > 0 {
             self.refill_rtx_index_after_plain_ack();
         }
@@ -3092,6 +3260,222 @@ mod tests {
             t0 + ms(1000) + ms(1),
         );
         assert!(space.active_rtx_seqs().is_empty());
+    }
+
+    /// Byte-for-byte comparison of the retransmission index state: the
+    /// active set, every entry's ready reasons, and the deadline-key sets
+    /// that drive `has_due` / `next_deadline` / `promote_due`.
+    fn assert_rtx_index_equiv(a: &PktSendSpace, b: &PktSendSpace, context: &str) {
+        assert_eq!(
+            a.active_rtx_seqs(),
+            b.active_rtx_seqs(),
+            "{context}: active set must match the full walk"
+        );
+        assert_eq!(
+            a.rtx_index.ready_snapshot(),
+            b.rtx_index.ready_snapshot(),
+            "{context}: ready reasons must match the full walk"
+        );
+        assert_eq!(
+            a.rtx_index.rto_deadline_snapshot(),
+            b.rtx_index.rto_deadline_snapshot(),
+            "{context}: RTO deadline keys must match the full walk"
+        );
+        assert_eq!(
+            a.rtx_index.reorder_sent_snapshot(),
+            b.rtx_index.reorder_sent_snapshot(),
+            "{context}: reorder deadline keys must match the full walk"
+        );
+        assert_eq!(
+            a.rtx_index.floor_sent_snapshot(),
+            b.rtx_index.floor_sent_snapshot(),
+            "{context}: floor deadline keys must match the full walk"
+        );
+        assert_eq!(
+            a.rtx_index.ready_deadline_snapshot(),
+            b.rtx_index.ready_deadline_snapshot(),
+            "{context}: ready deadline keys must match the full walk"
+        );
+    }
+
+    #[test]
+    fn scoped_ack_sync_matches_the_full_walk_across_sacks_and_fast_loss_transitions() {
+        let t0 = Instant::now();
+        // Two identical spaces driven by identical inputs; the reference
+        // routes every ACK-path sync through the pre-scoping full walk, the
+        // production arm through the scoped sync (with its whole-set
+        // fallback on global fast-loss transitions).
+        let mut scoped = PktSendSpace::new();
+        let mut reference = PktSendSpace::new();
+        reference.force_full_walk_ack_sync();
+        let run = |scoped: &mut PktSendSpace,
+                   reference: &mut PktSendSpace,
+                   context: &str,
+                   f: &dyn Fn(&mut PktSendSpace)| {
+            f(scoped);
+            f(reference);
+            assert_rtx_index_equiv(scoped, reference, context);
+        };
+
+        // Low-jitter link: the evidence-gated fast-loss gate is armed.
+        run(&mut scoped, &mut reference, "settle", &|s| {
+            settle_rtt_at(s, t0)
+        });
+        assert!(scoped.fast_loss_armed());
+
+        // A full flight of direct sends (staged data), RTO ~100 ms.
+        for i in 0..40u64 {
+            let at = t0 + ms(1000) + ms(i);
+            run(
+                &mut scoped,
+                &mut reference,
+                &format!("send {i}"),
+                &move |s| {
+                    send_packet(s, at);
+                },
+            );
+        }
+        let mut t = t0 + ms(1100);
+
+        // SACK storm: each SACK advances the reorder boundary and raises
+        // sacked_above on the older in-flight packets; seq 0 crosses the
+        // fast-loss threshold on the third SACK.
+        for i in 1..=3u64 {
+            let at = t;
+            run(
+                &mut scoped,
+                &mut reference,
+                &format!("sack {i}"),
+                &move |s| {
+                    sack_one(s, i, at);
+                },
+            );
+            t += ms(1);
+        }
+
+        // seq 0 is fast-loss ready while the reorder window has not expired:
+        // retransmit it, arming fast_loss_rtx_time.
+        run(&mut scoped, &mut reference, "fast-loss rtx", &|s| {
+            let rtx = s.rtx(t).expect("seq 0 must be fast-loss ready");
+            assert_eq!(rtx.seq, sq(0));
+        });
+
+        // Ack seq 0 immediately: the retransmit could not have round-tripped,
+        // so the link looks reordered — the observed-reordering disable arms
+        // MID-ACK, a global fast-loss transition that must fall back to the
+        // whole-set re-sync (the full walk) in the production arm too.
+        run(&mut scoped, &mut reference, "observed-reorder ack", &|s| {
+            assert_eq!(ack_one(s, 0, t + ms(1)), 1);
+        });
+        assert!(!scoped.fast_loss_armed());
+
+        // While disabled, further evidence runs the scoped path disarmed
+        // (preserve=false everywhere): a boundary advance must still add the
+        // reorder keys and clear reorder-ready reasons exactly like the full
+        // walk.
+        t += ms(20);
+        for i in 6..=9u64 {
+            let at = t;
+            run(
+                &mut scoped,
+                &mut reference,
+                &format!("disabled sack {i}"),
+                &move |s| {
+                    sack_one(s, i, at);
+                },
+            );
+            t += ms(1);
+        }
+
+        // Let the disable's round-trip bound elapse: the next evidence ack
+        // clears it (re-arming fast loss) and the arming state differs from
+        // the last synced state, so the production arm runs the whole-set
+        // re-sync exactly like the full walk.
+        let rearm_at = t0 + ms(1500);
+        run(&mut scoped, &mut reference, "re-arm sack 30", &|s| {
+            sack_one(s, 30, rearm_at);
+        });
+        assert!(scoped.fast_loss_armed());
+
+        // Promote the reorder window well past every below-boundary send:
+        // the whole below-boundary span becomes reorder-ready (deadline keys
+        // popped into ready reasons).
+        let promote_at = rearm_at + ms(200);
+        run(&mut scoped, &mut reference, "promote reorder+rtos", &|s| {
+            s.rtx_index.promote_due(
+                promote_at,
+                s.rtt_stats.reorder_window(),
+                s.rtt_stats.rto_duration(),
+            );
+        });
+
+        // Boundary advance with many reorder-ready packets OUTSIDE the
+        // newly-below-boundary range: the scoped sync must clear each
+        // transient reorder reason and re-add its deadline key (rearm_reorder
+        // branch), byte-identically to the full walk.
+        let at = promote_at + ms(1);
+        run(
+            &mut scoped,
+            &mut reference,
+            "sack 31 over reorder-ready",
+            &|s| {
+                sack_one(s, 31, at);
+            },
+        );
+
+        // Retransmits mid-flow (deactivate + re-activate) stay identical.
+        for round in 0..3 {
+            let at = promote_at + ms(50) + ms(round);
+            run(
+                &mut scoped,
+                &mut reference,
+                &format!("rtx round {round}"),
+                &move |s| {
+                    let _ = s.rtx(at);
+                },
+            );
+        }
+
+        // More SACKs: boundary advances and further per-packet fast-loss
+        // crossings re-arm through the scoped path's changed list.
+        let mut t = promote_at + ms(60);
+        for i in 32..=36u64 {
+            let at = t;
+            run(
+                &mut scoped,
+                &mut reference,
+                &format!("sack {i}"),
+                &move |s| {
+                    sack_one(s, i, at);
+                },
+            );
+            t += ms(1);
+        }
+
+        // A cumulative ack inside the window (no boundary move) hits the
+        // plain-refill path — identical in both arms, but still checked.
+        let at = t;
+        run(&mut scoped, &mut reference, "cumulative ack 15", &|s| {
+            let _ = ack_one(s, 15, at);
+        });
+        t += ms(1);
+
+        // Deliver everything below the boundary: the window slides past it,
+        // so on the final ack the boundary releases to None and the sync
+        // must clear every reorder-ready reason without re-adding keys.
+        for seq in [29u64, 34, 37, 39] {
+            let at = t;
+            run(
+                &mut scoped,
+                &mut reference,
+                &format!("drain ack {seq}"),
+                &move |s| {
+                    let _ = ack_one(s, seq, at);
+                },
+            );
+            t += ms(1);
+        }
+        assert!(scoped.active_rtx_seqs().is_empty());
     }
 
     #[test]
