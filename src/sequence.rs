@@ -467,10 +467,9 @@ impl<V> SendWindow<V> {
         let offset = self.start.forward_distance_to(start);
         let offset = offset.min(self.queue.len() as u64) as usize;
         self.queue
-            .iter()
+            .range(offset..)
             .enumerate()
-            .skip(offset)
-            .map(|(i, value)| (self.start.advance(i as u64), value))
+            .map(move |(i, value)| (self.start.advance((offset + i) as u64), value))
     }
 }
 
