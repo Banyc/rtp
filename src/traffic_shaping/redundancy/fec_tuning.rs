@@ -25,6 +25,8 @@
 //! 8 KiB UDP datagram, and one lost fragment kills the whole symbol — which
 //! inverts the benefit.  Use the default MSS for WAN paths.
 
+use super::fec_gate::FecLossGateThresholds;
+
 /// Per-connection FEC tuning.
 ///
 /// - `instream_flush`: when `true`, the transmission layer requests a prompt
@@ -47,8 +49,10 @@
 ///   deeper parity promptly without ever competing with data traffic.
 ///
 /// `Default` is `(false, 1)` — stock behaviour, byte-for-byte.  The
-/// `max_diversity` preset is `(true, 3)` — the recommended setting for
-/// interactive traffic on a large-MSS path.
+/// `interactive_prompt` preset is `(true, 1)` and `max_diversity` is
+/// `(true, 3)` — the recommended settings for interactive traffic on a
+/// large-MSS path.  Both force-flush presets also select the permissive
+/// loss gate (see [`FecTuning::loss_gate_thresholds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FecTuning {
     pub instream_flush: bool,
@@ -74,6 +78,33 @@ impl FecTuning {
         Self {
             instream_flush: true,
             small_group_parity_count: 3,
+        }
+    }
+
+    /// Prompt-parity preset for interactive traffic: force-flush each data
+    /// burst's open FEC group at the burst tail, with a single parity symbol,
+    /// and use the permissive loss gate so realistic WAN loss (~1–2%) opens
+    /// parity.  This is the recommended tuning for a low-rate ping lane; it
+    /// does not change the stock `Default` gate for bulk/agnostic traffic.
+    pub const fn interactive_prompt() -> Self {
+        Self {
+            instream_flush: true,
+            small_group_parity_count: 1,
+        }
+    }
+
+    /// Loss-gate sensitivity for this tuning.
+    ///
+    /// The interactive presets force-flush each burst tail
+    /// ([`Self::instream_flush`] is `true`) and use the permissive gate, so a
+    /// low-rate interactive lane opens parity at 1% loss with only 8 primary
+    /// sends.  The stock `Default` keeps the 5% gate and the 16-sample
+    /// minimum, so bulk/agnostic traffic is byte-for-byte unchanged.
+    pub(crate) const fn loss_gate_thresholds(self) -> FecLossGateThresholds {
+        if self.instream_flush {
+            FecLossGateThresholds::INTERACTIVE
+        } else {
+            FecLossGateThresholds::STOCK
         }
     }
 }
@@ -109,5 +140,30 @@ mod tests {
         let t = FecTuning::max_diversity();
         assert!(t.instream_flush);
         assert_eq!(t.small_group_parity_count, 3);
+    }
+
+    /// The prompt-parity preset is exactly the interactive lane's tuning: it
+    /// force-flushes the burst tail with a single parity symbol and selects
+    /// the permissive loss gate.  The stock default keeps the 5% gate.
+    #[test]
+    fn interactive_prompt_selects_the_permissive_gate() {
+        let t = FecTuning::interactive_prompt();
+        assert!(t.instream_flush);
+        assert_eq!(t.small_group_parity_count, 1);
+        assert_eq!(
+            t.loss_gate_thresholds(),
+            FecLossGateThresholds::INTERACTIVE,
+            "the interactive preset must use the permissive loss gate"
+        );
+        assert_eq!(
+            FecTuning::max_diversity().loss_gate_thresholds(),
+            FecLossGateThresholds::INTERACTIVE,
+            "every force-flush preset is interactive and uses the permissive gate"
+        );
+        assert_eq!(
+            FecTuning::default().loss_gate_thresholds(),
+            FecLossGateThresholds::STOCK,
+            "the stock default must keep the 5% loss gate"
+        );
     }
 }

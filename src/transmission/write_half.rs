@@ -21,7 +21,7 @@ use crate::traffic_shaping::core::{SendPacer, SendWake};
 use crate::traffic_shaping::redundancy::{
     ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig,
     fec::FecEncoderState,
-    fec_gate::{FecConditionGate, FecGateDecision},
+    fec_gate::{FecConditionGate, FecGateDecision, FecLossGateThresholds},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +68,9 @@ pub struct WriteHalf {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WriteHalfSettings {
     pub(super) fec_instream_flush: bool,
+    /// Loss-gate sensitivity for the FEC condition gate, selected by the
+    /// connection's [`FecTuning`](crate::FecTuning).
+    pub(super) fec_loss_gate: FecLossGateThresholds,
     pub(super) instream_group_fec_enabled: bool,
     pub(super) retransmission_armor: RetransmissionArmorConfig,
     /// Connection MSS, used to derive the handshake padding bound (see
@@ -437,6 +440,7 @@ impl WriteHalf {
     ) -> Self {
         let WriteHalfSettings {
             fec_instream_flush,
+            fec_loss_gate,
             instream_group_fec_enabled,
             retransmission_armor,
             mss,
@@ -447,7 +451,7 @@ impl WriteHalf {
             fec,
             fec_instream_flush,
             instream_group_fec_enabled,
-            fec_gate: FecConditionGate::default(),
+            fec_gate: FecConditionGate::with_thresholds(fec_loss_gate),
             retransmission_armor: RetransmissionArmor::new(retransmission_armor),
             send_pacer,
             ack_feedback,

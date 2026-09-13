@@ -4,10 +4,12 @@
 //! FEC eligibility has three independent conditions:
 //!
 //! 1. **Loss/recovery evidence** — the loss gate.  No congestion feedback
-//!    and fewer than [`MIN_RECOVERY_SAMPLES`] primary-send recovery samples
-//!    keep the gate closed.  It enables at [`ENABLE_LOSS`] (5%), stays
-//!    enabled through [`DISABLE_LOSS`] (3%), and disables below that
-//!    (hysteresis).
+//!    and fewer than the preset's minimum primary-send recovery samples keep
+//!    the gate closed.  It enables at the preset's enable threshold, stays
+//!    enabled down through its disable threshold, and disables below that
+//!    (hysteresis).  The stock preset enables at 5% and requires 16 samples;
+//!    the interactive preset enables at 1% and requires 8, so a low-rate ping
+//!    lane reaches the gate at realistic WAN loss.
 //! 2. **Genuinely spare capacity** — decided by the reliable layer
 //!    (`can_send_tail_fec` plus zero application write waiters and no
 //!    queue-building signal), not merely pacer tokens.  A closed capacity
@@ -22,16 +24,54 @@
 //! recent [`RECOVERY_WINDOW`] (64) successfully emitted primary data
 //! datagrams; armor duplicates and parity never enter that window.
 
-/// Loss ratio at which a closed loss gate opens (5%).
-const ENABLE_LOSS: f64 = 0.05;
-/// Loss ratio below which an open loss gate closes again (3%); the gate stays
-/// enabled between the two thresholds (hysteresis).
-const DISABLE_LOSS: f64 = 0.03;
 /// Number of primary data sends over which the recovery ratio is evaluated.
+/// Shared by every gate preset: only the thresholds (not the window) differ
+/// between stock and interactive sensitivity.
 const RECOVERY_WINDOW: usize = 64;
-/// Minimum primary-send recovery samples before the recovery ratio is
-/// considered measured at all.
-const MIN_RECOVERY_SAMPLES: usize = 16;
+
+/// Loss-gate sensitivity preset: the loss ratio at which a closed gate opens,
+/// the ratio below which an open gate closes again (hysteresis between the two),
+/// and the minimum primary-send recovery samples before the sender-side
+/// recovery ratio counts as measured at all.
+///
+/// The preset is selected per connection by [`FecTuning`], never globally:
+/// stock bulk/agnostic traffic keeps [`STOCK`](Self::STOCK), while the
+/// interactive prompt-parity presets use [`INTERACTIVE`](Self::INTERACTIVE).
+///
+/// [`FecTuning`]: crate::traffic_shaping::redundancy::fec_tuning::FecTuning
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FecLossGateThresholds {
+    /// Loss ratio at which a closed loss gate opens.
+    pub(crate) enable_loss: f64,
+    /// Loss ratio below which an open loss gate closes again; the gate stays
+    /// enabled between the two thresholds (hysteresis).
+    pub(crate) disable_loss: f64,
+    /// Minimum primary-send recovery samples before the recovery ratio is
+    /// considered measured.
+    pub(crate) min_recovery_samples: usize,
+}
+
+impl FecLossGateThresholds {
+    /// Stock sensitivity: open at 5% loss, stay open through 3%, require 16
+    /// recovery samples.  `FecTuning::default()` selects this preset, so the
+    /// stock bulk/agnostic path is byte-for-byte unchanged.
+    pub(crate) const STOCK: Self = Self {
+        enable_loss: 0.05,
+        disable_loss: 0.03,
+        min_recovery_samples: 16,
+    };
+
+    /// Interactive sensitivity: a low-rate prompt-parity lane reaches the gate
+    /// after only 8 primary sends and opens at 1% loss, staying open through
+    /// 0.5%.  Realistic WAN loss on a sparse ping stream (~1–2%) is enough to
+    /// emit repair parity, which can recover a lone lost interactive packet
+    /// with no extra round trip.
+    pub(crate) const INTERACTIVE: Self = Self {
+        enable_loss: 0.01,
+        disable_loss: 0.005,
+        min_recovery_samples: 8,
+    };
+}
 
 /// Outcome of evaluating the condition gate for one FEC data group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +99,7 @@ pub(crate) enum FecGateDecision {
 /// connection-lifetime cumulative.
 #[derive(Debug)]
 pub(crate) struct FecConditionGate {
+    thresholds: FecLossGateThresholds,
     loss_active: bool,
     recovery_samples: [bool; RECOVERY_WINDOW],
     recovery_sample_len: usize,
@@ -67,8 +108,19 @@ pub(crate) struct FecConditionGate {
 }
 
 impl Default for FecConditionGate {
+    /// The stock sensitivity; per-connection presets call
+    /// [`Self::with_thresholds`] instead.
     fn default() -> Self {
+        Self::with_thresholds(FecLossGateThresholds::STOCK)
+    }
+}
+
+impl FecConditionGate {
+    /// Build a gate with the given loss-gate sensitivity.  The recovery ring
+    /// starts empty and the loss gate starts closed.
+    pub(crate) fn with_thresholds(thresholds: FecLossGateThresholds) -> Self {
         Self {
+            thresholds,
             loss_active: false,
             recovery_samples: [false; RECOVERY_WINDOW],
             recovery_sample_len: 0,
@@ -76,9 +128,6 @@ impl Default for FecConditionGate {
             recovery_sends: 0,
         }
     }
-}
-
-impl FecConditionGate {
     /// Record one successfully emitted primary data datagram.  `recovery`
     /// marks a retransmission/repair send (`true`) versus a fresh send
     /// (`false`).  The window covers the most recent
@@ -110,8 +159,8 @@ impl FecConditionGate {
         };
         self.loss_active = match effective_loss {
             None => false,
-            Some(loss) if self.loss_active => loss >= DISABLE_LOSS,
-            Some(loss) => loss >= ENABLE_LOSS,
+            Some(loss) if self.loss_active => loss >= self.thresholds.disable_loss,
+            Some(loss) => loss >= self.thresholds.enable_loss,
         };
     }
 
@@ -134,10 +183,10 @@ impl FecConditionGate {
     }
 
     /// Recovery ratio over the ring: recovery sends divided by fresh sends.
-    /// `None` until [`MIN_RECOVERY_SAMPLES`] primary sends have been
-    /// recorded; `Some(1.0)` when every sample is a recovery send.
+    /// `None` until the preset's minimum recovery samples have been recorded;
+    /// `Some(1.0)` when every sample is a recovery send.
     fn recovery_loss_ratio(&self) -> Option<f64> {
-        if self.recovery_sample_len < MIN_RECOVERY_SAMPLES {
+        if self.recovery_sample_len < self.thresholds.min_recovery_samples {
             return None;
         }
         let fresh_sends = self.recovery_sample_len - self.recovery_sends;
@@ -206,9 +255,10 @@ mod tests {
     #[test]
     fn sparse_tail_recovery_opens_the_loss_gate() {
         let mut gate = FecConditionGate::default();
-        // 16 recovery samples (the minimum) with no fresh sends: the recovery
+        // Stock minimum recovery samples with no fresh sends: the recovery
         // ratio is 1.0, so the gate opens without congestion feedback.
-        for _ in 0..MIN_RECOVERY_SAMPLES {
+        let stock_min = FecLossGateThresholds::STOCK.min_recovery_samples;
+        for _ in 0..stock_min {
             gate.record_data_send(true);
         }
         assert_eq!(
@@ -229,13 +279,83 @@ mod tests {
 
         // A window under the minimum sample count never opens the gate.
         let mut sparse = FecConditionGate::default();
-        for _ in 0..(MIN_RECOVERY_SAMPLES - 1) {
+        for _ in 0..(stock_min - 1) {
             sparse.record_data_send(true);
         }
         sparse.refresh_loss(true, None);
         assert!(
             !sparse.loss_active(),
-            "fewer than MIN_RECOVERY_SAMPLES samples must not open the gate"
+            "fewer than the minimum recovery samples must not open the gate"
+        );
+    }
+
+    /// The interactive preset reaches the loss gate at realistic WAN loss
+    /// (~1–2%): it opens at the 1% enable threshold, while the stock preset
+    /// keeps requiring the original ≥5% evidence.
+    #[test]
+    fn interactive_preset_opens_at_realistic_loss_and_stock_requires_five_percent() {
+        let mut interactive = FecConditionGate::with_thresholds(FecLossGateThresholds::INTERACTIVE);
+        interactive.refresh_loss(true, Some(0.02));
+        assert!(
+            interactive.loss_active(),
+            "the interactive preset must open the gate at 2% loss"
+        );
+
+        let mut at_one = FecConditionGate::with_thresholds(FecLossGateThresholds::INTERACTIVE);
+        at_one.refresh_loss(true, Some(0.01));
+        assert!(
+            at_one.loss_active(),
+            "the interactive preset must open the gate at the 1% enable threshold"
+        );
+
+        let mut clean = FecConditionGate::with_thresholds(FecLossGateThresholds::INTERACTIVE);
+        clean.refresh_loss(true, Some(0.002));
+        assert!(
+            !clean.loss_active(),
+            "a clean link must keep even the interactive gate closed"
+        );
+
+        // Stock: realistic loss stays closed; only the 5% threshold opens it.
+        let mut stock = FecConditionGate::default();
+        stock.refresh_loss(true, Some(0.02));
+        assert!(
+            !stock.loss_active(),
+            "the stock preset must not open the gate at 2% loss"
+        );
+        stock.refresh_loss(true, Some(0.04));
+        assert!(
+            !stock.loss_active(),
+            "the stock preset must not open the gate below 5%"
+        );
+        stock.refresh_loss(true, Some(0.05));
+        assert!(
+            stock.loss_active(),
+            "the stock preset must open the gate at the 5% enable threshold"
+        );
+    }
+
+    /// The interactive preset treats the sender-side recovery ratio as
+    /// measured after 8 primary sends; the stock preset still requires 16.
+    #[test]
+    fn interactive_preset_needs_fewer_recovery_samples() {
+        let mut interactive = FecConditionGate::with_thresholds(FecLossGateThresholds::INTERACTIVE);
+        for _ in 0..FecLossGateThresholds::INTERACTIVE.min_recovery_samples {
+            interactive.record_data_send(true);
+        }
+        interactive.refresh_loss(true, None);
+        assert!(
+            interactive.loss_active(),
+            "8 recovery samples must open the interactive gate"
+        );
+
+        let mut stock = FecConditionGate::default();
+        for _ in 0..FecLossGateThresholds::INTERACTIVE.min_recovery_samples {
+            stock.record_data_send(true);
+        }
+        stock.refresh_loss(true, None);
+        assert!(
+            !stock.loss_active(),
+            "8 recovery samples must not open the stock gate"
         );
     }
 

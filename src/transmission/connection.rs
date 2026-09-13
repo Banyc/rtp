@@ -166,6 +166,7 @@ fn new_connection_inner(
         termination_writer,
         WriteHalfSettings {
             fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
+            fec_loss_gate: unreliable_layer.fec_tuning.loss_gate_thresholds(),
             instream_group_fec_enabled: unreliable_layer.instream_group_fec,
             retransmission_armor: unreliable_layer.retransmission_armor,
             mss: unreliable_layer.mss,
