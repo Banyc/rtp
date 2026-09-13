@@ -17,6 +17,17 @@ impl TransmissionLayer {
         self.write_half_for_test().drain_pacer_for_test(n, now)
     }
 
+    /// Test-only: pin the send pacer's burst floor to the legacy 64-packet
+    /// value and refill it, so suites that exercise send/recovery/FEC logic
+    /// (not pacing) keep the working burst they were written against.
+    pub(crate) fn pin_legacy_pacer_burst_for_test(&self, now: Instant) {
+        self.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .pin_legacy_pacer_burst_for_test(now);
+    }
+
     pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
         self.write_half_mut_for_test().send_pkts(bufs).await
     }
@@ -366,6 +377,7 @@ mod tests {
         ul.instream_group_fec = false;
         ul.ack_padding = ack_padding;
         let tl = TransmissionLayer::new(ul, None);
+        tl.pin_legacy_pacer_burst_for_test(Instant::now());
         (tl, recorder)
     }
 
@@ -661,6 +673,7 @@ mod tests {
         ul.retransmission_armor = RetransmissionArmorConfig::from(enabled);
         ul.instream_group_fec = instream_group_fec;
         let tl = TransmissionLayer::new(ul, None);
+        tl.pin_legacy_pacer_burst_for_test(Instant::now());
         (tl, recorder)
     }
 

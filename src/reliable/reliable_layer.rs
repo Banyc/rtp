@@ -488,6 +488,15 @@ impl ReliableLayer {
         self.pkt_send_space.set_cwnd(cwnd);
     }
 
+    /// Test-only: pin the send pacer's burst floor to the legacy 64-packet
+    /// value and refill it, so tests of the send/recovery/FEC algorithms keep
+    /// the working burst they were written against.  The pacer's own unit tests
+    /// cover the smaller production floor.
+    #[cfg(test)]
+    pub(crate) fn pin_legacy_pacer_burst_for_test(&self, now: Instant) {
+        self.send_rate_limiter.set_min_burst_for_test(64, now);
+    }
+
     pub fn sample_rtt(&mut self, rtt: Duration, now: Instant) {
         if self.pkt_send_space.sample_rtt(rtt, now) {
             self.outage_epoch_closed_at = Some(now);
@@ -1723,12 +1732,13 @@ mod tests {
     }
 
     fn test_layer(now: Instant) -> super::ReliableLayer {
-        super::ReliableLayer::new(
+        let (layer, pacer) = super::ReliableLayer::new(
             crate::mss::Mss::try_new(TEST_MSS).unwrap(),
             crate::delivery::frame::FrameMode::default(),
             now,
-        )
-        .0
+        );
+        pacer.set_min_burst_for_test(64, now);
+        layer
     }
 
     #[test]

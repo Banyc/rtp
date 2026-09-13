@@ -5,7 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TARGET_WAKE_INTERVAL: Duration = Duration::from_millis(1);
-const MIN_BURST_PACKETS: usize = 64;
+// The bucket's capacity is two wake intervals of tokens, but it is never
+// allowed to drop below this many packets.  The floor exists so a late wake
+// can still send the accrued catch-up batch (integer tokens beyond the
+// capacity are discarded, so too small a floor silently loses throughput
+// after scheduler jitter).  It must stay small: the old value of 64 let an
+// idle link credit ~64 packets, enough to dump ~90 ms of queue at 1 MiB/s and
+// spike interactive latency.
+const MIN_BURST_PACKETS: usize = 16;
 const MAX_BURST_PACKETS: usize = 512;
 
 /// A cloneable synchronized send pacer.  Every operation is a synchronous
@@ -22,17 +29,22 @@ struct PacerState {
     bucket: TokenBucket,
     rate: PosR<f64>,
     capacity: NonZeroUsize,
+    /// The floor applied to `capacity`.  It is `MIN_BURST_PACKETS` in
+    /// production; tests pin it to the legacy value so non-pacer suites keep
+    /// exercising the algorithms they were written for.
+    min_burst: usize,
 }
 
 impl SendPacer {
     pub(crate) fn new_prefilled(rate: PosR<f64>, now: Instant) -> Self {
-        let capacity = burst_capacity(rate);
+        let capacity = burst_capacity(rate, MIN_BURST_PACKETS);
         Self {
             state: Arc::new(Mutex::new(PacerState::with_tokens(
                 rate,
                 capacity,
                 capacity.get(),
                 now,
+                MIN_BURST_PACKETS,
             ))),
         }
     }
@@ -41,8 +53,23 @@ impl SendPacer {
         let mut state = self.state.lock().unwrap();
         state.bucket.gen_tokens(now);
         let tokens = state.bucket.outdated_coined_tokens();
-        let capacity = burst_capacity(rate);
-        *state = PacerState::with_tokens(rate, capacity, tokens.min(capacity.get()), now);
+        let min_burst = state.min_burst;
+        let capacity = burst_capacity(rate, min_burst);
+        *state =
+            PacerState::with_tokens(rate, capacity, tokens.min(capacity.get()), now, min_burst);
+    }
+
+    /// Test-only: pin the capacity floor to `min_burst` and refill the bucket.
+    /// Non-pacer suites need a working burst (the historical 64-packet floor)
+    /// so their send/recovery assertions are not re-specified around the
+    /// deliberately smaller interactive-rate burst; the pacer's own tests cover
+    /// the production floor.
+    #[cfg(test)]
+    pub(crate) fn set_min_burst_for_test(&self, min_burst: usize, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        let rate = state.rate;
+        let capacity = burst_capacity(rate, min_burst);
+        *state = PacerState::with_tokens(rate, capacity, capacity.get(), now, min_burst);
     }
 
     #[cfg(test)]
@@ -100,7 +127,13 @@ impl SendPacer {
 }
 
 impl PacerState {
-    fn with_tokens(rate: PosR<f64>, capacity: NonZeroUsize, tokens: usize, now: Instant) -> Self {
+    fn with_tokens(
+        rate: PosR<f64>,
+        capacity: NonZeroUsize,
+        tokens: usize,
+        now: Instant,
+        min_burst: usize,
+    ) -> Self {
         let tokens = tokens.min(capacity.get());
         let mut backdate = Duration::from_secs_f64((tokens as f64 + 0.5) / rate.get());
         let start = loop {
@@ -120,6 +153,7 @@ impl PacerState {
             bucket,
             rate,
             capacity,
+            min_burst,
         }
     }
 }
@@ -154,9 +188,15 @@ impl SendWake {
     }
 }
 
-fn burst_capacity(rate: PosR<f64>) -> NonZeroUsize {
+/// Capacity of the send pacer's token bucket, in packets: two wake intervals
+/// of tokens, bounded below by `min_burst` and above by `MAX_BURST_PACKETS`.
+/// The upper bound is unchanged so high rates, where the rate-scaled term
+/// dominates, keep their exact previous behaviour; only the small-rate floor is
+/// lowered to stop an idle bulk transfer from front-loading a queue the
+/// interactive path must wait behind.
+fn burst_capacity(rate: PosR<f64>, min_burst: usize) -> NonZeroUsize {
     let burst = (rate.get() * 2.0 * TARGET_WAKE_INTERVAL.as_secs_f64()).floor() as usize;
-    NonZeroUsize::new(burst.clamp(MIN_BURST_PACKETS, MAX_BURST_PACKETS)).unwrap()
+    NonZeroUsize::new(burst.clamp(min_burst, MAX_BURST_PACKETS)).unwrap()
 }
 
 #[cfg(test)]
@@ -247,10 +287,55 @@ mod tests {
 
     #[test]
     fn burst_capacity_scales_with_rate() {
-        assert_eq!(burst_capacity(rate(128.0)).get(), MIN_BURST_PACKETS);
-        let middle = burst_capacity(rate(100_000.0)).get();
+        assert_eq!(
+            burst_capacity(rate(128.0), MIN_BURST_PACKETS).get(),
+            MIN_BURST_PACKETS
+        );
+        let middle = burst_capacity(rate(100_000.0), MIN_BURST_PACKETS).get();
         assert!(middle > MIN_BURST_PACKETS);
         assert!(middle < MAX_BURST_PACKETS);
-        assert_eq!(burst_capacity(rate(1_000_000.0)).get(), MAX_BURST_PACKETS);
+        assert_eq!(
+            burst_capacity(rate(1_000_000.0), MIN_BURST_PACKETS).get(),
+            MAX_BURST_PACKETS
+        );
+    }
+
+    #[test]
+    fn low_rate_floor_rejects_a_bulk_sized_burst() {
+        // 1 MiB/s with ~1400-byte packets is ~750 pkt/s: `rate * 2 ms` is
+        // below the floor, so capacity is exactly the floor.  The old
+        // 64-packet floor let this rate dump ~64 packets (~90 ms of link
+        // time) after any idle period; it must now be far smaller.
+        let interactive = burst_capacity(rate(750.0), MIN_BURST_PACKETS).get();
+        assert_eq!(interactive, MIN_BURST_PACKETS);
+        assert!(
+            interactive < 64,
+            "low/interactive-rate burst {interactive} must not be an old-style bulk burst"
+        );
+
+        // A sub-packet-per-wake rate must still be floored (never zero) and
+        // must stay bounded by the same small floor.
+        let trickle = burst_capacity(rate(1.0), MIN_BURST_PACKETS).get();
+        assert!(trickle >= 1);
+        assert_eq!(trickle, MIN_BURST_PACKETS);
+    }
+
+    #[test]
+    fn high_rate_burst_capacity_is_unchanged() {
+        // Above the floor the rate-scaled term dominates, so these values are
+        // identical to the pre-fix formula (`floor(rate * 2 ms)`, capped at
+        // MAX): only the low-rate floor changed.
+        assert_eq!(
+            burst_capacity(rate(100_000.0), MIN_BURST_PACKETS).get(),
+            200
+        );
+        assert_eq!(
+            burst_capacity(rate(1_000_000.0), MIN_BURST_PACKETS).get(),
+            MAX_BURST_PACKETS
+        );
+        assert_eq!(
+            burst_capacity(rate(10_000_000.0), MIN_BURST_PACKETS).get(),
+            MAX_BURST_PACKETS
+        );
     }
 }
