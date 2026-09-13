@@ -102,9 +102,14 @@ impl RtxTimer {
 
     /// Whether the structural low-jitter gate is armed: `K * rttvar <
     /// srtt / 4`, i.e. the `srtt / 4` floor dominates the reorder window
-    /// because path jitter is small relative to sRTT.  This is the safety
-    /// gate for evidence-gated fast loss declaration — under high jitter
-    /// reordering mimics loss, so the fast path must stay off.
+    /// because path jitter is small relative to sRTT.  This is the
+    /// srtt-relative safety gate for evidence-gated fast loss declaration —
+    /// under high jitter reordering mimics loss, so the fast path must stay
+    /// off.  It is only one half of the caller's composite arming decision:
+    /// [`crate::traffic_shaping::recovery::rtt_stats::RttStats`] also arms
+    /// from the queue-independent lifetime minimum RTT (`rttvar < min_rtt`),
+    /// because queueing inflates srtt and rttvar together while `min_rtt`
+    /// stays at the uncongested propagation floor.
     pub fn fast_loss_armed(&self) -> bool {
         self.fast_loss_armed
     }

@@ -121,6 +121,24 @@ impl RttStats {
         self.rto.fast_loss_armed()
     }
 
+    /// Queue-independent fast-loss arming: the smoothed RTT variation is
+    /// below the lifetime minimum RTT — the propagation floor recorded while
+    /// the path was still uncongested — so a SACK gap is evidence of loss
+    /// rather than jitter-driven reordering.
+    ///
+    /// The srtt-relative gate [`Self::fast_loss_armed`] (`K*rttvar <
+    /// srtt/4`) is disarmed exactly when a bulk sender fills the bottleneck
+    /// queue, because queueing inflates both `srtt` and `rttvar`.  The
+    /// lifetime `min_rtt` does not inflate with queue depth (it is a minimum
+    /// over samples, including the uncongested ones), so this gate keeps the
+    /// evidence-gated fast-loss path armed under the bulk + loss conditions
+    /// where repair latency matters most.  `false` before any sample exists
+    /// (the gate abstains; the caller keeps the structural gate).
+    pub(crate) fn fast_loss_armed_against_min_rtt(&self) -> bool {
+        self.min_rtt
+            .is_some_and(|min_rtt| self.smooth_rtt_var() < min_rtt)
+    }
+
     pub(crate) fn reset_rto(&mut self, rtt: Duration) {
         self.rto.reset_to(rtt);
     }
@@ -129,5 +147,68 @@ impl RttStats {
 impl Default for RttStats {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::RttStats;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Bulk + loss fills the bottleneck queue: echoed-timestamp RTT samples
+    /// climb to 60-90 ms, inflating srtt to ~75 ms and rttvar to ~16 ms.  The
+    /// srtt-relative gate (`K*rttvar < srtt/4`) disarms, but the lifetime
+    /// min_rtt (30 ms, captured while the path was uncongested) does not
+    /// inflate, so the queue-independent gate must still arm.
+    #[test]
+    fn min_rtt_gate_arms_under_queue_inflation_where_the_srtt_gate_disarms() {
+        let mut stats = RttStats::new();
+        // Propagation floor recorded on the empty queue.
+        stats.record_rtt(ms(30));
+        for _ in 0..30 {
+            stats.record_rtt(ms(90));
+            stats.record_rtt(ms(60));
+        }
+
+        assert_eq!(stats.min_rtt(), Some(ms(30)), "propagation floor must hold");
+        let srtt = stats.smooth_rtt();
+        let rttvar = stats.smooth_rtt_var();
+        assert!(srtt >= ms(70) && srtt <= ms(80), "srtt={srtt:?}");
+        assert!(rttvar >= ms(12) && rttvar <= ms(20), "rttvar={rttvar:?}");
+
+        assert!(
+            !stats.fast_loss_armed(),
+            "srtt-relative gate must be disarmed by queue inflation"
+        );
+        assert!(
+            stats.fast_loss_armed_against_min_rtt(),
+            "queue-independent min-RTT gate must be armed"
+        );
+    }
+
+    #[test]
+    fn min_rtt_gate_stays_disarmed_on_a_high_jitter_link() {
+        let mut stats = RttStats::new();
+        for _ in 0..20 {
+            stats.record_rtt(ms(100));
+            stats.record_rtt(ms(900));
+        }
+        assert!(!stats.fast_loss_armed(), "srtt-relative gate disarmed");
+        assert!(
+            !stats.fast_loss_armed_against_min_rtt(),
+            "min-RTT gate must stay off when jitter dwarfs the propagation floor"
+        );
+    }
+
+    #[test]
+    fn min_rtt_gate_abstains_before_any_sample() {
+        let stats = RttStats::new();
+        assert!(stats.min_rtt().is_none());
+        assert!(!stats.fast_loss_armed_against_min_rtt());
     }
 }

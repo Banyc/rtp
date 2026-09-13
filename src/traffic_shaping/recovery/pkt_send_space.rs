@@ -220,15 +220,25 @@ impl PktSendSpace {
     }
 
     /// Whether the evidence-gated fast-loss path is currently armed.  Arming
-    /// requires the structural low-jitter gate (`K*rttvar < srtt/4`) AND no
-    /// currently-armed observed-reordering disable.  Always-on when armed;
-    /// there is no env toggle — the structural gate is the safety.  The
-    /// disable is *bounded*: it expires after
+    /// requires no currently-armed observed-reordering disable, AND either of
+    /// two low-jitter gates:
+    ///
+    /// * the structural srtt-relative gate (`K*rttvar < srtt/4`), and/or
+    /// * the queue-independent lifetime-min-RTT gate (`rttvar < min_rtt`).
+    ///
+    /// The srtt-relative gate alone is disarmed when a bulk sender fills the
+    /// bottleneck queue (queueing inflates srtt and rttvar together); the
+    /// lifetime minimum RTT is captured while the path is uncongested, so the
+    /// min-RTT gate keeps the fast path armed under bulk + loss.  Always-on
+    /// when armed; there is no env toggle — the gates are the safety.  The
+    /// observed-reordering disable is *bounded*: it expires after
     /// [`FAST_LOSS_DISABLE_ROUND_TRIPS`] smoothed round trips and is cleared
     /// by the next now-bearing state transition (`ack` / `sample_rtt` /
     /// retransmit), so a clean link re-enables fast loss.
     pub fn fast_loss_armed(&self) -> bool {
-        !self.fast_loss_disabled() && self.rtt_stats.fast_loss_armed()
+        !self.fast_loss_disabled()
+            && (self.rtt_stats.fast_loss_armed()
+                || self.rtt_stats.fast_loss_armed_against_min_rtt())
     }
 
     /// Whether the observed-reordering disable is currently armed (regardless
@@ -1572,8 +1582,9 @@ impl InFlightPkt {
     /// Whether this packet should be declared lost by the evidence-gated
     /// fast-loss path: it has not yet been retransmitted and at least
     /// [`FAST_LOSS_SACK_THRESHOLD`] newer in-flight packets have been SACKed
-    /// past it.  The structural arming gate and the observed-reordering
-    /// hard-disable are checked by the caller (`PktSendSpace::fast_loss_armed`).
+    /// past it.  The caller's composite arming gates
+    /// (`PktSendSpace::fast_loss_armed`) and the observed-reordering
+    /// hard-disable are checked before this evidence is used.
     pub fn is_fast_loss(&self) -> bool {
         !self.rtxed && self.sacked_above >= FAST_LOSS_SACK_THRESHOLD
     }
@@ -2377,6 +2388,80 @@ mod tests {
         assert_eq!(space.retransmission_counters.reorder_reason, 0);
     }
 
+    /// Bulk + loss fills the bottleneck queue, inflating both srtt and rttvar.
+    /// The srtt-relative structural gate disarms, but the lifetime min_rtt
+    /// (captured on the empty queue) does not, so the queue-independent gate
+    /// must keep fast loss armed and fire it on the SACK evidence — before
+    /// the queue-inflated reorder window that the old gate would have fallen
+    /// back to.
+    #[test]
+    fn fast_loss_arms_from_min_rtt_and_fires_under_bulk_queue_inflation() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+
+        // Queue-empty propagation floor: one 30 ms sample.
+        space.sample_rtt(ms(30), t0);
+
+        // Bulk saturates the bottleneck queue: echoed-timestamp samples climb
+        // to 60-90 ms, settling srtt ~75 ms and rttvar ~16 ms.
+        let mut now = t0 + ms(1);
+        for _ in 0..30 {
+            space.sample_rtt(ms(90), now);
+            now += ms(1);
+            space.sample_rtt(ms(60), now);
+            now += ms(1);
+        }
+
+        assert_eq!(space.min_rtt(), Some(ms(30)), "propagation floor");
+        let srtt = space.smooth_rtt();
+        let rttvar = space.smooth_rtt_var();
+        assert!(srtt >= ms(70) && srtt <= ms(80), "srtt={srtt:?}");
+        assert!(rttvar >= ms(12) && rttvar <= ms(20), "rttvar={rttvar:?}");
+        assert!(
+            !space.rtt_stats.fast_loss_armed(),
+            "srtt-relative gate must be disarmed by queue inflation"
+        );
+        assert!(
+            space.fast_loss_armed(),
+            "queue-independent min-RTT gate must arm fast loss"
+        );
+
+        // Send four packets; seq 0 is starved while 1, 2, 3 are SACKed past it.
+        let send_base = now;
+        send_packet(&mut space, send_base);
+        send_packet(&mut space, send_base + ms(1));
+        send_packet(&mut space, send_base + ms(2));
+        send_packet(&mut space, send_base + ms(3));
+        sack_one(&mut space, 1, send_base + ms(10));
+        sack_one(&mut space, 2, send_base + ms(11));
+        sack_one(&mut space, 3, send_base + ms(12));
+        assert_eq!(
+            sacked_above(&space, 0),
+            3,
+            "seq 0 should have 3 sack passes"
+        );
+
+        // Before the (queue-inflated) reorder window: only the evidence-gated
+        // fast-loss path can fire.
+        let early = send_base + ms(30);
+        assert!(
+            early.duration_since(send_base) < space.rtt_stats.reorder_window(),
+            "test must run before the reorder window expires"
+        );
+        assert!(
+            space.has_rtx(early),
+            "min-RTT-armed fast loss must make has_rtx true before the reorder window"
+        );
+        let rtx = space
+            .rtx(early)
+            .expect("min-RTT-armed fast loss must retransmit seq 0");
+        assert_eq!(rtx.seq, sq(0));
+        assert_eq!(space.retransmission_counters.attempts, 1);
+        assert_eq!(space.retransmission_counters.fast_loss_reason, 1);
+        assert_eq!(space.retransmission_counters.rto_reason, 0);
+        assert_eq!(space.retransmission_counters.reorder_reason, 0);
+    }
+
     #[test]
     fn duplicate_acks_carrying_no_new_information_do_not_earn_sacked_above() {
         let t0 = Instant::now();
@@ -2416,9 +2501,11 @@ mod tests {
         let mut space = PktSendSpace::new();
         settle_high_jitter(&mut space, t0);
 
-        // High-jitter link: K*rttvar dominates srtt/4, so the structural gate
-        // is disarmed — reordering can mimic loss, so the fast path must stay
-        // off and only the stock time-based declaration is allowed.
+        // High-jitter link: K*rttvar dominates srtt/4 AND rttvar dwarfs the
+        // propagation floor, so BOTH the srtt-relative structural gate and the
+        // queue-independent min-RTT gate are disarmed — reordering can mimic
+        // loss, so the fast path must stay off and only the stock time-based
+        // declaration is allowed.
         assert!(
             !space.fast_loss_armed(),
             "gate should be disarmed on a high-jitter link"
