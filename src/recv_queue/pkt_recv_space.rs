@@ -153,6 +153,7 @@ impl PktRecvSpace {
             &mut self.reused_buf,
             &mut self.scan_start,
             &mut self.scan_resume,
+            self.next,
         );
         // Collapse the head-tombstone prefix whether or not a frame was
         // found: the scan may have tombstoned abandoned frames (a hostile
@@ -358,34 +359,38 @@ mod tests {
 
     // Frame delivery tests — enabled mode.
 
+    // Ordered, gap-free delivery: a complete frame past an unrepaired front
+    // hole is withheld — the front hole must fill (retransmission or
+    // reordering) before the later frame is handed up.
     #[test]
-    fn ooo_complete_frame_delivers_past_sequence_hole() {
+    fn a_complete_frame_past_a_front_hole_is_withheld_until_the_hole_fills() {
         let mut space = PktRecvSpace::new();
-        // Hole at seq 0; deliver a complete 1-packet frame at seq 1 first.
+        // Hole at seq 0; a complete 1-packet frame arrives at seq 1.
         assert!(space.recv(1, b"frame1".to_vec(), Some(6)));
-        let frame = space.pop_complete_frame().unwrap();
-        assert_eq!(frame, b"frame1");
-        // Frame was delivered; seq 1 is now a tombstone.
-        assert!(matches!(
-            space.slots.get(&seq(1)),
-            Some(RecvSlot::Tombstone)
-        ));
-        // Now fill the hole at seq 0 to verify the window still works.
-        assert!(space.recv(0, b"late".to_vec(), None));
-        assert_eq!(space.pop().unwrap(), b"late");
+        // Complete but past the hole: withheld, its slot untouched.
+        assert!(space.pop_complete_frame().is_none());
+        assert!(matches!(space.slots.get(&seq(1)), Some(RecvSlot::Data(_))));
+        // Fill the hole with a frame of its own.
+        assert!(space.recv(0, b"late".to_vec(), Some(4)));
+        // The front frame delivers first, then the withheld one, in order.
+        assert_eq!(space.pop_complete_frame().unwrap(), b"late");
+        assert_eq!(space.pop_complete_frame().unwrap(), b"frame1");
+        // Both frames delivered; the cursor reached past their range.
+        assert_eq!(space.next, Some(seq(2)));
+        assert_eq!(space.slots.len(), 0);
     }
 
     #[test]
     fn multi_packet_frame_waits_for_all_its_packets() {
         let mut space = PktRecvSpace::new();
-        // Frame of 11 bytes across 3 packets: seq 1 (start, 6 bytes), seq 2 (3 bytes), seq 3 (2 bytes).
+        // Frame of 11 bytes across 3 packets: seq 0 (start, 6 bytes), seq 1 (3 bytes), seq 2 (2 bytes).
         // Send all but the last.
-        assert!(space.recv(1, b"hello ".to_vec(), Some(11)));
-        assert!(space.recv(2, b"wor".to_vec(), None));
+        assert!(space.recv(0, b"hello ".to_vec(), Some(11)));
+        assert!(space.recv(1, b"wor".to_vec(), None));
         // Frame is incomplete (11 bytes not collected yet).
         assert!(space.pop_complete_frame().is_none());
         // Send the last packet.
-        assert!(space.recv(3, b"ld".to_vec(), None));
+        assert!(space.recv(2, b"ld".to_vec(), None));
         // Now complete.
         let frame = space.pop_complete_frame().unwrap();
         assert_eq!(frame, b"hello world");
@@ -419,12 +424,13 @@ mod tests {
     fn interrupted_frame_does_not_wedge_the_receiver() {
         let mut space = PktRecvSpace::new();
         // Frame A (seqs 0-3, frame_len 80) is interrupted by a hostile
-        // frame-start at seq 3 (frame B, seqs 3-6): only A's first three
-        // packets (60 bytes) have arrived, so A is incomplete when B's start
-        // lands inside its range. B completes and is popped (tombstoning
-        // 3-6); A's retransmissions of 3-5 are then swallowed by the
-        // tombstones (occupied slots read as duplicates). The receiver must
-        // tombstone A's collected seqs (0-2) so the in-order cursor advances
+        // frame-start at seq 3 (frame B, seqs 3-6): the foreign start lands
+        // exactly on A's next continuation, capturing that slot forever — A
+        // can never reassemble, so the scan abandons A (collecting 0-2 for
+        // tombstoning) at the collision. B is then at the in-order front
+        // (A's abandonment tombstones collapse past it) and delivers. A's
+        // retransmissions of 3-5 are swallowed by B's delivery tombstones
+        // (occupied slots read as duplicates). The cursor advances past 0-6
         // instead of wedging on A forever.
         assert!(space.recv(0, b"AAAAAAAAAAAAAAAAAAAA".to_vec(), Some(80)));
         assert!(space.recv(1, b"BBBBBBBBBBBBBBBBBBBB".to_vec(), None));
@@ -454,28 +460,28 @@ mod tests {
         let mut space = PktRecvSpace::new();
         // Frame A (seqs 0-3, frame_len 80) and frame B (seqs 4-6, frame_len
         // 60) are contiguous from the sender's perspective, but B's packets
-        // arrive before A's continuation at seq 3. The scan abandons A at
-        // the collision with B (no tombstone inside A's range), B completes,
-        // and A must still reassemble when its packet arrives at a vacant
-        // slot.
+        // arrive before A's continuation at seq 3. B's start is one past the
+        // hole, so A stays repairable (no abandonment — nothing captured its
+        // continuation) while B is complete but withheld: nothing delivers
+        // until A's hole fills, then both deliver in order.
         assert!(space.recv(0, b"AAAAAAAAAAAAAAAAAAAA".to_vec(), Some(80)));
         assert!(space.recv(1, b"BBBBBBBBBBBBBBBBBBBB".to_vec(), None));
         assert!(space.recv(2, b"CCCCCCCCCCCCCCCCCCCC".to_vec(), None));
         assert!(space.recv(4, b"DDDDDDDDDDDDDDDDDDDD".to_vec(), Some(60)));
         assert!(space.recv(5, b"EEEEEEEEEEEEEEEEEEEE".to_vec(), None));
         assert!(space.recv(6, b"FFFFFFFFFFFFFFFFFFFF".to_vec(), None));
-        // B completes first.
-        assert_eq!(
-            space.pop_complete_frame().unwrap(),
-            b"DDDDDDDDDDDDDDDDDDDDEEEEEEEEEEEEEEEEEEEEFFFFFFFFFFFFFFFFFFFF"
-        );
+        // B is complete but begins past A's hole: withheld until A repairs.
+        assert!(space.pop_complete_frame().is_none());
         // A's continuation arrives at a vacant slot (B never overlapped A).
         assert!(space.recv(3, b"DDDDDDDDDDDDDDDDDDDD".to_vec(), None));
-        // A reassembles: the tombstone at 4-6 is AFTER A's range, so the
-        // contiguity run 0-3 is intact.
+        // A reassembles and delivers first (in order), then B.
         assert_eq!(
             space.pop_complete_frame().unwrap(),
             b"AAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBBBBBBBBCCCCCCCCCCCCCCCCCCCCDDDDDDDDDDDDDDDDDDDD"
+        );
+        assert_eq!(
+            space.pop_complete_frame().unwrap(),
+            b"DDDDDDDDDDDDDDDDDDDDEEEEEEEEEEEEEEEEEEEEFFFFFFFFFFFFFFFFFFFF"
         );
         assert_eq!(space.next, Some(seq(7)));
     }
@@ -522,6 +528,17 @@ mod tests {
         first.reserve(11);
         first.extend_from_slice(b"hello ");
         let first_ptr = first.as_ptr();
+        // Ordered delivery only hands up frames at the front, so seat a
+        // single-packet frame at seq 0 and deliver it first; the multi-packet
+        // frame below then starts at the in-order cursor (seq 1).
+        space.slots.insert(
+            seq(0),
+            RecvSlot::Data(RecvPkt {
+                data: b"_".to_vec(),
+                frame_len: Some(1),
+            }),
+        );
+        assert_eq!(space.pop_complete_frame().unwrap(), b"_");
         space.slots.insert(
             seq(1),
             RecvSlot::Data(RecvPkt {
@@ -570,21 +587,32 @@ mod tests {
         assert_eq!(space.next, Some(seq(3)));
     }
 
+    // Frame boundaries are contiguous from a legitimate sender, so a frame
+    // start landing exactly on an in-progress frame's next continuation means
+    // that continuation slot is captured forever (the interrupting packet
+    // occupies it): the old frame is unreparable and is abandoned, and the
+    // colliding packet's own frame_len still starts a NEW run (a run is
+    // never extended across a frame boundary).
     #[test]
-    fn frame_continuation_with_own_frame_len_starts_new_run() {
+    fn frame_start_on_an_in_progress_frames_continuation_abandons_the_old_frame() {
         let mut space = PktRecvSpace::new();
-        // Frame: seq 1 (start, len 6)
-        // But seq 2 is a new frame start (len 3), not a continuation — gap in seq 1's run.
-        // Then seq 3 would be continuation of seq 2's frame.
+        // Seed the front so the collision below sits at the in-order cursor.
+        assert!(space.recv(0, b"ab".to_vec(), Some(2)));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"ab");
+        // Frame A: seq 1 (start, len 6) — incomplete, 4 of 6 bytes collected.
+        // seq 2 is a NEW frame start (len 3) colliding exactly on A's next
+        // continuation: A's seq-2 packet can never be inserted, so A is
+        // abandoned and the new run starts at seq 2. seq 3 is an orphaned
+        // continuation (the run never extends across the boundary).
         assert!(space.recv(1, b"fram".to_vec(), Some(6)));
         assert!(space.recv(2, b"new".to_vec(), Some(3)));
         assert!(space.recv(3, b"foo".to_vec(), None));
-
-        // seq 2+3 should form a complete frame (3 bytes each, but frame_len is 3 so only seq 2 needed? No — frame_len is the total frame len, and seq 2 alone has 3 bytes = frame_len of 3, so it IS complete).
-        // Actually the test scenario: seq 1 frame is incomplete (need 6, only have 3 from seq 1).
-        // seq 2 is a complete frame (len 3, data "new" = 3 bytes).
+        // B completes at its single packet (3 bytes = frame_len 3) and is at
+        // the front after A's abandonment tombstone collapses.
         let frame = space.pop_complete_frame().unwrap();
         assert_eq!(frame, b"new");
+        // A's collected seq 1 was abandoned; the cursor advanced past it.
+        assert_eq!(space.next, Some(seq(3)));
     }
 
     #[test]
@@ -606,13 +634,22 @@ mod tests {
         assert_eq!(space.ack_history().blocks().count(), 0);
     }
 
+    // A delivered frame's tombstones are collapsed immediately at the front:
+    // ordered delivery only hands frames up at the cursor, so a frame's own
+    // tombstone is always head-contiguous and collapses. The window-pinning
+    // case is therefore an ABANDONED frame's tombstones sitting ahead of an
+    // unrepaired hole — they count toward the window until the front catches
+    // up and collapses them.
     #[test]
-    fn pop_complete_frame_tombstones_count_toward_window() {
+    fn abandoned_frame_tombstones_count_toward_the_window() {
         let mut space = PktRecvSpace::new();
-        // Deliver a frame at seq 1, leaving a hole at seq 0.
-        assert!(space.recv(1, b"x".to_vec(), Some(1)));
+        // Frame X (seqs 1-2, frame_len 80) is interrupted by a hostile
+        // frame-start at seq 2 — exactly X's continuation — so X is
+        // abandoned when the scan sees the collision.
+        assert!(space.recv(1, b"XXXXXXXXXXXXXXXXXXXX".to_vec(), Some(80)));
+        assert!(space.recv(2, b"YYYYYYYYYYYYYYYYYYYY".to_vec(), Some(80)));
         space.pop_complete_frame();
-        // seq 1 is now a tombstone; seq 0 is a hole.
+        // seq 1 is now an abandonment tombstone; seq 0 is an unfilled hole.
         assert!(matches!(
             space.slots.get(&seq(1)),
             Some(RecvSlot::Tombstone)
@@ -747,25 +784,33 @@ mod tests {
     #[test]
     fn a_late_packet_below_the_scan_cursor_still_completes_its_frame() {
         let mut space = PktRecvSpace::new();
+        // 62 single-packet frames at 2..63, plus frame "hello" split across
+        // 0 ("hel", fl 5) and 1 ("lo"), all arrive out of order.
         for s in 2..64 {
             assert!(space.recv(s, b"x".to_vec(), Some(1)));
         }
         assert!(space.recv(1, b"lo".to_vec(), None));
+        // The front (seq 0) is a hole: no complete later frame may deliver,
+        // however many are ready behind it.
         for _ in 2..64 {
-            assert!(space.pop_complete_frame().is_some());
+            assert!(space.pop_complete_frame().is_none());
         }
-        assert!(space.pop_complete_frame().is_none());
+        // The front hole fills: the frame at 0 reassembles and delivers, and
+        // the 62 ready frames follow in order.
         assert!(space.recv(0, b"hel".to_vec(), Some(5)));
         assert_eq!(
             space.pop_complete_frame().as_deref(),
             Some(&b"hello"[..]),
             "the frame waiting on the late packet was never handed up"
         );
+        for _ in 2..64 {
+            assert!(space.pop_complete_frame().is_some());
+        }
         space.collapse_tombstone_prefix();
         assert_eq!(
             space.next_seq(),
             Some(seq(64)),
-            "the in-order cursor did not advance past the filled hole"
+            "the in-order cursor did not advance past the delivered frames"
         );
     }
 
@@ -821,16 +866,23 @@ mod tests {
         assert_eq!(space.slots.len(), 0);
     }
 
-    fn ooo_pop_cost(outstanding: u64) -> f64 {
+    fn withheld_pop_cost(outstanding: u64) -> f64 {
         let mut best = f64::MAX;
         for _ in 0..3 {
             let mut space = PktRecvSpace::new();
             for s in 1..=outstanding {
                 assert!(space.recv(s, b"x".to_vec(), Some(1)));
             }
+            // The first pop walks the region once (nothing is at the front —
+            // seq 0 is a hole) and caches the scan resume behind the
+            // withheld frames.
+            assert!(space.pop_complete_frame().is_none());
             let start = std::time::Instant::now();
             for _ in 0..outstanding {
-                assert!(space.pop_complete_frame().is_some());
+                // Each subsequent pop resumes one frame past the cached
+                // frontier and withholds it the same way: the per-pop cost
+                // must not grow with the number of frames behind the hole.
+                assert!(space.pop_complete_frame().is_none());
             }
             best = best.min(start.elapsed().as_secs_f64() / outstanding as f64 * 1e9);
         }
@@ -854,16 +906,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf lane: wall-clock ns/frame ratio; run with cargo test --release -- --ignored"]
-    fn delivering_past_a_hole_costs_no_more_per_frame() {
-        let few = ooo_pop_cost(64);
-        let many = ooo_pop_cost(4096);
+    #[ignore = "perf lane: wall-clock ns/pop ratio; run with cargo test --release -- --ignored"]
+    fn withholding_frames_behind_a_hole_costs_no_more_per_pop() {
+        let few = withheld_pop_cost(64);
+        let many = withheld_pop_cost(4096);
         eprintln!(
-            "out-of-order frame delivery: {few:.1} ns/frame at 64 outstanding, {many:.1} ns/frame at 4096"
+            "frames withheld behind a front hole: {few:.1} ns/pop at 64 outstanding, {many:.1} ns/pop at 4096"
         );
         assert!(
             many < few * 8.0,
-            "{many:.1} ns/frame at 4096 outstanding against {few:.1} ns at 64: the per-frame cost grows with the number of frames delivered past the hole"
+            "{many:.1} ns/pop at 4096 outstanding against {few:.1} ns at 64: the per-pop cost grows with the number of frames withheld behind the hole"
         );
     }
 

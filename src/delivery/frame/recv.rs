@@ -18,19 +18,24 @@ pub(crate) struct RecvPkt {
 }
 
 /// The outcome of one reassembly scan: the complete frame (if any) plus the
-/// frames abandoned because a tombstone landed inside their collected range
-/// (a hostile peer's overlapping frames). The abandoned frames' collected
-/// seqs must be tombstoned so the in-order cursor can advance past them;
-/// otherwise the receiver wedges permanently on the abandoned frame.
+/// frames abandoned because their next continuation sequence is permanently
+/// captured — by a [`RecvSlot::Tombstone`] or by a foreign frame start — both
+/// of which arise from a hostile peer's overlapping frames. The abandoned
+/// frames' collected seqs must be tombstoned so the in-order cursor can
+/// advance past them; otherwise the receiver wedges permanently on an
+/// unrepairable frame.
 #[derive(Debug, Default)]
 pub(crate) struct FrameScan {
-    /// The complete frame, when the scan found one.
+    /// The complete frame, when the scan found one. The caller only hands
+    /// it up when it begins at the in-order front; a complete frame past an
+    /// unrepaired hole is withheld (see [`pop_complete_frame`]).
     pub(crate) complete: Option<(SequenceNumber, u64, u32)>,
-    /// `(start, packet_count)` of each frame abandoned mid-scan because a
-    /// tombstone landed inside its collected range. Empty in every
-    /// legitimate arrival pattern (a legitimate sender never interleaves
-    /// frames, so a tombstone can only appear inside an in-progress frame
-    /// when a hostile peer's frame overlapped it).
+    /// `(start, packet_count)` of each frame abandoned mid-scan because its
+    /// next continuation sequence is captured forever (a tombstone or a
+    /// foreign frame start lies there). Empty in every legitimate arrival
+    /// pattern (a legitimate sender never interleaves frames, so a captured
+    /// continuation can only arise when a hostile peer's frame overlapped
+    /// the in-progress frame).
     pub(crate) abandoned: Vec<(SequenceNumber, u64)>,
 }
 
@@ -45,10 +50,12 @@ pub(crate) struct FrameScan {
 /// collapse / removal / window-anchor advance, drops this state and forces
 /// a full rescan, which reproduces the stateless behavior exactly.
 ///
-/// The state is only written by a *benign* scan — one that neither found a
-/// complete frame nor abandoned one. A scan that completes or abandons a
-/// frame inserts tombstones this call, so its end state cannot be reused
-/// and the consumer explicitly clears it.
+/// The state is only written by a *benign* scan — one that inserted no
+/// tombstones. A scan that reports a complete frame is benign as long as the
+/// frame is *withheld* (complete but past an unrepaired hole, so its slots
+/// stay in place); the consumer clears the state when it actually delivers
+/// (tombstoning the frame) or when the scan abandoned a frame (whose
+/// tombstones rewire the scanned prefix).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScanResume {
     /// The last occupied sequence the scan examined. Read by the packet
@@ -60,7 +67,9 @@ pub(crate) struct ScanResume {
     scanning_front: bool,
     /// The in-progress frame the scan was accumulating when it stopped, if
     /// any (a contiguity break — a sequence hole or an interrupting frame
-    /// start — resets it to `None`).
+    /// start — resets it to `None`). A scan that stopped at a complete
+    /// frame always caches `None`: the sealed run must not be extended by a
+    /// resumed scan even if the frame is withheld.
     frame: Option<FrameProgress>,
 }
 
@@ -150,6 +159,28 @@ fn find_complete_frame(
         }
         match slot {
             RecvSlot::Data(pkt) => {
+                // A foreign frame start (a packet carrying its own frame_len)
+                // landing exactly on the in-progress frame's next continuation
+                // sequence captures that slot forever: the continuation packet
+                // can never be inserted (recv_bytes treats an occupied slot as
+                // a duplicate), so the in-progress frame can never reassemble.
+                // A legitimate sender never interleaves frames (frame
+                // boundaries are contiguous), so this only arises from a
+                // hostile peer's overlapping frame or a defective sender that
+                // abandoned the frame mid-flight. Abandon the frame the same
+                // way a tombstone inside its range would: record its collected
+                // seqs so the caller can tombstone them and the in-order
+                // cursor can advance past it.
+                if let Some(start) = locals.frame_start
+                    && pkt.frame_len.is_some()
+                    && seq == locals.frame_end.unwrap().advance(1)
+                {
+                    locals.abandoned.push((start, locals.packet_count));
+                    locals.frame_start = None;
+                    locals.frame_end = None;
+                    locals.packet_count = 0;
+                    locals.collected = 0;
+                }
                 if locals.frame_start.is_none() || pkt.frame_len.is_some() {
                     let Some(fl) = pkt.frame_len else {
                         continue;
@@ -198,15 +229,23 @@ fn find_complete_frame(
             }
         }
     }
-    let resume = if complete.is_none() && locals.abandoned.is_empty() {
-        // Benign end: an incomplete frame (or a run reset by a hole), with
-        // neither a completed nor an abandoned frame — this scan inserted
-        // no tombstones, so its end state can be reused verbatim next call
-        // as long as the map prefix below `up_to` stays unchanged.
+    let resume = if locals.abandoned.is_empty() {
+        // Benign end: this scan inserted no tombstones (it either stopped on
+        // an incomplete frame, a run reset by a hole, or a complete frame
+        // that will be withheld behind an unrepaired hole rather than
+        // delivered), so its end state can be reused verbatim next call as
+        // long as the map prefix below `up_to` stays unchanged. A scan that
+        // stopped at a complete frame must not resume its run (the frame is
+        // sealed; the consumer either delivers it — clearing this state — or
+        // withholds it, in which case the next scan continues *past* it).
         up_to.map(|up_to| ScanResume {
             up_to,
             scanning_front: locals.scanning_front,
-            frame: frame_progress_from_locals(&locals),
+            frame: if complete.is_some() {
+                None
+            } else {
+                frame_progress_from_locals(&locals)
+            },
         })
     } else {
         None
@@ -225,6 +264,7 @@ pub(crate) fn pop_complete_frame(
     reused_buf: &mut ObjPool<Vec<u8>>,
     scan_start: &mut SequenceNumber,
     resume: &mut Option<ScanResume>,
+    next: Option<SequenceNumber>,
 ) -> Option<Vec<u8>> {
     let ScanOutcome {
         scan: FrameScan {
@@ -233,7 +273,6 @@ pub(crate) fn pop_complete_frame(
         },
         resume: refresh,
     } = find_complete_frame(slots, scan_start, *resume);
-    *resume = refresh;
     // Tombstone the abandoned frames' collected seqs so the in-order cursor
     // can advance past them. Without this, a hostile peer's overlapping
     // frames wedge the receiver: the abandoned frame's retransmissions are
@@ -247,7 +286,36 @@ pub(crate) fn pop_complete_frame(
             }
         }
     }
-    let (frame_start, packet_count, frame_len) = complete?;
+    let Some((frame_start, packet_count, frame_len)) = complete else {
+        *resume = refresh;
+        return None;
+    };
+    // Ordered-delivery gate: a frame may only be handed up when it begins at
+    // the in-order front — the first not-yet-delivered sequence. The scan
+    // skips sequence holes (a missing slot is simply absent from the map), so
+    // without this gate a complete later frame would be delivered past an
+    // unrepaired hole, violating the ordered, gap-free delivery contract. A
+    // complete frame past a hole is WITHHELD: its slots stay in place and the
+    // scan resume cached above makes the next call continue past it instead
+    // of re-walking it. When the hole fills (retransmission or reordering),
+    // the insertion drops the resume and the full rescan re-finds the frame,
+    // now at the front, and delivers it.
+    let Some(mut front) = next else {
+        *resume = refresh;
+        return None;
+    };
+    // The abandonment tombstones just inserted may have unblocked the front:
+    // skip them to find the effective head of the queue.
+    while matches!(slots.get(&front), Some(RecvSlot::Tombstone)) {
+        front = front.advance(1);
+    }
+    if frame_start != front {
+        *resume = refresh;
+        return None;
+    }
+    // Delivering the frame tombstones its seqs, rewiring the scanned prefix:
+    // the cached resume state is no longer valid past this call.
+    *resume = None;
     if packet_count == 1 {
         // Single-packet fast path: the collected slot already holds the
         // whole frame, so hand its Vec straight back. No new allocation,

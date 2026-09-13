@@ -8,8 +8,12 @@
 //!   packet of a frame carries a `FRAME_DATA_TS` codec command with the
 //!   total frame length; continuation packets use `DATA_TS`).
 //! - ARQ / SACK / congestion control are untouched.
-//! - The receiver may deliver any *complete* frame out of order, past
-//!   sequence holes, by scanning the receive queue.
+//! - The receiver reassembles frames and delivers them in order, gap-free, at
+//!   the in-order cursor: a complete frame past an unrepaired sequence hole is
+//!   withheld until the hole fills (retransmission or reordering), preserving
+//!   the strict ordering guarantee of stock rtp. A frame whose next
+//!   continuation is permanently captured (a hostile peer's overlapping frame)
+//!   is abandoned so the cursor never wedges on it.
 //!
 //! # Both peers must enable together
 //!
