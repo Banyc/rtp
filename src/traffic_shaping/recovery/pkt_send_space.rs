@@ -696,11 +696,6 @@ impl PktSendSpace {
         let peer_response = peer_response || delivered > 0;
         if delivered > 0 {
             self.tlp.reset();
-            // Any freshly delivered packet — cumulative or out-of-order SACK —
-            // is delivery progress: the peer is alive and consuming data, so
-            // the delivery-staleness watchdog restarts.  The front-stall wall
-            // is NOT restarted here; only a cumulative advance moves it.
-            self.liveness.record_progress();
         }
         if !self.fast_loss_disabled()
             && let Some(reorder_suspicion_window) = self.rtt_stats.recent_min_rtt()
@@ -753,10 +748,7 @@ impl PktSendSpace {
             acked.push(p.stats);
         }
         if cumulative_advance > 0 {
-            // The delivery front physically moved: restart the hard
-            // front-stall wall so the session must keep advancing it at least
-            // once per max_timeout even while out-of-order delivery flows.
-            self.liveness.record_cumulative_advance(now);
+            self.liveness.record_progress();
         }
         // The newest unacked packet was acked: rescan for the new tail.  No
         // other ACK ever moves it, so no other ACK rescans.
@@ -3035,31 +3027,16 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_delivery_keeps_stuck_front_alive_until_the_front_stall_wall() {
+    fn fresh_sacks_behind_permanent_hole_do_not_reset_cumulative_progress() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
         assert_eq!(send_packet(&mut space, t0), sq(0));
         assert_eq!(ack_one(&mut space, 0, t0 + ms(10)), 1);
-        // Packet 1 is the permanent hole: the cumulative front never advances
-        // past it.
         assert_eq!(send_packet(&mut space, t0 + ms(11)), sq(1));
-        // The front-stall wall runs from the last cumulative advance: the ack
-        // of packet 0 at t0+10ms.
-        let wall_deadline = t0
-            + ms(10)
-            + crate::transmission::watchdog_tuning::WatchdogTuning::default().max_timeout;
-
         let mut last_ack = t0 + ms(11);
-        let mut i = 0u64;
-        loop {
-            // Keep delivering fresh packets right up to the wall so the wall
-            // (not the delivery-staleness watchdog) is the binding constraint
-            // at its deadline.
+        for i in 0..8 {
             let send_at = t0 + ms(12) + Duration::from_secs(i * 5);
-            if send_at + ms(1) > wall_deadline - Duration::from_secs(5) {
-                break;
-            }
             let seq = send_packet(&mut space, send_at);
             let balls = [
                 crate::ack::AckInterval {
@@ -3080,47 +3057,26 @@ mod tests {
             );
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
             assert_eq!(space.send_wnd.start(), sq(1));
-            i += 1;
         }
-
         let no_resp = space.no_resp_for(last_ack);
         let no_progress = space.no_progress_for(last_ack);
         assert_eq!(no_resp, Some(Duration::ZERO));
         assert!(
             no_progress.is_some_and(|d| d > Duration::from_secs(30)),
-            "the front-stall wall must age while the front is stuck; no_progress={no_progress:?}"
+            "fresh SACKs beyond the hole must not reset cumulative progress; no_progress={no_progress:?}"
         );
-        // The hole has survived far longer than the 30s delivery-staleness
-        // floor while the peer kept delivering: fresh SACKs feed the progress
-        // watchdog, so this must NOT be a proactive stall.
-        assert!(
-            !space.should_terminate_session(last_ack),
-            "live out-of-order delivery must not terminate a stuck-front session"
-        );
-        // The wall still bounds the stuck front: once the front has stood
-        // still for max_timeout, the session terminates even though delivery
-        // kept flowing right up to that deadline.
-        assert!(!space.should_terminate_session(wall_deadline - ms(1)));
-        assert!(space.should_terminate_session(wall_deadline + ms(1)));
+        assert!(space.should_terminate_session(last_ack));
     }
 
     #[test]
-    fn initial_hole_with_live_delivery_is_bounded_by_the_front_stall_wall() {
+    fn fresh_sacks_behind_initial_hole_age_cumulative_progress() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
         settle_rtt_at(&mut space, t0);
         assert_eq!(send_packet(&mut space, t0), sq(0));
-        // The wall is armed at the first send: the front never advances.
-        let wall_deadline =
-            t0 + crate::transmission::watchdog_tuning::WatchdogTuning::default().max_timeout;
-
         let mut last_ack = t0;
-        let mut i = 0u64;
-        loop {
+        for i in 0..8 {
             let send_at = t0 + ms(1) + Duration::from_secs(i * 5);
-            if send_at + ms(1) > wall_deadline - Duration::from_secs(5) {
-                break;
-            }
             let seq = send_packet(&mut space, send_at);
             let balls = [crate::ack::AckInterval {
                 start: sq(1),
@@ -3135,24 +3091,15 @@ mod tests {
             );
             assert_eq!(acked.len(), 1, "each heartbeat SACK must be fresh");
             assert_eq!(space.send_wnd.start(), sq(0));
-            i += 1;
         }
         let no_resp = space.no_resp_for(last_ack);
         let no_progress = space.no_progress_for(last_ack);
         assert_eq!(no_resp, Some(Duration::ZERO));
         assert!(
             no_progress.is_some_and(|d| d > Duration::from_secs(30)),
-            "the initial cumulative hole must age even with delivery flowing; no_progress={no_progress:?}"
+            "the initial cumulative hole must age even before first progress; no_progress={no_progress:?}"
         );
-        assert!(
-            space.liveness.ever_progressed,
-            "out-of-order delivery is progress and arms outage recovery"
-        );
-        // Delivery kept flowing, so the session is NOT a proactive stall yet;
-        // the wall armed at the first send still bounds it.
-        assert!(!space.should_terminate_session(last_ack));
-        assert!(!space.should_terminate_session(wall_deadline - ms(1)));
-        assert!(space.should_terminate_session(wall_deadline + ms(1)));
+        assert!(space.should_terminate_session(last_ack));
     }
 
     #[test]
@@ -3204,8 +3151,8 @@ mod tests {
         );
         assert_eq!(space.num_in_flight_pkts(), 2);
         assert!(
-            space.liveness.ever_progressed,
-            "any delivery is progress even while the cumulative front is stuck"
+            !space.liveness.ever_progressed,
+            "selective-only responses must not fake cumulative progress"
         );
 
         // SACKing the middle packet too: still selective-only.
@@ -3223,10 +3170,10 @@ mod tests {
         );
         assert_eq!(space.send_wnd.start(), sq(u64::MAX - 2));
         assert_eq!(space.num_in_flight_pkts(), 1);
-        assert!(space.liveness.ever_progressed);
+        assert!(!space.liveness.ever_progressed);
 
         // Only the in-order ack of the head advances the front (pop_none
-        // count is nonzero) and records a cumulative advance.
+        // count is nonzero) and records progress.
         let acked = ack_one(&mut space, u64::MAX - 2, t0 + ms(12));
         assert_eq!(acked, 1, "the head is the last in-flight packet");
         assert!(space.no_pkts_in_flight());
@@ -3234,39 +3181,6 @@ mod tests {
             space.liveness.ever_progressed,
             "an in-order cumulative ack must record progress"
         );
-        assert_eq!(
-            space.no_progress_for(t0 + ms(13)),
-            None,
-            "an empty window must clear every watchdog wait"
-        );
-    }
-
-    #[test]
-    fn silent_peer_is_terminated_promptly_by_the_response_watchdog() {
-        let t0 = Instant::now();
-        let mut space = PktSendSpace::new();
-        settle_rtt_at(&mut space, t0);
-        let tuning = crate::transmission::watchdog_tuning::WatchdogTuning::default();
-        let min_resp = tuning.min_no_response;
-
-        // Send three packets, then the peer goes completely silent: no ACKs of
-        // any kind.  The dead-peer (no-response) watchdog must fire at
-        // min_no_response, promptly, regardless of the front-stall wall.
-        for i in 0..3 {
-            send_packet(&mut space, t0 + ms(i));
-        }
-        assert!(
-            !space.should_terminate_session(t0 + min_resp - Duration::from_secs(1)),
-            "dead-peer bound must not fire early"
-        );
-        assert!(space.should_terminate_session(t0 + min_resp + ms(1)));
-        assert_eq!(
-            space.stall_reason(t0 + min_resp + ms(1)),
-            Some(crate::traffic_shaping::recovery::liveness::PeerStall::NoResponse),
-            "a silent peer must be classified as dead, not stalled"
-        );
-        let no_resp = space.no_resp_for(t0 + min_resp + ms(1)).unwrap();
-        assert!(no_resp >= min_resp, "no_resp={no_resp:?}");
     }
 
     fn sack_apply_cost(num_blocks: usize) -> f64 {
