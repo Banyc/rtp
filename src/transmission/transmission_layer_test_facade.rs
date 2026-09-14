@@ -355,6 +355,25 @@ mod tests {
         tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
         ack_padding: AckPaddingMode,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        harness_with_tuning_ack_padding_and_frame(
+            fec,
+            enabled,
+            tuning,
+            ack_padding,
+            crate::delivery::frame::FrameMode::default(),
+        )
+    }
+
+    /// [`harness_with_tuning_and_ack_padding`] with an explicit frame mode, so a
+    /// test can stage whole frames (carrying `frame_len`) instead of the
+    /// byte-stream staging buffer.
+    fn harness_with_tuning_ack_padding_and_frame(
+        fec: bool,
+        enabled: bool,
+        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        ack_padding: AckPaddingMode,
+        frame_mode: crate::delivery::frame::FrameMode,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
         #[async_trait]
@@ -377,7 +396,7 @@ mod tests {
             fec,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             tuning,
-            crate::delivery::frame::FrameMode::default(),
+            frame_mode,
         )
         .unwrap();
         ul.retransmission_armor = RetransmissionArmorConfig::from(enabled);
@@ -433,6 +452,18 @@ mod tests {
                 .unwrap(),
             payload.len()
         );
+    }
+
+    /// Stage one whole frame into the frame-delivery stage, so its first
+    /// packet carries the frame's declared length (`frame_len`).
+    fn stage_frame(tl: &TransmissionLayer, frame: &[u8]) {
+        let now = Instant::now();
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .send_frame_buf(frame, now)
+            .expect("a legal frame must stage");
     }
 
     #[tokio::test]
@@ -562,6 +593,62 @@ mod tests {
             dg[0], dg[1],
             "dup must reuse the exact encoded symbol bytes (no re-encode)"
         );
+    }
+
+    /// A single-symbol interactive frame that follows earlier data symbols in
+    /// the SAME open FEC group still gets its fresh-tail armor duplicates: the
+    /// whole-frame `frame_len` recognises it independently of the group's
+    /// symbol count, so a co-located stream's preceding data cannot withhold
+    /// the same-round-trip repair and force a full-RTT ARQ fall-through.  The
+    /// two-symbol leading frame fills the group first; the trailing message
+    /// then emits primary + five armor copies (the gate is closed, so no
+    /// parity trails) and the duplicates reuse the exact encoded symbol bytes.
+    #[tokio::test]
+    async fn interactive_single_symbol_frame_after_group_data_gets_armor() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        let (mut tl, recorder) = harness_with_tuning_ack_padding_and_frame(
+            true,
+            false,
+            FecTuning::interactive_prompt(),
+            AckPaddingMode::None,
+            crate::delivery::frame::FrameMode::enabled(),
+        );
+        let max_pkt = tl
+            .shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .max_data_size_per_pkt();
+        // A two-symbol frame (full symbol + short remainder) opens the group
+        // with two data symbols; the trailing 100-byte frame is a whole
+        // single-symbol frame that must still be recognised as the interactive
+        // tail.
+        let leading = vec![0u8; max_pkt + 100];
+        let trailing = vec![0u8; 100];
+        stage_frame(&tl, &leading);
+        stage_frame(&tl, &trailing);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let dg = recorder.lock().unwrap().datagrams();
+        // The leading frame's first symbol is a fresh group and is armoured by
+        // the existing group-count rule; its remainder symbol is not a frame
+        // start (`frame_len` is `None`).  The trailing whole single-symbol
+        // frame follows those two symbols in the same open group, so only the
+        // whole-frame `frame_len` rule can recognise it: it must still emit
+        // primary + five armor copies (the gate is closed, so no parity trails).
+        assert_eq!(
+            dg.len(),
+            13,
+            "leading first symbol + five copies + leading remainder + trailing primary + five copies (got {} datagrams)",
+            dg.len()
+        );
+        let trailing = &dg[dg.len() - 6..];
+        for (index, duplicate) in trailing.iter().enumerate().skip(1) {
+            assert_eq!(
+                trailing[0], *duplicate,
+                "trailing-frame armor duplicate {index} must reuse the exact encoded symbol bytes"
+            );
+        }
     }
 
     /// A fresh interactive single-symbol tail (the interactive FEC preset

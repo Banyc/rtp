@@ -871,17 +871,31 @@ impl WriteHalf {
                 }
                 None => utp_pkt,
             };
-            // A fresh interactive single-symbol group (one data symbol so far)
-            // gets armor duplicate copies: a lone loss is covered on the same
-            // round trip without parity bookkeeping, and without waiting for
-            // the condition gate to reopen.  Bulk/stock lanes never force
-            // `fec_instream_flush`, so they are untouched.
+            // A fresh interactive tail gets armor duplicate copies: a lone
+            // loss is covered on the same round trip without parity
+            // bookkeeping, and without waiting for the condition gate to
+            // reopen.  The tail is either the first data symbol of an open
+            // group or a whole single-symbol frame (the packet carries the
+            // frame's declared length).  The latter recognises the
+            // interactive message even when the open FEC group already holds
+            // preceding bulk data symbols from a co-located stream: a lone
+            // loss of that message still falls through to a full-RTT ARQ
+            // repair because the condition gate is closed (no parity is
+            // emitted), so it must still get the same-round-trip copies.
+            // Only a single-symbol frame qualifies; a multi-symbol bulk
+            // frame's first packet declares a larger `frame_len` and is never
+            // duplicated, so bulk traffic gains no redundancy.  Bulk/stock
+            // lanes never force `fec_instream_flush`, so they are untouched.
+            let single_symbol_frame = u32::try_from(data_written)
+                .ok()
+                .is_some_and(|written| p.frame_len == Some(written));
             let fresh_interactive_tail = !is_recovery
                 && self.fec_instream_flush
-                && self
-                    .fec
-                    .as_ref()
-                    .is_some_and(|fec| fec.open_group_data_count() == 1);
+                && (single_symbol_frame
+                    || self
+                        .fec
+                        .as_ref()
+                        .is_some_and(|fec| fec.open_group_data_count() == 1));
             let armor_decision =
                 self.retransmission_armor
                     .decide(is_recovery, fresh_interactive_tail, || {
