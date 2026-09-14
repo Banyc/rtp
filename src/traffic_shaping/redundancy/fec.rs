@@ -757,25 +757,6 @@ impl FecDecoderState {
                 .fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        // A message-sized interactive parity arrives shorter than the
-        // negotiated symbol; zero-extend it to the full symbol before the
-        // Reed-Solomon reconstruction so every shard has the same length. The
-        // omitted tail is all zero (the protected data symbol is zero-padded
-        // to the same size), so the extension is exact. Data symbols and
-        // full-length parities are passed through untouched.
-        let extended;
-        let pkt = if pkt.len() < fec_hdr_size() + self.symbol_size
-            && pkt.get(9).is_some_and(|&data_count| data_count != 0)
-        {
-            extended = {
-                let mut buf = pkt.to_vec();
-                buf.resize(fec_hdr_size() + self.symbol_size, 0);
-                buf
-            };
-            extended.as_slice()
-        } else {
-            pkt
-        };
         let recovered_before = self.recovered.len();
         let rejected_before = self.decoder.rejected_recovered_symbols();
         let decoder = &mut self.decoder;
