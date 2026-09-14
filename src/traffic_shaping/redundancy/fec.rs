@@ -1786,6 +1786,11 @@ mod tests {
         assert_eq!(fec.decoder.dropped_malformed_pkts(), 0);
     }
 
+    /// The reconstructed symbol's own length header is the last thing standing
+    /// between a hostile parity and a delivered payload, so an out-of-range
+    /// declared length must be rejected by the conversion itself: no recovered
+    /// payload escapes, and the decoder must not panic on the way.  The unwind
+    /// guard stays as defence in depth; this input no longer reaches it.
     #[test]
     fn a_recovered_symbol_claiming_more_than_it_holds_is_dropped() {
         let symbol_size = 1424 - 11;
@@ -1794,8 +1799,15 @@ mod tests {
         let parity = vec![0xFFu8; symbol_size];
         assert!(fec.decoder.decode(&wire_pkt(0, 0, 0, 0, &data0)).is_some());
         assert!(fec.decoder.decode(&wire_pkt(0, 2, 2, 1, &parity)).is_none());
-        assert_eq!(fec.decoder.dropped_fec_decoder_panics(), 1);
-        while fec.decoder.pop_recovered().is_some() {}
+        assert_eq!(
+            fec.decoder.dropped_fec_decoder_panics(),
+            0,
+            "an out-of-range recovered length must be rejected, not panicked on"
+        );
+        assert!(
+            fec.decoder.pop_recovered().is_none(),
+            "a recovered symbol claiming more than it holds must not be delivered"
+        );
     }
 
     use crate::testing::SplitMix64;
@@ -1804,11 +1816,9 @@ mod tests {
     /// deterministic hostile datagrams (out-of-range group/symbol IDs, random
     /// data/parity counts, and truncated bodies) and asserts every decoded
     /// payload and recovered symbol stays within its bound. A third-party
-    /// decoder panic is caught by the unwind guard and counted separately as
-    /// `dropped_fec_decoder_panics` (asserted by the sibling
-    /// recovered-symbol test), not folded into `dropped_malformed_pkts`. The
-    /// guard still runs the process panic hook before returning, so a
-    /// remotely reachable decoder panic can amplify stderr.
+    /// decoder panic would be caught by the unwind guard and counted separately
+    /// as `dropped_fec_decoder_panics`, not folded into
+    /// `dropped_malformed_pkts`; no input in this battery reaches it.
     #[test]
     fn a_hostile_datagram_never_escapes_the_fec_decoder() {
         const ROUNDS: usize = 50_000;
