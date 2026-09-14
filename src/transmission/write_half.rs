@@ -95,21 +95,21 @@ struct PiggybackAck {
 const MAX_CONSECUTIVE_WOULD_BLOCK: u32 = 16;
 
 /// Armor duplicate copies emitted for a fresh interactive single-symbol tail
-/// (in addition to the primary datagram) at the burst-cover tier when the
-/// FEC loss gate is OPEN and a parity datagram will therefore trail the same
-/// burst as the fifth wire slot.  Primary + three copies + the trailing
-/// parity is five back-to-back datagrams, which cannot all be wiped by a
-/// four-packet burst; the short-burst cover needs no extra wire.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY: usize = 3;
+/// (in addition to the primary datagram) at the burst-cover tier when the FEC
+/// loss gate is OPEN and a *message-sized* parity symbol will therefore trail
+/// the same burst as the sixth wire slot.  Primary + four copies + the small
+/// parity is six back-to-back datagrams, so a five-packet burst always leaves
+/// a survivor; the parity is a ~256 B symbol, not the 8 KB full-MSS symbol a
+/// stock flush would emit, so the sixth slot is cheap.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY: usize = 4;
 
 /// Armor duplicate copies at the burst-cover tier when the FEC loss gate is
-/// CLOSED, so no parity will trail the burst.  One extra copy fills the same
-/// fifth wire slot the parity would have occupied: primary + four copies is
-/// still five back-to-back datagrams, so a four-packet burst always leaves a
-/// survivor.  A 256-byte duplicate is far cheaper on the wire than the 8 KB
-/// parity symbol it stands in for, so the interactive wire stays bounded and
-/// non-increasing as loss rises (the copy count never grows with loss).
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY: usize = 4;
+/// CLOSED, so no parity will trail the burst.  Five copies fill the sixth
+/// wire slot the parity would have occupied: primary + five copies is still
+/// six back-to-back 256-byte datagrams, covering a five-packet burst.  The
+/// copy count is monotone non-increasing with loss, so the closed-gate tier
+/// never grows redundancy as the link degrades.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY: usize = 5;
 
 /// Armor duplicate copies retained once the measured loss passes
 /// [`FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS`]: the two-copy coverage this
@@ -139,12 +139,12 @@ const FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS: f64 = 0.30;
 /// the per-message packet count as the wire loss rate rises, so a hostile
 /// link never sees more redundancy than a clean one.  `None` (no loss
 /// evidence yet) is treated as the low-loss tier.  At the burst-cover tier
-/// the copy count compensates for a closed parity gate: with a trailing
-/// parity three copies suffice (five datagrams total), without it a fourth
-/// copy fills the same fifth slot so a four-packet burst still leaves a
-/// survivor.  The datagram budget is therefore five either way.  Only the
-/// interactive lane consults this: stock/bulk tuning never forces
-/// `fec_instream_flush`.
+/// the copy count compensates for the parity gate: with a trailing
+/// message-sized parity four copies suffice (six datagrams total), without it
+/// a fifth copy fills the same sixth slot so a five-packet burst still leaves
+/// a survivor.  The per-message datagram budget is therefore six either way
+/// and only ever shrinks with loss.  Only the interactive lane consults this:
+/// stock/bulk tuning never forces `fec_instream_flush`.
 fn fresh_tail_armor_copies(effective_loss: Option<f64>, parity_covers_burst: bool) -> usize {
     match effective_loss {
         Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS => {
@@ -1403,9 +1403,9 @@ mod tests {
     /// emit more redundancy per message than a clean one.  The low/unmeasured
     /// tier pays the burst-cover copy, the mid band keeps the historical base,
     /// and the hostile tier backs off to the primary datagram alone.  At the
-    /// burst-cover tier the count compensates for a closed parity gate: with a
-    /// trailing parity three copies, without it four, so the total datagram
-    /// budget stays at five either way.
+    /// burst-cover tier the count compensates for the parity gate: with a
+    /// trailing message-sized parity four copies, without it five, so the
+    /// total per-message datagram budget stays at six either way.
     #[test]
     fn fresh_tail_armor_copies_are_monotone_non_increasing_in_loss() {
         use super::{
@@ -1441,7 +1441,7 @@ mod tests {
                 false // parity irrelevant below the moderate threshold
             ),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
-            "the no-parity burst-cover tier pays the fourth copy"
+            "the no-parity burst-cover tier pays the fifth copy"
         );
         assert_eq!(
             fresh_tail_armor_copies(
@@ -1449,7 +1449,7 @@ mod tests {
                 true // parity irrelevant below the moderate threshold
             ),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
-            "the with-parity burst-cover tier pays three copies"
+            "the with-parity burst-cover tier pays four copies"
         );
         assert_eq!(
             fresh_tail_armor_copies(Some(0.15), false),
@@ -1476,6 +1476,55 @@ mod tests {
                 previous = copies;
             }
         }
+    }
+
+    /// The interactive fresh tail's per-message wire is bounded by six
+    /// back-to-back datagrams at every loss tier and never grows with loss.
+    /// The primary datagram plus the armor copies plus the (at most one)
+    /// trailing message-sized parity is the whole budget; the closed-gate
+    /// tier pays one more 256-byte copy in place of the parity, so both
+    /// low-loss compositions land on six slots and the byte cost stays
+    /// bounded far below a single full-MSS parity symbol.
+    #[test]
+    fn fresh_tail_burst_cover_stays_within_the_six_datagram_budget() {
+        use super::fresh_tail_armor_copies;
+        const PRIMARY: usize = 1;
+        const PARITY_SLOT: usize = 1;
+        const MESSAGE_WIRE_BYTES: usize = 256;
+        const BUDGET_DATAGRAMS: usize = 6;
+        const BUDGET_WIRE_BYTES: usize = BUDGET_DATAGRAMS * MESSAGE_WIRE_BYTES;
+        for parity in [true, false] {
+            let mut previous = usize::MAX;
+            for step in 0..=100 {
+                let loss = Some(step as f64 / 100.0);
+                let copies = fresh_tail_armor_copies(loss, parity);
+                let total = PRIMARY + copies + usize::from(parity) * PARITY_SLOT;
+                assert!(
+                    total <= BUDGET_DATAGRAMS,
+                    "loss {loss:?} (parity={parity}) spent {total} datagrams, over the {BUDGET_DATAGRAMS}-slot budget"
+                );
+                assert!(
+                    total <= previous,
+                    "loss {loss:?} (parity={parity}) spent {total} datagrams, more than a lower loss ({previous})"
+                );
+                previous = total;
+                assert!(
+                    total * MESSAGE_WIRE_BYTES <= BUDGET_WIRE_BYTES,
+                    "the per-message wire must stay under the {BUDGET_WIRE_BYTES}-byte ceiling"
+                );
+            }
+        }
+        // The two low-loss compositions are exactly six slots: five copies
+        // when no parity trails, four copies plus the small parity when one
+        // does.
+        assert_eq!(
+            PRIMARY + fresh_tail_armor_copies(None, false),
+            BUDGET_DATAGRAMS
+        );
+        assert_eq!(
+            PRIMARY + fresh_tail_armor_copies(None, true) + PARITY_SLOT,
+            BUDGET_DATAGRAMS
+        );
     }
 
     fn term(l: &PeerLiveness, now: Instant, has_in_flight: bool) -> bool {

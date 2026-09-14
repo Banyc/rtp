@@ -1017,11 +1017,14 @@ mod tests {
     /// drops runs of `burst` consecutive packets separated by a randomized
     /// quiet gap, so a burst can wipe a whole redundancy group (the primary,
     /// every fresh-tail armor copy, and the parity that trails the group).
-    /// Classifies each echo by repair path: a same-round-trip recovery stays
-    /// near the loopback floor, while a fall-through to the reorder-window ARQ
-    /// repair costs at least one extra RTT. Run with `--ignored --nocapture`.
+    /// Sweeps bursts three through six: the six-datagram cover is expected to
+    /// absorb a five-packet burst on the same round trip, while a six-packet
+    /// burst is the remaining residual.  Classifies each echo by repair path:
+    /// a same-round-trip recovery stays near the loopback floor, while a
+    /// fall-through to the reorder-window ARQ repair costs at least one extra
+    /// RTT. Run with `--ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "in-process burst-loss interactive repair probe; ~60 s; run with --ignored --nocapture"]
+    #[ignore = "in-process burst-loss interactive repair probe; ~145 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_burst_loss_latency() {
         use crate::socket::socket;
         use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -1045,6 +1048,8 @@ mod tests {
             ("clean_delayed", 0usize, 1usize, 1usize, 0x1111_2222u64),
             ("burst3_gap8_12", 3usize, 8usize, 12usize, 0x1234_5678u64),
             ("burst4_gap18_26", 4, 18, 26, 0x0BAD_F00D),
+            ("burst5_gap22_30", 5, 22, 30, 0x5EED_0005),
+            ("burst6_gap26_34", 6, 26, 34, 0x5EED_0006),
         ] {
             let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
             let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

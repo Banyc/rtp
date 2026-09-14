@@ -77,6 +77,7 @@ pub(crate) fn checked_mss_and_fec(
         Some(FecState::new(FecConfig {
             symbol_size,
             small_group_parity_count: tuning.small_group_parity_count,
+            message_sized_single_symbol_parity: tuning.instream_flush,
         }))
     } else {
         None

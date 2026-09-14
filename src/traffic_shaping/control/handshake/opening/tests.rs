@@ -179,6 +179,7 @@ fn packets_are_framed_and_rejected_by_both_rtp_wire_modes() {
         let fec = FecState::new(FecConfig {
             symbol_size: 1_424,
             small_group_parity_count: 1,
+            message_sized_single_symbol_parity: false,
         });
         let (_encoder, mut decoder, _stats) = fec.into_actor_parts();
         assert!(decoder.decode(&encoded).is_none());
