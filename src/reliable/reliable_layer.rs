@@ -1180,7 +1180,14 @@ impl ReliableLayer {
         if !self.frame_delivery.enabled {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
-        if let Some(frame) = self.pkt_recv_space.pop_complete_frame() {
+        // Strict frame delivery keeps the original no-arg entry point; only
+        // the opt-in fast-forward reaches the reorder-parameterised one.
+        let frame = if self.frame_delivery.allow_reorder {
+            self.pkt_recv_space.pop_complete_frame_with_reorder(true)
+        } else {
+            self.pkt_recv_space.pop_complete_frame()
+        };
+        if let Some(frame) = frame {
             return Ok(Some(frame));
         }
         if self.pkt_recv_space.fin_at_head() {
@@ -2681,6 +2688,68 @@ mod tests {
             .expect("frame delivery must not error")
             .expect("the withheld later frame must deliver after the earlier frame");
         assert_eq!(frame, b"EEEEFFFF");
+    }
+
+    /// Opt-in receiver-side fast-forward: with `allow_reorder` set, a complete
+    /// later frame is handed up immediately even though an earlier frame's
+    /// hole is unrepaired, while the in-order cursor stays pinned. Filling the
+    /// hole delivers the earlier frame and never redelivers the fast-forwarded
+    /// one. This is the interactive-lane mode where mux's per-stream
+    /// reassembly restores ordering; the strict default is asserted by the
+    /// test above.
+    #[test]
+    fn frame_delivery_reordering_delivers_a_complete_later_frame_past_a_hole() {
+        let now = Instant::now();
+        let mut rl = super::ReliableLayer::new(
+            crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
+            crate::delivery::frame::FrameMode::enabled_reordering(),
+            now,
+        )
+        .0;
+        let seq = crate::sequence::SequenceNumber::from_wire;
+
+        // Frame A: four 4-byte packets at seqs 0..=3, declared frame_len 16.
+        // seq 1 is lost, so A cannot reassemble yet.
+        assert!(rl.recv_data_pkt(seq(0), Some(16), b"AAAA").is_new());
+        assert!(rl.recv_data_pkt(seq(2), None, b"CCCC").is_new());
+        assert!(rl.recv_data_pkt(seq(3), None, b"DDDD").is_new());
+
+        // Frame B: two 4-byte packets at seqs 4..=5, declared frame_len 8,
+        // fully received.
+        assert!(rl.recv_data_pkt(seq(4), Some(8), b"EEEE").is_new());
+        assert!(rl.recv_data_pkt(seq(5), None, b"FFFF").is_new());
+
+        // B is delivered immediately despite A's unrepaired hole.
+        let frame = rl
+            .recv_frame_buf()
+            .expect("frame delivery must not error")
+            .expect("the complete later frame must be fast-forwarded");
+        assert_eq!(frame, b"EEEEFFFF");
+
+        // The in-order cursor is still pinned at A's undelivered front.
+        assert_eq!(
+            rl.pkt_recv_space().next_seq(),
+            Some(seq(0)),
+            "fast-forward must not advance the in-order cursor"
+        );
+
+        // A's missing packet arrives: A reassembles and delivers, the cursor
+        // collapses A's and B's tombstones, and B is not redelivered.
+        assert!(rl.recv_data_pkt(seq(1), None, b"BBBB").is_new());
+        let frame = rl
+            .recv_frame_buf()
+            .expect("frame delivery must not error")
+            .expect("the earlier frame must reassemble once its hole is filled");
+        assert_eq!(frame, b"AAAABBBBCCCCDDDD");
+        assert_eq!(
+            rl.pkt_recv_space().next_seq(),
+            Some(seq(6)),
+            "the cursor must collapse the tombstones after the hole fills"
+        );
+        assert_eq!(
+            rl.recv_frame_buf().expect_err("no frame remains").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

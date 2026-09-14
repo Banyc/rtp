@@ -380,8 +380,7 @@ impl Listener {
             let accepted = accept(
                 accepted,
                 raw_fd,
-                AcceptSetup::from_config(handshake, config)?
-                    .with_frame_delivery(FrameMode::enabled()),
+                AcceptSetup::from_config(handshake, config)?.force_frame_delivery(),
                 key,
                 policy,
                 session_count,
@@ -551,10 +550,12 @@ impl AcceptSetup {
         })
     }
 
-    /// Override the frame-delivery mode; used by `accept_frame_delivery`
-    /// which always forces [`FrameMode::enabled`] regardless of the config.
-    fn with_frame_delivery(mut self, frame_delivery: FrameMode) -> Self {
-        self.frame_delivery = frame_delivery;
+    /// Force frame delivery on while preserving the config's receiver-side
+    /// fast-forward flag; used by `accept_frame_delivery`, whose entry point
+    /// always selects frame mode regardless of `AcceptConfig::frame_delivery`
+    /// but must still honour `FrameMode::allow_reorder`.
+    fn force_frame_delivery(mut self) -> Self {
+        self.frame_delivery.enabled = true;
         self
     }
 }
@@ -741,7 +742,10 @@ impl FrameDeliveryIo {
             bind,
             addr,
             ConnectConfig {
-                frame_delivery: FrameMode::enabled(),
+                frame_delivery: FrameMode {
+                    enabled: true,
+                    ..config.frame_delivery
+                },
                 ..config
             },
         )
@@ -765,7 +769,10 @@ impl FrameDeliveryIo {
             socket,
             addr,
             ConnectConfig {
-                frame_delivery: FrameMode::enabled(),
+                frame_delivery: FrameMode {
+                    enabled: true,
+                    ..config.frame_delivery
+                },
                 ..config
             },
         )

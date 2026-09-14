@@ -27,8 +27,9 @@ pub(crate) struct RecvPkt {
 #[derive(Debug, Default)]
 pub(crate) struct FrameScan {
     /// The complete frame, when the scan found one. The caller only hands
-    /// it up when it begins at the in-order front; a complete frame past an
-    /// unrepaired hole is withheld (see [`pop_complete_frame`]).
+    /// it up when it begins at the in-order front, or — when the
+    /// receiver-side fast-forward is enabled — when it begins past the front
+    /// while the front itself stays pinned (see [`pop_complete_frame`]).
     pub(crate) complete: Option<(SequenceNumber, u64, u32)>,
     /// `(start, packet_count)` of each frame abandoned mid-scan because its
     /// next continuation sequence is captured forever (a tombstone or a
@@ -265,6 +266,7 @@ pub(crate) fn pop_complete_frame(
     scan_start: &mut SequenceNumber,
     resume: &mut Option<ScanResume>,
     next: Option<SequenceNumber>,
+    allow_reorder: bool,
 ) -> Option<Vec<u8>> {
     let ScanOutcome {
         scan: FrameScan {
@@ -290,16 +292,27 @@ pub(crate) fn pop_complete_frame(
         *resume = refresh;
         return None;
     };
-    // Ordered-delivery gate: a frame may only be handed up when it begins at
-    // the in-order front — the first not-yet-delivered sequence. The scan
-    // skips sequence holes (a missing slot is simply absent from the map), so
-    // without this gate a complete later frame would be delivered past an
-    // unrepaired hole, violating the ordered, gap-free delivery contract. A
-    // complete frame past a hole is WITHHELD: its slots stay in place and the
-    // scan resume cached above makes the next call continue past it instead
-    // of re-walking it. When the hole fills (retransmission or reordering),
-    // the insertion drops the resume and the full rescan re-finds the frame,
-    // now at the front, and delivers it.
+    // Ordered-delivery gate. By default a frame may only be handed up when it
+    // begins at the in-order front — the first not-yet-delivered sequence. The
+    // scan skips sequence holes (a missing slot is simply absent from the
+    // map), so without this gate a complete later frame would be delivered
+    // past an unrepaired hole, violating the ordered, gap-free delivery
+    // contract. A complete frame past a hole is WITHHELD: its slots stay in
+    // place and the scan resume cached above makes the next call continue past
+    // it instead of re-walking it. When the hole fills (retransmission or
+    // reordering), the insertion drops the resume and the full rescan
+    // re-finds the frame, now at the front, and delivers it.
+    //
+    // With `allow_reorder` (opt-in receiver-side fast-forward) the complete
+    // frame is delivered even though it starts past the hole. Delivery below
+    // tombstones the frame's sequence numbers exactly as in the strict path,
+    // but `next` is left pinned at the hole: an absent head slot keeps
+    // `collapse_tombstone_prefix` from advancing the cursor, so the ACK
+    // cumulative front and the liveness watchdog are unaffected. When the
+    // hole finally fills, the cursor reaches the frame's tombstones and
+    // collapses them, advancing without redelivering. Consumers that opt in
+    // must restore ordering themselves (e.g. a per-stream reorder buffer);
+    // the default `false` is byte-for-byte the strict behaviour.
     let Some(mut front) = next else {
         *resume = refresh;
         return None;
@@ -309,7 +322,7 @@ pub(crate) fn pop_complete_frame(
     while matches!(slots.get(&front), Some(RecvSlot::Tombstone)) {
         front = front.advance(1);
     }
-    if frame_start != front {
+    if frame_start != front && !allow_reorder {
         *resume = refresh;
         return None;
     }

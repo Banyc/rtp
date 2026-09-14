@@ -147,18 +147,38 @@ impl PktRecvSpace {
         RecvDisposition::Inserted
     }
 
+    /// Strict ordered frame delivery: equivalent to
+    /// [`Self::pop_complete_frame_with_reorder`] with the receiver-side
+    /// fast-forward disabled. Kept as the default entry point so callers that
+    /// do not opt in are byte-for-byte unchanged.
     pub fn pop_complete_frame(&mut self) -> Option<Vec<u8>> {
+        self.pop_complete_frame_with_reorder(false)
+    }
+
+    /// Pop the next deliverable complete frame.
+    ///
+    /// With `allow_reorder == false` a frame is delivered only when it begins
+    /// at the in-order front (strict, gap-free ordering). With
+    /// `allow_reorder == true` a complete frame starting past an unrepaired
+    /// hole is also delivered, while `next` stays pinned at the hole and the
+    /// frame's sequence numbers are tombstoned so the cursor collapses them
+    /// once the hole fills. Delivery never changes the ACKs already recorded
+    /// by [`Self::recv_bytes`], so liveness is unaffected either way.
+    pub fn pop_complete_frame_with_reorder(&mut self, allow_reorder: bool) -> Option<Vec<u8>> {
         let frame_bytes = crate::delivery::frame::recv::pop_complete_frame(
             &mut self.slots,
             &mut self.reused_buf,
             &mut self.scan_start,
             &mut self.scan_resume,
             self.next,
+            allow_reorder,
         );
         // Collapse the head-tombstone prefix whether or not a frame was
         // found: the scan may have tombstoned abandoned frames (a hostile
         // peer's overlapping frames) with no complete frame to return, and
         // the cursor must still advance past them or the receiver wedges.
+        // Out-of-order tombstones are past the pinned front, so they are
+        // retained until `next` reaches them.
         self.collapse_tombstone_prefix();
         frame_bytes
     }
@@ -378,6 +398,88 @@ mod tests {
         // Both frames delivered; the cursor reached past their range.
         assert_eq!(space.next, Some(seq(2)));
         assert_eq!(space.slots.len(), 0);
+    }
+
+    // The default entry point and an explicit `false` are the strict ordered
+    // path: a complete frame past a front hole is withheld and its slot is
+    // left in place, byte-for-byte the pre-fast-forward behaviour.
+    #[test]
+    fn default_and_explicit_strict_make_the_same_withholding_decision() {
+        let mut space = PktRecvSpace::new();
+        assert!(space.recv(1, b"frame1".to_vec(), Some(6)));
+        assert!(space.pop_complete_frame().is_none());
+        assert!(matches!(space.slots.get(&seq(1)), Some(RecvSlot::Data(_))));
+        assert!(space.pop_complete_frame_with_reorder(false).is_none());
+        assert!(matches!(space.slots.get(&seq(1)), Some(RecvSlot::Data(_))));
+        assert_eq!(space.next, Some(seq(0)));
+    }
+
+    // Opt-in receiver-side fast-forward: a complete frame past an unrepaired
+    // front hole is delivered immediately, but `next` stays pinned at the
+    // hole and the frame's seqs are tombstoned (retained, not collapsed)
+    // until the hole fills.
+    #[test]
+    fn opt_in_reorder_delivers_a_complete_frame_past_a_front_hole_while_the_cursor_stays_pinned() {
+        let mut space = PktRecvSpace::new();
+        // Hole at seq 0; a complete 1-packet frame arrives at seq 1.
+        assert!(space.recv(1, b"frame1".to_vec(), Some(6)));
+        // Opted in: the complete frame is delivered immediately.
+        assert_eq!(
+            space.pop_complete_frame_with_reorder(true).unwrap(),
+            b"frame1"
+        );
+        // `next` is still pinned at the hole; the delivered frame's seq is a
+        // tombstone retained ahead of the hole (not collapsed).
+        assert_eq!(space.next, Some(seq(0)));
+        assert!(matches!(
+            space.slots.get(&seq(1)),
+            Some(RecvSlot::Tombstone)
+        ));
+        // The cumulative ACK front is likewise pinned at the hole, so the
+        // peer's liveness watchdog still sees no cumulative progress.
+        assert_eq!(space.ack_history().next(), seq(0));
+        // Nothing else is deliverable.
+        assert!(space.pop_complete_frame_with_reorder(true).is_none());
+        // The hole finally fills: the cursor advances through the hole and
+        // then collapses the retained tombstone without redelivering.
+        assert!(space.recv(0, b"late".to_vec(), Some(4)));
+        assert_eq!(
+            space.pop_complete_frame_with_reorder(true).unwrap(),
+            b"late"
+        );
+        assert_eq!(space.next, Some(seq(2)));
+        assert_eq!(space.slots.len(), 0);
+    }
+
+    // Fast-forward delivers a multi-packet frame whose packets arrived
+    // shuffled behind a front hole, and the whole range tombstone-collapses
+    // once the hole fills.
+    #[test]
+    fn opt_in_reorder_delivers_a_multi_packet_frame_past_a_hole() {
+        let mut space = PktRecvSpace::new();
+        // Hole at seq 0. Frame B: seqs 1 (start, 11 bytes), 2, 3 (cont).
+        assert!(space.recv(1, b"hello ".to_vec(), Some(11)));
+        assert!(space.recv(3, b"ld".to_vec(), None));
+        assert!(space.recv(2, b"wor".to_vec(), None));
+        assert_eq!(
+            space.pop_complete_frame_with_reorder(true).unwrap(),
+            b"hello world"
+        );
+        // Cursor pinned; all three seqs tombstoned.
+        assert_eq!(space.next, Some(seq(0)));
+        for s in 1..=3 {
+            assert!(matches!(
+                space.slots.get(&seq(s)),
+                Some(RecvSlot::Tombstone)
+            ));
+        }
+        // Hole fills; cursor collapses the tombstones and no frame is
+        // redelivered.
+        assert!(space.recv(0, b"x".to_vec(), Some(1)));
+        assert_eq!(space.pop_complete_frame_with_reorder(true).unwrap(), b"x");
+        assert_eq!(space.next, Some(seq(4)));
+        assert_eq!(space.slots.len(), 0);
+        assert!(space.pop_complete_frame_with_reorder(true).is_none());
     }
 
     #[test]
