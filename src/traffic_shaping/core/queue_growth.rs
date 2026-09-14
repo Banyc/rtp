@@ -11,6 +11,15 @@ use super::gentle::DrainEpisode;
 use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
 
 pub(crate) const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
+/// Shorter RTT-floor bucket for a reorder-tolerant connection (the interactive
+/// frame fast-forward lane). A long bucket lets an isolated low RTT sample —
+/// the receiver echoes the send timestamp of a reordered packet that took a
+/// faster path — pin the propagation floor for the whole bucket, so the
+/// ordinary RTT then reads as a standing queue and the delay controller
+/// drains the send rate. The interactive lane opts into out-of-order frame
+/// delivery, so its floor must track the recent baseline instead of holding
+/// one outlier. Bulk and strict paths keep [`RTT_MIN_BUCKET`].
+pub(crate) const RTT_MIN_BUCKET_REORDER: Duration = Duration::from_millis(200);
 pub(crate) const RTT_MIN_BUCKET_RTT_SCALE: u32 = 10;
 
 pub(crate) const QUEUE_RTT_FACTOR: f64 = 2.0;
@@ -32,19 +41,31 @@ pub(crate) struct WindowedRttMin {
     bucket_start: Instant,
     cur: Option<Duration>,
     prev: Option<Duration>,
+    min_bucket: Duration,
 }
 
 impl WindowedRttMin {
+    #[cfg(test)]
     pub(crate) fn new(now: Instant) -> Self {
+        Self::with_min_bucket(now, RTT_MIN_BUCKET)
+    }
+
+    /// A floor window with a caller-chosen minimum bucket length. The bucket
+    /// is still scaled up with the RTT (`rtt * RTT_MIN_BUCKET_RTT_SCALE`), so
+    /// a high-RTT path keeps a proportionally long window.
+    pub(crate) fn with_min_bucket(now: Instant, min_bucket: Duration) -> Self {
         Self {
             bucket_start: now,
             cur: None,
             prev: None,
+            min_bucket,
         }
     }
 
     pub(crate) fn update(&mut self, now: Instant, rtt: Duration) -> Duration {
-        let bucket = RTT_MIN_BUCKET.max(rtt.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
+        let bucket = self
+            .min_bucket
+            .max(rtt.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
         let elapsed = now.duration_since(self.bucket_start);
         if elapsed > bucket * 2 {
             // Idle staleness: both buckets have aged out, mirror LossEventWindow::rotate.
@@ -81,23 +102,39 @@ pub(crate) struct QueueGrowthObservation {
 #[derive(Debug)]
 pub(crate) struct QueueGrowth {
     floor: WindowedRttMin,
+    /// `true` for the interactive frame fast-forward lane: reordering is
+    /// expected, so the floor window is shortened to reject isolated
+    /// reorder-induced low RTT outliers instead of treating them as the path
+    /// baseline.
+    reorder_tolerant: bool,
     persistent_since: Option<Instant>,
     building: bool,
     gentle: GentleMode,
 }
 
 impl QueueGrowth {
-    pub(crate) fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant, reorder_tolerant: bool) -> Self {
+        let floor = Self::fresh_floor(now, reorder_tolerant);
         Self {
-            floor: WindowedRttMin::new(now),
+            floor,
+            reorder_tolerant,
             persistent_since: None,
             building: false,
             gentle: GentleMode::new(),
         }
     }
 
+    fn fresh_floor(now: Instant, reorder_tolerant: bool) -> WindowedRttMin {
+        let min_bucket = if reorder_tolerant {
+            RTT_MIN_BUCKET_REORDER
+        } else {
+            RTT_MIN_BUCKET
+        };
+        WindowedRttMin::with_min_bucket(now, min_bucket)
+    }
+
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
-        self.floor = WindowedRttMin::new(now);
+        self.floor = Self::fresh_floor(now, self.reorder_tolerant);
         self.persistent_since = None;
         self.building = false;
         self.gentle.reset()
@@ -270,7 +307,7 @@ mod tests {
         assert!(smooth > floor + normal);
         assert!(smooth <= floor + persistent);
 
-        let mut growth = QueueGrowth::new(now);
+        let mut growth = QueueGrowth::new(now, false);
         growth.observe(floor, rttvar, Some(0.0), now, Duration::from_millis(100));
         let observation = growth.observe(
             smooth,
@@ -281,5 +318,39 @@ mod tests {
         );
         assert!(observation.building);
         assert_eq!(observation.persistent_for, None);
+    }
+
+    /// The interactive fast-forward lane opts into out-of-order delivery, so a
+    /// single reordered packet's low echoed RTT must not pin the propagation
+    /// floor for the whole (multi-second) default bucket. The reorder-tolerant
+    /// floor tracks the recent baseline; the default keeps its long bucket.
+    #[test]
+    fn reorder_tolerant_floor_recovers_from_a_low_outlier_sooner() {
+        let t0 = Instant::now();
+        let low = Duration::from_millis(25);
+        let normal = Duration::from_millis(50);
+        let control_rtt = Duration::from_millis(100);
+
+        let mut default = QueueGrowth::new(t0, false);
+        let mut reorder = QueueGrowth::new(t0, true);
+        default.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
+        reorder.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
+
+        let later = t0 + Duration::from_secs(2);
+        let default_floor = default
+            .observe(normal, Duration::ZERO, Some(0.0), later, control_rtt)
+            .floor;
+        let reorder_floor = reorder
+            .observe(normal, Duration::ZERO, Some(0.0), later, control_rtt)
+            .floor;
+
+        assert_eq!(
+            default_floor, low,
+            "the default floor must keep its long-bucket baseline"
+        );
+        assert_eq!(
+            reorder_floor, normal,
+            "the reorder-tolerant floor must track the recent RTT"
+        );
     }
 }

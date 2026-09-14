@@ -60,9 +60,9 @@ pub(crate) struct CongestionResponse {
 }
 
 impl CongestionResponse {
-    pub(crate) fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: Instant, reorder_tolerant: bool) -> Self {
         Self {
-            queue_growth: QueueGrowth::new(now),
+            queue_growth: QueueGrowth::new(now, reorder_tolerant),
             delivery_peak: WindowedDeliveryMax::new(now),
             bandwidth_probe: OrdinaryBandwidthProbe::new(),
             queue_response: QueueResponse::default(),
