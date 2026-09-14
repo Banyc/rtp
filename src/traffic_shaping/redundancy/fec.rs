@@ -871,6 +871,8 @@ impl FecStatsHandle {
             dropped_malformed_packets: self.0.dropped_malformed_pkts.load(Ordering::Relaxed) as u64,
             dropped_decoder_panics: self.0.dropped_fec_decoder_panics.load(Ordering::Relaxed)
                 as u64,
+            rejected_recovered_symbols: self.0.rejected_recovered_symbols.load(Ordering::Relaxed)
+                as u64,
         }
     }
 

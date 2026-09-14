@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Version of the typed observation schema.
-pub const SCHEMA_VERSION: u16 = 28;
+pub const SCHEMA_VERSION: u16 = 29;
 
 /// Why the session reached its first terminal error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +348,10 @@ pub struct MetricsFecCounters {
     pub recovered_symbols: u64,
     pub dropped_malformed_packets: u64,
     pub dropped_decoder_panics: u64,
+    /// Reconstructed symbols rejected because they claim more bytes than their
+    /// shard holds.  The decoder is the only witness, so this is the sole
+    /// signal that a hostile or corrupt parity reached reconstruction.
+    pub rejected_recovered_symbols: u64,
 }
 
 impl MetricsEvent {
