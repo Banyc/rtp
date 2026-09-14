@@ -375,7 +375,6 @@ dependencies = [
 [[package]]
 name = "fec"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/fec.git?tag=v0.0.3#f82ac96590536ec4a8cbf34d365a9d9ba393a0af"
 dependencies = [
  "bon",
  "reed-solomon-erasure",
