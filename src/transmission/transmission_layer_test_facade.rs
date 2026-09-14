@@ -558,10 +558,10 @@ mod tests {
     }
 
     /// A fresh interactive single-symbol tail (the interactive FEC preset
-    /// force-flushes every burst) gets one armor duplicate on its first send,
-    /// independent of the recovery-armor env toggle: a lone loss is then
-    /// covered on the same round trip instead of waiting for FEC parity or a
-    /// repair round trip.
+    /// force-flushes every burst) gets armor duplicate copies on its first
+    /// send, independent of the recovery-armor env toggle: a lone loss — or a
+    /// burst of two tail losses — is then covered on the same round trip
+    /// instead of waiting for FEC parity or a repair round trip.
     #[tokio::test]
     async fn fresh_interactive_single_symbol_tail_gets_an_armor_duplicate() {
         use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -575,12 +575,16 @@ mod tests {
         let dg = recorder.lock().unwrap().datagrams();
         assert_eq!(
             dg.len(),
-            2,
-            "the fresh interactive single-symbol tail must send primary + armor duplicate"
+            3,
+            "the fresh interactive single-symbol tail must send primary + two armor duplicates"
         );
         assert_eq!(
             dg[0], dg[1],
             "the fresh-tail armor duplicate must reuse the exact encoded symbol bytes"
+        );
+        assert_eq!(
+            dg[0], dg[2],
+            "the second fresh-tail armor duplicate must also reuse the exact encoded symbol bytes"
         );
     }
 
@@ -669,8 +673,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 5,
-            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 1 fresh-tail armor + 3 parity = 5 datagrams, got {n}"
+            n, 6,
+            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 2 fresh-tail armor + 3 parity = 6 datagrams, got {n}"
         );
     }
 
@@ -784,8 +788,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 13,
-            "interactive_prompt tuning must emit 8 data + 1 fresh-tail armor + 4 in-stream parity = 13 datagrams, got {n}"
+            n, 14,
+            "interactive_prompt tuning must emit 8 data + 2 fresh-tail armor + 4 in-stream parity = 14 datagrams, got {n}"
         );
     }
 
@@ -838,8 +842,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 2,
-            "startup without measured congestion loss must emit 1 data + 1 fresh-tail armor + 0 parity = 2 datagrams, got {n}"
+            n, 3,
+            "startup without measured congestion loss must emit 1 data + 2 fresh-tail armor + 0 parity = 3 datagrams, got {n}"
         );
     }
 

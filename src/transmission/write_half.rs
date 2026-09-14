@@ -94,6 +94,14 @@ struct PiggybackAck {
 /// instead of re-minting packets that never traverse the wire.
 const MAX_CONSECUTIVE_WOULD_BLOCK: u32 = 16;
 
+/// Armor duplicate copies emitted for a fresh interactive single-symbol tail
+/// (in addition to the primary datagram).  The interactive lane carries no
+/// parity while the FEC loss gate is closed, so a lone copy still falls back
+/// to the one-reorder-window ARQ repair when the primary and the copy are both
+/// lost; two copies cover a burst of two tail losses.  Only recovery sends and
+/// non-interactive lanes keep the single-copy default.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES: usize = 2;
+
 /// Convert a codec [`EncodeError`] into the session [`IoErr`] surfaced by the
 /// terminal-error paths. An encode failure is a wire-format invariant
 /// violation (an oversized payload or an undersized envelope) and reads
@@ -793,9 +801,9 @@ impl WriteHalf {
                 None => utp_pkt,
             };
             // A fresh interactive single-symbol group (one data symbol so far)
-            // gets one armor duplicate copy: its lone loss is covered on the
-            // same round trip without parity bookkeeping, and without waiting
-            // for the condition gate to reopen.  Bulk/stock lanes never force
+            // gets armor duplicate copies: a lone loss is covered on the same
+            // round trip without parity bookkeeping, and without waiting for
+            // the condition gate to reopen.  Bulk/stock lanes never force
             // `fec_instream_flush`, so they are untouched.
             let fresh_interactive_tail = !is_recovery
                 && self.fec_instream_flush
@@ -861,8 +869,26 @@ impl WriteHalf {
                         return Err(error);
                     }
                     if armor_decision == ArmorDecision::Duplicate {
-                        let token_taken = self.send_pacer.take_exact_tokens(1, now);
-                        if token_taken {
+                        // A recovery send gets one armor copy; a fresh
+                        // interactive single-symbol tail gets
+                        // `FRESH_INTERACTIVE_TAIL_ARMOR_COPIES`.  The
+                        // interactive lane's redundancy while the FEC loss
+                        // gate is closed is primary + armor only, so a single
+                        // copy still falls through to the one-reorder-window
+                        // ARQ repair when both copies are lost.  A second copy
+                        // covers a burst of two tail losses (iid p^3) with no
+                        // wire-format change; only this lane pays the extra
+                        // pacer token (bulk/stock never force
+                        // `fec_instream_flush`).
+                        let copies = if fresh_interactive_tail {
+                            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES
+                        } else {
+                            1
+                        };
+                        for _ in 0..copies {
+                            if !self.send_pacer.take_exact_tokens(1, now) {
+                                break;
+                            }
                             match self.utp_write.send(send_buf).await {
                                 Ok(_) => self.shared.log_at(
                                     crate::metrics::MetricsEvent::RetransmissionArmorDuplicate,
@@ -872,6 +898,9 @@ impl WriteHalf {
                                     if FEC_DEBUG {
                                         eprintln!("send_pkts: dup WouldBlock (transient)");
                                     }
+                                    // The underlay is backpressured: a further
+                                    // copy would only spin against it.
+                                    break;
                                 }
                                 Err(e) => {
                                     // The primary data send (with the
