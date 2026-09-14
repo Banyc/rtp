@@ -845,7 +845,8 @@ mod tests {
             let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
             let sent_ok = Arc::new(AtomicU64::new(0));
             let sent_ok_task = Arc::clone(&sent_ok);
-            let echo = tokio::spawn(async move {
+            let mut echo_tasks = tokio::task::JoinSet::new();
+            echo_tasks.spawn(async move {
                 let mut buf = vec![0u8; msg_len];
                 let mut delivered = 0usize;
                 loop {
@@ -882,10 +883,12 @@ mod tests {
             }
             drop(a_w);
             drop(a_r);
-            let (delivered, recovered) = tokio::time::timeout(Duration::from_secs(5), echo)
-                .await
-                .expect("echo task stalled")
-                .expect("echo task panicked");
+            let (delivered, recovered) =
+                tokio::time::timeout(Duration::from_secs(5), echo_tasks.join_next())
+                    .await
+                    .expect("echo task stalled")
+                    .expect("echo task panicked")
+                    .expect("echo task missing");
             let counters = *observed.lock().unwrap();
             eprintln!(
                 "[probe {label}] sent={} delivered={} recovered={:?} counters={counters:?}",
