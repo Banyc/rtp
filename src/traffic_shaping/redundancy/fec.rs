@@ -633,23 +633,31 @@ impl FecEncoderState {
             let parity_count = INSTREAM_PARITY_PER_GROUP as u8;
             let available_tokens = send_rate_limiter.gen_tokens(now);
             let parity_budget = available_tokens / PARITY_BUDGET_DEN;
-            if usize::from(parity_count) > parity_budget {
+            // Budget-adaptive, non-destructive: emit as many parity symbols as
+            // the 1/3 spare-budget share allows (one is enough to recover a
+            // single lost data symbol), and HOLD the group open when none is
+            // affordable rather than destroying it.  The all-or-nothing gate
+            // destroyed the whole group's parity the moment the pacer was
+            // momentarily drained — on a batched interactive lane that is the
+            // common case, and the group then had no parity at all, so its
+            // loss fell through to RTO/reorder ARQ.  Holding preserves the
+            // accumulated data symbols so the next pass (after the token
+            // refill) still emits their parity.
+            if parity_budget == 0 {
                 self.stats
                     .groups_skipped_no_surplus_tokens
                     .fetch_add(1, Ordering::Relaxed);
                 inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
-                self.encoder.skip_group();
                 return vec![];
             }
-            assert!(send_rate_limiter.take_exact_tokens(usize::from(parity_count), now));
+            let depth = u8::try_from(usize::from(parity_count).min(parity_budget)).unwrap();
+            assert!(send_rate_limiter.take_exact_tokens(usize::from(depth), now));
             if FEC_DEBUG {
-                eprintln!(
-                    "FEC: flushing {parity_count} parities for in-stream group of {data_count}"
-                );
+                eprintln!("FEC: flushing {depth} parities for in-stream group of {data_count}");
             }
             self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
             inc_hist(&self.stats.group_size_flushed, data_count);
-            let mut parity_encoder = self.encoder.flush_parities(parity_count);
+            let mut parity_encoder = self.encoder.flush_parities(depth);
             let mut pkts = vec![];
             while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
                 pkts.push(self.enc_buf[..n].to_vec());
@@ -1260,6 +1268,65 @@ mod tests {
             0,
             "single-symbol group at depth 1 with empty bucket must be skipped, got {}",
             pkts.len()
+        );
+    }
+
+    /// The in-stream multi-symbol parity burst is budget-adaptive and
+    /// non-destructive: it emits as many parity symbols as the 1/3 spare
+    /// budget share allows (one is enough to recover a single lost data
+    /// symbol), and when the share is zero it HOLDS the group open instead of
+    /// destroying its parity.  The old all-or-nothing gate dropped the whole
+    /// group the moment the pacer was momentarily drained, so a batched
+    /// interactive lane — where the pacer is drained right after the data
+    /// burst — emitted no parity at all and every loss fell through to ARQ.
+    #[test]
+    fn in_stream_multi_symbol_parity_is_budget_adaptive_and_non_destructive() {
+        let t0 = Instant::now();
+        let data = b"payload";
+        let mut sym_buf = vec![0u8; 8192];
+
+        // A 3-token bucket affords exactly one parity (3 / PARITY_BUDGET_DEN):
+        // emit one rather than dropping the whole group.
+        let mut fec = fec_state(8192 - 11, 1);
+        let (mut tb, now) = bucket_with_tokens(3.0, usize::MAX, t0);
+        fec.encoder.encode_data(data, &mut sym_buf, true);
+        fec.encoder.encode_data(data, &mut sym_buf, true);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(
+            pkts.len(),
+            1,
+            "a 3-token bucket must emit 1 parity for an in-stream group, got {}",
+            pkts.len()
+        );
+        assert_eq!(fec.encoder.parity_sent(), 1);
+
+        // An empty bucket holds the group open (0 parity this pass, group
+        // intact), recording the skip.
+        let mut fec = fec_state(8192 - 11, 1);
+        let mut tb = empty_bucket(now);
+        fec.encoder.encode_data(data, &mut sym_buf, true);
+        fec.encoder.encode_data(data, &mut sym_buf, true);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, true);
+        assert_eq!(pkts.len(), 0);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            2,
+            "an empty bucket must HOLD the in-stream group open, not destroy it"
+        );
+        assert_eq!(
+            fec.encoder
+                .stats
+                .snapshot()
+                .groups_skipped_no_surplus_tokens,
+            1
+        );
+
+        // After a token refill the still-open group flushes its parity.
+        let later = now + core::time::Duration::from_secs(1000);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, later, true);
+        assert!(
+            !pkts.is_empty(),
+            "the held in-stream group must flush its parity after the refill"
         );
     }
 

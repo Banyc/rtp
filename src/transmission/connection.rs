@@ -167,7 +167,15 @@ fn new_connection_inner(
         WriteHalfSettings {
             fec_instream_flush: unreliable_layer.fec_tuning.instream_flush,
             fec_loss_gate: unreliable_layer.fec_tuning.loss_gate_thresholds(),
-            instream_group_fec_enabled: unreliable_layer.instream_group_fec,
+            // A tuning that force-flushes every burst tail is an interactive
+            // preset; it must also cover the multi-symbol groups that the
+            // send driver's batching actually produces (a single interactive
+            // message is routinely batched with its neighbours into one
+            // group), otherwise the stock `PARITY_DATA_THRESHOLD` force-skip
+            // leaves those groups with no parity at all.  Stock/bulk tuning
+            // (`instream_flush == false`) keeps the connection flag verbatim.
+            instream_group_fec_enabled: unreliable_layer.instream_group_fec
+                || unreliable_layer.fec_tuning.instream_flush,
             retransmission_armor: unreliable_layer.retransmission_armor,
             mss: unreliable_layer.mss,
             ack_padding: unreliable_layer.ack_padding,

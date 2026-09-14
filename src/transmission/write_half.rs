@@ -494,9 +494,14 @@ impl WriteHalf {
     /// capacity comes from the reliable layer (tail gate + zero write waiters
     /// + no queue building); the tail policy is the caller's request.
     fn fec_gate_decision(&self, now: Instant, tail_requested: bool) -> FecGateDecision {
-        let spare = self
-            .shared
-            .with_reliable_layer(|layer| layer.fec_has_spare_capacity(now));
+        let interactive = self.fec_instream_flush;
+        let spare = self.shared.with_reliable_layer(|layer| {
+            if interactive {
+                layer.fec_has_spare_capacity_interactive()
+            } else {
+                layer.fec_has_spare_capacity(now)
+            }
+        });
         self.fec_gate.decide(spare, tail_requested)
     }
 

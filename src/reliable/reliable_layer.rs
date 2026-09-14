@@ -418,6 +418,35 @@ impl ReliableLayer {
             && !self.congestion_response.queue_building()
     }
 
+    /// Interactive-lane variant of [`Self::fec_has_spare_capacity`]: the
+    /// genuinely-spare-bandwidth conditions (empty stage, a sendable window,
+    /// no pending application write, no queue growth) still hold, but a
+    /// pending retransmission or tail-loss probe does NOT close the gate.
+    ///
+    /// On a lossy, batched interactive lane the tail-settled conditions are
+    /// effectively always false — the lane is either repairing a loss or
+    /// waiting for its tail probe — so the interactive parity that exists to
+    /// avoid those repairs was deferred until after the repair and never
+    /// emitted.  The parity is still bounded: the loss condition gate must be
+    /// open, the burst is capped at 1/3 of the send budget, and it is emitted
+    /// only at a group/burst boundary, so it never competes with the data
+    /// stream.  Used only by tunings that force-flush every burst tail
+    /// (`instream_flush`); stock/bulk traffic keeps [`Self::fec_has_spare_capacity`]
+    /// byte-for-byte.
+    pub(crate) fn fec_has_spare_capacity_interactive(&self) -> bool {
+        // Deliberately does NOT require the send stage to be empty: the
+        // in-stream full-group flush is designed to fire mid-burst (at
+        // `INSTREAM_DATA_PER_GROUP` symbols) while later application symbols
+        // are still staged, and requiring an empty stage defeated it, leaving
+        // the batched interactive lane with no parity.  The send window must
+        // still have room (`accepts_new_pkt`) and the queue must not be
+        // building, so parity never competes with a congestion-limited data
+        // stream.
+        self.pkt_send_space.accepts_new_pkt()
+            && self.application_write_waiters.load(Ordering::Relaxed) == 0
+            && !self.congestion_response.queue_building()
+    }
+
     pub fn pkt_send_space(&self) -> &PktSendSpace {
         &self.pkt_send_space
     }
@@ -1768,6 +1797,38 @@ mod tests {
             assert_eq!(layer.metrics_at(now).application_write_waiters, 1);
         }
         assert_eq!(layer.metrics_at(now).application_write_waiters, 0);
+    }
+
+    /// The interactive FEC capacity gate keeps the genuinely-spare conditions
+    /// (a sendable window, no waiting application writer, no queue growth) but
+    /// deliberately does NOT require the staging queue to be empty or the tail
+    /// to be settled: the in-stream group parity is designed to flush
+    /// mid-burst with later application symbols still staged, and on a lossy
+    /// interactive lane a pending retransmit/tail probe is the norm rather
+    /// than the exception.  Application backpressure still closes it.
+    #[test]
+    fn interactive_spare_capacity_ignores_a_nonempty_stage_but_not_waiters() {
+        let now = Instant::now();
+        let mut layer = test_layer(now);
+        assert!(layer.fec_has_spare_capacity(now));
+        assert!(layer.fec_has_spare_capacity_interactive());
+
+        let payload = vec![0u8; 64];
+        assert!(layer.send_data_buf(&payload, now).unwrap() > 0);
+        assert!(
+            !layer.fec_has_spare_capacity(now),
+            "a non-empty stage must close the stock tail gate"
+        );
+        assert!(
+            layer.fec_has_spare_capacity_interactive(),
+            "the interactive gate must stay open with a non-empty stage"
+        );
+
+        let _waiter = layer.application_write_waiter();
+        assert!(
+            !layer.fec_has_spare_capacity_interactive(),
+            "application backpressure must close the interactive gate too"
+        );
     }
 
     #[test]

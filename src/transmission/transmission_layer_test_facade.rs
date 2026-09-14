@@ -645,6 +645,22 @@ mod tests {
         instream_group_fec: bool,
         mss: usize,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
+        harness_with_mss_and_tuning(
+            fec,
+            enabled,
+            instream_group_fec,
+            mss,
+            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+        )
+    }
+
+    fn harness_with_mss_and_tuning(
+        fec: bool,
+        enabled: bool,
+        instream_group_fec: bool,
+        mss: usize,
+        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+    ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
         #[async_trait]
@@ -666,7 +682,7 @@ mod tests {
             Box::new(write),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            tuning,
             crate::delivery::frame::FrameMode::default(),
         )
         .unwrap();
@@ -694,6 +710,36 @@ mod tests {
         assert_eq!(
             n, 12,
             "full in-stream group must emit 8 data + 4 parity = 12 datagrams, got {n}"
+        );
+    }
+
+    /// An interactive tuning that force-flushes every burst tail
+    /// (`instream_flush`) must also use the in-stream group path for the
+    /// multi-symbol groups the send driver's batching actually produces;
+    /// otherwise the stock `PARITY_DATA_THRESHOLD` force-skip leaves those
+    /// groups with no parity.  A full 8-symbol group therefore emits its 4
+    /// inline parities from `interactive_prompt` tuning alone, without the
+    /// separate connection-level `instream_group_fec` flag.
+    #[tokio::test]
+    async fn interactive_tuning_enables_in_stream_group_parity_mid_burst() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        // MSS 8192 fits the 8 staged packets needed to fill one in-stream
+        // group; the separate connection flag is left OFF so the tuning alone
+        // must enable the group path.
+        let (mut tl, recorder) =
+            harness_with_mss_and_tuning(true, false, false, 8192, FecTuning::interactive_prompt());
+        tl.shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
+        stage_n_packets(&tl, 8);
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let n = recorder.lock().unwrap().count();
+        assert_eq!(
+            n, 12,
+            "interactive_prompt tuning must emit 8 data + 4 in-stream parity = 12 datagrams, got {n}"
         );
     }
 
