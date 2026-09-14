@@ -558,10 +558,12 @@ mod tests {
     }
 
     /// A fresh interactive single-symbol tail (the interactive FEC preset
-    /// force-flushes every burst) gets armor duplicate copies on its first
-    /// send, independent of the recovery-armor env toggle: a lone loss — or a
-    /// burst of two tail losses — is then covered on the same round trip
-    /// instead of waiting for FEC parity or a repair round trip.
+    /// force-flushes every burst) gets loss-adaptive armor duplicate copies on
+    /// its first send, independent of the recovery-armor env toggle: a lone
+    /// loss — or a short burst that eats the primary and the first copies — is
+    /// then covered on the same round trip instead of waiting for FEC parity
+    /// or a repair round trip.  With no loss evidence yet the policy uses the
+    /// low-loss (burst-cover) tier.
     #[tokio::test]
     async fn fresh_interactive_single_symbol_tail_gets_an_armor_duplicate() {
         use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -575,8 +577,8 @@ mod tests {
         let dg = recorder.lock().unwrap().datagrams();
         assert_eq!(
             dg.len(),
-            3,
-            "the fresh interactive single-symbol tail must send primary + two armor duplicates"
+            4,
+            "the fresh interactive single-symbol tail must send primary + three armor duplicates on a low-loss link"
         );
         assert_eq!(
             dg[0], dg[1],
@@ -586,6 +588,43 @@ mod tests {
             dg[0], dg[2],
             "the second fresh-tail armor duplicate must also reuse the exact encoded symbol bytes"
         );
+        assert_eq!(
+            dg[0], dg[3],
+            "the third fresh-tail armor duplicate must also reuse the exact encoded symbol bytes"
+        );
+    }
+
+    /// At every tier where the loss gate is open, the fresh-tail's total
+    /// datagram count (primary + loss-adaptive armor copies + the single
+    /// tail parity) is monotone non-increasing in the measured loss, and the
+    /// extra burst-cover copy is only paid in the low/moderate band.  A
+    /// hostile link must never see more packets per message than a clean one.
+    #[tokio::test]
+    async fn fresh_tail_armor_copies_shrink_as_loss_rises() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        let mut previous = usize::MAX;
+        for (loss, expected) in [(0.05, 5usize), (0.20, 4), (0.40, 2)] {
+            let (mut tl, recorder) =
+                harness_with_tuning(true, false, FecTuning::interactive_prompt());
+            tl.shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap()
+                .set_congestion_loss_ratio_for_test(Some(loss));
+            stage_small_message(&tl);
+            let mut bufs = SendBufs::new();
+            let _ = tl.send_pkts(&mut bufs).await;
+            let count = recorder.lock().unwrap().count();
+            assert_eq!(
+                count, expected,
+                "loss {loss} must emit {expected} datagrams (primary + adaptive armor + one parity)"
+            );
+            assert!(
+                count <= previous,
+                "loss {loss} must not emit more datagrams ({count}) than a lower loss ({previous})"
+            );
+            previous = count;
+        }
     }
 
     /// The bulk/stock lane is byte-for-byte unchanged: a fresh send on a
@@ -673,8 +712,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 6,
-            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 2 fresh-tail armor + 3 parity = 6 datagrams, got {n}"
+            n, 7,
+            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 3 fresh-tail armor + 3 parity = 7 datagrams, got {n}"
         );
     }
 
@@ -788,8 +827,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 14,
-            "interactive_prompt tuning must emit 8 data + 2 fresh-tail armor + 4 in-stream parity = 14 datagrams, got {n}"
+            n, 15,
+            "interactive_prompt tuning must emit 8 data + 3 fresh-tail armor + 4 in-stream parity = 15 datagrams, got {n}"
         );
     }
 
@@ -842,8 +881,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 3,
-            "startup without measured congestion loss must emit 1 data + 2 fresh-tail armor + 0 parity = 3 datagrams, got {n}"
+            n, 4,
+            "startup without measured congestion loss must emit 1 data + 3 fresh-tail armor + 0 parity = 4 datagrams, got {n}"
         );
     }
 

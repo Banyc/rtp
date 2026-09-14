@@ -101,6 +101,10 @@ pub(crate) enum FecGateDecision {
 pub(crate) struct FecConditionGate {
     thresholds: FecLossGateThresholds,
     loss_active: bool,
+    /// Latest effective loss ratio (`max(congestion, recovery)`), `None` until
+    /// evidence exists.  Retained so the interactive fresh-tail armor policy
+    /// can scale its copies down as the wire loss rate rises.
+    effective_loss: Option<f64>,
     recovery_samples: [bool; RECOVERY_WINDOW],
     recovery_sample_len: usize,
     recovery_sample_next: usize,
@@ -122,6 +126,7 @@ impl FecConditionGate {
         Self {
             thresholds,
             loss_active: false,
+            effective_loss: None,
             recovery_samples: [false; RECOVERY_WINDOW],
             recovery_sample_len: 0,
             recovery_sample_next: 0,
@@ -149,6 +154,7 @@ impl FecConditionGate {
     pub(crate) fn refresh_loss(&mut self, configured: bool, congestion_loss: Option<f64>) {
         if !configured {
             self.loss_active = false;
+            self.effective_loss = None;
             return;
         }
         let recovery_loss = self.recovery_loss_ratio();
@@ -157,11 +163,18 @@ impl FecConditionGate {
             (Some(loss), None) | (None, Some(loss)) => Some(loss),
             (None, None) => None,
         };
+        self.effective_loss = effective_loss;
         self.loss_active = match effective_loss {
             None => false,
             Some(loss) if self.loss_active => loss >= self.thresholds.disable_loss,
             Some(loss) => loss >= self.thresholds.enable_loss,
         };
+    }
+
+    /// Latest effective loss ratio (`max(congestion, recovery)`): the wire
+    /// loss evidence the interactive fresh-tail armor policy backs off from.
+    pub(crate) fn effective_loss_ratio(&self) -> Option<f64> {
+        self.effective_loss
     }
 
     /// Decide for one open group: the loss gate first, then spare capacity,

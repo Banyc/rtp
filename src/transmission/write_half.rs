@@ -95,12 +95,53 @@ struct PiggybackAck {
 const MAX_CONSECUTIVE_WOULD_BLOCK: u32 = 16;
 
 /// Armor duplicate copies emitted for a fresh interactive single-symbol tail
-/// (in addition to the primary datagram).  The interactive lane carries no
-/// parity while the FEC loss gate is closed, so a lone copy still falls back
-/// to the one-reorder-window ARQ repair when the primary and the copy are both
-/// lost; two copies cover a burst of two tail losses.  Only recovery sends and
-/// non-interactive lanes keep the single-copy default.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES: usize = 2;
+/// (in addition to the primary datagram), on a LOW/MODERATE-loss link.  The
+/// interactive lane carries no parity while the FEC loss gate is closed, so a
+/// lone copy still falls back to the one-reorder-window ARQ repair when the
+/// primary and the copies are lost.  Three copies cover a short burst that
+/// eats the primary and the first two copies while the trailing parity (if
+/// emitted) or a surviving copy still recovers on the same round trip.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST: usize = 3;
+
+/// Armor duplicate copies retained once the measured loss passes
+/// [`FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS`]: the two-copy coverage this
+/// lane shipped with, kept for the mid-loss band where a single loss is still
+/// the common event.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE: usize = 2;
+
+/// Armor duplicate copies retained once the measured loss passes
+/// [`FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS`].  On a hostile link the extra
+/// packets amplify queue pressure instead of helping, so the fresh tail backs
+/// off to the primary datagram alone and leaves repair to FEC/ARQ.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN: usize = 0;
+
+/// Measured effective loss ratio above which the fresh interactive tail drops
+/// from the burst-cover copy count to the historical two-copy base.
+const FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS: f64 = 0.15;
+
+/// Measured effective loss ratio above which the fresh interactive tail backs
+/// off to the primary datagram alone: a hostile link must never pay extra
+/// redundancy that amplifies congestion.
+const FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS: f64 = 0.30;
+
+/// Armor duplicate copies for a fresh interactive single-symbol tail as a
+/// function of the measured effective loss ratio.  The mapping is
+/// **monotone non-increasing** in loss: it may only ever shrink the
+/// per-message packet count as the wire loss rate rises, so a hostile link
+/// never sees more redundancy than a clean one.  `None` (no loss evidence
+/// yet) is treated as the low-loss tier.  Only the interactive lane consults
+/// this: stock/bulk tuning never forces `fec_instream_flush`.
+fn fresh_tail_armor_copies(effective_loss: Option<f64>) -> usize {
+    match effective_loss {
+        Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS => {
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN
+        }
+        Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS => {
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE
+        }
+        _ => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+    }
+}
 
 /// Convert a codec [`EncodeError`] into the session [`IoErr`] surfaced by the
 /// terminal-error paths. An encode failure is a wire-format invariant
@@ -870,18 +911,20 @@ impl WriteHalf {
                     }
                     if armor_decision == ArmorDecision::Duplicate {
                         // A recovery send gets one armor copy; a fresh
-                        // interactive single-symbol tail gets
-                        // `FRESH_INTERACTIVE_TAIL_ARMOR_COPIES`.  The
-                        // interactive lane's redundancy while the FEC loss
-                        // gate is closed is primary + armor only, so a single
-                        // copy still falls through to the one-reorder-window
-                        // ARQ repair when both copies are lost.  A second copy
-                        // covers a burst of two tail losses (iid p^3) with no
-                        // wire-format change; only this lane pays the extra
-                        // pacer token (bulk/stock never force
-                        // `fec_instream_flush`).
+                        // interactive single-symbol tail gets a loss-adaptive
+                        // copy count.  The interactive lane's redundancy while
+                        // the FEC loss gate is closed is primary + armor only,
+                        // so a single copy still falls through to the
+                        // one-reorder-window ARQ repair when it is lost.  The
+                        // count is monotone non-increasing in the measured
+                        // loss (see [`fresh_tail_armor_copies`]): the extra
+                        // burst-cover copy is only paid while the link is
+                        // low/moderate loss and is withdrawn as loss rises, so
+                        // redundancy never amplifies a hostile link.  Only
+                        // this lane pays the extra pacer token (bulk/stock
+                        // never force `fec_instream_flush`).
                         let copies = if fresh_interactive_tail {
-                            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES
+                            fresh_tail_armor_copies(self.fec_gate.effective_loss_ratio())
                         } else {
                             1
                         };
@@ -1331,6 +1374,54 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::FecSymbolCache;
+
+    /// The fresh interactive tail's armor copy count is monotone
+    /// non-increasing in the measured loss ratio: a hostile link can never
+    /// emit more redundancy per message than a clean one.  The low/unmeasured
+    /// tier pays the burst-cover copy, the mid band keeps the historical base,
+    /// and the hostile tier backs off to the primary datagram alone.
+    #[test]
+    fn fresh_tail_armor_copies_are_monotone_non_increasing_in_loss() {
+        use super::{
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE, FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN, fresh_tail_armor_copies,
+        };
+        assert_eq!(
+            fresh_tail_armor_copies(None),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+            "no loss evidence yet must use the burst-cover tier"
+        );
+        assert_eq!(
+            fresh_tail_armor_copies(Some(0.0)),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+            "a clean link must use the burst-cover tier"
+        );
+        assert_eq!(
+            fresh_tail_armor_copies(Some(0.14)),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+            "just below the moderate threshold keeps the burst-cover tier"
+        );
+        assert_eq!(
+            fresh_tail_armor_copies(Some(0.15)),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
+            "the moderate threshold drops to the two-copy base"
+        );
+        assert_eq!(
+            fresh_tail_armor_copies(Some(0.30)),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
+            "the hostile threshold backs off to the primary alone"
+        );
+        let mut previous = usize::MAX;
+        for step in 0..=100 {
+            let loss = Some(step as f64 / 100.0);
+            let copies = fresh_tail_armor_copies(loss);
+            assert!(
+                copies <= previous,
+                "loss {loss:?} emitted {copies} copies, more than a lower loss ({previous})"
+            );
+            previous = copies;
+        }
+    }
 
     fn term(l: &PeerLiveness, now: Instant, has_in_flight: bool) -> bool {
         l.should_terminate_session(now, has_in_flight)

@@ -1012,6 +1012,172 @@ mod tests {
         );
     }
 
+    /// Burst-loss companion to `probe_fresh_tail_armor_latency`: the same
+    /// 256-byte, 25 ms interactive stream, but the sender-to-receiver direction
+    /// drops runs of `burst` consecutive packets separated by a randomized
+    /// quiet gap, so a burst can wipe a whole redundancy group (the primary,
+    /// every fresh-tail armor copy, and the parity that trails the group).
+    /// Classifies each echo by repair path: a same-round-trip recovery stays
+    /// near the loopback floor, while a fall-through to the reorder-window ARQ
+    /// repair costs at least one extra RTT. Run with `--ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "in-process burst-loss interactive repair probe; ~60 s; run with --ignored --nocapture"]
+    async fn probe_fresh_tail_burst_loss_latency() {
+        use crate::socket::socket;
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::udp::testing::{
+            BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
+            wrap_fec_delayed_with_mss_and_fec_tuning,
+        };
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use std::time::Instant;
+
+        let msg_len = 256usize;
+        let n = 400usize;
+        let mss = 8192usize;
+        // A 20 ms one-way delay puts the loopback link's round trip at ~40 ms,
+        // the deployment's WAN-scale RTT, so an ARQ fall-through shows the
+        // real `reorder_window + one round trip` tail rather than the
+        // sub-millisecond loopback floor.
+        let owd = Duration::from_millis(20);
+        for (label, burst, quiet_min, quiet_max, seed) in [
+            ("clean_delayed", 0usize, 1usize, 1usize, 0x1111_2222u64),
+            ("burst3_gap8_12", 3usize, 8usize, 12usize, 0x1234_5678u64),
+            ("burst4_gap18_26", 4, 18, 26, 0x0BAD_F00D),
+        ] {
+            let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+            let loss = BurstLoss::new(burst, quiet_min, quiet_max, seed);
+            let loss_sink = loss.clone();
+            let mut a_layer = wrap_fec_burst_delayed_with_mss_and_fec_tuning(
+                a.clone(),
+                a,
+                true,
+                mss,
+                FecTuning::interactive_prompt(),
+                loss,
+                owd,
+            );
+            let observed = Arc::new(Mutex::new(None));
+            let armor_duplicates = Arc::new(AtomicU64::new(0));
+            let sink = Arc::clone(&observed);
+            let armor_sink = Arc::clone(&armor_duplicates);
+            a_layer.metrics_observer =
+                Some(crate::metrics::MetricsObserver::new(move |observation| {
+                    if observation.event
+                        == crate::metrics::MetricsEvent::RetransmissionArmorDuplicate
+                    {
+                        armor_sink.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if let Some(counters) = observation
+                        .snapshot
+                        .and_then(|snapshot| snapshot.fec_counters)
+                    {
+                        *sink.lock().unwrap() = Some(counters);
+                    }
+                }));
+            let b_layer = wrap_fec_delayed_with_mss_and_fec_tuning(
+                b.clone(),
+                b,
+                true,
+                mss,
+                FecTuning::interactive_prompt(),
+                owd,
+            );
+            let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
+            let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
+            let recovered = Arc::new(AtomicU64::new(0));
+            let recovered_sink = Arc::clone(&recovered);
+            let mut echo_tasks = tokio::task::JoinSet::new();
+            echo_tasks.spawn(async move {
+                let mut buf = vec![0u8; msg_len];
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(2000), b_r.recv(&mut buf))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(len)) => {
+                            let _ = b_w.send(&buf[..len]).await;
+                        }
+                    }
+                }
+                if let Some(recovered) = b_r.fec_recovered_symbols() {
+                    recovered_sink.store(recovered as u64, AtomicOrdering::Relaxed);
+                }
+            });
+            let mut latencies = Vec::with_capacity(n);
+            let mut timeouts = 0usize;
+            for i in 0..n {
+                let mut msg = vec![(i % 251) as u8; msg_len];
+                // Stamp the index so a stale echo left over from an earlier
+                // timeout is detected and discarded instead of being counted
+                // as this message's near-instant round trip.
+                msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let started = Instant::now();
+                let _ = tokio::time::timeout(Duration::from_secs(2), a_w.send(&msg)).await;
+                let mut echo_buf = vec![0u8; msg_len];
+                let mut matched = None;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(2), a_r.recv(&mut echo_buf))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) => break,
+                        Ok(Ok(_)) => {
+                            if echo_buf[..4] == msg[..4] {
+                                matched = Some(started.elapsed());
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            timeouts += 1;
+                            break;
+                        }
+                    }
+                }
+                if let Some(latency) = matched {
+                    latencies.push(latency);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            drop(a_w);
+            drop(a_r);
+            let _ = tokio::time::timeout(Duration::from_secs(5), echo_tasks.join_next()).await;
+            latencies.sort_unstable();
+            let pick = |q: f64| -> Duration {
+                if latencies.is_empty() {
+                    return Duration::ZERO;
+                }
+                let idx = ((latencies.len() - 1) as f64 * q).round() as usize;
+                latencies[idx]
+            };
+            let count_gt = |ms: u64| {
+                latencies
+                    .iter()
+                    .filter(|latency| **latency > Duration::from_millis(ms))
+                    .count()
+            };
+            let counters = *observed.lock().unwrap();
+            eprintln!(
+                "[probe burst {label}] samples={} timeouts={} gt60ms={} gt90ms={} gt150ms={} p50={:?} p90={:?} p99={:?} max={:?} armor_duplicates={} dropped={} recovered={} counters={counters:?}",
+                latencies.len(),
+                timeouts,
+                count_gt(60),
+                count_gt(90),
+                count_gt(150),
+                pick(0.50),
+                pick(0.90),
+                pick(0.99),
+                latencies.last().copied().unwrap_or_default(),
+                armor_duplicates.load(AtomicOrdering::Relaxed),
+                loss_sink.dropped(),
+                recovered.load(AtomicOrdering::Relaxed),
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_max_write_bytes_scales_with_mss() {
         use crate::udp::wrap_fec;
