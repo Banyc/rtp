@@ -798,6 +798,100 @@ mod tests {
         );
     }
 
+    /// Focused, deterministic in-process probe for the single-symbol
+    /// interactive repair path: 256-byte messages (one data symbol at MSS
+    /// 8192) at a 25 ms cadence under 2% iid loss, for both the depth-1
+    /// `interactive_prompt` preset (deployment) and depth-3 `max_diversity`.
+    /// Prints the sender parity/gate counters and the receiver recovered
+    /// count so the repair path is observable without the netem oracle.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "in-process FEC-repair measurement probe; ~45 s; run with --ignored --nocapture"]
+    async fn probe_single_symbol_interactive_fec_repair() {
+        use crate::socket::socket;
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        let msg_len = 256usize;
+        let n = 800usize;
+        for (label, tuning) in [
+            ("depth1_interactive_prompt", FecTuning::interactive_prompt()),
+            ("depth3_max_diversity", FecTuning::max_diversity()),
+        ] {
+            let rate_a = BasisPoints::new(200);
+            let rate_b = BasisPoints::new(200);
+            let mss = 8192usize;
+            let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+            let mut a_layer =
+                wrap_fec_lossy_with_mss_and_fec_tuning(a.clone(), a, true, mss, tuning, rate_a);
+            let observed = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&observed);
+            a_layer.metrics_observer =
+                Some(crate::metrics::MetricsObserver::new(move |observation| {
+                    if let Some(counters) =
+                        observation.snapshot.and_then(|snapshot| snapshot.fec_counters)
+                    {
+                        *sink.lock().unwrap() = Some(counters);
+                    }
+                }));
+            let b_layer =
+                wrap_fec_lossy_with_mss_and_fec_tuning(b.clone(), b, true, mss, tuning, rate_b);
+            let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
+            let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
+            let sent_ok = Arc::new(AtomicU64::new(0));
+            let sent_ok_task = Arc::clone(&sent_ok);
+            let echo = tokio::spawn(async move {
+                let mut buf = vec![0u8; msg_len];
+                let mut delivered = 0usize;
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(2000), b_r.recv(&mut buf))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(len)) => {
+                            delivered += 1;
+                            let _ = b_w.send(&buf[..len]).await;
+                        }
+                    }
+                }
+                (delivered, b_r.fec_recovered_symbols())
+            });
+            for i in 0..n {
+                let msg = vec![(i % 251) as u8; msg_len];
+                if tokio::time::timeout(Duration::from_secs(2), a_w.send(&msg))
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+                {
+                    sent_ok_task.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                let mut echo_buf = vec![0u8; msg_len];
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(500), a_r.recv(&mut echo_buf)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                if i == 99 || i == 399 || i == n - 1 {
+                    eprintln!("[probe {label}] i={i} counters={:?}", *observed.lock().unwrap());
+                }
+            }
+            drop(a_w);
+            drop(a_r);
+            let (delivered, recovered) = tokio::time::timeout(Duration::from_secs(5), echo)
+                .await
+                .expect("echo task stalled")
+                .expect("echo task panicked");
+            let counters = *observed.lock().unwrap();
+            eprintln!(
+                "[probe {label}] sent={} delivered={} recovered={:?} counters={counters:?}",
+                sent_ok.load(AtomicOrdering::Relaxed),
+                delivered,
+                recovered,
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_max_write_bytes_scales_with_mss() {
         use crate::udp::wrap_fec;
