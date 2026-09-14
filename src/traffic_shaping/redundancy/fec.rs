@@ -85,13 +85,6 @@ pub struct FecConfig {
     /// spare-token budget gate regardless of this value.  `1` is stock
     /// behaviour.  See `FecTuning::small_group_parity_count`.
     pub small_group_parity_count: u8,
-    /// Truncate a single-symbol group's parity to the protected message's
-    /// size instead of emitting the full negotiated symbol.  Set only by the
-    /// interactive force-flush tuning (see `FecTuning::instream_flush`): the
-    /// single-symbol group is exactly the interactive tail, and its
-    /// message-sized parity is a cheap wire slot.  Stock/bulk connections
-    /// leave this off, so their parity is byte-for-byte unchanged.
-    pub message_sized_single_symbol_parity: bool,
 }
 
 /// Split FEC ownership for the read/write actor halves.  The encoder half is
@@ -112,19 +105,6 @@ pub(crate) struct FecEncoderState {
     encoder: FecEncoder,
     enc_buf: Vec<u8>,
     small_group_parity_count: u8,
-    /// The negotiated symbol size, retained so a single-symbol interactive
-    /// parity can be sized to the message it protects without re-deriving the
-    /// size from the shared `MAX_MSS` probe.
-    symbol_size: usize,
-    /// See [`FecConfig::message_sized_single_symbol_parity`].
-    message_sized_single_symbol_parity: bool,
-    /// Meaningful padded length of the open group's single data symbol:
-    /// `Some(len)` while the group holds exactly one symbol, `None` once a
-    /// second symbol arrives (so the group is no longer single-symbol).
-    /// Drives the message-sized parity truncation: the omitted tail of the
-    /// Reed-Solomon symbol is all zero (the data symbol is zero-padded to the
-    /// negotiated size), so a receiver can zero-extend it back exactly.
-    single_symbol_padded_len: Option<usize>,
     stats: Arc<Stats>,
     /// Whether the open group's parity flush is currently deferred by the
     /// no-spare-capacity gate (queued work, cwnd pressure, or a pending tail
@@ -333,9 +313,6 @@ impl FecState {
                 small_group_parity_count: config
                     .small_group_parity_count
                     .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
-                symbol_size: config.symbol_size,
-                message_sized_single_symbol_parity: config.message_sized_single_symbol_parity,
-                single_symbol_padded_len: None,
                 stats: Arc::clone(&stats),
                 deferred_no_spare_capacity: false,
                 pending_cap_parity: VecDeque::new(),
@@ -476,15 +453,6 @@ impl FecEncoderState {
         if self.encoder.group_data_count() >= MAX_DATA_PER_GROUP {
             self.force_flush_capped_group();
         }
-        // The open group is single-symbol exactly until a second symbol is
-        // pushed.  Record the meaningful padded length of that one symbol so
-        // a later parity flush can truncate the full-MSS Reed-Solomon symbol
-        // to the message it actually protects.
-        self.single_symbol_padded_len = (self.encoder.group_data_count() == 0).then(|| {
-            data.len()
-                .saturating_add(fec::proto::DATA_SYMBOL_HDR_SIZE)
-                .min(self.symbol_size)
-        });
         self.encoder.encode_data(data, out)
     }
 
@@ -659,7 +627,7 @@ impl FecEncoderState {
             self.stats
                 .parity_sent
                 .fetch_add(pkts.len(), Ordering::Relaxed);
-            return self.finish_parity_pkts(pkts, data_count);
+            return pkts;
         }
         // In-stream group FEC path: any multi-symbol group (data_count >= 2)
         // emits `INSTREAM_PARITY_PER_GROUP` parity symbols, budget-gated.
@@ -747,27 +715,6 @@ impl FecEncoderState {
         self.stats
             .parity_sent
             .fetch_add(pkts.len(), Ordering::Relaxed);
-        self.finish_parity_pkts(pkts, data_count)
-    }
-
-    /// Truncate a single-symbol interactive group's parity packets to the
-    /// message-sized symbol the group actually carried, so the parity is a
-    /// cheap wire slot rather than a full-MSS symbol.  The omitted tail bytes
-    /// of the Reed-Solomon symbol are all zero (the data symbol is zero-padded
-    /// to the negotiated size), so the receiver's zero-extension reconstructs
-    /// the exact symbol.  Multi-symbol and stock paths are returned unchanged:
-    /// only the interactive single-symbol tail pays the truncation.
-    fn finish_parity_pkts(&self, mut pkts: Vec<Vec<u8>>, data_count: usize) -> Vec<Vec<u8>> {
-        if !self.message_sized_single_symbol_parity || data_count != 1 {
-            return pkts;
-        }
-        let Some(padded_len) = self.single_symbol_padded_len else {
-            return pkts;
-        };
-        let wire_len = fec_hdr_size().saturating_add(padded_len);
-        for pkt in &mut pkts {
-            pkt.truncate(wire_len.min(pkt.len()));
-        }
         pkts
     }
 
@@ -976,20 +923,9 @@ mod tests {
     /// A fresh `FecState` with a given interactive parity depth, sized for a
     /// large-MSS loopback path so single-symbol groups dominate.
     fn fec_state(symbol_size: usize, small_group_parity_count: u8) -> FecState {
-        fec_state_with_parity_sizing(symbol_size, small_group_parity_count, false)
-    }
-
-    /// A `FecState` whose single-symbol interactive parity is truncated to the
-    /// protected message's size (`message_sized_single_symbol_parity`).
-    fn fec_state_with_parity_sizing(
-        symbol_size: usize,
-        small_group_parity_count: u8,
-        message_sized_single_symbol_parity: bool,
-    ) -> FecState {
         FecState::new(FecConfig {
             symbol_size,
             small_group_parity_count,
-            message_sized_single_symbol_parity,
         })
     }
 
@@ -1937,15 +1873,15 @@ mod tests {
         );
     }
 
-    /// A message-sized interactive parity is truncated to the protected
-    /// data symbol's meaningful length; the receiver must zero-extend it back
-    /// to the negotiated symbol size and still reconstruct the lost payload.
-    /// The omitted tail is all zero (the data symbol is zero-padded to the
-    /// same size), so the extension is exact rather than lossy.
+    /// A parity is truncated to the protected group's information prefix; the
+    /// receiver must zero-extend it back to the negotiated symbol size and still
+    /// reconstruct the lost payload.  The omitted tail is all zero (the data
+    /// symbol is zero-padded to the same size), so the extension is exact
+    /// rather than lossy.
     #[test]
     fn a_message_sized_parity_reconstructs_after_zero_extension() {
         let symbol_size = 512usize;
-        let fec = fec_state_with_parity_sizing(symbol_size, 3, true);
+        let fec = fec_state(symbol_size, 3);
         let (mut encoder, mut decoder, _stats) = fec.into_actor_parts();
         let data: Vec<u8> = (0..100u16).map(|i| (i % 251) as u8).collect();
         let mut buf = vec![0u8; symbol_size];
@@ -1962,7 +1898,7 @@ mod tests {
             assert_eq!(
                 parity.len(),
                 expected_len,
-                "a single-symbol interactive parity must be truncated to the message size, not the full symbol"
+                "a parity must be truncated to the group's information prefix, not the full symbol"
             );
         }
         // Feed ONLY a truncated parity: the data symbol itself is treated as
@@ -1981,17 +1917,18 @@ mod tests {
         );
     }
 
-    /// A stock single-symbol group keeps the full negotiated symbol for its
-    /// parity: only the interactive tuning opts into the message-sized parity,
-    /// so bulk/stock behaviour is byte-for-byte unchanged.
+    /// Every group's parity stops at the group's longest information prefix, not
+    /// just the interactive single-symbol tail: the omitted tail is the zero pad
+    /// in every data shard, so its parity bytes are zero and the receiver's
+    /// zero-extension reconstructs the exact symbol.
     #[test]
-    fn a_stock_single_symbol_parity_keeps_the_full_symbol_size() {
+    fn a_parity_is_trimmed_to_the_group_information_prefix() {
         let symbol_size = 512usize;
         let fec = fec_state(symbol_size, 1);
         let (mut encoder, _decoder, _stats) = fec.into_actor_parts();
         let mut buf = vec![0u8; symbol_size];
-        let _ = encoder.encode_data(&[7u8; 100], &mut buf, false);
         let (mut bucket, now) = unlimited_bucket(Instant::now());
+        let _ = encoder.encode_data(&[7u8; 100], &mut buf, false);
         let parities = encoder.maybe_flush_parities(&mut bucket, now, false);
         assert_eq!(
             parities.len(),
@@ -2000,8 +1937,20 @@ mod tests {
         );
         assert_eq!(
             parities[0].len(),
-            fec_hdr_size() + symbol_size,
-            "a stock parity must stay the full negotiated symbol size"
+            fec_hdr_size() + fec::proto::DATA_SYMBOL_HDR_SIZE + 100,
+            "a single-symbol parity must stop at the member's information prefix"
+        );
+
+        // A multi-member group trims at its LONGEST member, not its first.
+        let _ = encoder.encode_data(&[7u8; 40], &mut buf, false);
+        let _ = encoder.encode_data(&[7u8; 300], &mut buf, false);
+        let (mut bucket, now) = unlimited_bucket(Instant::now());
+        let parities = encoder.maybe_flush_parities(&mut bucket, now, false);
+        assert_eq!(parities.len(), 1, "a two-symbol group emits one parity");
+        assert_eq!(
+            parities[0].len(),
+            fec_hdr_size() + fec::proto::DATA_SYMBOL_HDR_SIZE + 300,
+            "a multi-symbol parity must stop at the longest member's prefix"
         );
     }
 }
