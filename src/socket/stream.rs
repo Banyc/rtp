@@ -469,6 +469,52 @@ mod tests {
     use super::*;
     use core::time::Duration;
 
+    /// Counts every datagram the layer above hands to the underlay.  Installed
+    /// *inside* the loss wrapper, so it counts forwarded (wire) datagrams only;
+    /// a datagram the loss injector discards never reaches it.
+    #[derive(Debug)]
+    struct CountingWrite<W> {
+        inner: W,
+        datagrams: Arc<std::sync::atomic::AtomicU64>,
+        bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl<W> CountingWrite<W> {
+        fn new(
+            inner: W,
+        ) -> (
+            Self,
+            Arc<std::sync::atomic::AtomicU64>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) {
+            let datagrams = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            (
+                Self {
+                    inner,
+                    datagrams: Arc::clone(&datagrams),
+                    bytes: Arc::clone(&bytes),
+                },
+                datagrams,
+                bytes,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<W: crate::transmission::transmission_layer::UnreliableWrite>
+        crate::transmission::transmission_layer::UnreliableWrite for CountingWrite<W>
+    {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+            let n = self.inner.send(buf).await?;
+            self.datagrams
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.bytes
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
     #[tokio::test]
     async fn empty_stock_io_is_an_immediate_noop() {
         let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1181,6 +1227,224 @@ mod tests {
                 recovered.load(AtomicOrdering::Relaxed),
             );
         }
+    }
+
+    /// Efficiency-frontier probe for the interactive fresh-tail armor.
+    ///
+    /// One request/response cell of the 256-byte / 25 ms interactive stream
+    /// over a 20 ms one-way WAN delay, with the sender-to-receiver direction
+    /// impaired by iid loss or a deterministic burst.  The armor copy count is
+    /// forced through the test-only override so it can be swept independently
+    /// of the loss-adaptive ladder; `ARMOR_COPIES=-1` keeps the production
+    /// ladder (the trunk baseline).  Prints one `ARMOR_CELL` line with the
+    /// percentile echo latencies and the forwarded datagrams/bytes per message.
+    /// Configuration comes from the environment so a shell loop can sweep
+    /// cells without recompiling: `ARMOR_COPIES` (-1 = trunk), `ARMOR_BPS`
+    /// (iid basis points, 0 = off), `ARMOR_BURST`/`ARMOR_GAP` (burst length and
+    /// fixed quiet gap, burst 0 = off), `ARMOR_N`, `ARMOR_SEED`.  Run with
+    /// `--ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "in-process armor-frontier cell; ~10 s per cell; run with --ignored --nocapture"]
+    async fn probe_armor_copy_cell() {
+        use crate::socket::socket;
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::udp::testing::{
+            BasisPoints, BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
+            wrap_fec_delayed_with_mss_and_fec_tuning, wrap_fec_iid_delayed_with_mss_and_fec_tuning,
+        };
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use std::time::Instant;
+
+        let env_usize = |key: &str, default: usize| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+
+        let msg_len = 256usize;
+        let n = env_usize("ARMOR_N", 400);
+        let copies_arg = std::env::var("ARMOR_COPIES")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(-1);
+        let copies_override = (copies_arg >= 0).then_some(copies_arg as usize);
+        let bps = env_usize("ARMOR_BPS", 0);
+        let burst = env_usize("ARMOR_BURST", 0);
+        let gap = env_usize("ARMOR_GAP", 0);
+        let seed = env_usize("ARMOR_SEED", 0x1234_5678) as u64;
+        let owd = Duration::from_millis(20);
+        let cadence_ms = env_usize("ARMOR_CADENCE_MS", 25);
+        let mss = 8192usize;
+
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+
+        let (counting, datagrams, wire_bytes) = CountingWrite::new(a.clone());
+        let mut a_layer = if burst > 0 {
+            let loss = BurstLoss::new(burst, gap, gap, seed);
+            wrap_fec_burst_delayed_with_mss_and_fec_tuning(
+                a.clone(),
+                counting,
+                true,
+                mss,
+                FecTuning::interactive_prompt(),
+                loss,
+                owd,
+            )
+        } else {
+            wrap_fec_iid_delayed_with_mss_and_fec_tuning(
+                a.clone(),
+                counting,
+                true,
+                mss,
+                FecTuning::interactive_prompt(),
+                BasisPoints::new(bps),
+                owd,
+            )
+        };
+        a_layer.fresh_tail_armor_copies_override = copies_override;
+        let last_state = Arc::new(std::sync::Mutex::new((0.0f64, 0.0f64, 0usize)));
+        let armor_copies = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let sink = Arc::clone(&last_state);
+            let armor = Arc::clone(&armor_copies);
+            a_layer.metrics_observer =
+                Some(crate::metrics::MetricsObserver::new(move |observation| {
+                    if observation.event
+                        == crate::metrics::MetricsEvent::RetransmissionArmorDuplicate
+                    {
+                        armor.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if let Some(snapshot) = observation.snapshot {
+                        *sink.lock().unwrap() = (
+                            snapshot.send_rate_packets_per_second,
+                            snapshot.pacer_tokens_packets,
+                            snapshot.congestion_window_packets,
+                        );
+                    }
+                }));
+        }
+
+        let b_layer = wrap_fec_delayed_with_mss_and_fec_tuning(
+            b.clone(),
+            b,
+            true,
+            mss,
+            FecTuning::interactive_prompt(),
+            owd,
+        );
+        let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
+        let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
+        let mut echo_tasks = tokio::task::JoinSet::new();
+        echo_tasks.spawn(async move {
+            let mut buf = vec![0u8; msg_len];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(2000), b_r.recv(&mut buf)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(len)) => {
+                        let _ = b_w.send(&buf[..len]).await;
+                    }
+                }
+            }
+        });
+
+        let send_times: Arc<std::sync::Mutex<std::collections::HashMap<u32, Instant>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let latencies = Arc::new(std::sync::Mutex::new(Vec::with_capacity(n)));
+        // Consumer: record the echo round-trip of each stamped message as it
+        // arrives.  Running independently of the producer keeps the send
+        // cadence fixed at 25 ms even when a lost head-of-line message delays
+        // every later echo, so the measured latency is the true application
+        // tail rather than an artifact of a synchronous request/response loop.
+        let mut consumer_tasks = tokio::task::JoinSet::new();
+        {
+            let send_times = Arc::clone(&send_times);
+            let latencies = Arc::clone(&latencies);
+            consumer_tasks.spawn(async move {
+                let mut buf = vec![0u8; msg_len];
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(2), a_r.recv(&mut buf)).await {
+                        Ok(Ok(len)) if len >= 4 => {
+                            let id = u32::from_le_bytes(buf[..4].try_into().unwrap());
+                            if let Some(start) = send_times.lock().unwrap().remove(&id) {
+                                latencies.lock().unwrap().push(start.elapsed());
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+        // Producer: a fixed 25 ms cadence of 256-byte stamped messages.
+        let mut send_failures = 0usize;
+        for i in 0..n {
+            let mut msg = vec![(i % 251) as u8; msg_len];
+            msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            send_times.lock().unwrap().insert(i as u32, Instant::now());
+            if !tokio::time::timeout(Duration::from_secs(2), a_w.send(&msg))
+                .await
+                .is_ok_and(|r| r.is_ok())
+            {
+                send_failures += 1;
+                send_times.lock().unwrap().remove(&(i as u32));
+            }
+            tokio::time::sleep(Duration::from_millis(cadence_ms as u64)).await;
+        }
+        drop(a_w);
+        // Let the consumer drain the last echoes (it exits after 2 s of idle).
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while consumer_tasks.join_next().await.is_some() {}
+        })
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), echo_tasks.join_next()).await;
+
+        let mut latencies = latencies.lock().unwrap().clone();
+        latencies.sort_unstable();
+        let pick = |q: f64| -> f64 {
+            if latencies.is_empty() {
+                return 0.0;
+            }
+            let idx = ((latencies.len() - 1) as f64 * q).round() as usize;
+            latencies[idx].as_secs_f64() * 1000.0
+        };
+        let dgrams = datagrams.load(AtomicOrdering::Relaxed);
+        let bytes = wire_bytes.load(AtomicOrdering::Relaxed);
+        let copies_label = if copies_arg >= 0 {
+            copies_arg.to_string()
+        } else {
+            "trunk".to_string()
+        };
+        let (rate, tokens, cwnd) = *last_state.lock().unwrap();
+        eprintln!(
+            "ARMOR_CELL copies={} bps={} burst={} gap={} n={} cadence_ms={} samples={} undelivered={} send_failures={} p50_ms={:.2} p90_ms={:.2} p99_ms={:.2} max_ms={:.2} armor_copies={} armor_per_msg={:.3} dgrams={} dgrams_per_msg={:.3} bytes_per_msg={:.1} send_rate={:.1} tokens={:.2} cwnd={}",
+            copies_label,
+            bps,
+            burst,
+            gap,
+            n,
+            cadence_ms,
+            latencies.len(),
+            n - latencies.len(),
+            send_failures,
+            pick(0.50),
+            pick(0.90),
+            pick(0.99),
+            latencies
+                .last()
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            armor_copies.load(AtomicOrdering::Relaxed),
+            armor_copies.load(AtomicOrdering::Relaxed) as f64 / n as f64,
+            dgrams,
+            dgrams as f64 / n as f64,
+            bytes as f64 / n as f64,
+            rate,
+            tokens,
+            cwnd,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

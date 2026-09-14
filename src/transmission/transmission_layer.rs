@@ -124,6 +124,12 @@ pub struct UnreliableLayer {
     /// so padded and unpadded ACKs decode identically. Both peers must
     /// configure identically.
     pub(crate) ack_padding: AckPaddingMode,
+    /// Test-only override for the fresh interactive tail's armor duplicate
+    /// copy count, so a probe can sweep the count independently of the
+    /// loss-adaptive ladder.  Production leaves this `None`: the ladder in
+    /// [`crate::transmission::write_half::fresh_tail_armor_copies`] decides,
+    /// and only the interactive lane (`fec_instream_flush`) consults it.
+    pub(crate) fresh_tail_armor_copies_override: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

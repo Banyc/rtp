@@ -17,6 +17,13 @@ impl TransmissionLayer {
         self.write_half_for_test().drain_pacer_for_test(n, now)
     }
 
+    /// Test-only: force the fresh interactive tail's armor copy count so a
+    /// probe can sweep it independently of the loss-adaptive ladder.
+    pub(crate) fn set_fresh_tail_armor_copies_override_for_test(&mut self, copies: Option<usize>) {
+        self.write_half_mut_for_test()
+            .set_fresh_tail_armor_copies_override_for_test(copies);
+    }
+
     /// Test-only: pin the send pacer's burst floor to the legacy 64-packet
     /// value and refill it, so suites that exercise send/recovery/FEC logic
     /// (not pacing) keep the working burst they were written against.
@@ -620,6 +627,34 @@ mod tests {
                 "loss {loss} must not emit more datagrams ({count}) than a lower loss ({previous})"
             );
             previous = count;
+        }
+    }
+
+    /// The test-only armor override forces the fresh interactive tail's copy
+    /// count regardless of the measured loss tier, so a probe can sweep the
+    /// count.  A hostile loss tier that would normally select zero copies must
+    /// still emit exactly what the override asks for (plus at most the one
+    /// trailing message-sized parity).
+    #[tokio::test]
+    async fn fresh_tail_armor_override_forces_the_copy_count() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        for forced in [0usize, 3, 7] {
+            let (mut tl, recorder) =
+                harness_with_tuning(true, false, FecTuning::interactive_prompt());
+            tl.shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap()
+                .set_congestion_loss_ratio_for_test(Some(0.5));
+            tl.set_fresh_tail_armor_copies_override_for_test(Some(forced));
+            stage_small_message(&tl);
+            let mut bufs = SendBufs::new();
+            let _ = tl.send_pkts(&mut bufs).await;
+            let count = recorder.lock().unwrap().count();
+            assert!(
+                (1 + forced..=1 + forced + 1).contains(&count),
+                "forced {forced} copies must emit primary + {forced} copies + at most one parity, got {count}"
+            );
         }
     }
 

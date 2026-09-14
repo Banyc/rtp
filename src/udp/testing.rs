@@ -396,6 +396,7 @@ where
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
         ack_padding: AckPaddingMode::None,
+        fresh_tail_armor_copies_override: None,
     }
 }
 
@@ -464,6 +465,7 @@ where
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
         ack_padding: AckPaddingMode::None,
+        fresh_tail_armor_copies_override: None,
     }
 }
 
@@ -506,6 +508,7 @@ where
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
         ack_padding: AckPaddingMode::None,
+        fresh_tail_armor_copies_override: None,
     }
 }
 
@@ -549,6 +552,52 @@ where
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
         ack_padding: AckPaddingMode::None,
+        fresh_tail_armor_copies_override: None,
+    }
+}
+
+/// iid-loss + WAN-delay variant of
+/// [`wrap_fec_burst_delayed_with_mss_and_fec_tuning`]: the sender-to-receiver
+/// direction carries independent (not burst) loss, the read direction is clean
+/// but delayed.  A loss that outruns the same-round-trip armor therefore falls
+/// through to the reorder-window ARQ tail instead of the sub-millisecond
+/// loopback floor, matching the burst probe's timing shape.
+pub fn wrap_fec_iid_delayed_with_mss_and_fec_tuning<R, W>(
+    read: R,
+    write: W,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+    loss: BasisPoints,
+    delay: std::time::Duration,
+) -> UnreliableLayer
+where
+    R: UnreliableRead + Send + Sync + 'static,
+    W: UnreliableWrite,
+{
+    let (mss, fec_state, tuning) = checked_mss_and_fec(
+        fec,
+        Mss::try_new(mss).unwrap(),
+        tuning,
+        FrameMode::default(),
+    )
+    .unwrap();
+    UnreliableLayer {
+        utp_read: Box::new(DelayedRead::new(read, delay)),
+        utp_write: Box::new(LossyWrite::new(write, loss)),
+        post_open_handshake: None,
+        session_tag: None,
+        initial_sequences: crate::sequence::InitialSequences::ZERO,
+        initial_rtt: None,
+        metrics_observer: None,
+        mss,
+        fec: fec_state,
+        fec_tuning: tuning,
+        frame_delivery: FrameMode::default(),
+        retransmission_armor: RetransmissionArmorConfig::disabled(),
+        instream_group_fec: false,
+        ack_padding: AckPaddingMode::None,
+        fresh_tail_armor_copies_override: None,
     }
 }
 
@@ -588,6 +637,7 @@ where
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
         ack_padding: AckPaddingMode::None,
+        fresh_tail_armor_copies_override: None,
     }
 }
 

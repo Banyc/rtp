@@ -61,6 +61,10 @@ pub struct WriteHalf {
     /// Sampler over recent sent data-packet sizes feeding fitted ACK
     /// padding (only read in `Fitted` mode).
     data_size_sampler: DataSizeSampler,
+    /// Test-only override for the fresh interactive tail's armor copy count
+    /// (see `UnreliableLayer::fresh_tail_armor_copies_override`).  `None` in
+    /// production, where the loss-adaptive ladder decides.
+    fresh_tail_armor_copies_override: Option<usize>,
 }
 
 /// FEC and retransmission-armor settings for the write half, bundled so
@@ -78,6 +82,8 @@ pub(super) struct WriteHalfSettings {
     pub(super) mss: crate::mss::Mss,
     /// ACK-padding mode (see [`crate::transmission::transmission_layer::UnreliableLayer`]).
     pub(super) ack_padding: AckPaddingMode,
+    /// Test-only armor copy-count override; `None` in production.
+    pub(super) fresh_tail_armor_copies_override: Option<usize>,
 }
 
 /// A due ACK claimed for piggybacking on a data packet: page 0 rides on the
@@ -509,6 +515,7 @@ impl WriteHalf {
             retransmission_armor,
             mss,
             ack_padding,
+            fresh_tail_armor_copies_override,
         } = settings;
         Self {
             utp_write,
@@ -524,6 +531,7 @@ impl WriteHalf {
             mss,
             ack_padding,
             data_size_sampler: DataSizeSampler::new(),
+            fresh_tail_armor_copies_override,
         }
     }
 
@@ -584,6 +592,13 @@ impl WriteHalf {
     #[cfg(test)]
     pub(crate) fn drain_pacer_for_test(&self, n: usize, now: Instant) -> usize {
         self.send_pacer.take_at_most_tokens(n, now)
+    }
+
+    /// Test-only: force the fresh interactive tail's armor copy count, so a
+    /// probe can sweep it independently of the loss-adaptive ladder.
+    #[cfg(test)]
+    pub(crate) fn set_fresh_tail_armor_copies_override_for_test(&mut self, copies: Option<usize>) {
+        self.fresh_tail_armor_copies_override = copies;
     }
 
     async fn try_send_requested_kill(&mut self, bufs: &mut SendBufs) -> Option<Result<(), IoErr>> {
@@ -944,10 +959,12 @@ impl WriteHalf {
                         // this lane pays the extra pacer token (bulk/stock
                         // never force `fec_instream_flush`).
                         let copies = if fresh_interactive_tail {
-                            fresh_tail_armor_copies(
-                                self.fec_gate.effective_loss_ratio(),
-                                self.fec_gate.loss_active(),
-                            )
+                            self.fresh_tail_armor_copies_override.unwrap_or_else(|| {
+                                fresh_tail_armor_copies(
+                                    self.fec_gate.effective_loss_ratio(),
+                                    self.fec_gate.loss_active(),
+                                )
+                            })
                         } else {
                             1
                         };
@@ -1667,6 +1684,7 @@ mod tests {
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
+            fresh_tail_armor_copies_override: None,
         };
         let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let (shared, write_half, _read_half, _reaper) =

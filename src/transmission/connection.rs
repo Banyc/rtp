@@ -179,6 +179,7 @@ fn new_connection_inner(
             retransmission_armor: unreliable_layer.retransmission_armor,
             mss: unreliable_layer.mss,
             ack_padding: unreliable_layer.ack_padding,
+            fresh_tail_armor_copies_override: unreliable_layer.fresh_tail_armor_copies_override,
         },
     );
     let read_half = ReadHalf::new(unreliable_layer.utp_read, fec_decoder, Arc::clone(&shared));
@@ -908,6 +909,7 @@ mod tests {
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
+            fresh_tail_armor_copies_override: None,
         }
     }
 
