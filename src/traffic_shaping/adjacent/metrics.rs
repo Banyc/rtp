@@ -197,8 +197,10 @@ pub enum MetricsEvent {
     /// A send-loop packet attempt, including attempts that find no sendable
     /// packet because pacing, congestion control, or the queue blocks them.
     SendDataPacketAttempt,
-    /// The retransmission-armor duplicate copy of a recovery datagram was
-    /// emitted.  Rare event: counted, never a state row.
+    /// The retransmission-armor duplicate copy of a datagram was emitted:
+    /// either a recovery datagram (env-gated) or a fresh interactive
+    /// single-symbol tail (the force-flush interactive tuning).  Rare event:
+    /// counted, never a state row.
     RetransmissionArmorDuplicate,
     /// The send path returned `WouldBlock` while trying to write a datagram.
     /// Rare event: counted, never a state row.

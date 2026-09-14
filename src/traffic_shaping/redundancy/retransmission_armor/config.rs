@@ -2,7 +2,10 @@
 //!
 //! The duplicate-copy toggle is fixed once at connection construction (the
 //! connect/accept config `Default` reads `RTP_RTX_DUP` exactly once) and is
-//! never changed for the life of the session.
+//! never changed for the life of the session.  It gates the duplicate of a
+//! *recovery* send only; a fresh interactive single-symbol tail is duplicated
+//! independently, driven by the connection's force-flush FEC tuning (see the
+//! retransmission-armor policy).
 
 /// Environment variable that enables retransmission-armor duplicate copies.
 pub const RETRANSMISSION_ARMOR_ENV: &str = "RTP_RTX_DUP";

@@ -1,5 +1,6 @@
-//! Retransmission-armor policy: when a recovery packet gets an extra
-//! duplicate wire copy.
+//! Retransmission-armor policy: when a send gets an extra duplicate wire
+//! copy.  Recovery sends are covered by the session toggle; a fresh
+//! interactive single-symbol tail is covered by the caller's flag.
 
 use super::RetransmissionArmorConfig;
 
@@ -8,7 +9,8 @@ use super::RetransmissionArmorConfig;
 pub(crate) enum ArmorDecision {
     /// Send the duplicate copy.
     Duplicate,
-    /// Fresh (non-recovery) sends never get a duplicate.
+    /// A fresh send that the caller did not mark as an interactive
+    /// single-symbol tail never gets a duplicate.
     SkipNotRecovery,
     /// The sender is queue-building; the duplicate is suppressed.
     SkipQueueBuilding,
@@ -27,19 +29,30 @@ impl RetransmissionArmor {
         Self { config }
     }
 
-    /// Decide whether a packet gets an armor duplicate.  Recovery is tested
-    /// first, then the enabled toggle, and only then is the lazy queue
-    /// closure invoked, so fresh/disabled sends never lock queue state.
+    /// Decide whether a packet gets an armor duplicate.  A recovery send is
+    /// eligible when the session toggle is on; a fresh send is eligible only
+    /// when the caller marks it as an interactive single-symbol tail (the
+    /// `fresh_interactive_tail` argument), independent of the recovery
+    /// toggle, because the interactive lane opts in through its FEC tuning.
+    /// Eligibility is tested before the lazy queue closure is invoked, so
+    /// ineligible sends never lock queue state.
     pub(crate) fn decide(
         &self,
         is_recovery: bool,
+        fresh_interactive_tail: bool,
         queue_building: impl FnOnce() -> bool,
     ) -> ArmorDecision {
-        if !is_recovery {
-            return ArmorDecision::SkipNotRecovery;
-        }
-        if !self.config.is_enabled() {
-            return ArmorDecision::SkipDisabled;
+        let eligible = if is_recovery {
+            self.config.is_enabled()
+        } else {
+            fresh_interactive_tail
+        };
+        if !eligible {
+            return if is_recovery {
+                ArmorDecision::SkipDisabled
+            } else {
+                ArmorDecision::SkipNotRecovery
+            };
         }
         if queue_building() {
             return ArmorDecision::SkipQueueBuilding;
@@ -63,31 +76,39 @@ mod tests {
         let armor = RetransmissionArmor::new(RetransmissionArmorConfig::enabled());
 
         assert_eq!(
-            armor.decide(true, observe),
+            armor.decide(true, false, observe),
             ArmorDecision::Duplicate,
             "recovery + enabled + not queue-building must duplicate"
         );
         assert_eq!(queue_observations.get(), 1);
 
         assert_eq!(
-            armor.decide(false, observe),
+            armor.decide(false, false, observe),
             ArmorDecision::SkipNotRecovery,
-            "fresh sends must never duplicate"
+            "a fresh non-tail send must never duplicate"
         );
         assert_eq!(
             queue_observations.get(),
             1,
-            "a fresh send must not observe the queue"
+            "a fresh non-tail send must not observe the queue"
         );
 
         assert_eq!(
-            RetransmissionArmor::new(RetransmissionArmorConfig::disabled()).decide(true, observe),
+            armor.decide(false, true, observe),
+            ArmorDecision::Duplicate,
+            "a fresh interactive tail duplicates even with the recovery toggle off"
+        );
+        assert_eq!(queue_observations.get(), 2);
+
+        assert_eq!(
+            RetransmissionArmor::new(RetransmissionArmorConfig::disabled())
+                .decide(true, false, observe),
             ArmorDecision::SkipDisabled,
-            "a disabled session must never duplicate"
+            "a disabled session must never duplicate recovery"
         );
         assert_eq!(
             queue_observations.get(),
-            1,
+            2,
             "a disabled session must not observe the queue"
         );
 
@@ -97,10 +118,16 @@ mod tests {
             true
         };
         assert_eq!(
-            armor.decide(true, observe_building),
+            armor.decide(true, false, observe_building),
             ArmorDecision::SkipQueueBuilding,
             "recovery + enabled + queue-building must suppress the duplicate"
         );
         assert_eq!(building_observations.get(), 1);
+        assert_eq!(
+            armor.decide(false, true, observe_building),
+            ArmorDecision::SkipQueueBuilding,
+            "a fresh interactive tail is suppressed while the queue is building"
+        );
+        assert_eq!(building_observations.get(), 2);
     }
 }

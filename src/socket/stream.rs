@@ -832,8 +832,9 @@ mod tests {
             let sink = Arc::clone(&observed);
             a_layer.metrics_observer =
                 Some(crate::metrics::MetricsObserver::new(move |observation| {
-                    if let Some(counters) =
-                        observation.snapshot.and_then(|snapshot| snapshot.fec_counters)
+                    if let Some(counters) = observation
+                        .snapshot
+                        .and_then(|snapshot| snapshot.fec_counters)
                     {
                         *sink.lock().unwrap() = Some(counters);
                     }
@@ -873,7 +874,10 @@ mod tests {
                     tokio::time::timeout(Duration::from_millis(500), a_r.recv(&mut echo_buf)).await;
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 if i == 99 || i == 399 || i == n - 1 {
-                    eprintln!("[probe {label}] i={i} counters={:?}", *observed.lock().unwrap());
+                    eprintln!(
+                        "[probe {label}] i={i} counters={:?}",
+                        *observed.lock().unwrap()
+                    );
                 }
             }
             drop(a_w);
@@ -890,6 +894,119 @@ mod tests {
                 recovered,
             );
         }
+    }
+
+    /// Latency-focused companion to the single-symbol repair probe: 256-byte
+    /// messages at a 25 ms cadence under 2% iid loss on the interactive
+    /// preset, recording each echo round-trip latency and the sender's
+    /// armor-duplicate count.  A lone loss repaired by same-round-trip
+    /// redundancy shows as a sub-millisecond echo instead of the ~10 ms
+    /// tail-loss-probe wait, so the p99 echo latency is the interactive
+    /// repair tail.  Run with `--ignored --nocapture` to print the summary.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "in-process interactive repair-latency probe; ~25 s; run with --ignored --nocapture"]
+    async fn probe_fresh_tail_armor_latency() {
+        use crate::socket::socket;
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use std::time::Instant;
+
+        let msg_len = 256usize;
+        let n = 800usize;
+        let rate_a = BasisPoints::new(200);
+        let rate_b = BasisPoints::new(200);
+        let mss = 8192usize;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        let mut a_layer = wrap_fec_lossy_with_mss_and_fec_tuning(
+            a.clone(),
+            a,
+            true,
+            mss,
+            FecTuning::interactive_prompt(),
+            rate_a,
+        );
+        let observed = Arc::new(Mutex::new(None));
+        let armor_duplicates = Arc::new(AtomicU64::new(0));
+        let sink = Arc::clone(&observed);
+        let armor_sink = Arc::clone(&armor_duplicates);
+        a_layer.metrics_observer = Some(crate::metrics::MetricsObserver::new(move |observation| {
+            if observation.event == crate::metrics::MetricsEvent::RetransmissionArmorDuplicate {
+                armor_sink.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            if let Some(counters) = observation
+                .snapshot
+                .and_then(|snapshot| snapshot.fec_counters)
+            {
+                *sink.lock().unwrap() = Some(counters);
+            }
+        }));
+        let b_layer = wrap_fec_lossy_with_mss_and_fec_tuning(
+            b.clone(),
+            b,
+            true,
+            mss,
+            FecTuning::interactive_prompt(),
+            rate_b,
+        );
+        let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
+        let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
+        let mut echo_tasks = tokio::task::JoinSet::new();
+        echo_tasks.spawn(async move {
+            let mut buf = vec![0u8; msg_len];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(2000), b_r.recv(&mut buf)).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(len)) => {
+                        let _ = b_w.send(&buf[..len]).await;
+                    }
+                }
+            }
+        });
+        let mut latencies = Vec::with_capacity(n);
+        for i in 0..n {
+            let msg = vec![(i % 251) as u8; msg_len];
+            let started = Instant::now();
+            let _ = tokio::time::timeout(Duration::from_secs(2), a_w.send(&msg)).await;
+            let mut echo_buf = vec![0u8; msg_len];
+            if tokio::time::timeout(Duration::from_millis(500), a_r.recv(&mut echo_buf))
+                .await
+                .is_ok_and(|r| r.is_ok())
+            {
+                latencies.push(started.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(a_w);
+        drop(a_r);
+        let _ = tokio::time::timeout(Duration::from_secs(5), echo_tasks.join_next()).await;
+        latencies.sort_unstable();
+        let pick = |q: f64| -> Duration {
+            if latencies.is_empty() {
+                return Duration::ZERO;
+            }
+            let idx = ((latencies.len() - 1) as f64 * q).round() as usize;
+            latencies[idx]
+        };
+        let repaired = latencies
+            .iter()
+            .filter(|latency| **latency > Duration::from_millis(2))
+            .count();
+        let counters = *observed.lock().unwrap();
+        eprintln!(
+            "[probe fresh-armor] samples={} repaired_gt_2ms={} p50={:?} p90={:?} p99={:?} max={:?} armor_duplicates={} counters={counters:?}",
+            latencies.len(),
+            repaired,
+            pick(0.50),
+            pick(0.90),
+            pick(0.99),
+            latencies.last().copied().unwrap_or_default(),
+            armor_duplicates.load(AtomicOrdering::Relaxed),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

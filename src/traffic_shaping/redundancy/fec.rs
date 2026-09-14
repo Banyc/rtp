@@ -488,6 +488,14 @@ impl FecEncoderState {
         instream && self.encoder.group_data_count() >= INSTREAM_DATA_PER_GROUP
     }
 
+    /// Number of data symbols currently in the open FEC group.  The write
+    /// half uses this to recognise a fresh *single-symbol* interactive group
+    /// (exactly one data symbol so far) whose lone loss would otherwise wait
+    /// a full repair round trip when the parity is skipped or lost.
+    pub(crate) fn open_group_data_count(&self) -> usize {
+        self.encoder.group_data_count()
+    }
+
     /// Attempt to flush parities for the current group, rate-limited by the
     /// token bucket. Returns `(parity_pkts, total_bytes)` where each entry is
     /// a ready-to-send wire packet. If the parity burst would exceed 1/3 of

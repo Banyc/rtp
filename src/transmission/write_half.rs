@@ -746,10 +746,6 @@ impl WriteHalf {
             // PARITY_DATA_THRESHOLD when `instream` is false, matching the
             // flush paths' gated decisions.
             let instream = self.instream_group_fec_enabled();
-            let armor_decision = self.retransmission_armor.decide(is_recovery, || {
-                self.shared
-                    .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
-            });
             // The first data packet of the pass piggybacks a due ACK on the
             // data datagram (page 0 rides ahead of the data; page 1, if any,
             // is sent standalone after). This hides ACKs among data packets
@@ -796,6 +792,23 @@ impl WriteHalf {
                 }
                 None => utp_pkt,
             };
+            // A fresh interactive single-symbol group (one data symbol so far)
+            // gets one armor duplicate copy: its lone loss is covered on the
+            // same round trip without parity bookkeeping, and without waiting
+            // for the condition gate to reopen.  Bulk/stock lanes never force
+            // `fec_instream_flush`, so they are untouched.
+            let fresh_interactive_tail = !is_recovery
+                && self.fec_instream_flush
+                && self
+                    .fec
+                    .as_ref()
+                    .is_some_and(|fec| fec.open_group_data_count() == 1);
+            let armor_decision =
+                self.retransmission_armor
+                    .decide(is_recovery, fresh_interactive_tail, || {
+                        self.shared
+                            .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
+                    });
             if crate::debug::debug_send() {
                 eprintln!(
                     "[send] conn={:x} seq={} len={} recovery={} piggyback={}",

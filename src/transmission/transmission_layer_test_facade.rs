@@ -495,8 +495,8 @@ mod tests {
         assert!(!tl.shared_for_test().terminal_is_cancelled());
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            2,
-            "the primary data and first parity datagrams should be attempted"
+            3,
+            "the primary data, its fresh-tail armor duplicate, and the first parity datagrams should be attempted"
         );
     }
 
@@ -554,6 +554,52 @@ mod tests {
         assert_eq!(
             dg[0], dg[1],
             "dup must reuse the exact encoded symbol bytes (no re-encode)"
+        );
+    }
+
+    /// A fresh interactive single-symbol tail (the interactive FEC preset
+    /// force-flushes every burst) gets one armor duplicate on its first send,
+    /// independent of the recovery-armor env toggle: a lone loss is then
+    /// covered on the same round trip instead of waiting for FEC parity or a
+    /// repair round trip.
+    #[tokio::test]
+    async fn fresh_interactive_single_symbol_tail_gets_an_armor_duplicate() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::interactive_prompt());
+        let mut bufs = SendBufs::new();
+        stage_small_message(&tl);
+        assert!(
+            tl.send_pkts(&mut bufs).await.unwrap(),
+            "a data packet must go out"
+        );
+        let dg = recorder.lock().unwrap().datagrams();
+        assert_eq!(
+            dg.len(),
+            2,
+            "the fresh interactive single-symbol tail must send primary + armor duplicate"
+        );
+        assert_eq!(
+            dg[0], dg[1],
+            "the fresh-tail armor duplicate must reuse the exact encoded symbol bytes"
+        );
+    }
+
+    /// The bulk/stock lane is byte-for-byte unchanged: a fresh send on a
+    /// tuning that does not force-flush the interactive tail never gets an
+    /// armor duplicate, even when the recovery-armor toggle is on.
+    #[tokio::test]
+    async fn stock_fresh_data_never_gets_an_armor_duplicate() {
+        let (mut tl, recorder) = harness(false, true);
+        let mut bufs = SendBufs::new();
+        stage_small_message(&tl);
+        assert!(
+            tl.send_pkts(&mut bufs).await.unwrap(),
+            "a data packet must go out"
+        );
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            1,
+            "stock fresh data must not be duplicated"
         );
     }
     #[tokio::test]
@@ -623,8 +669,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 4,
-            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 3 parity = 4 datagrams, got {n}"
+            n, 5,
+            "max_diversity single-symbol burst with the loss gate open must emit 1 data + 1 fresh-tail armor + 3 parity = 5 datagrams, got {n}"
         );
     }
 
@@ -738,8 +784,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 12,
-            "interactive_prompt tuning must emit 8 data + 4 in-stream parity = 12 datagrams, got {n}"
+            n, 13,
+            "interactive_prompt tuning must emit 8 data + 1 fresh-tail armor + 4 in-stream parity = 13 datagrams, got {n}"
         );
     }
 
@@ -792,8 +838,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 1,
-            "startup without measured congestion loss must emit 1 data + 0 parity = 1 datagram, got {n}"
+            n, 2,
+            "startup without measured congestion loss must emit 1 data + 1 fresh-tail armor + 0 parity = 2 datagrams, got {n}"
         );
     }
 
