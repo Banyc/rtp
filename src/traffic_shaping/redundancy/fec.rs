@@ -146,6 +146,7 @@ struct FecStats {
     recovered_symbols: usize,
     dropped_malformed_pkts: usize,
     dropped_fec_decoder_panics: usize,
+    rejected_recovered_symbols: usize,
     group_size_flushed: [u64; GROUP_SIZE_HIST_LEN],
     group_size_skipped_burst_end: [u64; GROUP_SIZE_HIST_LEN],
     group_size_skipped_no_surplus_tokens: [u64; GROUP_SIZE_HIST_LEN],
@@ -167,6 +168,7 @@ struct Stats {
     recovered_symbols: AtomicUsize,
     dropped_malformed_pkts: AtomicUsize,
     dropped_fec_decoder_panics: AtomicUsize,
+    rejected_recovered_symbols: AtomicUsize,
     group_size_flushed: [AtomicU64; GROUP_SIZE_HIST_LEN],
     group_size_skipped_burst_end: [AtomicU64; GROUP_SIZE_HIST_LEN],
     group_size_skipped_no_surplus_tokens: [AtomicU64; GROUP_SIZE_HIST_LEN],
@@ -187,6 +189,7 @@ impl Default for Stats {
             recovered_symbols: AtomicUsize::new(0),
             dropped_malformed_pkts: AtomicUsize::new(0),
             dropped_fec_decoder_panics: AtomicUsize::new(0),
+            rejected_recovered_symbols: AtomicUsize::new(0),
             group_size_flushed: hist(),
             group_size_skipped_burst_end: hist(),
             group_size_skipped_no_surplus_tokens: hist(),
@@ -212,6 +215,7 @@ impl Stats {
             recovered_symbols: self.recovered_symbols.load(Ordering::Relaxed),
             dropped_malformed_pkts: self.dropped_malformed_pkts.load(Ordering::Relaxed),
             dropped_fec_decoder_panics: self.dropped_fec_decoder_panics.load(Ordering::Relaxed),
+            rejected_recovered_symbols: self.rejected_recovered_symbols.load(Ordering::Relaxed),
             group_size_flushed: std::array::from_fn(|index| {
                 self.group_size_flushed[index].load(Ordering::Relaxed)
             }),
@@ -773,6 +777,7 @@ impl FecDecoderState {
             pkt
         };
         let recovered_before = self.recovered.len();
+        let rejected_before = self.decoder.rejected_recovered_symbols();
         let decoder = &mut self.decoder;
         let recovered = &mut self.recovered;
         let unwound = {
@@ -799,6 +804,12 @@ impl FecDecoderState {
             self.stats
                 .recovered_symbols
                 .fetch_add(recovered, Ordering::Relaxed);
+        }
+        let rejected = decoder.rejected_recovered_symbols() - rejected_before;
+        if rejected != 0 {
+            self.stats
+                .rejected_recovered_symbols
+                .fetch_add(rejected, Ordering::Relaxed);
         }
         if FEC_DEBUG {
             let kind = if hdr_len.is_some() {
@@ -829,6 +840,13 @@ impl FecDecoderState {
     pub(crate) fn dropped_fec_decoder_panics(&self) -> usize {
         self.stats
             .dropped_fec_decoder_panics
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rejected_recovered_symbols(&self) -> usize {
+        self.stats
+            .rejected_recovered_symbols
             .load(Ordering::Relaxed)
     }
 }
@@ -1743,6 +1761,11 @@ mod tests {
         assert!(
             fec.decoder.pop_recovered().is_none(),
             "a recovered symbol claiming more than it holds must not be delivered"
+        );
+        assert_eq!(
+            fec.decoder.rejected_recovered_symbols(),
+            1,
+            "the rejected reconstruction must be counted, not silently dropped"
         );
     }
 
