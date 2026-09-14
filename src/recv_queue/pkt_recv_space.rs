@@ -482,6 +482,78 @@ mod tests {
         assert!(space.pop_complete_frame_with_reorder(true).is_none());
     }
 
+    // A later frame delivered via fast-forward leaves tombstones past an
+    // earlier frame's still-unrepaired hole. A tombstone *beyond* the hole
+    // must not abandon the earlier frame: its missing continuation is not
+    // captured (the slot is vacant), so the in-flight packet can still fill
+    // it and the frame reassemble. (Regression: the scan used to abandon the
+    // earlier frame at the first tombstone it met while a frame was in
+    // progress, tombstoning its collected seqs so the late continuation
+    // could never complete it — the frame was permanently lost.)
+    #[test]
+    fn fast_forward_tombstone_past_a_hole_does_not_abandon_the_earlier_frame() {
+        let mut space = PktRecvSpace::new();
+        // Front hole at seq 0 (still in flight). Frame A spans seqs 1..=3
+        // (frame_len 9) with seq 3 still in flight (a hole inside it).
+        // Frame B spans seqs 4..=5 (frame_len 6) and is complete.
+        assert!(space.recv(1, b"AAA".to_vec(), Some(9)));
+        assert!(space.recv(2, b"BBB".to_vec(), None));
+        assert!(space.recv(4, b"DDD".to_vec(), Some(6)));
+        assert!(space.recv(5, b"EEE".to_vec(), None));
+        // Fast-forward delivers B, tombstoning seqs 4 and 5.
+        assert_eq!(
+            space.pop_complete_frame_with_reorder(true).unwrap(),
+            b"DDDEEE"
+        );
+        assert!(matches!(
+            space.slots.get(&seq(4)),
+            Some(RecvSlot::Tombstone)
+        ));
+        assert!(matches!(
+            space.slots.get(&seq(5)),
+            Some(RecvSlot::Tombstone)
+        ));
+        // The next scan meets those tombstones while A is still in progress
+        // with its seq-3 continuation missing. That must not abandon A, so
+        // A's collected packets stay in place for the eventual reassembly.
+        assert!(space.pop_complete_frame_with_reorder(true).is_none());
+        assert!(matches!(space.slots.get(&seq(1)), Some(RecvSlot::Data(_))));
+        assert!(matches!(space.slots.get(&seq(2)), Some(RecvSlot::Data(_))));
+        // A's in-flight continuation arrives: the frame must reassemble and
+        // deliver, exactly as it would without the fast-forward tombstones.
+        assert!(space.recv(3, b"CCC".to_vec(), None));
+        assert_eq!(
+            space.pop_complete_frame_with_reorder(true).unwrap(),
+            b"AAABBBCCC"
+        );
+    }
+
+    // A tombstone landing *exactly* on the in-progress frame's next
+    // continuation captures that slot forever, so the frame is genuinely
+    // unreparable and is still abandoned (its collected seqs tombstoned).
+    // This pins the fast-forward fix's boundary: only a tombstone *beyond*
+    // the missing continuation is benign.
+    #[test]
+    fn tombstone_on_an_in_progress_frames_continuation_still_abandons() {
+        let mut space = PktRecvSpace::new();
+        // A frame at seq 2 is delivered first (fast-forwarded past the front
+        // holes), leaving a tombstone there before frame A exists.
+        assert!(space.recv(2, b"ZZZ".to_vec(), Some(3)));
+        assert_eq!(space.pop_complete_frame_with_reorder(true).unwrap(), b"ZZZ");
+        assert!(matches!(
+            space.slots.get(&seq(2)),
+            Some(RecvSlot::Tombstone)
+        ));
+        // Frame A now spans seqs 0..=2 (frame_len 9), needing seq 2 — which
+        // the tombstone has captured forever.
+        assert!(space.recv(0, b"AAA".to_vec(), Some(9)));
+        assert!(space.recv(1, b"BBB".to_vec(), None));
+        // A is unreparable: it is abandoned and its collected seqs are
+        // tombstoned so the cursor advances past them instead of wedging.
+        assert!(space.pop_complete_frame_with_reorder(true).is_none());
+        assert_eq!(space.next, Some(seq(3)));
+    }
+
     #[test]
     fn multi_packet_frame_waits_for_all_its_packets() {
         let mut space = PktRecvSpace::new();

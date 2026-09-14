@@ -214,13 +214,28 @@ fn find_complete_frame(
                 }
             }
             RecvSlot::Tombstone => {
-                // A tombstone inside an in-progress frame means the frame can
-                // never reassemble: its retransmissions are swallowed by the
-                // tombstone (recv_bytes treats an occupied slot as a
-                // duplicate), so the cursor would stay pinned at the frame's
-                // start forever. Record it so the caller can tombstone its
-                // collected seqs and let the cursor advance.
-                if let Some(start) = locals.frame_start {
+                // A tombstone captures a sequence forever (recv_bytes treats
+                // an occupied slot as a duplicate), so a tombstone landing
+                // *exactly* on the in-progress frame's next continuation
+                // means the frame can never reassemble: its retransmission
+                // is swallowed by the tombstone, so the cursor would stay
+                // pinned at the frame's start forever. Record it so the
+                // caller can tombstone its collected seqs and let the cursor
+                // advance.
+                //
+                // A tombstone *beyond* that next continuation lies past a
+                // still-vacant hole inside the frame; it captures nothing the
+                // frame needs yet (the hole can still be filled by an
+                // in-flight or retransmitted packet) and so belongs to a
+                // later frame that was already delivered — notably a frame
+                // fast-forwarded past the hole. Abandoning the earlier frame
+                // here would tombstone its collected packets and lose it
+                // permanently even though its missing symbol later arrives.
+                // Reset the in-progress run instead and keep scanning,
+                // exactly as an absent slot (a hole) does.
+                if let Some(start) = locals.frame_start
+                    && seq == locals.frame_end.unwrap().advance(1)
+                {
                     locals.abandoned.push((start, locals.packet_count));
                 }
                 locals.frame_start = None;
