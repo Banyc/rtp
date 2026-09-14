@@ -559,11 +559,13 @@ mod tests {
 
     /// A fresh interactive single-symbol tail (the interactive FEC preset
     /// force-flushes every burst) gets loss-adaptive armor duplicate copies on
-    /// its first send, independent of the recovery-armor env toggle: a lone
-    /// loss — or a short burst that eats the primary and the first copies — is
-    /// then covered on the same round trip instead of waiting for FEC parity
-    /// or a repair round trip.  With no loss evidence yet the policy uses the
-    /// low-loss (burst-cover) tier.
+    /// its first send, independent of the recovery-armor env toggle.  With no
+    /// loss evidence yet the FEC loss gate is closed and no parity will trail
+    /// the burst, so the burst-cover tier pays a fourth small copy to fill the
+    /// same fifth wire slot the parity would occupy: primary + four armor
+    /// duplicates is five back-to-back datagrams, which a four-packet burst
+    /// cannot fully wipe.  A lone loss — or a short burst — is then covered on
+    /// the same round trip instead of waiting for a repair round trip.
     #[tokio::test]
     async fn fresh_interactive_single_symbol_tail_gets_an_armor_duplicate() {
         use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
@@ -577,21 +579,15 @@ mod tests {
         let dg = recorder.lock().unwrap().datagrams();
         assert_eq!(
             dg.len(),
-            4,
-            "the fresh interactive single-symbol tail must send primary + three armor duplicates on a low-loss link"
+            5,
+            "a gate-closed fresh interactive single-symbol tail must send primary + four armor duplicates (five datagrams, the parity's slot filled by a copy)"
         );
-        assert_eq!(
-            dg[0], dg[1],
-            "the fresh-tail armor duplicate must reuse the exact encoded symbol bytes"
-        );
-        assert_eq!(
-            dg[0], dg[2],
-            "the second fresh-tail armor duplicate must also reuse the exact encoded symbol bytes"
-        );
-        assert_eq!(
-            dg[0], dg[3],
-            "the third fresh-tail armor duplicate must also reuse the exact encoded symbol bytes"
-        );
+        for index in 1..dg.len() {
+            assert_eq!(
+                dg[0], dg[index],
+                "fresh-tail armor duplicate {index} must reuse the exact encoded symbol bytes"
+            );
+        }
     }
 
     /// At every tier where the loss gate is open, the fresh-tail's total
@@ -622,6 +618,42 @@ mod tests {
             assert!(
                 count <= previous,
                 "loss {loss} must not emit more datagrams ({count}) than a lower loss ({previous})"
+            );
+            previous = count;
+        }
+    }
+
+    /// The fresh interactive single-symbol tail's per-message datagram budget
+    /// is bounded by the current low-loss value (five: the primary, the
+    /// burst-cover armor copies, and the parity — or the fourth armor copy
+    /// that fills its slot when the loss gate is closed) and is monotone
+    /// non-increasing in loss.  A sweep from a pristine gate-closed link
+    /// through the gate-open tiers must never emit more datagrams than the
+    /// no-loss budget, and never more than a lower loss did.
+    #[tokio::test]
+    async fn fresh_tail_datagram_budget_is_bounded_and_non_increasing_in_loss() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        const BUDGET: usize = 5;
+        let mut previous = usize::MAX;
+        for loss in [0.0, 0.005, 0.01, 0.05, 0.14, 0.15, 0.29, 0.30, 1.0] {
+            let (mut tl, recorder) =
+                harness_with_tuning(true, false, FecTuning::interactive_prompt());
+            tl.shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap()
+                .set_congestion_loss_ratio_for_test(Some(loss));
+            stage_small_message(&tl);
+            let mut bufs = SendBufs::new();
+            let _ = tl.send_pkts(&mut bufs).await;
+            let count = recorder.lock().unwrap().count();
+            assert!(
+                count <= BUDGET,
+                "loss {loss} emitted {count} datagrams, above the low-loss budget {BUDGET}"
+            );
+            assert!(
+                count <= previous,
+                "loss {loss} emitted {count} datagrams, more than a lower loss ({previous})"
             );
             previous = count;
         }
@@ -869,7 +901,9 @@ mod tests {
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
         // Fresh connection: no congestion feedback and no recovery samples
         // yet, so the loss gate stays closed even though capacity is spare
-        // and the instream_flush tail policy requests a flush.
+        // and the instream_flush tail policy requests a flush.  With no parity
+        // trailing the burst the burst-cover tier pays the fourth armor copy,
+        // keeping the per-message datagram budget at five.
         let payload = vec![0u8; 100];
         let now = Instant::now();
         {
@@ -881,8 +915,8 @@ mod tests {
         let _ = tl.send_pkts(&mut bufs).await;
         let n = recorder.lock().unwrap().count();
         assert_eq!(
-            n, 4,
-            "startup without measured congestion loss must emit 1 data + 3 fresh-tail armor + 0 parity = 4 datagrams, got {n}"
+            n, 5,
+            "startup without measured congestion loss must emit 1 data + 4 fresh-tail armor + 0 parity = 5 datagrams, got {n}"
         );
     }
 

@@ -95,13 +95,21 @@ struct PiggybackAck {
 const MAX_CONSECUTIVE_WOULD_BLOCK: u32 = 16;
 
 /// Armor duplicate copies emitted for a fresh interactive single-symbol tail
-/// (in addition to the primary datagram), on a LOW/MODERATE-loss link.  The
-/// interactive lane carries no parity while the FEC loss gate is closed, so a
-/// lone copy still falls back to the one-reorder-window ARQ repair when the
-/// primary and the copies are lost.  Three copies cover a short burst that
-/// eats the primary and the first two copies while the trailing parity (if
-/// emitted) or a surviving copy still recovers on the same round trip.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST: usize = 3;
+/// (in addition to the primary datagram) at the burst-cover tier when the
+/// FEC loss gate is OPEN and a parity datagram will therefore trail the same
+/// burst as the fifth wire slot.  Primary + three copies + the trailing
+/// parity is five back-to-back datagrams, which cannot all be wiped by a
+/// four-packet burst; the short-burst cover needs no extra wire.
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY: usize = 3;
+
+/// Armor duplicate copies at the burst-cover tier when the FEC loss gate is
+/// CLOSED, so no parity will trail the burst.  One extra copy fills the same
+/// fifth wire slot the parity would have occupied: primary + four copies is
+/// still five back-to-back datagrams, so a four-packet burst always leaves a
+/// survivor.  A 256-byte duplicate is far cheaper on the wire than the 8 KB
+/// parity symbol it stands in for, so the interactive wire stays bounded and
+/// non-increasing as loss rises (the copy count never grows with loss).
+const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY: usize = 4;
 
 /// Armor duplicate copies retained once the measured loss passes
 /// [`FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS`]: the two-copy coverage this
@@ -125,13 +133,19 @@ const FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS: f64 = 0.15;
 const FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS: f64 = 0.30;
 
 /// Armor duplicate copies for a fresh interactive single-symbol tail as a
-/// function of the measured effective loss ratio.  The mapping is
-/// **monotone non-increasing** in loss: it may only ever shrink the
-/// per-message packet count as the wire loss rate rises, so a hostile link
-/// never sees more redundancy than a clean one.  `None` (no loss evidence
-/// yet) is treated as the low-loss tier.  Only the interactive lane consults
-/// this: stock/bulk tuning never forces `fec_instream_flush`.
-fn fresh_tail_armor_copies(effective_loss: Option<f64>) -> usize {
+/// function of the measured effective loss ratio and whether a parity
+/// datagram will trail the same burst (the FEC loss gate is open).  The
+/// mapping is **monotone non-increasing** in loss: it may only ever shrink
+/// the per-message packet count as the wire loss rate rises, so a hostile
+/// link never sees more redundancy than a clean one.  `None` (no loss
+/// evidence yet) is treated as the low-loss tier.  At the burst-cover tier
+/// the copy count compensates for a closed parity gate: with a trailing
+/// parity three copies suffice (five datagrams total), without it a fourth
+/// copy fills the same fifth slot so a four-packet burst still leaves a
+/// survivor.  The datagram budget is therefore five either way.  Only the
+/// interactive lane consults this: stock/bulk tuning never forces
+/// `fec_instream_flush`.
+fn fresh_tail_armor_copies(effective_loss: Option<f64>, parity_covers_burst: bool) -> usize {
     match effective_loss {
         Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS => {
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN
@@ -139,7 +153,8 @@ fn fresh_tail_armor_copies(effective_loss: Option<f64>) -> usize {
         Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS => {
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE
         }
-        _ => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+        _ if parity_covers_burst => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
+        _ => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
     }
 }
 
@@ -920,11 +935,19 @@ impl WriteHalf {
                         // loss (see [`fresh_tail_armor_copies`]): the extra
                         // burst-cover copy is only paid while the link is
                         // low/moderate loss and is withdrawn as loss rises, so
-                        // redundancy never amplifies a hostile link.  Only
+                        // redundancy never amplifies a hostile link.  At the
+                        // burst-cover tier the count compensates for a closed
+                        // FEC loss gate: a fourth small copy stands in for the
+                        // parity datagram that would otherwise trail the burst
+                        // as the fifth wire slot, keeping the per-message
+                        // datagram budget at five without an 8 KB parity.  Only
                         // this lane pays the extra pacer token (bulk/stock
                         // never force `fec_instream_flush`).
                         let copies = if fresh_interactive_tail {
-                            fresh_tail_armor_copies(self.fec_gate.effective_loss_ratio())
+                            fresh_tail_armor_copies(
+                                self.fec_gate.effective_loss_ratio(),
+                                self.fec_gate.loss_active(),
+                            )
                         } else {
                             1
                         };
@@ -1379,47 +1402,79 @@ mod tests {
     /// non-increasing in the measured loss ratio: a hostile link can never
     /// emit more redundancy per message than a clean one.  The low/unmeasured
     /// tier pays the burst-cover copy, the mid band keeps the historical base,
-    /// and the hostile tier backs off to the primary datagram alone.
+    /// and the hostile tier backs off to the primary datagram alone.  At the
+    /// burst-cover tier the count compensates for a closed parity gate: with a
+    /// trailing parity three copies, without it four, so the total datagram
+    /// budget stays at five either way.
     #[test]
     fn fresh_tail_armor_copies_are_monotone_non_increasing_in_loss() {
         use super::{
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE, FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN, fresh_tail_armor_copies,
         };
+        for parity in [true, false] {
+            assert_eq!(
+                fresh_tail_armor_copies(None, parity),
+                if parity {
+                    FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY
+                } else {
+                    FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY
+                },
+                "no loss evidence yet must use the burst-cover tier (parity={parity})"
+            );
+            assert_eq!(
+                fresh_tail_armor_copies(Some(0.0), parity),
+                fresh_tail_armor_copies(None, parity),
+                "a clean link must use the burst-cover tier (parity={parity})"
+            );
+            assert_eq!(
+                fresh_tail_armor_copies(Some(0.14), parity),
+                fresh_tail_armor_copies(None, parity),
+                "just below the moderate threshold keeps the burst-cover tier (parity={parity})"
+            );
+        }
         assert_eq!(
-            fresh_tail_armor_copies(None),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
-            "no loss evidence yet must use the burst-cover tier"
+            fresh_tail_armor_copies(
+                Some(0.14),
+                false // parity irrelevant below the moderate threshold
+            ),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
+            "the no-parity burst-cover tier pays the fourth copy"
         );
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.0)),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
-            "a clean link must use the burst-cover tier"
+            fresh_tail_armor_copies(
+                Some(0.14),
+                true // parity irrelevant below the moderate threshold
+            ),
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
+            "the with-parity burst-cover tier pays three copies"
         );
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.14)),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST,
-            "just below the moderate threshold keeps the burst-cover tier"
-        );
-        assert_eq!(
-            fresh_tail_armor_copies(Some(0.15)),
+            fresh_tail_armor_copies(Some(0.15), false),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
             "the moderate threshold drops to the two-copy base"
         );
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.30)),
+            fresh_tail_armor_copies(Some(0.30), true),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
             "the hostile threshold backs off to the primary alone"
         );
-        let mut previous = usize::MAX;
-        for step in 0..=100 {
-            let loss = Some(step as f64 / 100.0);
-            let copies = fresh_tail_armor_copies(loss);
-            assert!(
-                copies <= previous,
-                "loss {loss:?} emitted {copies} copies, more than a lower loss ({previous})"
-            );
-            previous = copies;
+        // Non-increasing in loss for either gate state: an open gate (parity
+        // trails the burst) must never emit more copies than a closed one, and
+        // neither may grow with loss.
+        for parity in [true, false] {
+            let mut previous = usize::MAX;
+            for step in 0..=100 {
+                let loss = Some(step as f64 / 100.0);
+                let copies = fresh_tail_armor_copies(loss, parity);
+                assert!(
+                    copies <= previous,
+                    "loss {loss:?} (parity={parity}) emitted {copies} copies, more than a lower loss ({previous})"
+                );
+                previous = copies;
+            }
         }
     }
 
