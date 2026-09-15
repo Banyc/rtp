@@ -9,6 +9,11 @@ use super::rto::RtxTimer;
 /// congestion) cannot pin that window for the connection's life.
 const RECENT_MIN_RTT_SAMPLES: usize = 8;
 
+/// Smoothing weight for the gate's one-sided RTT-deviation estimator.  It
+/// matches the RTO filter's `BETA` so the gate reacts on the same timescale as
+/// the smoothed RTT it is compared against.
+const GATE_RTT_VAR_BETA: f64 = 0.25;
+
 /// Bundle of RTT statistics: the smoothed-RTT / RTO timer, the lifetime
 /// minimum RTT, and a rolling minimum over the most recent samples.
 #[derive(Debug)]
@@ -22,6 +27,21 @@ pub(crate) struct RttStats {
     recent_min_rtt: Option<Duration>,
     /// The most recent [`RECENT_MIN_RTT_SAMPLES`] RTT samples, oldest first.
     recent_rtt_samples: VecDeque<Duration>,
+    /// One-sided (upward) EWMA of the raw RTT deviation from the pre-update
+    /// smoothed RTT, consumed only by the delay-based queue gate.
+    ///
+    /// A queue can only raise RTT *above* the path baseline, so a downward
+    /// excursion (a reordered packet echoing a stale timestamp, or the
+    /// smoothed RTT overshooting while a queue drains) is not evidence of
+    /// queue growth.  The RTO's two-sided `smooth_rtt_var` counts those
+    /// downward excursions and so inflates the gate tolerance on a
+    /// reorder-tolerant lane; [`Self::gate_rtt_var`] caps the gate at twice
+    /// this upward component so a downward-only overshoot cannot license a
+    /// larger queue than the upward evidence justifies, while symmetric
+    /// jitter and a genuine latency step keep the full two-sided margin.
+    gate_up_rtt_var: Duration,
+    /// The floating-point accumulator behind [`Self::gate_up_rtt_var`].
+    gate_up_rtt_var_secs: f64,
     rto: RtxTimer,
 }
 
@@ -31,6 +51,8 @@ impl RttStats {
             min_rtt: None,
             recent_min_rtt: None,
             recent_rtt_samples: VecDeque::new(),
+            gate_up_rtt_var: Duration::ZERO,
+            gate_up_rtt_var_secs: 0.0,
             rto: RtxTimer::new(),
         }
     }
@@ -49,6 +71,13 @@ impl RttStats {
     /// Record an RTT sample: update the SRTT filter, the lifetime minimum,
     /// and the rolling recent minimum.
     pub(crate) fn record_rtt(&mut self, rtt: Duration) {
+        // The gate's one-sided deviation is measured against the smoothed RTT
+        // *before* this sample is folded in, exactly like the RTO's `rtt_var`.
+        let pre_srtt = self.rto.smooth_rtt();
+        let upward = rtt.saturating_sub(pre_srtt).as_secs_f64();
+        self.gate_up_rtt_var_secs =
+            (1. - GATE_RTT_VAR_BETA) * self.gate_up_rtt_var_secs + GATE_RTT_VAR_BETA * upward;
+        self.gate_up_rtt_var = Duration::from_secs_f64(self.gate_up_rtt_var_secs);
         self.rto.set(rtt);
         self.min_rtt = Some(match self.min_rtt {
             Some(m) => m.min(rtt),
@@ -76,6 +105,8 @@ impl RttStats {
         self.recent_rtt_samples.clear();
         self.recent_rtt_samples.push_back(rtt);
         self.recent_min_rtt = Some(rtt);
+        self.gate_up_rtt_var = Duration::ZERO;
+        self.gate_up_rtt_var_secs = 0.0;
     }
 
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
@@ -95,6 +126,23 @@ impl RttStats {
 
     pub(crate) fn smooth_rtt_var(&self) -> Duration {
         self.rto.smooth_rtt_var()
+    }
+
+    /// Robust RTT variance for the delay-based queue gate: the two-sided
+    /// `smooth_rtt_var`, capped at twice the one-sided upward component.
+    ///
+    /// A queue raises RTT above the baseline; the downward half of the
+    /// two-sided variance is therefore not queue evidence.  On the
+    /// reorder-tolerant lane those downward excursions (reorder low echoes,
+    /// and the smoothed RTT overshooting while a queue drains) can dominate
+    /// the variance and inflate the gate until it tolerates the standing queue
+    /// it is meant to detect.  Capping at `2 * up` keeps the full margin for
+    /// symmetric jitter and a genuine step (where `up >= down`) but discards a
+    /// downward-only overshoot.  See the [`Self::gate_up_rtt_var`] field docs.
+    pub(crate) fn gate_rtt_var(&self) -> Duration {
+        self.gate_up_rtt_var
+            .mul_f64(2.0)
+            .min(self.rto.smooth_rtt_var())
     }
 
     pub(crate) fn rto_duration(&self) -> Duration {
@@ -210,5 +258,57 @@ mod tests {
         let stats = RttStats::new();
         assert!(stats.min_rtt().is_none());
         assert!(!stats.fast_loss_armed_against_min_rtt());
+    }
+
+    /// A genuine latency step is upward-only: every sample sits above the
+    /// lagging smoothed RTT, so the one-sided upward component is at least the
+    /// downward one and the gate keeps the full two-sided margin.  This is the
+    /// property that lets the reorder lane's gate stay robust without
+    /// abandoning a sustained step.
+    #[test]
+    fn gate_variance_keeps_the_full_margin_on_an_upward_step() {
+        let mut stats = RttStats::new();
+        for _ in 0..20 {
+            stats.record_rtt(ms(50));
+        }
+        for _ in 0..3 {
+            stats.record_rtt(ms(200));
+        }
+        assert_eq!(
+            stats.gate_rtt_var(),
+            stats.smooth_rtt_var(),
+            "an upward step must keep the two-sided gate margin"
+        );
+    }
+
+    /// A downward overshoot (the smoothed RTT left high while the queue
+    /// drains, or a reordered packet echoing a low RTT) inflates the two-sided
+    /// `smooth_rtt_var` but carries no queue evidence.  The gate caps at twice
+    /// the upward component, so it collapses back toward the upward-only
+    /// deviation and does not license a larger queue than the path shows.
+    #[test]
+    fn gate_variance_discounts_a_downward_overshoot() {
+        let mut stats = RttStats::new();
+        for _ in 0..20 {
+            stats.record_rtt(ms(50));
+        }
+        // Push the smoothed RTT high, then let the samples fall back below it.
+        for _ in 0..8 {
+            stats.record_rtt(ms(200));
+        }
+        for _ in 0..8 {
+            stats.record_rtt(ms(50));
+        }
+        assert!(
+            stats.smooth_rtt_var() > ms(40),
+            "the two-sided variance must stay inflated by the downward return: {:?}",
+            stats.smooth_rtt_var()
+        );
+        assert!(
+            stats.gate_rtt_var() < stats.smooth_rtt_var(),
+            "the gate must discount the downward overshoot: gate={:?} two-sided={:?}",
+            stats.gate_rtt_var(),
+            stats.smooth_rtt_var()
+        );
     }
 }

@@ -219,6 +219,13 @@ impl PktSendSpace {
         self.rtt_stats.smooth_rtt_var()
     }
 
+    /// Robust delay-gate RTT variance for the reorder-tolerant lane (the
+    /// two-sided variance capped at twice its upward component).  The
+    /// stock/bulk gate keeps [`Self::smooth_rtt_var`].
+    pub(crate) fn gate_rtt_var(&self) -> Duration {
+        self.rtt_stats.gate_rtt_var()
+    }
+
     /// Whether the evidence-gated fast-loss path is currently armed.  Arming
     /// requires no currently-armed observed-reordering disable, AND either of
     /// two low-jitter gates:

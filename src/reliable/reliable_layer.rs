@@ -986,9 +986,20 @@ impl ReliableLayer {
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
         self.last_congestion_loss_ratio = loss_event_rate;
         let control_rtt = self.control_rtt();
+        // The delay gate's jitter margin discounts the downward half of the
+        // RTT variance on the reorder-tolerant lane: reorder/late-echo samples
+        // fall *below* the smoothed RTT, and the smoothed RTT overshoots while
+        // a queue drains, so the two-sided RTO variance can be inflated by the
+        // very excursions that are not queue evidence.  The stock/bulk lane
+        // keeps the two-sided variance unchanged.
+        let gate_rtt_var = if self.congestion_response.reorder_tolerant() {
+            self.pkt_send_space.gate_rtt_var()
+        } else {
+            self.pkt_send_space.smooth_rtt_var()
+        };
         let observation = self.congestion_response.observe(
             smooth,
-            self.pkt_send_space.smooth_rtt_var(),
+            gate_rtt_var,
             loss_event_rate,
             sr.delivery_rate(),
             now,
