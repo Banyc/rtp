@@ -42,30 +42,54 @@ pub(crate) struct WindowedRttMin {
     cur: Option<Duration>,
     prev: Option<Duration>,
     min_bucket: Duration,
+    /// Scale the bucket by the *established* floor instead of the incoming
+    /// sample. Used on the reorder-tolerant lane: a path shift inflates the
+    /// incoming smoothed RTT, and scaling the window by that inflated value
+    /// would keep the pre-shift floor alive for proportionally longer — the
+    /// longer the new RTT, the longer the stale floor pins the delay gate.
+    /// Scaling by the established floor keeps the window at the baseline's
+    /// timescale until the floor itself tracks the shift.
+    baseline_scaled: bool,
 }
 
 impl WindowedRttMin {
     #[cfg(test)]
     pub(crate) fn new(now: Instant) -> Self {
-        Self::with_min_bucket(now, RTT_MIN_BUCKET)
+        Self::with_min_bucket(now, RTT_MIN_BUCKET, false)
     }
 
     /// A floor window with a caller-chosen minimum bucket length. The bucket
     /// is still scaled up with the RTT (`rtt * RTT_MIN_BUCKET_RTT_SCALE`), so
-    /// a high-RTT path keeps a proportionally long window.
-    pub(crate) fn with_min_bucket(now: Instant, min_bucket: Duration) -> Self {
+    /// a high-RTT path keeps a proportionally long window. `baseline_scaled`
+    /// selects the *established floor* as the scaling basis (see the field
+    /// docs).
+    pub(crate) fn with_min_bucket(
+        now: Instant,
+        min_bucket: Duration,
+        baseline_scaled: bool,
+    ) -> Self {
         Self {
             bucket_start: now,
             cur: None,
             prev: None,
             min_bucket,
+            baseline_scaled,
         }
     }
 
     pub(crate) fn update(&mut self, now: Instant, rtt: Duration) -> Duration {
+        let basis = if self.baseline_scaled {
+            match (self.cur, self.prev) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => rtt,
+            }
+        } else {
+            rtt
+        };
         let bucket = self
             .min_bucket
-            .max(rtt.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
+            .max(basis.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
         let elapsed = now.duration_since(self.bucket_start);
         if elapsed > bucket * 2 {
             // Idle staleness: both buckets have aged out, mirror LossEventWindow::rotate.
@@ -125,12 +149,12 @@ impl QueueGrowth {
     }
 
     fn fresh_floor(now: Instant, reorder_tolerant: bool) -> WindowedRttMin {
-        let min_bucket = if reorder_tolerant {
-            RTT_MIN_BUCKET_REORDER
+        let (min_bucket, baseline_scaled) = if reorder_tolerant {
+            (RTT_MIN_BUCKET_REORDER, true)
         } else {
-            RTT_MIN_BUCKET
+            (RTT_MIN_BUCKET, false)
         };
-        WindowedRttMin::with_min_bucket(now, min_bucket)
+        WindowedRttMin::with_min_bucket(now, min_bucket, baseline_scaled)
     }
 
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
@@ -351,6 +375,45 @@ mod tests {
         assert_eq!(
             reorder_floor, normal,
             "the reorder-tolerant floor must track the recent RTT"
+        );
+    }
+
+    /// The other direction of floor staleness: a genuine latency STEP up.  The
+    /// reorder-tolerant floor scales its short bucket by the *established*
+    /// floor, so the step-inflated sample cannot stretch the window that must
+    /// forget the old low floor.  The default (sample-scaled) floor keeps the
+    /// stale value for the full 5 s bucket, and the reorder floor does not.
+    #[test]
+    fn reorder_baseline_scaled_floor_tracks_a_latency_step() {
+        let t0 = Instant::now();
+        let low = Duration::from_millis(50);
+        let high = Duration::from_millis(250);
+        let control_rtt = Duration::from_millis(200);
+
+        let mut default = QueueGrowth::new(t0, false);
+        let mut reorder = QueueGrowth::new(t0, true);
+        default.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
+        reorder.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
+
+        let mut default_floor = low;
+        let mut reorder_floor = low;
+        for i in 1..=3u64 {
+            let t = t0 + Duration::from_secs(i);
+            default_floor = default
+                .observe(high, Duration::ZERO, Some(0.0), t, control_rtt)
+                .floor;
+            reorder_floor = reorder
+                .observe(high, Duration::ZERO, Some(0.0), t, control_rtt)
+                .floor;
+        }
+
+        assert_eq!(
+            default_floor, low,
+            "the default floor must keep its long-bucket baseline"
+        );
+        assert_eq!(
+            reorder_floor, high,
+            "the reorder-tolerant floor must track the new path RTT"
         );
     }
 }

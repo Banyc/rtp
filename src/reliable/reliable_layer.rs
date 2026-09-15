@@ -1777,6 +1777,117 @@ mod tests {
         layer
     }
 
+    fn test_layer_reorder(now: Instant) -> super::ReliableLayer {
+        // The congestion floor keys off `allow_reorder` only; keep the stock
+        // byte-stream send path so `send_max`/`ack_all` drive it directly.
+        let (layer, pacer) = super::ReliableLayer::new(
+            crate::mss::Mss::try_new(TEST_MSS).unwrap(),
+            crate::delivery::frame::FrameMode {
+                enabled: false,
+                allow_reorder: true,
+            },
+            now,
+        );
+        pacer.set_min_burst_for_test(64, now);
+        layer
+    }
+
+    /// A genuine *standing queue* on the reorder-tolerant lane must still be
+    /// flagged and drained.  This guards the floor-window change against
+    /// trading away queue detection for path-shift recovery.
+    #[test]
+    fn reorder_lane_still_drains_a_standing_queue() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_reorder(t0);
+        let mut t = t0;
+
+        let ramp_rtt = Duration::from_millis(10);
+        for _ in 0..40 {
+            send_max(&mut rl, t);
+            t += ramp_rtt;
+            ack_all(&mut rl, Some(ramp_rtt), t);
+        }
+        let held_rate = rl.send_rate.get();
+
+        // Mirror the default-lane standing-queue test: transient jitter first
+        // to settle rttvar, then a sustained ~260 ms queue.  The mirror keeps
+        // the two lanes comparable and only the floor bucket differs.
+        for i in 0..48 {
+            let rtt = if i % 2 == 0 {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_millis(140)
+            };
+            rl.sample_rtt(rtt, t);
+            t += Duration::from_micros(100);
+        }
+        let seq = send_one(&mut rl, t);
+        t += Duration::from_millis(140);
+        ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(140), t);
+
+        for _ in 0..30 {
+            rl.sample_rtt(Duration::from_millis(260), t);
+            t += Duration::from_micros(100);
+        }
+        let seq = send_one(&mut rl, t);
+        t += Duration::from_millis(260);
+        ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(260), t);
+
+        assert_eq!(
+            rl.last_congestion_action,
+            Some(crate::metrics::MetricsCongestionAction::DelayDrain),
+            "a standing queue must still trigger a drain"
+        );
+        assert!(
+            rl.send_rate.get() < held_rate,
+            "a standing queue must reduce the rate below {held_rate}, got {}",
+            rl.send_rate.get()
+        );
+    }
+
+    /// The other direction of windowed-floor staleness: a genuine latency STEP
+    /// (a path shift with no queue).  The floor is a windowed minimum of the
+    /// smoothed RTT; the reorder-tolerant lane's short bucket must scale with
+    /// the *established* floor, not the step-inflated incoming sample, or the
+    /// stale pre-shift floor stays alive for seconds and the delay controller
+    /// drains the interactive send rate on a path with no queue at all.
+    #[test]
+    fn latency_step_up_does_not_drain_the_reorder_lane() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_reorder(t0);
+        let mut t = t0;
+
+        // Ramp on a brisk 10 ms RTT so slow start exits and the rate climbs.
+        for _ in 0..60 {
+            send_max(&mut rl, t);
+            t += Duration::from_millis(10);
+            ack_all(&mut rl, Some(Duration::from_millis(10)), t);
+            t += Duration::from_nanos(1);
+        }
+        let ramp_rate = rl.send_rate.get();
+        assert!(ramp_rate > 2.0 * INIT_SEND_RATE, "ramp_rate={ramp_rate}");
+
+        // Step the path RTT up to 200 ms and hold it.  Every rate sample must
+        // stay on the non-drain path: the step is not a queue.
+        let mut min_rate = ramp_rate;
+        for _ in 0..25 {
+            send_max(&mut rl, t);
+            t += Duration::from_millis(200);
+            ack_all(&mut rl, Some(Duration::from_millis(200)), t);
+            t += Duration::from_nanos(1);
+            assert_ne!(
+                rl.last_congestion_action,
+                Some(crate::metrics::MetricsCongestionAction::DelayDrain),
+                "a bare latency step (no queue) must not drain the send rate"
+            );
+            min_rate = min_rate.min(rl.send_rate.get());
+        }
+        assert!(
+            min_rate > ramp_rate / 2.0,
+            "the bare latency step must not collapse the send rate: {min_rate} vs {ramp_rate}"
+        );
+    }
+
     #[test]
     fn application_write_waiter_registration_is_drop_scoped() {
         let now = Instant::now();
