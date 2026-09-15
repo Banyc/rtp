@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::gentle::{GentleExitCause, GentleProbeOutcome};
 use super::{OrdinaryBandwidthProbe, QueueGrowth, WindowedDeliveryMax};
+use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 use decision::{ResponsePath, select_path};
 use loss_backoff::{LossBackoff, LossBackoffInput};
 use queue_response::{DrainInput, QueueResponse};
@@ -82,7 +83,7 @@ impl CongestionResponse {
     pub(crate) fn observe(
         &mut self,
         smooth_rtt: Duration,
-        rtt_var: Duration,
+        jitter: GateJitter,
         loss_event_rate: Option<f64>,
         delivery_rate: f64,
         now: Instant,
@@ -91,7 +92,7 @@ impl CongestionResponse {
         let peak_delivery = self.delivery_peak.update(now, delivery_rate);
         let queue =
             self.queue_growth
-                .observe(smooth_rtt, rtt_var, loss_event_rate, now, control_rtt);
+                .observe(smooth_rtt, jitter, loss_event_rate, now, control_rtt);
         CongestionObservation {
             floor: queue.floor,
             tolerance: queue.tolerance,

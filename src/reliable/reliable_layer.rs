@@ -38,6 +38,7 @@ use crate::{
         SendPacer, linear_backoff_step,
     },
     traffic_shaping::recovery::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
+    traffic_shaping::recovery::rtt_stats::GateJitter,
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
@@ -987,19 +988,18 @@ impl ReliableLayer {
         self.last_congestion_loss_ratio = loss_event_rate;
         let control_rtt = self.control_rtt();
         // The delay gate's jitter margin discounts the downward half of the
-        // RTT variance on the reorder-tolerant lane: reorder/late-echo samples
-        // fall *below* the smoothed RTT, and the smoothed RTT overshoots while
-        // a queue drains, so the two-sided RTO variance can be inflated by the
-        // very excursions that are not queue evidence.  The stock/bulk lane
-        // keeps the two-sided variance unchanged.
-        let gate_rtt_var = if self.congestion_response.reorder_tolerant() {
-            self.pkt_send_space.gate_rtt_var()
+        // RTT variance on the reorder-tolerant lane, and tracks the
+        // windowed steady-state jitter floor rather than the queue-inflated
+        // trending variance.  The stock/bulk lane keeps the two-sided variance
+        // unchanged (both estimates equal).
+        let gate_jitter = if self.congestion_response.reorder_tolerant() {
+            self.pkt_send_space.gate_jitter()
         } else {
-            self.pkt_send_space.smooth_rtt_var()
+            GateJitter::uniform(self.pkt_send_space.smooth_rtt_var())
         };
         let observation = self.congestion_response.observe(
             smooth,
-            gate_rtt_var,
+            gate_jitter,
             loss_event_rate,
             sr.delivery_rate(),
             now,

@@ -15,7 +15,7 @@ use crate::{
         liveness::PeerLiveness,
         loss_event_window::LossEventWindow,
         outage::{OutageDetection, OutageEpoch},
-        rtt_stats::RttStats,
+        rtt_stats::{GateJitter, RttStats},
         rtx_index::{
             DeferredLossIndex, ReadyReason, RetransmissionActivation, RetransmissionIndex,
         },
@@ -219,11 +219,12 @@ impl PktSendSpace {
         self.rtt_stats.smooth_rtt_var()
     }
 
-    /// Robust delay-gate RTT variance for the reorder-tolerant lane (the
-    /// two-sided variance capped at twice its upward component).  The
+    /// The delay gate's jitter evidence for the reorder-tolerant lane: the
+    /// trending margin beside the windowed steady-state floor so the caller
+    /// can pick the trending value while its RTT floor is stepping.  The
     /// stock/bulk gate keeps [`Self::smooth_rtt_var`].
-    pub(crate) fn gate_rtt_var(&self) -> Duration {
-        self.rtt_stats.gate_rtt_var()
+    pub(crate) fn gate_jitter(&self) -> GateJitter {
+        self.rtt_stats.gate_jitter()
     }
 
     /// Whether the evidence-gated fast-loss path is currently armed.  Arming

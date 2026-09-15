@@ -14,6 +14,35 @@ const RECENT_MIN_RTT_SAMPLES: usize = 8;
 /// the smoothed RTT it is compared against.
 const GATE_RTT_VAR_BETA: f64 = 0.25;
 
+/// Number of most recent two-sided variance estimates spanned by the
+/// reorder lane's *steady-state jitter* floor.  A self-inflicted queue raises
+/// the variance with the very growth the delay gate must detect, so the gate's
+/// jitter margin cannot be the trending variance itself; it is the minimum
+/// over a short sliding window instead.  The window must be short enough that
+/// a genuinely jittery path (where every window contains an excursion) keeps a
+/// real margin, and long enough to bridge the quiet stretch before a queue
+/// builds.
+const GATE_VAR_WINDOW_SAMPLES: usize = 16;
+
+/// Number of RTT samples after a step-class jump during which the gate falls
+/// back to the trending variance.  A path step and an instantaneous queue fill
+/// are indistinguishable in a single sample, so the steady-state window must
+/// not be discarded on the jump (that would let a queue fill seed its own
+/// inflated margin).  The fallback only bridges the first samples, before the
+/// floor window has begun to move; once the floor is rising the caller's
+/// [`crate::traffic_shaping::core::QueueGrowth`] uses the trending margin for
+/// the rest of the transition.
+const GATE_STEP_TRANSIENT_SAMPLES: usize = 3;
+
+/// Number of RTT samples after which the windowed steady-state jitter is
+/// trusted.  A freshly-established connection has no jitter history: the
+/// window fills with the smooth slow-start ramp (near-zero variance), so its
+/// minimum reads ~0 and a first reorder/jitter excursion would be mistaken for
+/// a queue.  Until the window has this much history the trending margin is
+/// used, exactly as before the steady-state estimate existed.  The interactive
+/// lane's early history is sparse, so this spans well past connection setup.
+const GATE_VAR_MATURE_SAMPLES: usize = 128;
+
 /// Bundle of RTT statistics: the smoothed-RTT / RTO timer, the lifetime
 /// minimum RTT, and a rolling minimum over the most recent samples.
 #[derive(Debug)]
@@ -42,7 +71,48 @@ pub(crate) struct RttStats {
     gate_up_rtt_var: Duration,
     /// The floating-point accumulator behind [`Self::gate_up_rtt_var`].
     gate_up_rtt_var_secs: f64,
+    /// Most recent [`GATE_VAR_WINDOW_SAMPLES`] two-sided variance estimates,
+    /// oldest first.  The reorder lane's gate margin is their minimum: the
+    /// steady-state jitter of the quietest recent stretch, which a transient
+    /// queue can raise for at most one window before the quiet samples age
+    /// out.  See [`Self::gate_rtt_var`].
+    gate_var_samples: VecDeque<Duration>,
+    /// Samples remaining in a raw step transient, during which the windowed
+    /// steady-state jitter is not trusted because the floor window has not yet
+    /// tracked the new path RTT.  See [`GATE_STEP_TRANSIENT_SAMPLES`].
+    step_transient_remaining: usize,
+    /// Total RTT samples recorded; the steady-state window is only trusted
+    /// after [`GATE_VAR_MATURE_SAMPLES`].
+    samples_recorded: usize,
     rto: RtxTimer,
+}
+
+/// The delay gate's jitter evidence for one interval.
+///
+/// Two estimates of the same jitter are offered because they fail in opposite
+/// directions: the trending variance reacts immediately to a path step but is
+/// inflated by a self-inflicted queue, while the windowed steady-state floor
+/// is immune to the queue but lags a step.  [`QueueGrowth`](crate::traffic_shaping::core::QueueGrowth)
+/// picks the trending value while its own RTT floor is stepping and the
+/// steady-state value otherwise.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GateJitter {
+    /// Jitter for a settled path: the windowed steady-state minimum, or the
+    /// trending value during a raw step transient.
+    pub(crate) steady: Duration,
+    /// The trending two-sided margin (with the `2 * up` cap applied).
+    pub(crate) trending: Duration,
+}
+
+impl GateJitter {
+    /// A single jitter value for a lane that does not distinguish the two
+    /// estimates (the stock/bulk lane).
+    pub(crate) fn uniform(rttvar: Duration) -> Self {
+        Self {
+            steady: rttvar,
+            trending: rttvar,
+        }
+    }
 }
 
 impl RttStats {
@@ -53,7 +123,18 @@ impl RttStats {
             recent_rtt_samples: VecDeque::new(),
             gate_up_rtt_var: Duration::ZERO,
             gate_up_rtt_var_secs: 0.0,
+            gate_var_samples: VecDeque::new(),
+            step_transient_remaining: 0,
+            samples_recorded: 0,
             rto: RtxTimer::new(),
+        }
+    }
+
+    /// Record the two-sided variance estimate into the steady-state window.
+    fn record_gate_var_sample(&mut self) {
+        self.gate_var_samples.push_back(self.rto.smooth_rtt_var());
+        if self.gate_var_samples.len() > GATE_VAR_WINDOW_SAMPLES {
+            self.gate_var_samples.pop_front();
         }
     }
 
@@ -79,6 +160,17 @@ impl RttStats {
             (1. - GATE_RTT_VAR_BETA) * self.gate_up_rtt_var_secs + GATE_RTT_VAR_BETA * upward;
         self.gate_up_rtt_var = Duration::from_secs_f64(self.gate_up_rtt_var_secs);
         self.rto.set(rtt);
+        self.record_gate_var_sample();
+        self.samples_recorded = self.samples_recorded.saturating_add(1);
+        // A step-class jump arms a short fallback to the trending variance; the
+        // steady-state window is deliberately *not* discarded, so an
+        // instantaneous queue fill cannot seed its own inflated margin.  A
+        // queue ramp grows by a fraction of the smoothed RTT per sample, so it
+        // stops re-arming this after the first jump.
+        self.step_transient_remaining = self.step_transient_remaining.saturating_sub(1);
+        if rtt.saturating_sub(pre_srtt) > pre_srtt {
+            self.step_transient_remaining = GATE_STEP_TRANSIENT_SAMPLES;
+        }
         self.min_rtt = Some(match self.min_rtt {
             Some(m) => m.min(rtt),
             None => rtt,
@@ -107,6 +199,10 @@ impl RttStats {
         self.recent_min_rtt = Some(rtt);
         self.gate_up_rtt_var = Duration::ZERO;
         self.gate_up_rtt_var_secs = 0.0;
+        self.gate_var_samples.clear();
+        self.record_gate_var_sample();
+        self.step_transient_remaining = 0;
+        self.samples_recorded = 0;
     }
 
     pub(crate) fn min_rtt(&self) -> Option<Duration> {
@@ -128,21 +224,52 @@ impl RttStats {
         self.rto.smooth_rtt_var()
     }
 
-    /// Robust RTT variance for the delay-based queue gate: the two-sided
-    /// `smooth_rtt_var`, capped at twice the one-sided upward component.
+    /// Robust RTT variance for the delay-based queue gate: the *steady-state*
+    /// jitter floor, capped at twice the one-sided upward component.
     ///
-    /// A queue raises RTT above the baseline; the downward half of the
-    /// two-sided variance is therefore not queue evidence.  On the
-    /// reorder-tolerant lane those downward excursions (reorder low echoes,
-    /// and the smoothed RTT overshooting while a queue drains) can dominate
-    /// the variance and inflate the gate until it tolerates the standing queue
-    /// it is meant to detect.  Capping at `2 * up` keeps the full margin for
-    /// symmetric jitter and a genuine step (where `up >= down`) but discards a
-    /// downward-only overshoot.  See the [`Self::gate_up_rtt_var`] field docs.
+    /// A self-inflicted queue raises the smoothed variance with the very
+    /// backlog the delay gate must detect, so the trending two-sided
+    /// `smooth_rtt_var` lets the gate hold a queue at the depth that inflated
+    /// its own tolerance.  Instead the margin is the minimum two-sided
+    /// variance over the last [`GATE_VAR_WINDOW_SAMPLES`] samples: the
+    /// quietest recent stretch, which a rising queue cannot raise until its
+    /// own inflation has displaced every quiet sample in the window.  On a
+    /// genuinely jittery path (the reorder lane's reorder echoes) every window
+    /// still contains an excursion, so the minimum stays at the real jitter
+    /// and no spurious drain appears.  The separate `2 * up` cap still
+    /// discounts a downward-only overshoot (see [`Self::gate_up_rtt_var`]).
+    ///
+    /// During a raw step transient the trending value is returned because the
+    /// floor window has not begun to move yet; the caller's floor-rise check
+    /// covers the rest of the transition.  See [`Self::gate_jitter`].
     pub(crate) fn gate_rtt_var(&self) -> Duration {
+        if self.step_transient_remaining > 0 || self.samples_recorded < GATE_VAR_MATURE_SAMPLES {
+            return self.trending_gate_rtt_var();
+        }
+        let steady_state = self
+            .gate_var_samples
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or_else(|| self.rto.smooth_rtt_var());
+        self.gate_up_rtt_var.mul_f64(2.0).min(steady_state)
+    }
+
+    /// The trending two-sided margin with the `2 * up` cap applied (it42):
+    /// reacts immediately to a path step, but is inflated by a self-inflicted
+    /// queue.
+    pub(crate) fn trending_gate_rtt_var(&self) -> Duration {
         self.gate_up_rtt_var
             .mul_f64(2.0)
             .min(self.rto.smooth_rtt_var())
+    }
+
+    /// Both jitter estimates for the delay gate; see [`GateJitter`].
+    pub(crate) fn gate_jitter(&self) -> GateJitter {
+        GateJitter {
+            steady: self.gate_rtt_var(),
+            trending: self.trending_gate_rtt_var(),
+        }
     }
 
     pub(crate) fn rto_duration(&self) -> Duration {
@@ -202,7 +329,7 @@ impl Default for RttStats {
 mod tests {
     use std::time::Duration;
 
-    use super::RttStats;
+    use super::{GATE_VAR_MATURE_SAMPLES, RttStats};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -309,6 +436,56 @@ mod tests {
             "the gate must discount the downward overshoot: gate={:?} two-sided={:?}",
             stats.gate_rtt_var(),
             stats.smooth_rtt_var()
+        );
+    }
+
+    /// A self-inflicted queue raises the trending variance, but the gate must
+    /// use the windowed steady-state floor instead: after a quiet mature
+    /// stretch, a ramp that inflates the trending variance must not raise the
+    /// gate toward it.
+    #[test]
+    fn steady_state_window_ignores_a_transient_variance_spike() {
+        let mut stats = RttStats::new();
+        for _ in 0..(GATE_VAR_MATURE_SAMPLES + 32) {
+            stats.record_rtt(ms(100));
+        }
+        // Ramp up without any single jump doubling the smoothed RTT, so no
+        // step transient is armed; the trending variance inflates with it and
+        // the quiet pre-ramp samples stay in the window.
+        for rtt in [130u64, 160, 190, 220, 250] {
+            stats.record_rtt(ms(rtt));
+        }
+        assert!(
+            stats.smooth_rtt_var() > ms(30),
+            "the ramp must inflate the trending variance: {:?}",
+            stats.smooth_rtt_var()
+        );
+        assert!(
+            stats.trending_gate_rtt_var() > ms(30),
+            "the trending margin is what the queue would inflate: {:?}",
+            stats.trending_gate_rtt_var()
+        );
+        assert!(
+            stats.gate_rtt_var() < stats.trending_gate_rtt_var() / 2,
+            "the windowed steady-state floor must ignore the ramp: gate={:?} trending={:?}",
+            stats.gate_rtt_var(),
+            stats.trending_gate_rtt_var()
+        );
+    }
+
+    /// Before the window has enough history it is not trusted: the gate keeps
+    /// the trending margin, so a first jitter excursion cannot be mistaken for
+    /// a queue.
+    #[test]
+    fn steady_state_window_is_not_trusted_before_maturity() {
+        let mut stats = RttStats::new();
+        for _ in 0..8 {
+            stats.record_rtt(ms(50));
+        }
+        assert_eq!(
+            stats.gate_rtt_var(),
+            stats.trending_gate_rtt_var(),
+            "an immature connection must keep the trending margin"
         );
     }
 }

@@ -6,6 +6,8 @@
 //! those parts cannot drift apart across the congestion controller.
 use std::time::{Duration, Instant};
 
+use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
+
 #[cfg(test)]
 use super::gentle::DrainEpisode;
 use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
@@ -29,6 +31,22 @@ pub(crate) const QUEUE_RTT_FACTOR: f64 = 2.0;
 pub(crate) const PERSISTENT_QUEUE_RTTVAR_FACTOR: f64 = 2.0;
 pub(crate) const QUEUE_TOL_RTT_FRACTION: f64 = 0.25;
 pub(crate) const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(5);
+
+/// Fractional single-observe rise of the RTT floor that marks a path *step*
+/// rather than queue growth.  While the floor is stepping the delay gate uses
+/// the trending jitter margin instead of the windowed steady-state floor: the
+/// steady-state floor still describes the pre-step path and would license a
+/// spurious drain during the floor transition.  A self-inflicted queue raises
+/// the floor only gradually (the floor is a windowed minimum), so it stays
+/// below this threshold and keeps the steady-state (queue-immune) margin.
+pub(crate) const QUEUE_FLOOR_STEP_RISE_FRACTION: f64 = 0.3;
+
+/// Number of `observe` calls the trending margin is held after a floor step is
+/// detected.  The floor window rotates in discrete buckets, so a sustained step
+/// raises it in a few separate jumps; holding the trending margin bridges the
+/// gaps between them instead of falling back to the stale steady-state floor
+/// mid-transition.
+const QUEUE_FLOOR_STEP_HOLD_OBSERVES: usize = 8;
 
 /// Minimum of a sliding window of RTT samples.
 ///
@@ -126,6 +144,13 @@ pub(crate) struct QueueGrowthObservation {
 #[derive(Debug)]
 pub(crate) struct QueueGrowth {
     floor: WindowedRttMin,
+    /// The floor returned by the previous `observe`, used to detect a path step
+    /// (a large fractional floor rise) versus queue growth.  See
+    /// [`QUEUE_FLOOR_STEP_RISE_FRACTION`].
+    prev_floor: Option<Duration>,
+    /// `observe` calls remaining in the post-step hold; see
+    /// [`QUEUE_FLOOR_STEP_HOLD_OBSERVES`].
+    floor_step_hold: usize,
     /// `true` for the interactive frame fast-forward lane: reordering is
     /// expected, so the floor window is shortened to reject isolated
     /// reorder-induced low RTT outliers instead of treating them as the path
@@ -141,6 +166,8 @@ impl QueueGrowth {
         let floor = Self::fresh_floor(now, reorder_tolerant);
         Self {
             floor,
+            prev_floor: None,
+            floor_step_hold: 0,
             reorder_tolerant,
             persistent_since: None,
             building: false,
@@ -159,6 +186,8 @@ impl QueueGrowth {
 
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
         self.floor = Self::fresh_floor(now, self.reorder_tolerant);
+        self.prev_floor = None;
+        self.floor_step_hold = 0;
         self.persistent_since = None;
         self.building = false;
         self.gentle.reset()
@@ -167,7 +196,7 @@ impl QueueGrowth {
     pub(crate) fn observe(
         &mut self,
         smooth: Duration,
-        rttvar: Duration,
+        jitter: GateJitter,
         loss_event_rate: Option<f64>,
         now: Instant,
         control_rtt: Duration,
@@ -175,6 +204,24 @@ impl QueueGrowth {
         // The floor is deliberately fed by smoothed RTT.  The raw-min variant
         // measured worse; the separate RTT-variance terms protect jitter.
         let floor = self.floor.update(now, smooth);
+        // A large fractional rise of the floor is a path step, not queue
+        // growth: use the trending margin so the pre-step steady-state floor
+        // cannot license a drain during the floor transition.  A queue raises
+        // the floor only gradually and keeps the queue-immune steady margin.
+        let floor_stepped = self
+            .prev_floor
+            .is_some_and(|previous| floor > previous.mul_f64(1.0 + QUEUE_FLOOR_STEP_RISE_FRACTION));
+        self.prev_floor = Some(floor);
+        if floor_stepped {
+            self.floor_step_hold = QUEUE_FLOOR_STEP_HOLD_OBSERVES;
+        } else {
+            self.floor_step_hold = self.floor_step_hold.saturating_sub(1);
+        }
+        let rttvar = if self.floor_step_hold > 0 {
+            jitter.trending
+        } else {
+            jitter.steady
+        };
         let tolerance = queue_tolerance(rttvar, floor, QUEUE_RTT_FACTOR);
         let persistent_tolerance = queue_tolerance(
             rttvar,
@@ -338,10 +385,16 @@ mod tests {
         assert!(smooth <= floor + persistent);
 
         let mut growth = QueueGrowth::new(now, false);
-        growth.observe(floor, rttvar, Some(0.0), now, Duration::from_millis(100));
+        growth.observe(
+            floor,
+            GateJitter::uniform(rttvar),
+            Some(0.0),
+            now,
+            Duration::from_millis(100),
+        );
         let observation = growth.observe(
             smooth,
-            rttvar,
+            GateJitter::uniform(rttvar),
             Some(0.0),
             now + Duration::from_millis(1),
             Duration::from_millis(100),
@@ -363,15 +416,39 @@ mod tests {
 
         let mut default = QueueGrowth::new(t0, false);
         let mut reorder = QueueGrowth::new(t0, true);
-        default.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
-        reorder.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
+        default.observe(
+            low,
+            GateJitter::uniform(Duration::ZERO),
+            Some(0.0),
+            t0,
+            control_rtt,
+        );
+        reorder.observe(
+            low,
+            GateJitter::uniform(Duration::ZERO),
+            Some(0.0),
+            t0,
+            control_rtt,
+        );
 
         let later = t0 + Duration::from_secs(2);
         let default_floor = default
-            .observe(normal, Duration::ZERO, Some(0.0), later, control_rtt)
+            .observe(
+                normal,
+                GateJitter::uniform(Duration::ZERO),
+                Some(0.0),
+                later,
+                control_rtt,
+            )
             .floor;
         let reorder_floor = reorder
-            .observe(normal, Duration::ZERO, Some(0.0), later, control_rtt)
+            .observe(
+                normal,
+                GateJitter::uniform(Duration::ZERO),
+                Some(0.0),
+                later,
+                control_rtt,
+            )
             .floor;
 
         assert_eq!(
@@ -398,18 +475,42 @@ mod tests {
 
         let mut default = QueueGrowth::new(t0, false);
         let mut reorder = QueueGrowth::new(t0, true);
-        default.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
-        reorder.observe(low, Duration::ZERO, Some(0.0), t0, control_rtt);
+        default.observe(
+            low,
+            GateJitter::uniform(Duration::ZERO),
+            Some(0.0),
+            t0,
+            control_rtt,
+        );
+        reorder.observe(
+            low,
+            GateJitter::uniform(Duration::ZERO),
+            Some(0.0),
+            t0,
+            control_rtt,
+        );
 
         let mut default_floor = low;
         let mut reorder_floor = low;
         for i in 1..=3u64 {
             let t = t0 + Duration::from_secs(i);
             default_floor = default
-                .observe(high, Duration::ZERO, Some(0.0), t, control_rtt)
+                .observe(
+                    high,
+                    GateJitter::uniform(Duration::ZERO),
+                    Some(0.0),
+                    t,
+                    control_rtt,
+                )
                 .floor;
             reorder_floor = reorder
-                .observe(high, Duration::ZERO, Some(0.0), t, control_rtt)
+                .observe(
+                    high,
+                    GateJitter::uniform(Duration::ZERO),
+                    Some(0.0),
+                    t,
+                    control_rtt,
+                )
                 .floor;
         }
 
@@ -420,6 +521,69 @@ mod tests {
         assert_eq!(
             reorder_floor, high,
             "the reorder-tolerant floor must track the new path RTT"
+        );
+    }
+
+    /// A path step (a large fractional floor rise) must select the trending
+    /// jitter margin, because the pre-step steady-state floor would license a
+    /// drain during the floor transition.  A gradual floor rise (queue growth)
+    /// keeps the queue-immune steady margin so the queue is still detected.
+    #[test]
+    fn floor_step_selects_the_trending_margin_queue_growth_keeps_steady() {
+        let t0 = Instant::now();
+        let trending = Duration::from_millis(80);
+        let steady = Duration::from_millis(5);
+        let jitter = GateJitter { steady, trending };
+        let control_rtt = Duration::from_millis(200);
+
+        // A step: the floor jumps from 20 ms to 200 ms.  The stepped margin is
+        // the trending one, so the tolerance far exceeds the steady-state one.
+        let mut stepped = QueueGrowth::new(t0, true);
+        stepped.observe(
+            Duration::from_millis(20),
+            jitter,
+            Some(0.0),
+            t0,
+            control_rtt,
+        );
+        let observation = stepped.observe(
+            Duration::from_millis(200),
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_secs(1),
+            control_rtt,
+        );
+        let steady_tolerance = queue_tolerance(steady, observation.floor, QUEUE_RTT_FACTOR);
+        assert!(
+            observation.tolerance > steady_tolerance,
+            "a floor step must use the trending margin: tol={:?} steady={:?}",
+            observation.tolerance,
+            steady_tolerance
+        );
+
+        // A gradual floor rise of the same absolute size but below the step
+        // fraction (queue growth) keeps the steady margin.
+        let mut queued = QueueGrowth::new(t0, true);
+        queued.observe(
+            Duration::from_millis(40),
+            jitter,
+            Some(0.0),
+            t0,
+            control_rtt,
+        );
+        let observation = queued.observe(
+            Duration::from_millis(46),
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+        let trending_tolerance = queue_tolerance(trending, observation.floor, QUEUE_RTT_FACTOR);
+        assert!(
+            observation.tolerance < trending_tolerance,
+            "gradual queue growth must keep the steady margin: tol={:?} trending={:?}",
+            observation.tolerance,
+            trending_tolerance
         );
     }
 }
