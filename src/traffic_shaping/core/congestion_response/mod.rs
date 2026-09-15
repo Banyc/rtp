@@ -7,7 +7,7 @@
 //! a loss sample blocks every delay-control branch.
 use std::time::{Duration, Instant};
 
-use super::gentle::{GentleExitCause, GentleProbeOutcome};
+use super::gentle::{DRAIN_RATE_FRACTION, GentleExitCause, GentleProbeOutcome};
 use super::{OrdinaryBandwidthProbe, QueueGrowth, WindowedDeliveryMax};
 use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 use decision::{ResponsePath, select_path};
@@ -58,16 +58,25 @@ pub(crate) struct CongestionResponse {
     bandwidth_probe: OrdinaryBandwidthProbe,
     queue_response: QueueResponse,
     loss_backoff: LossBackoff,
+    /// `true` for a stock byte-stream connection (no frame delivery).  Gentle
+    /// mode's deeper drain exists to keep a bulk flow from driving a shared
+    /// droptail so hard that interactive cross-traffic is tail-dropped.  On the
+    /// dedicated byte-stream bulk lane there is no other consumer of this
+    /// connection's queue, and the deep cut drains a fat pipe below the link
+    /// rate long enough to idle it, so the bulk lane drains at the ordinary
+    /// fraction instead.  Frame-delivery lanes keep the conservative fraction.
+    byte_stream: bool,
 }
 
 impl CongestionResponse {
-    pub(crate) fn new(now: Instant, reorder_tolerant: bool) -> Self {
+    pub(crate) fn new(now: Instant, reorder_tolerant: bool, byte_stream: bool) -> Self {
         Self {
             queue_growth: QueueGrowth::new(now, reorder_tolerant),
             delivery_peak: WindowedDeliveryMax::new(now),
             bandwidth_probe: OrdinaryBandwidthProbe::new(),
             queue_response: QueueResponse::default(),
             loss_backoff: LossBackoff::default(),
+            byte_stream,
         }
     }
 
@@ -151,7 +160,7 @@ impl CongestionResponse {
             ResponsePath::Drain => {
                 let decision = self.queue_response.decide_drain(DrainInput {
                     delivery_rate: input.delivery_rate,
-                    drain_fraction: self.queue_growth.drain_frac(),
+                    drain_fraction: self.drain_fraction(),
                     peak_delivery: observation.peak_delivery,
                     current_rate: input.current_rate,
                     minimum_rate: input.minimum_rate,
@@ -236,6 +245,17 @@ impl CongestionResponse {
         )
     }
 
+    /// The drain fraction for the current mode.  A byte-stream lane always
+    /// drains at the ordinary fraction; a frame-delivery lane uses gentle
+    /// mode's deeper fraction while gentle mode is active.
+    fn drain_fraction(&self) -> f64 {
+        if self.byte_stream {
+            DRAIN_RATE_FRACTION
+        } else {
+            self.queue_growth.drain_frac()
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn queue_growth(&mut self) -> &mut QueueGrowth {
         &mut self.queue_growth
@@ -251,5 +271,120 @@ impl CongestionResponse {
     #[cfg(test)]
     pub(crate) fn set_queue_building_for_test(&mut self, v: bool) {
         self.queue_growth.set_building(v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::super::gentle::{DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC};
+    use super::*;
+    use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
+
+    /// Drive a sustained low-loss queue so gentle mode enters, then run one
+    /// drain decision.  A byte-stream lane must drain at the ordinary fraction
+    /// (there is no shared cross-traffic to protect) while a frame-delivery
+    /// lane keeps gentle mode's deeper fraction.
+    #[test]
+    fn byte_stream_lane_drains_at_the_ordinary_fraction_in_gentle_mode() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let floor_smooth = Duration::from_millis(100);
+        let queue_smooth = Duration::from_millis(300);
+        let jitter = GateJitter::uniform(Duration::from_millis(5));
+        let delivery_rate = 1000.0;
+        let queue_start = t0 + Duration::from_millis(1);
+        let enter_at = t0 + Duration::from_secs(1) + Duration::from_millis(2);
+
+        let mut byte_stream = CongestionResponse::new(t0, false, true);
+        let mut frame = CongestionResponse::new(t0, false, false);
+        // Establish a low floor, then hold a standing queue above it for the
+        // one-second gentle-entry stretch.
+        let _ = byte_stream.observe(
+            floor_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            t0,
+            control_rtt,
+        );
+        let _ = frame.observe(
+            floor_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            t0,
+            control_rtt,
+        );
+        let _ = byte_stream.observe(
+            queue_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            queue_start,
+            control_rtt,
+        );
+        let _ = frame.observe(
+            queue_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            queue_start,
+            control_rtt,
+        );
+        let byte_stream_obs = byte_stream.observe(
+            queue_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            enter_at,
+            control_rtt,
+        );
+        let frame_obs = frame.observe(
+            queue_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            enter_at,
+            control_rtt,
+        );
+        assert!(
+            byte_stream.gentle_mode(),
+            "byte-stream must enter gentle mode"
+        );
+        assert!(frame.gentle_mode(), "frame must enter gentle mode");
+
+        let input = |now| CongestionInput {
+            delivery_rate,
+            current_rate: delivery_rate,
+            smooth_rtt: queue_smooth,
+            control_rtt,
+            loss_event_rate: Some(0.0),
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            now,
+        };
+        let byte_stream_out = byte_stream.decide(byte_stream_obs, input(enter_at));
+        let frame_out = frame.decide(frame_obs, input(enter_at));
+        let (
+            CongestionDecision::Drain {
+                target: byte_stream_target,
+                ..
+            },
+            CongestionDecision::Drain {
+                target: frame_target,
+                ..
+            },
+        ) = (byte_stream_out.decision(), frame_out.decision())
+        else {
+            panic!("both lanes must take the drain path");
+        };
+        assert_eq!(byte_stream_target, delivery_rate * DRAIN_RATE_FRACTION);
+        assert_eq!(frame_target, delivery_rate * GENTLE_DRAIN_FRAC);
+        assert!(
+            byte_stream_target > frame_target,
+            "the byte-stream drain must be shallower than the frame drain"
+        );
     }
 }
