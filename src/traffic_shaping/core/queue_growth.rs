@@ -193,6 +193,11 @@ impl QueueGrowth {
         self.gentle.reset()
     }
 
+    /// Mark this controller as the dedicated byte-stream bulk lane.
+    pub(crate) fn set_byte_stream(&mut self, byte_stream: bool) {
+        self.gentle.set_byte_stream(byte_stream);
+    }
+
     pub(crate) fn observe(
         &mut self,
         smooth: Duration,
