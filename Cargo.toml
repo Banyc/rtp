@@ -9,8 +9,8 @@ async_async_io = "0.2"
 byteorder = "1"
 csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
-# fec = { git = "https://github.com/Banyc/fec.git", tag = "v0.0.3" }
-fec = { path = "../fec" }
+fec = { git = "https://github.com/Banyc/fec.git", tag = "v0.0.4" }
+# fec = { path = "../fec" }
 mpudp = { git = "https://github.com/Banyc/mpudp.git", tag = "v0.0.3" }
 primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
 rand = "0.10"
