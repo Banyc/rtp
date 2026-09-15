@@ -199,6 +199,11 @@ impl CongestionResponse {
         self.queue_growth.building()
     }
 
+    /// Whether this connection is the reorder-tolerant interactive lane.
+    pub(crate) fn reorder_tolerant(&self) -> bool {
+        self.queue_growth.reorder_tolerant()
+    }
+
     /// The stale-peak protection floor is currently limiting a drain.
     pub(crate) fn drain_floor_binding(&self) -> bool {
         self.queue_response.floor_binding()

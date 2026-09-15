@@ -57,6 +57,18 @@ const _: () = assert!(MAX_FRAME_LEN == MAX_SEND_DATA_BUF_LEN);
 /// drains; this is intentional and is why we gate acceptance, not eviction.
 const STAGE_WINDOW_SECS: f64 = 0.005;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
+/// Largest factor by which one ordinary bandwidth-probe opportunity may raise
+/// the send rate on the reorder-tolerant interactive lane.
+///
+/// A reordered packet can be SACKed after a spuriously retransmitted copy is
+/// first acked, and the delivery-rate estimator then mis-anchors the sampling
+/// interval and reports a rate far above the link (observed 3-6x at 10%
+/// reorder). The probe would multiply that sample by its 1.5 gain and jump the
+/// send rate several-fold in a single control RTT, filling the bottleneck with
+/// a self-inflicted multi-second queue. The stock lane keeps the unbounded
+/// probe; the reorder-tolerant lane bounds the per-probe gain to the probe's
+/// own intended 1.5x so a spurious sample can only step the rate, not spike it.
+const REORDER_PROBE_RATE_CAP: f64 = 1.5;
 const MIN_SEND_RATE: f64 = 1.;
 pub(crate) const INIT_SEND_RATE: f64 = 128.;
 
@@ -1023,11 +1035,13 @@ impl ReliableLayer {
                 ProbeKind::Gentle => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::GentleProbe);
+                    let target = self.bounded_probe_target(current, target);
                     self.set_smooth_send_rate(target, now);
                 }
                 ProbeKind::Bandwidth => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::BandwidthProbe);
+                    let target = self.bounded_probe_target(current, target);
                     self.record_bandwidth_probe(now, current, target);
                     self.set_smooth_send_rate(target, now);
                 }
@@ -1071,6 +1085,20 @@ impl ReliableLayer {
             }
         }
         outcome.gentle_exit()
+    }
+
+    /// Bound one probe target. On the reorder-tolerant interactive lane a
+    /// reorder-inflated delivery-rate sample may not raise the rate by more
+    /// than [`REORDER_PROBE_RATE_CAP`] in a single probe, so a spurious sample
+    /// can only step the rate; the stock/bulk lane returns the target
+    /// unchanged. The gentle probe's 1.2x gain is already below the cap, so
+    /// this only bites on a reorder-inflated sample.
+    fn bounded_probe_target(&self, current: f64, target: f64) -> f64 {
+        if self.congestion_response.reorder_tolerant() {
+            target.min(current * REORDER_PROBE_RATE_CAP)
+        } else {
+            target
+        }
     }
 
     fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
@@ -1636,7 +1664,7 @@ mod tests {
         GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS, HUGE_DATA_LOSS_CHECK_INTERVAL,
         INIT_SEND_RATE, MAX_SEND_DATA_BUF_LEN, MetricsGentleExitCause,
         PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
-        RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
+        REORDER_PROBE_RATE_CAP, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
     };
     use crate::delivery::byte_stream::send::send_data_buf_len;
     use primitive::ops::float::PosR;
@@ -1647,6 +1675,42 @@ mod tests {
         delivery::byte_stream::send::SEND_DATA_BUF_LEN,
         udp::NO_FEC_MSS,
     };
+
+    /// The reorder-tolerant interactive lane bounds the per-probe rate increase
+    /// so a reorder-inflated delivery-rate sample cannot spike the rate
+    /// several-fold in one control RTT; the stock/bulk lane keeps the unbounded
+    /// probe.
+    #[test]
+    fn reorder_probe_target_is_capped_only_on_the_reorder_lane() {
+        let now = Instant::now();
+        let (reorder, _) = super::ReliableLayer::new(
+            crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
+            crate::delivery::frame::FrameMode::enabled_reordering(),
+            now,
+        );
+        let (stock, _) = super::ReliableLayer::new(
+            crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
+            crate::delivery::frame::FrameMode::enabled(),
+            now,
+        );
+        let current = 400.0;
+        let spurious = 6000.0;
+        assert_eq!(
+            reorder.bounded_probe_target(current, spurious),
+            current * REORDER_PROBE_RATE_CAP,
+            "the reorder lane must cap a spurious per-probe rate jump",
+        );
+        assert_eq!(
+            stock.bounded_probe_target(current, spurious),
+            spurious,
+            "the stock/bulk lane must keep the unbounded probe",
+        );
+        assert_eq!(
+            reorder.bounded_probe_target(current, 500.0),
+            500.0,
+            "a legitimate target below the cap is unchanged",
+        );
+    }
 
     #[test]
     fn windowed_rtt_min_slides_and_forgets() {

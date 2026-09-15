@@ -266,6 +266,12 @@ impl QueueGrowth {
         self.building
     }
 
+    /// Whether this connection opted into receiver-side frame fast-forward (the
+    /// reorder-tolerant interactive lane).
+    pub(crate) fn reorder_tolerant(&self) -> bool {
+        self.reorder_tolerant
+    }
+
     #[cfg(test)]
     pub(crate) fn set_building(&mut self, building: bool) {
         self.building = building;
