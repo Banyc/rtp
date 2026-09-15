@@ -120,11 +120,13 @@ fn new_connection_inner(
         None => (None, None, None),
     };
     let frame_delivery = unreliable_layer.frame_delivery;
+    let congestion_lane = unreliable_layer.congestion_lane;
     let metrics_observer = unreliable_layer.metrics_observer.clone();
     let (mut reliable_layer, send_rate_limiter) = match watchdog_tuning {
         Some(tuning) => ReliableLayer::new_with_watchdog_tuning_at(
             unreliable_layer.mss,
             frame_delivery,
+            congestion_lane,
             now,
             unreliable_layer.initial_sequences,
             tuning,
@@ -132,6 +134,7 @@ fn new_connection_inner(
         None => ReliableLayer::new_at(
             unreliable_layer.mss,
             frame_delivery,
+            congestion_lane,
             now,
             unreliable_layer.initial_sequences,
         ),
@@ -906,6 +909,7 @@ mod tests {
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery,
+            congestion_lane: crate::CongestionLane::default(),
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,

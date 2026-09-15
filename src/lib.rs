@@ -21,6 +21,7 @@ mod transmission;
 pub mod udp;
 pub use traffic_shaping::adjacent::metrics;
 pub use traffic_shaping::control::probe;
+pub use traffic_shaping::core::CongestionLane;
 
 pub use delivery::frame::{FrameMode, frame_delivery_from_env};
 pub use io_err::IoErr;

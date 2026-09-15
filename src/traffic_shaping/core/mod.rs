@@ -4,6 +4,31 @@ mod gentle;
 mod pacing;
 mod queue_growth;
 mod rate_window;
+
+/// Congestion-controller lane intent declared by the connection's owner.
+///
+/// The delay controller tunes its cross-traffic protection from this intent,
+/// never from the delivery mode: the two are orthogonal (a frame-delivery lane
+/// can be either shared or dedicated).  A [`Dedicated`](Self::Dedicated) lane
+/// has no competing traffic over this connection's queue, so it may creep
+/// toward capacity and drain shallower; a [`Shared`](Self::Shared) lane keeps
+/// the conservative cross-traffic-protecting behaviour so it cannot push
+/// interactive packets out of a shared bottleneck.
+///
+/// `rtp_mux` declares the intent from its lane class (bulk lanes are dedicated,
+/// the interactive lane is shared).  Callers that do not declare an intent get
+/// [`Shared`](Self::Shared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CongestionLane {
+    /// A link shared with competing traffic: keep the conservative,
+    /// cross-traffic-protecting controller tuning.  The default.
+    #[default]
+    Shared,
+    /// A dedicated pipe with no competing traffic over this connection's
+    /// queue: the bulk-lane tuning.
+    Dedicated,
+}
+
 pub(crate) use bandwidth_probe::OrdinaryBandwidthProbe;
 pub(crate) use congestion_response::{
     CongestionDecision, CongestionInput, CongestionResponse, ProbeKind, linear_backoff_step,

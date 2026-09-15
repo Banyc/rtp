@@ -106,6 +106,11 @@ pub struct UnreliableLayer {
     pub(crate) fec: Option<FecState>,
     pub(crate) fec_tuning: FecTuning,
     pub(crate) frame_delivery: FrameMode,
+    /// The connection owner's declared congestion intent (see
+    /// [`crate::CongestionLane`]).  Seeded from the connect/accept config; the
+    /// shared session state reads it once at construction.  Frame delivery and
+    /// byte-stream delivery are orthogonal to this intent.
+    pub(crate) congestion_lane: crate::CongestionLane,
     /// Retransmission-armor duplicate-copy config.  Set once at construction
     /// from the connect/accept config (which reads `RTP_RTX_DUP` in
     /// `Default`); the shared session state is seeded from here.

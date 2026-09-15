@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use super::CongestionLane;
 use super::bandwidth_probe::loss_scaled_gain;
 
 // Gentle-mode parameters for the delay-gated congestion controller.  These are
@@ -8,13 +9,13 @@ use super::bandwidth_probe::loss_scaled_gain;
 // cross-traffic keeps getting tail-dropped.
 pub(crate) const GENTLE_BW_PROBE_GAIN: f64 = 0.20;
 
-/// Gentle-mode multiplicative probe gain for the dedicated byte-stream bulk
-/// lane.  The lane has no cross-traffic to protect, so it can afford to creep
-/// toward capacity instead of probing `1.2x` every cycle: a smaller overshoot
+/// Gentle-mode multiplicative probe gain for the dedicated bulk lane.  The
+/// lane has no cross-traffic to protect, so it can afford to creep toward
+/// capacity instead of probing `1.2x` every cycle: a smaller overshoot
 /// stretches each probe phase, spending less of the window in the drain/
 /// transition overhead that costs link time at every sawtooth turn while
 /// leaving the standing queue's peak and average depth unchanged.
-pub(crate) const BYTE_STREAM_GENTLE_BW_PROBE_GAIN: f64 = 0.02;
+pub(crate) const DEDICATED_GENTLE_BW_PROBE_GAIN: f64 = 0.02;
 
 pub(crate) const GENTLE_DRAIN_FRAC: f64 = 0.75;
 
@@ -77,10 +78,11 @@ pub(crate) struct GentleMode {
     drain_episode: Option<DrainEpisode>,
     gentle_block_until: Option<Instant>,
     gentle_gate_open_since: Option<Instant>,
-    /// `true` for the stock byte-stream bulk lane (no frame delivery), which
-    /// uses the gentler probe gain below.  A frame-delivery lane keeps the
-    /// conservative cross-traffic-protecting behaviour.
-    byte_stream: bool,
+    /// The connection's declared congestion lane; a [`CongestionLane::Dedicated`]
+    /// lane creeps at the shallower probe gain below.  A
+    /// [`CongestionLane::Shared`] lane keeps the conservative
+    /// cross-traffic-protecting gain.
+    lane: CongestionLane,
 }
 
 impl GentleMode {
@@ -91,13 +93,13 @@ impl GentleMode {
             drain_episode: None,
             gentle_block_until: None,
             gentle_gate_open_since: None,
-            byte_stream: false,
+            lane: CongestionLane::default(),
         }
     }
 
-    /// Mark this controller as the dedicated byte-stream bulk lane.
-    pub(crate) fn set_byte_stream(&mut self, byte_stream: bool) {
-        self.byte_stream = byte_stream;
+    /// Declare this controller's congestion lane.
+    pub(crate) fn set_lane(&mut self, lane: CongestionLane) {
+        self.lane = lane;
     }
 
     /// Reset all gentle-mode state (called on outage-recovery epoch start).
@@ -200,9 +202,9 @@ impl GentleMode {
             // Scale the multiplicative gain by the survival fraction so a
             // loss-suppressed delivery rate does not compound the full
             // gentle gain either.  At zero loss the historical 1.2x holds; the
-            // dedicated byte-stream bulk lane instead uses its shallower gain.
-            let gain = if self.byte_stream {
-                BYTE_STREAM_GENTLE_BW_PROBE_GAIN
+            // dedicated lane instead uses its shallower gain.
+            let gain = if self.lane == CongestionLane::Dedicated {
+                DEDICATED_GENTLE_BW_PROBE_GAIN
             } else {
                 GENTLE_BW_PROBE_GAIN
             };
@@ -293,7 +295,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        BYTE_STREAM_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN,
+        DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN,
         GENTLE_DRAIN_CHECK_RTTS, GENTLE_DRAIN_FRAC, GENTLE_ENTER_MIN, GentleExitCause, GentleMode,
         GentleProbeOutcome,
     };
@@ -366,14 +368,14 @@ mod tests {
         assert_eq!(target, 158.0);
     }
 
-    /// The dedicated byte-stream bulk lane creeps toward capacity instead of
-    /// probing the frame lane's full `1.2x`, so each probe phase is longer and
-    /// less of the window is spent in the drain/transition overhead.
+    /// The dedicated bulk lane creeps toward capacity instead of probing the
+    /// shared lane's full `1.2x`, so each probe phase is longer and less of the
+    /// window is spent in the drain/transition overhead.
     #[test]
-    fn byte_stream_gentle_probe_uses_its_shallower_gain() {
+    fn dedicated_gentle_probe_uses_its_shallower_gain() {
         let t0 = Instant::now();
         let mut gentle = GentleMode::new();
-        gentle.set_byte_stream(true);
+        gentle.set_lane(super::super::CongestionLane::Dedicated);
         let control_rtt = Duration::from_millis(100);
         let _ = gentle.update_mode(
             Some(GENTLE_ENTER_MIN),
@@ -391,10 +393,10 @@ mod tests {
         ) else {
             panic!("gentle mode should probe before the open threshold");
         };
-        assert_eq!(BYTE_STREAM_GENTLE_BW_PROBE_GAIN, 0.02);
+        assert_eq!(DEDICATED_GENTLE_BW_PROBE_GAIN, 0.02);
         // 1.02x = 102, plus the additive 4/0.1 s = 40 -> 142.
         assert_eq!(target, 142.0);
-        assert!(target < 160.0, "the byte-stream probe must be shallower");
+        assert!(target < 160.0, "the dedicated probe must be shallower");
     }
 
     #[test]

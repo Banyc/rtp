@@ -1695,6 +1695,7 @@ mod tests {
             fec: None,
             fec_tuning: FecTuning::default(),
             frame_delivery: FrameMode::default(),
+            congestion_lane: crate::CongestionLane::default(),
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,

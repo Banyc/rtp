@@ -18,6 +18,7 @@ use crate::io_err::IoErr;
 #[cfg(test)]
 use crate::transmission::transmission_layer::UnreliableLayer;
 use crate::{
+    CongestionLane,
     delivery::frame::{FrameMode, frame_delivery_from_env},
     socket::{
         ConnReader, ConnWriter, FrameByteReader, FrameByteWriter, SessionHandle,
@@ -428,6 +429,13 @@ pub struct AcceptConfig {
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
     pub frame_delivery: FrameMode,
+    /// The connection owner's declared congestion intent (see
+    /// [`crate::CongestionLane`]).  Defaults to
+    /// [`CongestionLane::Shared`](crate::CongestionLane::Shared) — the
+    /// conservative, cross-traffic-protecting tuning — so raw callers that do
+    /// not declare an intent keep the stock behaviour.  A dedicated bulk pipe
+    /// opts into [`CongestionLane::Dedicated`](crate::CongestionLane::Dedicated).
+    pub congestion_lane: CongestionLane,
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub metrics_observer: Option<crate::metrics::MetricsObserver>,
@@ -456,6 +464,7 @@ impl Default for AcceptConfig {
             mss: MssConfig::Default,
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
+            congestion_lane: CongestionLane::default(),
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
@@ -478,6 +487,11 @@ pub struct ConnectConfig<'a> {
     pub mss: MssConfig,
     pub fec_tuning: FecTuning,
     pub frame_delivery: FrameMode,
+    /// The connection owner's declared congestion intent (see
+    /// [`crate::CongestionLane`]).  Defaults to
+    /// [`CongestionLane::Shared`](crate::CongestionLane::Shared); see
+    /// [`AcceptConfig::congestion_lane`].
+    pub congestion_lane: CongestionLane,
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub watchdog: Option<WatchdogTuning>,
@@ -507,6 +521,7 @@ impl<'a> Default for ConnectConfig<'a> {
             mss: MssConfig::Default,
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
+            congestion_lane: CongestionLane::default(),
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
@@ -527,6 +542,7 @@ struct AcceptSetup {
     mss: Mss,
     tuning: FecTuning,
     frame_delivery: FrameMode,
+    congestion_lane: CongestionLane,
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
@@ -544,6 +560,7 @@ impl AcceptSetup {
             mss: config.mss.resolve()?,
             tuning: config.fec_tuning,
             frame_delivery: config.frame_delivery,
+            congestion_lane: config.congestion_lane,
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
@@ -601,6 +618,7 @@ async fn accept(
         mss,
         tuning,
         frame_delivery,
+        congestion_lane,
         retransmission_armor,
         instream_group_fec,
         metrics_observer,
@@ -643,6 +661,7 @@ async fn accept(
         tuning,
         frame_delivery,
     )?;
+    unreliable_layer.congestion_lane = congestion_lane;
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
@@ -993,6 +1012,7 @@ async fn connect_bound(
         mss,
         fec_tuning,
         frame_delivery,
+        congestion_lane,
         retransmission_armor,
         instream_group_fec,
         watchdog,
@@ -1050,6 +1070,7 @@ async fn connect_bound(
         fec_tuning,
         frame_delivery,
     )?;
+    unreliable_layer.congestion_lane = congestion_lane;
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;

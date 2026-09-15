@@ -34,8 +34,8 @@ use crate::{
     },
     recv_queue::pkt_recv_space::PktRecvSpace,
     traffic_shaping::core::{
-        CongestionDecision, CongestionInput, CongestionResponse, GentleExitCause, ProbeKind,
-        SendPacer, linear_backoff_step,
+        CongestionDecision, CongestionInput, CongestionLane, CongestionResponse, GentleExitCause,
+        ProbeKind, SendPacer, linear_backoff_step,
     },
     traffic_shaping::recovery::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     traffic_shaping::recovery::rtt_stats::GateJitter,
@@ -225,19 +225,46 @@ pub struct ReliableLayer {
     pkt_buf: Vec<dre::Packet>,
 }
 
+/// Decide whether one delivery-rate sample leaves slow start.
+///
+/// Every lane keeps the stock exit: the dedicated-lane cold-start hold that
+/// ignored transient app-limited samples was evaluated and dropped, because on
+/// a lossy link it kept the lane ramping past the point where the stock exit
+/// would have shed the flight, and the hostile goodput collapsed on some seeds.
+/// The dedicated tuning is therefore confined to the gentle drain fraction and
+/// probe gain, which are queue-depth-neutral on the hostile lane.
+fn should_exit_slow_start(
+    send_rate: f64,
+    probed: f64,
+    app_limited: bool,
+    loss_blocks_delay_control: bool,
+    queue_building: bool,
+) -> bool {
+    loss_blocks_delay_control || queue_building || send_rate <= probed || app_limited
+}
+
 impl ReliableLayer {
     #[cfg(test)]
     pub fn new(mss: crate::mss::Mss, frame_delivery: FrameMode, now: Instant) -> (Self, SendPacer) {
-        Self::new_at(mss, frame_delivery, now, InitialSequences::ZERO)
+        Self::new_at(
+            mss,
+            frame_delivery,
+            CongestionLane::default(),
+            now,
+            InitialSequences::ZERO,
+        )
     }
 
     /// Construct with handshake-derived directional initial sequences:
     /// `PktSendSpace` starts at `initial_sequences.send` and `PktRecvSpace`
     /// at `initial_sequences.recv`.  The zero-seeded `new()` keeps skipped-
-    /// handshake peers zero-compatible.
+    /// handshake peers zero-compatible.  `congestion_lane` is the owner's
+    /// declared congestion intent (see [`CongestionLane`]); callers that do not
+    /// declare one get the conservative [`CongestionLane::Shared`].
     pub fn new_at(
         mss: crate::mss::Mss,
         frame_delivery: FrameMode,
+        congestion_lane: CongestionLane,
         now: Instant,
         initial_sequences: InitialSequences,
     ) -> (Self, SendPacer) {
@@ -263,7 +290,7 @@ impl ReliableLayer {
             congestion_response: CongestionResponse::new(
                 now,
                 frame_delivery.allow_reorder,
-                !frame_delivery.enabled,
+                congestion_lane,
             ),
             slow_start: true,
             slow_start_acked_pkts: 0,
@@ -284,6 +311,7 @@ impl ReliableLayer {
     pub fn new_with_watchdog_tuning_at(
         mss: crate::mss::Mss,
         frame_delivery: FrameMode,
+        congestion_lane: CongestionLane,
         now: Instant,
         initial_sequences: InitialSequences,
         tuning: WatchdogTuning,
@@ -311,7 +339,7 @@ impl ReliableLayer {
             congestion_response: CongestionResponse::new(
                 now,
                 frame_delivery.allow_reorder,
-                !frame_delivery.enabled,
+                congestion_lane,
             ),
             slow_start: true,
             slow_start_acked_pkts: 0,
@@ -1022,12 +1050,13 @@ impl ReliableLayer {
         if self.slow_start {
             let probed =
                 CongestionResponse::proposed_probe_rate(sr.delivery_rate(), loss_event_rate);
-            let caught_up = self.send_rate.get() <= probed;
-            if observation.loss_blocks_delay_control
-                || observation.queue_building
-                || caught_up
-                || sr.is_app_limited()
-            {
+            if should_exit_slow_start(
+                self.send_rate.get(),
+                probed,
+                sr.is_app_limited(),
+                observation.loss_blocks_delay_control,
+                observation.queue_building,
+            ) {
                 self.slow_start = false;
             }
         }
@@ -1684,6 +1713,7 @@ mod tests {
         INIT_SEND_RATE, MAX_SEND_DATA_BUF_LEN, MetricsGentleExitCause,
         PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
         REORDER_PROBE_RATE_CAP, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
+        should_exit_slow_start,
     };
     use crate::delivery::byte_stream::send::send_data_buf_len;
     use primitive::ops::float::PosR;
@@ -2229,6 +2259,37 @@ mod tests {
         assert!(
             rl.log().send_rate.is_finite(),
             "send_rate must not be inf/nan after zero-rtt first echo"
+        );
+    }
+
+    /// A cold-start delivery sample on a long-RTT, high-BDP path. Every lane
+    /// uses the stock exit: a single app-limited sample below the probe target
+    /// leaves slow start (the dedicated cold-start hold was dropped as
+    /// hostile-unsafe). Loss and queue growth also leave slow start.
+    #[test]
+    fn every_lane_uses_the_stock_slow_start_exit() {
+        let send = 140.0;
+        let probed = 156.0; // 1.5 * delivery(104) while the pipe is still filling
+
+        assert!(
+            should_exit_slow_start(send, probed, true, false, false),
+            "an app-limited cold-start sample must leave slow start"
+        );
+        assert!(
+            should_exit_slow_start(send, probed, false, false, false),
+            "send below the probe target must leave slow start"
+        );
+        assert!(
+            !should_exit_slow_start(160.0, probed, false, false, false),
+            "send above the probe target may stay in slow start"
+        );
+        assert!(
+            should_exit_slow_start(send, probed, false, true, false),
+            "loss must exit slow start"
+        );
+        assert!(
+            should_exit_slow_start(send, probed, false, false, true),
+            "queue growth must exit slow start"
         );
     }
 

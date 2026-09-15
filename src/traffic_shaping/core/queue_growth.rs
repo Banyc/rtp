@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 
+use super::CongestionLane;
 #[cfg(test)]
 use super::gentle::DrainEpisode;
 use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
@@ -193,9 +194,9 @@ impl QueueGrowth {
         self.gentle.reset()
     }
 
-    /// Mark this controller as the dedicated byte-stream bulk lane.
-    pub(crate) fn set_byte_stream(&mut self, byte_stream: bool) {
-        self.gentle.set_byte_stream(byte_stream);
+    /// Declare this controller's congestion lane.
+    pub(crate) fn set_lane(&mut self, lane: CongestionLane) {
+        self.gentle.set_lane(lane);
     }
 
     pub(crate) fn observe(
