@@ -231,6 +231,15 @@ impl QueueGrowth {
                 >= control_rtt.mul_f64(GENTLE_ENTER_RTTS).max(GENTLE_ENTER_MIN)
         });
         self.last_observe = Some(now);
+        // A gap in observations also voids the drain-episode continuity: the
+        // ineffective-drain guard measures a continuous drain over the last
+        // twelve control RTTs, and a lane that went quiet during the episode
+        // was not draining at all.  Restart the measurement so the first
+        // post-idle drain cannot exit gentle mode (with its re-entry cooldown)
+        // on the strength of the idle stretch.
+        if idle_gap_breaks_queue {
+            self.gentle.restart_drain_episode();
+        }
         // A large fractional rise of the floor is a path step, not queue
         // growth: use the trending margin so the pre-step steady-state floor
         // cannot license a drain during the floor transition.  A queue raises

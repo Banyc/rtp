@@ -522,4 +522,97 @@ mod tests {
             "the shared probe must also scale from the peak, with the historical gain: {shared_target}"
         );
     }
+
+    /// A gentle-mode drain episode's "ineffective drain" timer must not
+    /// accumulate across an idle gap.  The guard leaves gentle mode (and
+    /// blocks re-entry for the cooldown) after twelve control RTTs of a drain
+    /// that has not shrunk the queue gap, but a lane that went quiet during
+    /// the episode was not draining at all: the first post-idle drain must
+    /// restart the measurement instead of minting a spurious exit and
+    /// cooldown on the strength of the idle stretch.
+    #[test]
+    fn gentle_drain_episode_does_not_span_an_idle_gap() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let floor_smooth = Duration::from_millis(100);
+        let queue_smooth = Duration::from_millis(300);
+        let jitter = GateJitter::uniform(Duration::from_millis(5));
+        let delivery_rate = 1000.0;
+        let input = |now| CongestionInput {
+            delivery_rate,
+            current_rate: delivery_rate,
+            smooth_rtt: queue_smooth,
+            control_rtt,
+            loss_event_rate: Some(0.0),
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            now,
+        };
+
+        let mut c = CongestionResponse::new(t0, false, CongestionLane::Shared);
+        let _ = c.observe(
+            floor_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            t0,
+            control_rtt,
+        );
+        // Backlogged cadence: one queue sample per control RTT so gentle mode
+        // enters on the sustained standing queue.
+        let enter_at = t0 + Duration::from_secs(1) + Duration::from_millis(2);
+        let mut t = t0 + Duration::from_millis(1);
+        while t < enter_at {
+            let obs = c.observe(
+                queue_smooth,
+                jitter,
+                Some(0.0),
+                delivery_rate,
+                t,
+                control_rtt,
+            );
+            let _ = c.decide(obs, input(t));
+            t += control_rtt;
+        }
+        let obs = c.observe(
+            queue_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            enter_at,
+            control_rtt,
+        );
+        let _ = c.decide(obs, input(enter_at));
+        assert!(c.gentle_mode(), "the standing queue must enter gentle mode");
+        assert!(
+            c.queue_growth().drain_episode().is_some(),
+            "the gentle drain must record an episode"
+        );
+
+        // The lane goes quiet far past the twelve-control-RTT drain check, then
+        // resumes with the same standing queue.
+        let resumed = enter_at + Duration::from_secs(8);
+        let obs = c.observe(
+            queue_smooth,
+            jitter,
+            Some(0.0),
+            delivery_rate,
+            resumed,
+            control_rtt,
+        );
+        let decision = c.decide(obs, input(resumed)).decision();
+        assert!(
+            matches!(decision, CongestionDecision::Drain { .. }),
+            "the post-idle standing queue must still drain"
+        );
+        assert!(
+            c.gentle_mode(),
+            "a drain episode that merely idled must not exit gentle mode"
+        );
+        assert!(
+            c.queue_growth().gentle_block_until().is_none(),
+            "no ineffective-drain cooldown may be minted across an idle gap"
+        );
+    }
 }

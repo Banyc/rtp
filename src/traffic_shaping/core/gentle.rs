@@ -171,6 +171,22 @@ impl GentleMode {
         self.gentle_gate_open_since = None;
     }
 
+    /// Restart the drain-episode measurement without changing gentle-mode
+    /// state.
+    ///
+    /// The drain-episode guard judges a drain ineffective once it has run for
+    /// twelve control RTTs without shrinking the queue gap.  An observation
+    /// gap voids that continuity: no rate sample produced a drain during the
+    /// quiet stretch, so a stale episode start would let the first post-idle
+    /// drain claim twelve RTTs of ineffective draining that never happened and
+    /// exit gentle mode with a re-entry cooldown.  Clearing the episode makes
+    /// the next drain begin a fresh measurement; gentle mode and any existing
+    /// re-entry cooldown are untouched, so only the time accumulation is
+    /// voided.
+    pub(crate) fn restart_drain_episode(&mut self) {
+        self.drain_episode = None;
+    }
+
     /// Attempt a gentle-mode probe.
     ///
     /// Distinguishes an inactive controller, an applied gentle probe, and the
