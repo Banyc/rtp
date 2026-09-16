@@ -1,5 +1,6 @@
 mod bandwidth_probe;
 mod congestion_response;
+mod fast_start;
 mod gentle;
 mod pacing;
 mod queue_growth;
@@ -33,6 +34,7 @@ pub(crate) use bandwidth_probe::OrdinaryBandwidthProbe;
 pub(crate) use congestion_response::{
     CongestionDecision, CongestionInput, CongestionResponse, ProbeKind, linear_backoff_step,
 };
+pub(crate) use fast_start::{FastStart, FastStartStep};
 pub(crate) use gentle::GentleExitCause;
 pub(crate) use pacing::{SendPacer, SendWake};
 pub(crate) use queue_growth::QueueGrowth;

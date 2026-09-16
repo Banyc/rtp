@@ -95,6 +95,15 @@ impl CongestionResponse {
         gentle_exit
     }
 
+    /// Discard the tracked recent delivery peak without touching the rest of
+    /// the controller.  Used when a dedicated fast-start episode ends: a burst
+    /// of ACKs during the ramp can report a delivery rate above the path's
+    /// sustained capacity, and the gentle probe would otherwise use that
+    /// inflated peak as its creep base.
+    pub(crate) fn clear_delivery_peak(&mut self, now: Instant) {
+        self.delivery_peak = WindowedDeliveryMax::new(now);
+    }
+
     pub(crate) fn observe(
         &mut self,
         smooth_rtt: Duration,
@@ -226,6 +235,11 @@ impl CongestionResponse {
     /// Whether this connection is the reorder-tolerant interactive lane.
     pub(crate) fn reorder_tolerant(&self) -> bool {
         self.queue_growth.reorder_tolerant()
+    }
+
+    /// Whether this connection declared the dedicated bulk lane.
+    pub(crate) fn dedicated(&self) -> bool {
+        self.lane == CongestionLane::Dedicated
     }
 
     /// The stale-peak protection floor is currently limiting a drain.

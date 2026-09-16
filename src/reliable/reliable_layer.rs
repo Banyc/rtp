@@ -34,8 +34,8 @@ use crate::{
     },
     recv_queue::pkt_recv_space::PktRecvSpace,
     traffic_shaping::core::{
-        CongestionDecision, CongestionInput, CongestionLane, CongestionResponse, GentleExitCause,
-        ProbeKind, SendPacer, linear_backoff_step,
+        CongestionDecision, CongestionInput, CongestionLane, CongestionResponse, FastStart,
+        FastStartStep, GentleExitCause, ProbeKind, SendPacer, linear_backoff_step,
     },
     traffic_shaping::recovery::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
     traffic_shaping::recovery::rtt_stats::GateJitter,
@@ -202,6 +202,8 @@ pub struct ReliableLayer {
     congestion_response: CongestionResponse,
     slow_start: bool,
     slow_start_acked_pkts: usize,
+    /// Windowed ACK-clock ramp for the dedicated lane's bounded fast start.
+    fast_start: FastStart,
     last_congestion_loss_ratio: Option<f64>,
     last_congestion_action: Option<crate::metrics::MetricsCongestionAction>,
     /// Whether congestion-controller interval accounting is on.  Set once at
@@ -225,14 +227,15 @@ pub struct ReliableLayer {
     pkt_buf: Vec<dre::Packet>,
 }
 
-/// Decide whether one delivery-rate sample leaves slow start.
+/// Decide whether one delivery-rate sample leaves slow start on the shared
+/// lane.
 ///
-/// Every lane keeps the stock exit: the dedicated-lane cold-start hold that
+/// The shared lane keeps the stock exit. The dedicated lane instead owns its
+/// ramp with the windowed ACK-clock in [`FastStart`] and exits on loss or a
+/// built queue (see `on_rate_sample`); the dedicated cold-start hold that
 /// ignored transient app-limited samples was evaluated and dropped, because on
 /// a lossy link it kept the lane ramping past the point where the stock exit
 /// would have shed the flight, and the hostile goodput collapsed on some seeds.
-/// The dedicated tuning is therefore confined to the gentle drain fraction and
-/// probe gain, which are queue-depth-neutral on the hostile lane.
 fn should_exit_slow_start(
     send_rate: f64,
     probed: f64,
@@ -294,6 +297,7 @@ impl ReliableLayer {
             ),
             slow_start: true,
             slow_start_acked_pkts: 0,
+            fast_start: FastStart::new(now),
             last_congestion_loss_ratio: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
@@ -343,6 +347,7 @@ impl ReliableLayer {
             ),
             slow_start: true,
             slow_start_acked_pkts: 0,
+            fast_start: FastStart::new(now),
             last_congestion_loss_ratio: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
@@ -927,6 +932,7 @@ impl ReliableLayer {
             }
             self.slow_start = false;
             self.slow_start_acked_pkts = 0;
+            self.fast_start.reset(now);
             self.last_congestion_loss_ratio = None;
             self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
             self.last_congestion_action =
@@ -943,16 +949,54 @@ impl ReliableLayer {
         // produce no usable rate sample (e.g. zero-RTT first echoes or sparse
         // bursts). The per-burst accumulator lives here, before the rate sample
         // is computed and cleared.
+        //
+        // The dedicated lane uses a windowed ACK-clock instead: the historical
+        // lifetime accumulator keeps growing on a backlogged flow (the pipe
+        // never drains), so reviving slow start with it would run the pacer
+        // past capacity without bound. The windowed ramp is bounded by the
+        // recent delivered rate and leaves fast start as soon as that rate
+        // plateaus or the paced rate outruns it. The shared lane keeps the
+        // stock accumulator/exit.
         if self.slow_start {
             if self.congestion_metrics_enabled {
                 self.congestion_metrics.clear_decision_gauges();
             }
-            self.slow_start_acked_pkts += self.pkt_send_space.fresh_acked_count();
-            let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
-            let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
-            self.set_send_rate(ss_rate, now);
-            self.last_congestion_action =
-                Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
+            if self.congestion_response.dedicated() {
+                let fresh = self.pkt_send_space.fresh_acked_count();
+                // The window is one control RTT, so it is only meaningful once
+                // a real RTT estimate exists. The 5 ms floor before the first
+                // sample would otherwise close several tiny windows that corrupt
+                // the previous-delivery baseline.
+                if self.pkt_send_space.min_rtt().is_some() {
+                    let control_rtt = self.control_rtt();
+                    let current = self.send_rate.get();
+                    match self.fast_start.on_ack(fresh, now, control_rtt, current) {
+                        FastStartStep::Hold => {}
+                        FastStartStep::Ramp(target) => {
+                            self.set_send_rate(PosR::new(target).unwrap(), now);
+                            self.last_congestion_action =
+                                Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
+                        }
+                        FastStartStep::Plateau(delivered) => {
+                            self.slow_start = false;
+                            self.set_send_rate(PosR::new(delivered).unwrap(), now);
+                            // A burst of ACKs during the ramp can inflate the
+                            // tracked delivery peak; drop it so the gentle probe
+                            // cannot use it as a base and creep back over capacity.
+                            self.congestion_response.clear_delivery_peak(now);
+                            self.last_congestion_action =
+                                Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
+                        }
+                    }
+                }
+            } else {
+                self.slow_start_acked_pkts += self.pkt_send_space.fresh_acked_count();
+                let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
+                let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
+                self.set_send_rate(ss_rate, now);
+                self.last_congestion_action =
+                    Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
+            }
         }
 
         // Per-episode accumulator: once the pipe drains, reset for the next
@@ -1048,16 +1092,29 @@ impl ReliableLayer {
             observation.peak_delivery,
         );
         if self.slow_start {
-            let probed =
-                CongestionResponse::proposed_probe_rate(sr.delivery_rate(), loss_event_rate);
-            if should_exit_slow_start(
-                self.send_rate.get(),
-                probed,
-                sr.is_app_limited(),
-                observation.loss_blocks_delay_control,
-                observation.queue_building,
-            ) {
-                self.slow_start = false;
+            if self.congestion_response.dedicated() {
+                // The dedicated fast start exits on any loss or on a built
+                // queue. The stock probe-target and app-limited exits would
+                // fire on the first sample, before the ramp has begun, so the
+                // windowed ACK-clock (in `recv_ack_pkt`) owns the ramp and its
+                // own delivery-plateau exit.
+                let any_loss = loss_event_rate.is_some_and(|loss| loss > 0.0);
+                if observation.loss_blocks_delay_control || any_loss || observation.queue_building {
+                    self.slow_start = false;
+                    self.congestion_response.clear_delivery_peak(now);
+                }
+            } else {
+                let probed =
+                    CongestionResponse::proposed_probe_rate(sr.delivery_rate(), loss_event_rate);
+                if should_exit_slow_start(
+                    self.send_rate.get(),
+                    probed,
+                    sr.is_app_limited(),
+                    observation.loss_blocks_delay_control,
+                    observation.queue_building,
+                ) {
+                    self.slow_start = false;
+                }
             }
         }
         let current = self.send_rate.get();
@@ -1906,6 +1963,18 @@ mod tests {
         layer
     }
 
+    fn test_layer_dedicated(now: Instant) -> super::ReliableLayer {
+        let (layer, pacer) = super::ReliableLayer::new_at(
+            crate::mss::Mss::try_new(TEST_MSS).unwrap(),
+            crate::delivery::frame::FrameMode::default(),
+            crate::CongestionLane::Dedicated,
+            now,
+            crate::sequence::InitialSequences::ZERO,
+        );
+        pacer.set_min_burst_for_test(64, now);
+        layer
+    }
+
     /// A genuine *standing queue* on the reorder-tolerant lane must still be
     /// flagged and drained.  This guards the floor-window change against
     /// trading away queue detection for path-shift recovery.
@@ -2293,12 +2362,11 @@ mod tests {
         );
     }
 
-    /// A cold-start delivery sample on a long-RTT, high-BDP path. Every lane
-    /// uses the stock exit: a single app-limited sample below the probe target
-    /// leaves slow start (the dedicated cold-start hold was dropped as
-    /// hostile-unsafe). Loss and queue growth also leave slow start.
+    /// A cold-start delivery sample on a long-RTT, high-BDP path. The shared
+    /// lane uses the stock exit: a single app-limited sample below the probe
+    /// target leaves slow start. Loss and queue growth also leave slow start.
     #[test]
-    fn every_lane_uses_the_stock_slow_start_exit() {
+    fn shared_lane_uses_the_stock_slow_start_exit() {
         let send = 140.0;
         let probed = 156.0; // 1.5 * delivery(104) while the pipe is still filling
 
@@ -2352,6 +2420,86 @@ mod tests {
             rl.log().send_rate <= 2.0 * INIT_SEND_RATE,
             "per-episode accumulator should keep slow-start bounded, got {}",
             rl.log().send_rate
+        );
+    }
+
+    /// The dedicated lane's windowed fast start ramps up to the delivered rate
+    /// and then leaves slow start once the capped delivery plateaus, instead of
+    /// growing the pacer rate without bound.  A bottleneck of `cap` packets per
+    /// control RTT is modelled by only ever acknowledging a fixed prefix.
+    #[test]
+    fn dedicated_fast_start_plateaus_at_a_capped_delivery() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_dedicated(t0);
+        let rtt = Duration::from_millis(100);
+        let cap = 40u64; // 40 packets / 100 ms = 400 packets/second
+        let mut acked = 0u64;
+        let mut t = t0;
+
+        for _ in 0..40 {
+            send_max(&mut rl, t);
+            t += rtt;
+            let next = rl.pkt_send_space().next_seq().to_wire();
+            acked = (acked + cap).min(next);
+            if acked > 0 {
+                ack_prefix(&mut rl, acked, rtt, t);
+            }
+            t += Duration::from_nanos(1);
+        }
+
+        assert!(
+            !rl.slow_start,
+            "a flat capped delivery must end the fast start"
+        );
+        assert!(
+            rl.send_rate.get() < 4.0 * cap as f64 / rtt.as_secs_f64(),
+            "the settled rate must stay bounded near the capped delivery, got {}",
+            rl.send_rate.get()
+        );
+    }
+
+    /// A stalled delivery ends the dedicated fast start rather than growing
+    /// the pacer rate without bound.
+    #[test]
+    fn dedicated_fast_start_plateaus_before_an_unbounded_rate() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_dedicated(t0);
+        let rtt = Duration::from_millis(100);
+        let mut t = t0;
+        // Fill the pipe for two RTTs so the first measurement window ramps
+        // (the very first ack only seeds the window).
+        send_max(&mut rl, t);
+        t += rtt;
+        ack_all(&mut rl, Some(rtt), t);
+        send_max(&mut rl, t);
+        t += rtt;
+        ack_all(&mut rl, Some(rtt), t);
+        let ramped = rl.send_rate.get();
+        assert!(ramped > INIT_SEND_RATE, "the first window must ramp");
+
+        // Acknowledge only one additional packet per window: the windowed
+        // delivery collapses, so the next window must plateau and exit.
+        let mut acked = rl.pkt_send_space().next_seq().to_wire();
+        for _ in 0..8 {
+            send_max(&mut rl, t);
+            t += rtt;
+            let next = rl.pkt_send_space().next_seq().to_wire();
+            acked = (acked + 1).min(next);
+            if acked > 0 {
+                ack_prefix(&mut rl, acked, rtt, t);
+            }
+            t += Duration::from_nanos(1);
+            if !rl.slow_start {
+                break;
+            }
+        }
+        assert!(
+            !rl.slow_start,
+            "a stalled delivery must end the dedicated fast start"
+        );
+        assert!(
+            rl.send_rate.get() <= ramped,
+            "the plateau must not raise the rate on a stalled delivery"
         );
     }
 
