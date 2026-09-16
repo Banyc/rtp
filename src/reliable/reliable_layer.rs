@@ -973,13 +973,25 @@ impl ReliableLayer {
                     match self.fast_start.on_ack(fresh, now, control_rtt, current) {
                         FastStartStep::Hold => {}
                         FastStartStep::Ramp(target) => {
-                            self.set_send_rate(PosR::new(target).unwrap(), now);
+                            // `target` is floored at the current rate, so it is
+                            // always a valid positive rate already; the fallback
+                            // only keeps a future non-finite target from
+                            // panicking the transport worker.
+                            self.set_send_rate(PosR::new(target).unwrap_or(self.send_rate), now);
                             self.last_congestion_action =
                                 Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
                         }
                         FastStartStep::Plateau(delivered) => {
                             self.slow_start = false;
-                            self.set_send_rate(PosR::new(delivered).unwrap(), now);
+                            // A zero-delivery window (idle gap, all-lost flight,
+                            // duplicate/coalesced ACK) and any non-finite
+                            // computation are not rates to settle at, and `PosR`
+                            // rejects them. The ACK-clock already substitutes the
+                            // paced rate in that case; this fallback is the guard
+                            // that keeps `PosR::new(0.0).unwrap()` from panicking
+                            // the worker on any future regression.
+                            let settled = PosR::new(delivered).unwrap_or(self.send_rate);
+                            self.set_send_rate(settled, now);
                             // A burst of ACKs during the ramp can inflate the
                             // tracked delivery peak; drop it so the gentle probe
                             // cannot use it as a base and creep back over capacity.
@@ -2500,6 +2512,45 @@ mod tests {
         assert!(
             rl.send_rate.get() <= ramped,
             "the plateau must not raise the rate on a stalled delivery"
+        );
+    }
+
+    #[test]
+    fn dedicated_fast_start_survives_a_zero_fresh_ack_window() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_dedicated(t0);
+        let rtt = Duration::from_millis(100);
+        let mut t = t0;
+        // Seed the window and close two real delivery windows so the
+        // two-windows-past delivery baseline exists.
+        for _ in 0..3 {
+            send_max(&mut rl, t);
+            t += rtt;
+            ack_all(&mut rl, Some(rtt), t);
+            t += Duration::from_nanos(1);
+        }
+        assert!(rl.slow_start, "the ramp must still be running");
+        let ramped = rl.send_rate.get();
+
+        // A full control-RTT window later, replay the already-acknowledged
+        // prefix: the window carries no fresh delivery.
+        let acked = rl.pkt_send_space().next_seq().to_wire();
+        assert!(acked > 0, "the ramp must have sent packets");
+        t += rtt;
+        ack_prefix(&mut rl, acked, rtt, t);
+
+        assert!(
+            !rl.slow_start,
+            "a zero-delivery window must leave the dedicated fast start"
+        );
+        assert!(
+            rl.send_rate.get() > 0.0 && rl.send_rate.get().is_finite(),
+            "the settled rate must stay positive and finite, got {}",
+            rl.send_rate.get()
+        );
+        assert!(
+            rl.send_rate.get() <= ramped,
+            "a zero-delivery settle must not raise the rate"
         );
     }
 

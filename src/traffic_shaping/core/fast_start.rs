@@ -38,8 +38,9 @@ pub(crate) enum FastStartStep {
     /// Delivery kept growing: ramp toward this target (already floored at the
     /// rate that was paced).
     Ramp(f64),
-    /// Delivery plateaued at capacity: leave fast start and settle at this
-    /// delivered rate.
+    /// Delivery plateaued at capacity (or a window delivered nothing): leave
+    /// fast start and settle at this rate. A zero-delivery window settles at
+    /// the paced rate, never at zero.
     Plateau(f64),
 }
 
@@ -99,6 +100,17 @@ impl FastStart {
         let delivered = self.window_acked as f64 / elapsed.as_secs_f64();
         self.window_start = now;
         self.window_acked = 0;
+
+        // A window can close with no freshly-acknowledged packets: an idle
+        // gap, an all-lost flight, or a duplicate/coalesced ACK. Zero
+        // delivery is neither a capacity plateau nor a rate to settle at, and
+        // a transient non-finite computation is equally unusable. Leave slow
+        // start at the rate that was actually being paced and leave the
+        // two-window baselines untouched, so a resumed flow is compared
+        // against the last window that really delivered data.
+        if delivered <= 0.0 || !delivered.is_finite() {
+            return FastStartStep::Plateau(current_rate);
+        }
 
         // The first two measured windows are bootstrap: there is no
         // two-windows-past delivery to compare against.  A delivery plateau
@@ -210,6 +222,39 @@ mod tests {
             FastStartStep::Plateau(rate) => assert!((rate - 1100.0).abs() < 1.0),
             other => panic!("expected Plateau, got {other:?}"),
         }
+    }
+
+    /// A window that closes with no freshly-acknowledged packets must not be
+    /// reported as a zero-rate plateau: zero delivery is an idle gap, an
+    /// all-lost flight, or a duplicate/coalesced ACK, not evidence that the
+    /// pipe is full. The plateau must instead settle at the rate that was
+    /// actually being paced; the previous `Plateau(0.0)` reached the caller's
+    /// `PosR` construction and panicked the transport worker.
+    #[test]
+    fn zero_delivery_window_settles_at_the_paced_rate() {
+        let t0 = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let mut fs = FastStart::new(t0);
+        let mut now = t0;
+        // Seed the window, then close two real windows so the two-windows-past
+        // delivery baseline is populated and a plateau is classifiable.
+        assert_eq!(fs.on_ack(0, now, rtt, 128.0), FastStartStep::Hold);
+        for _ in 0..2 {
+            now += rtt;
+            assert!(matches!(
+                fs.on_ack(100, now, rtt, 128.0),
+                FastStartStep::Ramp(_)
+            ));
+        }
+        // The third window delivers nothing: settle at the paced rate, never
+        // at zero.
+        now += rtt;
+        let step = fs.on_ack(0, now, rtt, 128.0);
+        assert_eq!(
+            step,
+            FastStartStep::Plateau(128.0),
+            "a zero-delivery window must settle at a valid positive rate"
+        );
     }
 
     /// A window shorter than one control RTT holds the rate.
