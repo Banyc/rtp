@@ -1105,13 +1105,19 @@ impl ReliableLayer {
         );
         if self.slow_start {
             if self.congestion_response.dedicated() {
-                // The dedicated fast start exits on any loss or on a built
-                // queue. The stock probe-target and app-limited exits would
-                // fire on the first sample, before the ramp has begun, so the
-                // windowed ACK-clock (in `recv_ack_pkt`) owns the ramp and its
-                // own delivery-plateau exit.
-                let any_loss = loss_event_rate.is_some_and(|loss| loss > 0.0);
-                if observation.loss_blocks_delay_control || any_loss || observation.queue_building {
+                // The dedicated fast start exits on a congestion loss or on a
+                // built queue. The stock probe-target and app-limited exits
+                // would fire on the first sample, before the ramp has begun,
+                // so the windowed ACK-clock (in `recv_ack_pkt`) owns the ramp
+                // and its own delivery-plateau exit. A lone non-congestion
+                // (iid) loss is not a capacity signal: keep the bounded ramp
+                // alive so it settles at the delivered plateau instead of
+                // aborting to the ordinary probe's overshoot/drain. Settling
+                // the paced rate at the instantaneous delivery sample here
+                // would halve the pace on every loss (the sample lags the pace
+                // by about one control RTT) and strand the ramp below
+                // capacity.
+                if observation.loss_blocks_delay_control || observation.queue_building {
                     self.slow_start = false;
                     self.congestion_response.clear_delivery_peak(now);
                 }
@@ -2551,6 +2557,49 @@ mod tests {
         assert!(
             rl.send_rate.get() <= ramped,
             "a zero-delivery settle must not raise the rate"
+        );
+    }
+
+    /// A lone non-congestion (iid) loss must not abort the dedicated fast
+    /// start. A single loss among many deliveries is a loss rate far below the
+    /// 20% congestion threshold: the ramp settles at the windowed delivered
+    /// rate and keeps running, so it reaches the delivered plateau instead of
+    /// handing off to the ordinary probe's overshoot/drain.
+    #[test]
+    fn dedicated_fast_start_survives_a_lone_iid_loss() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_dedicated(t0);
+        let rtt = Duration::from_millis(100);
+        let mut t = t0;
+        // Seed the window, close one full-delivery window so the ramp is
+        // running, then record a lone iid loss and close the next window.
+        // The two-window-past baseline is still unset, so the delivery
+        // plateau cannot fire and the loss branch is what is exercised.
+        for i in 0..3 {
+            send_max(&mut rl, t);
+            t += rtt;
+            if i == 2 {
+                // One iid loss among many deliveries is a rate far below the
+                // 20% congestion threshold.
+                rl.pkt_send_space.inject_loss_event(t);
+            }
+            ack_all(&mut rl, Some(rtt), t);
+            t += Duration::from_nanos(1);
+        }
+
+        assert!(
+            rl.slow_start,
+            "a lone iid loss must not abort the dedicated fast start"
+        );
+        assert!(
+            rl.send_rate.get() > 0.0 && rl.send_rate.get().is_finite(),
+            "the settled rate must stay positive and finite, got {}",
+            rl.send_rate.get()
+        );
+        assert!(
+            rl.congestion_loss_ratio().is_some_and(|loss| loss < 0.2),
+            "the injected loss must be classified as non-congestion, got {:?}",
+            rl.congestion_loss_ratio()
         );
     }
 
