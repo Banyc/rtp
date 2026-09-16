@@ -65,19 +65,32 @@ pub(super) enum ResponsePath {
     LossBackoff,
 }
 
+/// Choose the controller branch for one sample.
+///
+/// A loss block always wins so loss backoff is never suppressed.  When the
+/// rate sample is *application-limited* on a shared lane, the sender had less
+/// queued than the pipe could carry, so any standing delay is cross-traffic's
+/// queue rather than this lane's: the delay controller must not drain its own
+/// send rate in response.  Probing is still allowed (it never lowers the
+/// rate), so the lane can recover from an earlier drain without the
+/// drain/hold oscillation that starves a sparse interactive lane sharing a
+/// bottleneck with bulk traffic.  A dedicated lane passes `false`: it has no
+/// competing traffic over its queue, so a standing delay is its own queue and
+/// the ordinary drain applies.
 pub(super) fn select_path(
     queue_building: bool,
     persistent_queue: bool,
     loss_blocks_delay_control: bool,
+    shared_app_limited: bool,
 ) -> ResponsePath {
-    if !loss_blocks_delay_control && !queue_building {
-        ResponsePath::Probe
-    } else if !loss_blocks_delay_control && !persistent_queue {
-        ResponsePath::Hold
-    } else if !loss_blocks_delay_control {
-        ResponsePath::Drain
-    } else {
+    if loss_blocks_delay_control {
         ResponsePath::LossBackoff
+    } else if shared_app_limited || !queue_building {
+        ResponsePath::Probe
+    } else if !persistent_queue {
+        ResponsePath::Hold
+    } else {
+        ResponsePath::Drain
     }
 }
 
@@ -88,14 +101,34 @@ mod tests {
     #[test]
     fn response_path_encodes_the_controller_precedence() {
         // Probe when no loss block and no queue.
-        assert_eq!(select_path(false, false, false), ResponsePath::Probe);
+        assert_eq!(select_path(false, false, false, false), ResponsePath::Probe);
         // Hold for a transient (non-persistent) queue.
-        assert_eq!(select_path(true, false, false), ResponsePath::Hold);
+        assert_eq!(select_path(true, false, false, false), ResponsePath::Hold);
         // Drain for a persistent queue.
-        assert_eq!(select_path(true, true, false), ResponsePath::Drain);
+        assert_eq!(select_path(true, true, false, false), ResponsePath::Drain);
+        // An application-limited *shared* sample cannot attribute the standing
+        // delay to this lane, so a persistent queue must not drain; probing
+        // keeps the lane able to recover.  A dedicated lane passes `false` and
+        // keeps the ordinary drain.
+        assert_eq!(select_path(true, true, false, true), ResponsePath::Probe);
+        assert_eq!(select_path(true, false, false, true), ResponsePath::Probe);
         // LossBackoff wins whenever loss blocks delay control.
-        assert_eq!(select_path(false, false, true), ResponsePath::LossBackoff);
-        assert_eq!(select_path(true, false, true), ResponsePath::LossBackoff);
-        assert_eq!(select_path(true, true, true), ResponsePath::LossBackoff);
+        assert_eq!(
+            select_path(false, false, true, false),
+            ResponsePath::LossBackoff
+        );
+        assert_eq!(
+            select_path(true, false, true, false),
+            ResponsePath::LossBackoff
+        );
+        assert_eq!(
+            select_path(true, true, true, false),
+            ResponsePath::LossBackoff
+        );
+        // ...and app-limited does not suppress it either.
+        assert_eq!(
+            select_path(true, true, true, true),
+            ResponsePath::LossBackoff
+        );
     }
 }

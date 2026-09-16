@@ -1069,6 +1069,7 @@ impl ReliableLayer {
                 smooth_rtt: smooth,
                 control_rtt,
                 loss_event_rate,
+                app_limited: sr.is_app_limited(),
                 minimum_rate: MIN_SEND_RATE,
                 initial_rate: INIT_SEND_RATE,
                 now,
@@ -2159,6 +2160,36 @@ mod tests {
         }
     }
 
+    /// Like [`send_one`] but keeps at least one full packet staged after the
+    /// send, so the lane is never application-limited at the following ACK.
+    ///
+    /// The delay controller only drains a lane that actually has a
+    /// self-inflicted queue: an application-limited sender has less queued
+    /// than the pipe can carry, so a standing delay belongs to cross-traffic
+    /// and the drain path is (correctly) skipped.  Gentle-mode drain tests
+    /// therefore must drive a *backlogged* lane, which is the only kind that
+    /// can build its own queue.  One packet is sent per call so the per-round
+    /// timing the tests rely on is preserved.
+    fn send_queued(rl: &mut super::ReliableLayer, now: Instant) -> crate::sequence::SequenceNumber {
+        let payload_len = rl.max_data_size_per_pkt();
+        while rl.send_data_buf.len() < 2 * payload_len {
+            let free = rl.send_data_buf.capacity() - rl.send_data_buf.len();
+            if free < payload_len {
+                break;
+            }
+            let payload = vec![0u8; payload_len];
+            assert_eq!(rl.send_data_buf(&payload, now).unwrap(), payload_len);
+        }
+        let mut pkt = vec![0u8; TEST_MSS];
+        let p = rl
+            .send_data_pkt(&mut pkt, now)
+            .expect("send_data_pkt must send");
+        match p.data_written {
+            super::DataPktPayload::Data(_) => p.seq,
+            _ => panic!("expected data packet"),
+        }
+    }
+
     #[test]
     fn fin_latches_stock_and_frame_staging_closed() {
         let now = Instant::now();
@@ -2518,7 +2549,7 @@ mod tests {
         // Settle the RTT floor around 600 ms by feeding long-RTT samples.
         let mut t = t0;
         for _ in 0..8 {
-            let seq = send_one(&mut rl, t);
+            let seq = send_queued(&mut rl, t);
             t += Duration::from_millis(700);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(600), t);
         }
@@ -2535,7 +2566,7 @@ mod tests {
         t += Duration::from_millis(1);
         let enter_start = t;
         loop {
-            let seq = send_one(&mut rl, t);
+            let seq = send_queued(&mut rl, t);
             t += Duration::from_millis(1100);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(1000), t);
             if rl.congestion_response.queue_growth().gentle_mode() {
@@ -2586,7 +2617,7 @@ mod tests {
         let guard_start = t;
         let mut guard_fired = false;
         for _ in 0..20 {
-            let seq = send_one(&mut rl, t);
+            let seq = send_queued(&mut rl, t);
             t += Duration::from_millis(1100);
             let guard_exit =
                 ack_seq_observed(&mut rl, seq.to_wire(), Duration::from_millis(1000), t);
@@ -2728,7 +2759,7 @@ mod tests {
         // Converge SRTT quickly with a burst of identical high-RTT samples
         // while the floor is still the warm-up 200 ms value.
         for _ in 0..6 {
-            let seq = send_one(&mut rl, t);
+            let seq = send_queued(&mut rl, t);
             t += Duration::from_millis(250);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(200), t);
         }
@@ -2736,7 +2767,7 @@ mod tests {
         t += Duration::from_millis(1);
         let enter_start = t;
         loop {
-            let seq = send_one(&mut rl, t);
+            let seq = send_queued(&mut rl, t);
             t += Duration::from_millis(900);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
             if rl.congestion_response.queue_growth().gentle_mode() {
@@ -2749,7 +2780,7 @@ mod tests {
         }
         let guard_start = t;
         loop {
-            let seq = send_one(&mut rl, t);
+            let seq = send_queued(&mut rl, t);
             t += Duration::from_millis(900);
             ack_seq(&mut rl, seq.to_wire(), Duration::from_millis(800), t);
             if !rl.congestion_response.queue_growth().gentle_mode() {
@@ -2767,7 +2798,7 @@ mod tests {
 
         // Make forward progress so outage detection is eligible, then let the
         // next packet stall for two RTOs and trigger an outage reset.
-        let progress_seq = send_one(&mut rl, t);
+        let progress_seq = send_queued(&mut rl, t);
         t += Duration::from_millis(50);
         ack_seq(
             &mut rl,
@@ -2776,7 +2807,7 @@ mod tests {
             t,
         );
 
-        let stall_seq = send_one(&mut rl, t);
+        let stall_seq = send_queued(&mut rl, t);
         let _ = stall_seq;
         let rto = rl.pkt_send_space.rto_duration();
         let detect_t = t + rto * 2 + Duration::from_millis(1);

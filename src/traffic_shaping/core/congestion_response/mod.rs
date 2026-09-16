@@ -45,6 +45,11 @@ pub(crate) struct CongestionInput {
     pub(crate) smooth_rtt: Duration,
     pub(crate) control_rtt: Duration,
     pub(crate) loss_event_rate: Option<f64>,
+    /// Whether the transport flagged this rate sample as application-limited:
+    /// the sender had less queued than the pipe could carry.  Consulted only
+    /// for a shared lane, where it means a standing delay cannot be attributed
+    /// to this lane's own queue.
+    pub(crate) app_limited: bool,
     pub(crate) minimum_rate: f64,
     pub(crate) initial_rate: f64,
     pub(crate) now: Instant,
@@ -120,10 +125,16 @@ impl CongestionResponse {
         observation: CongestionObservation,
         input: CongestionInput,
     ) -> CongestionOutcome {
+        // An application-limited sample can only be *another* flow's queue on
+        // a shared lane: a dedicated lane has no competing traffic over its
+        // queue, so a standing delay there is its own queue and the ordinary
+        // drain applies even when the sender is briefly starved.
+        let shared_app_limited = input.app_limited && self.lane == CongestionLane::Shared;
         let path = select_path(
             observation.queue_building,
             observation.persistent_for.is_some(),
             observation.loss_blocks_delay_control,
+            shared_app_limited,
         );
         if path != ResponsePath::Probe {
             self.queue_growth.clear_gate_open();
@@ -381,6 +392,7 @@ mod tests {
             smooth_rtt: queue_smooth,
             control_rtt,
             loss_event_rate: Some(0.0),
+            app_limited: false,
             minimum_rate: 1.0,
             initial_rate: 128.0,
             now,
@@ -463,6 +475,7 @@ mod tests {
             smooth_rtt: floor,
             control_rtt,
             loss_event_rate: Some(0.0),
+            app_limited: false,
             minimum_rate: 1.0,
             initial_rate: 128.0,
             now: probe_at,
