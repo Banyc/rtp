@@ -345,22 +345,31 @@ mod tests {
             t0,
             control_rtt,
         );
-        let _ = dedicated.observe(
-            queue_smooth,
-            jitter,
-            Some(0.0),
-            delivery_rate,
-            queue_start,
-            control_rtt,
-        );
-        let _ = shared.observe(
-            queue_smooth,
-            jitter,
-            Some(0.0),
-            delivery_rate,
-            queue_start,
-            control_rtt,
-        );
+        // A standing queue produces a rate sample every control RTT, not one
+        // observation straddling the whole entry stretch: feed the queue at
+        // the cadence a backlogged lane would, so the persistent-queue timer
+        // accumulates continuously (an observation gap as long as the entry
+        // stretch legitimately breaks the episode and restarts the timer).
+        let mut t = queue_start;
+        while t < enter_at {
+            let _ = dedicated.observe(
+                queue_smooth,
+                jitter,
+                Some(0.0),
+                delivery_rate,
+                t,
+                control_rtt,
+            );
+            let _ = shared.observe(
+                queue_smooth,
+                jitter,
+                Some(0.0),
+                delivery_rate,
+                t,
+                control_rtt,
+            );
+            t += control_rtt;
+        }
         let dedicated_obs = dedicated.observe(
             queue_smooth,
             jitter,
@@ -450,6 +459,14 @@ mod tests {
                 t0 + Duration::from_millis(1),
                 control_rtt,
             );
+            // Backlogged cadence: one observation per control RTT (see the
+            // drain-fraction test), so the persistent-queue timer accumulates
+            // continuously and gentle mode enters before `enter_at`.
+            let mut t = t0 + Duration::from_millis(1) + control_rtt;
+            while t < enter_at {
+                let _ = c.observe(queued, jitter, Some(0.0), established_peak, t, control_rtt);
+                t += control_rtt;
+            }
             let _ = c.observe(
                 queued,
                 jitter,
