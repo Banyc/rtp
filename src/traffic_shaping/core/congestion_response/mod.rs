@@ -7,14 +7,16 @@
 //! a loss sample blocks every delay-control branch.
 use std::time::{Duration, Instant};
 
-use super::gentle::{DRAIN_RATE_FRACTION, GentleExitCause, GentleProbeOutcome};
-use super::{CongestionLane, OrdinaryBandwidthProbe, QueueGrowth, WindowedDeliveryMax};
+use super::gentle::{GentleExitCause, GentleProbeOutcome};
+use super::{OrdinaryBandwidthProbe, QueueGrowth, WindowedDeliveryMax};
 use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 use decision::{ResponsePath, select_path};
+use lane::{CongestionLane, peak_scaled_probe_base};
 use loss_backoff::{LossBackoff, LossBackoffInput};
 use queue_response::{DrainInput, QueueResponse};
 
 mod decision;
+pub(crate) mod lane;
 mod loss_backoff;
 mod queue_response;
 
@@ -146,7 +148,7 @@ impl CongestionResponse {
         // a shared lane: a dedicated lane has no competing traffic over its
         // queue, so a standing delay there is its own queue and the ordinary
         // drain applies even when the sender is briefly starved.
-        let shared_app_limited = input.app_limited && self.lane == CongestionLane::Shared;
+        let shared_app_limited = self.lane.app_limited_means_cross_traffic(input.app_limited);
         let path = select_path(
             observation.queue_building,
             observation.persistent_for.is_some(),
@@ -164,7 +166,7 @@ impl CongestionResponse {
             ResponsePath::Probe => {
                 self.queue_response.reset();
                 let probe_base =
-                    self.gentle_probe_base(input.delivery_rate, observation.peak_delivery);
+                    peak_scaled_probe_base(input.delivery_rate, observation.peak_delivery);
                 match self.queue_growth.probe(
                     probe_base,
                     input.current_rate,
@@ -247,7 +249,7 @@ impl CongestionResponse {
 
     /// Whether this connection declared the dedicated bulk lane.
     pub(crate) fn dedicated(&self) -> bool {
-        self.lane == CongestionLane::Dedicated
+        self.lane.owns_fast_start()
     }
 
     /// The stale-peak protection floor is currently limiting a drain.
@@ -281,29 +283,12 @@ impl CongestionResponse {
         )
     }
 
-    /// Delivery rate the gentle probe scales toward its next target.
-    ///
-    /// The instantaneous delivery sample is depressed by the controller's own
-    /// drain, so probing from it ramps the lane back to line rate one feedback
-    /// sample at a time and leaves the pipe idle for most of the recovery lag.
-    /// The recent delivery peak still remembers the established capacity, so
-    /// the probe scales from the peak and refills the pipe within a sample.
-    /// This is queue-depth-neutral (the peak and average standing-queue depth
-    /// are unchanged), so it applies to every lane.
-    fn gentle_probe_base(&self, delivery_rate: f64, peak_delivery: f64) -> f64 {
-        delivery_rate.max(peak_delivery)
-    }
-
     /// The drain fraction for the current lane.  A [`CongestionLane::Dedicated`]
     /// lane has no cross-traffic to protect and drains at the ordinary
     /// fraction; a [`CongestionLane::Shared`] lane uses gentle mode's deeper
     /// fraction while gentle mode is active.
     fn drain_fraction(&self) -> f64 {
-        if self.lane == CongestionLane::Dedicated {
-            DRAIN_RATE_FRACTION
-        } else {
-            self.queue_growth.drain_frac()
-        }
+        self.queue_growth.drain_frac()
     }
 
     #[cfg(test)]

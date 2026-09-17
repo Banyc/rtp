@@ -4,22 +4,15 @@ use super::CongestionLane;
 use super::bandwidth_probe::loss_scaled_gain;
 use super::idle_gap::{IdleContinuity, idle_gap_threshold};
 
+#[cfg(test)]
+pub(crate) use super::congestion_response::lane::{
+    DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN, GENTLE_DRAIN_FRAC,
+};
+
 // Gentle-mode parameters for the delay-gated congestion controller.  These are
 // intentionally conservative: they let a bulk flow drain a self-inflicted
 // droptail bottleneck without driving the delay gate so hard that interactive
 // cross-traffic keeps getting tail-dropped.
-pub(crate) const GENTLE_BW_PROBE_GAIN: f64 = 0.20;
-
-/// Gentle-mode multiplicative probe gain for the dedicated bulk lane.  The
-/// lane has no cross-traffic to protect, so it can afford to creep toward
-/// capacity instead of probing `1.2x` every cycle: a smaller overshoot
-/// stretches each probe phase, spending less of the window in the drain/
-/// transition overhead that costs link time at every sawtooth turn while
-/// leaving the standing queue's peak and average depth unchanged.
-pub(crate) const DEDICATED_GENTLE_BW_PROBE_GAIN: f64 = 0.02;
-
-pub(crate) const GENTLE_DRAIN_FRAC: f64 = 0.75;
-
 pub(crate) const GENTLE_ADD_PKTS: f64 = 4.0;
 pub(crate) const GENTLE_ENTER_RTTS: f64 = 3.0;
 pub(crate) const GENTLE_ENTER_MIN: Duration = Duration::from_secs(1);
@@ -29,7 +22,6 @@ pub(crate) const GENTLE_DRAIN_CHECK_RTTS: f64 = 12.0;
 pub(crate) const GENTLE_DRAIN_GAP_SHRINK: f64 = 0.85;
 
 pub(crate) const GENTLE_REENTRY_COOLDOWN: Duration = Duration::from_secs(15);
-pub(crate) const DRAIN_RATE_FRACTION: f64 = 0.9;
 
 /// Exact controller transition that ended one gentle-mode episode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,12 +219,9 @@ impl GentleMode {
             // Scale the multiplicative gain by the survival fraction so a
             // loss-suppressed delivery rate does not compound the full
             // gentle gain either.  At zero loss the historical 1.2x holds; the
-            // dedicated lane instead uses its shallower gain.
-            let gain = if self.lane == CongestionLane::Dedicated {
-                DEDICATED_GENTLE_BW_PROBE_GAIN
-            } else {
-                GENTLE_BW_PROBE_GAIN
-            };
+            // lane supplies its own gain (the dedicated lane creeps at a
+            // shallower one).
+            let gain = self.lane.gentle_probe_gain();
             let probed = delivery_rate * (1.0 + loss_scaled_gain(gain, loss_event_rate));
             let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
             let target = (probed + additive).max(send_rate);
@@ -242,11 +231,7 @@ impl GentleMode {
 
     /// Get the drain fraction - gentle mode drains more conservatively.
     pub(crate) fn drain_frac(&self) -> f64 {
-        if self.gentle_mode {
-            GENTLE_DRAIN_FRAC
-        } else {
-            DRAIN_RATE_FRACTION
-        }
+        self.lane.drain_fraction(self.gentle_mode)
     }
 
     /// Update the drain-episode guard in gentle mode.
