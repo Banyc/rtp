@@ -1,15 +1,12 @@
 mod bandwidth_probe;
 mod congestion_response;
 mod fast_start;
-mod gate_jitter;
 mod gentle;
 mod idle_gap;
 mod pacing;
-mod probe_cap;
 mod queue_growth;
 mod rate_bridge;
 mod rate_window;
-mod reorder_floor;
 mod spare_capacity;
 
 pub(crate) use bandwidth_probe::{ORDINARY_PROBE_MAX_GAIN, OrdinaryBandwidthProbe};
@@ -18,14 +15,19 @@ pub(crate) use congestion_response::{
     CongestionDecision, CongestionInput, CongestionResponse, ProbeKind, linear_backoff_step,
 };
 pub(crate) use fast_start::{FastStartEpisode, FastStartStep, should_exit_slow_start};
-pub(crate) use gate_jitter::select_gate_jitter;
 pub(crate) use gentle::GentleExitCause;
 pub(crate) use pacing::{SendPacer, SendWake};
-pub(crate) use probe_cap::cap_probe_target;
 pub(crate) use queue_growth::QueueGrowth;
 pub(crate) use rate_bridge::settle_computed_rate;
 pub(crate) use rate_window::WindowedDeliveryMax;
 pub(crate) use spare_capacity::{has_spare_capacity, has_spare_capacity_interactive};
+
+// The reorder-lane policy that selects among these estimators' outputs now
+// lives in `recovery::reorder_tolerance`; re-exported here so the existing
+// `core::…` call sites keep resolving.
+pub(crate) use crate::traffic_shaping::recovery::reorder_tolerance::{
+    cap_probe_target, select_gate_jitter,
+};
 
 #[cfg(test)]
 pub(crate) use congestion_response::DRAIN_FLOOR_PEAK_FRACTION;

@@ -13,9 +13,11 @@ use super::CongestionLane;
 use super::gentle::DrainEpisode;
 use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
 use super::idle_gap::{IdleGap, QueueGrowthContinuity};
-use super::reorder_floor::{FloorBucket, floor_bucket};
+use crate::traffic_shaping::recovery::reorder_tolerance::{FloorBucket, floor_bucket};
 
-pub(crate) use super::reorder_floor::{RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE};
+pub(crate) use crate::traffic_shaping::recovery::reorder_tolerance::{
+    RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE,
+};
 
 pub(crate) const QUEUE_RTT_FACTOR: f64 = 2.0;
 /// The persistent-queue timer uses a wider RTT-variance margin than the

@@ -1,6 +1,6 @@
 //! Reorder-tolerant lane probe-target cap.
 
-use super::ORDINARY_PROBE_MAX_GAIN;
+use crate::traffic_shaping::core::ORDINARY_PROBE_MAX_GAIN;
 
 /// Bound one probe target.  On the reorder-tolerant interactive lane a
 /// reorder-inflated delivery-rate sample may not raise the rate by more than
