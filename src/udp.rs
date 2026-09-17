@@ -573,7 +573,7 @@ impl AcceptSetup {
     /// always selects frame mode regardless of `AcceptConfig::frame_delivery`
     /// but must still honour `FrameMode::allow_reorder`.
     fn force_frame_delivery(mut self) -> Self {
-        self.frame_delivery.enabled = true;
+        self.frame_delivery = self.frame_delivery.with_enabled(true);
         self
     }
 }
@@ -762,10 +762,7 @@ impl FrameDeliveryIo {
             bind,
             addr,
             ConnectConfig {
-                frame_delivery: FrameMode {
-                    enabled: true,
-                    ..config.frame_delivery
-                },
+                frame_delivery: config.frame_delivery.with_enabled(true),
                 ..config
             },
         )
@@ -789,10 +786,7 @@ impl FrameDeliveryIo {
             socket,
             addr,
             ConnectConfig {
-                frame_delivery: FrameMode {
-                    enabled: true,
-                    ..config.frame_delivery
-                },
+                frame_delivery: config.frame_delivery.with_enabled(true),
                 ..config
             },
         )
@@ -1668,6 +1662,39 @@ mod tests {
     fn mss_config_resolves_default_and_custom_values() {
         assert_eq!(MssConfig::Default.resolve().unwrap().get(), NO_FEC_MSS);
         assert_eq!(MssConfig::Custom(9_000).resolve().unwrap().get(), 9_000);
+    }
+
+    /// `accept_frame_delivery` forces frame mode on through
+    /// [`FrameMode::with_enabled`], so a config that opted into the
+    /// receiver-side fast-forward keeps `allow_reorder`.
+    #[test]
+    fn force_frame_delivery_preserves_allow_reorder() {
+        let setup = AcceptSetup {
+            handshake: false,
+            fec: false,
+            mss: Mss::try_new(NO_FEC_MSS).unwrap(),
+            tuning: FecTuning::default(),
+            frame_delivery: crate::delivery::frame::mode::FrameMode::enabled_reordering(),
+            congestion_lane: CongestionLane::default(),
+            retransmission_armor: RetransmissionArmorConfig::default(),
+            instream_group_fec: false,
+            metrics_observer: None,
+        };
+        let forced = setup.force_frame_delivery();
+        assert!(forced.frame_delivery.enabled, "frame delivery must be on");
+        assert!(
+            forced.frame_delivery.allow_reorder,
+            "the receiver's fast-forward opt-in must survive the force-on"
+        );
+
+        // The strictly-ordered config stays strict when forced on.
+        let strict = AcceptSetup {
+            frame_delivery: crate::delivery::frame::mode::FrameMode::default(),
+            ..forced
+        }
+        .force_frame_delivery();
+        assert!(strict.frame_delivery.enabled);
+        assert!(!strict.frame_delivery.allow_reorder);
     }
 
     #[tokio::test(flavor = "multi_thread")]
