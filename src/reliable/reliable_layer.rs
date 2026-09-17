@@ -934,7 +934,7 @@ impl ReliableLayer {
             self.slow_start_acked_pkts = 0;
             self.fast_start.reset(now);
             self.last_congestion_loss_ratio = None;
-            self.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), now);
+            self.set_send_rate(INIT_SEND_RATE, now);
             self.last_congestion_action =
                 Some(crate::metrics::MetricsCongestionAction::OutageReset);
             // Congestion-epoch boundary: clear the controller interval state
@@ -973,11 +973,7 @@ impl ReliableLayer {
                     match self.fast_start.on_ack(fresh, now, control_rtt, current) {
                         FastStartStep::Hold => {}
                         FastStartStep::Ramp(target) => {
-                            // `target` is floored at the current rate, so it is
-                            // always a valid positive rate already; the fallback
-                            // only keeps a future non-finite target from
-                            // panicking the transport worker.
-                            self.set_send_rate(PosR::new(target).unwrap_or(self.send_rate), now);
+                            self.set_send_rate(target, now);
                             self.last_congestion_action =
                                 Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
                         }
@@ -985,13 +981,9 @@ impl ReliableLayer {
                             self.slow_start = false;
                             // A zero-delivery window (idle gap, all-lost flight,
                             // duplicate/coalesced ACK) and any non-finite
-                            // computation are not rates to settle at, and `PosR`
-                            // rejects them. The ACK-clock already substitutes the
-                            // paced rate in that case; this fallback is the guard
-                            // that keeps `PosR::new(0.0).unwrap()` from panicking
-                            // the worker on any future regression.
-                            let settled = PosR::new(delivered).unwrap_or(self.send_rate);
-                            self.set_send_rate(settled, now);
+                            // computation are not rates to settle at; the
+                            // setter substitutes the live rate in that case.
+                            self.set_send_rate(delivered, now);
                             // A burst of ACKs during the ramp can inflate the
                             // tracked delivery peak; drop it so the gentle probe
                             // cannot use it as a base and creep back over capacity.
@@ -1004,8 +996,7 @@ impl ReliableLayer {
             } else {
                 self.slow_start_acked_pkts += self.pkt_send_space.fresh_acked_count();
                 let ss_rate = self.slow_start_acked_pkts as f64 / self.control_rtt().as_secs_f64();
-                let ss_rate = PosR::new(ss_rate.max(self.send_rate.get())).unwrap();
-                self.set_send_rate(ss_rate, now);
+                self.set_send_rate(ss_rate.max(self.send_rate.get()), now);
                 self.last_congestion_action =
                     Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
             }
@@ -1181,11 +1172,8 @@ impl ReliableLayer {
                     control_rtt,
                     CWND_SEND_RATE_SCALE,
                 ) {
-                    Some(new_rate) => self.set_send_rate(PosR::new(new_rate).unwrap(), now),
-                    None => {
-                        let send_rate = PosR::new(self.send_rate.get()).unwrap();
-                        self.set_send_rate(send_rate, now);
-                    }
+                    Some(new_rate) => self.set_send_rate(new_rate, now),
+                    None => self.set_send_rate(self.send_rate.get(), now),
                 }
             }
             CongestionDecision::LossBackoff { raw, floor, target } => {
@@ -1200,7 +1188,7 @@ impl ReliableLayer {
                         control_rtt,
                         CWND_SEND_RATE_SCALE,
                     ) {
-                        self.set_send_rate(PosR::new(new_rate).unwrap(), now);
+                        self.set_send_rate(new_rate, now);
                     }
                 } else {
                     self.slow_start = false;
@@ -1228,8 +1216,7 @@ impl ReliableLayer {
     fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
         let smooth_send_rate = self.send_rate.get() * (1. - SMOOTH_SEND_RATE_ALPHA)
             + target_send_rate * SMOOTH_SEND_RATE_ALPHA;
-        let send_rate = PosR::new(smooth_send_rate).unwrap();
-        self.set_send_rate(send_rate, now);
+        self.set_send_rate(smooth_send_rate, now);
     }
 
     /// Linear backoff on unrecovered huge data loss.
@@ -1251,7 +1238,7 @@ impl ReliableLayer {
         };
         self.last_congestion_action =
             Some(crate::metrics::MetricsCongestionAction::HugeLossBackoff);
-        self.set_send_rate(PosR::new(new_rate).unwrap(), now);
+        self.set_send_rate(new_rate, now);
     }
 
     /// Original exponential backoff on unrecovered huge data loss.
@@ -1261,8 +1248,7 @@ impl ReliableLayer {
         };
         self.last_congestion_action =
             Some(crate::metrics::MetricsCongestionAction::HugeLossBackoff);
-        let send_rate = PosR::new(self.send_rate.get() / 2.).unwrap();
-        self.set_send_rate(send_rate, now);
+        self.set_send_rate(self.send_rate.get() / 2., now);
     }
 
     /// Shared gate for huge-data-loss backoff. Returns the elapsed time the
@@ -1432,7 +1418,15 @@ impl ReliableLayer {
         );
     }
 
-    fn set_send_rate(&mut self, send_rate: PosR<f64>, now: Instant) {
+    /// Apply a computed sender rate.
+    ///
+    /// This is the single bridge from a computed `f64` into the validated
+    /// positive rate type.  A non-positive or non-finite computation (a
+    /// zero-delivery ACK window, a division by a degenerate interval) is not a
+    /// rate to settle at, so it degrades to the live rate instead of panicking
+    /// the transport worker.  Every computed-rate site hands its raw `f64`
+    /// here, so no call site can carry an unchecked `PosR::new(...).unwrap()`.
+    fn set_send_rate(&mut self, rate: f64, now: Instant) {
         // While an outage-recovery epoch is open every rate writer is clamped
         // to INIT_SEND_RATE until a fresh post-outage sample closes the
         // epoch: the pre-outage backlog must not be released at a stale high
@@ -1440,7 +1434,7 @@ impl ReliableLayer {
         let send_rate = if self.pkt_send_space.in_outage_recovery() {
             PosR::new(INIT_SEND_RATE).unwrap()
         } else {
-            send_rate
+            PosR::new(rate).unwrap_or(self.send_rate)
         };
         // Reapply the rate to the send space even when its numeric value did
         // not change: cwnd also depends on the latest RTT and outage state.
@@ -1792,7 +1786,6 @@ mod tests {
         should_exit_slow_start,
     };
     use crate::delivery::byte_stream::send::send_data_buf_len;
-    use primitive::ops::float::PosR;
 
     const TEST_MSS: usize = 1200;
     use crate::{
@@ -1991,6 +1984,42 @@ mod tests {
         );
         pacer.set_min_burst_for_test(64, now);
         layer
+    }
+
+    /// The sender-rate setter is the single total bridge from a computed
+    /// `f64`: a non-positive or non-finite rate must degrade to the live rate
+    /// instead of panicking the transport worker.  This covers every computed
+    /// ACK/congestion/recovery site, which now hand their raw f64 here.
+    #[test]
+    fn computed_rate_inputs_settle_at_the_live_rate() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let live = 4096.0;
+        rl.set_send_rate(live, t0);
+        assert_eq!(rl.send_rate.get(), live);
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            rl.set_send_rate(bad, t0);
+            assert_eq!(
+                rl.send_rate.get(),
+                live,
+                "a {bad:?} computed rate must settle at the live rate"
+            );
+        }
+    }
+
+    /// The smoothed-probe site is a concrete computed-rate caller: its blend is
+    /// non-finite when the target is, and the setter must still settle at the
+    /// live rate rather than panicking.
+    #[test]
+    fn non_finite_smoothed_target_settles_at_the_live_rate() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        rl.set_send_rate(4096.0, t0);
+        rl.set_smooth_send_rate(f64::NAN, t0);
+        assert_eq!(rl.send_rate.get(), 4096.0);
+        rl.set_smooth_send_rate(f64::INFINITY, t0);
+        assert_eq!(rl.send_rate.get(), 4096.0);
     }
 
     /// A genuine *standing queue* on the reorder-tolerant lane must still be
@@ -3382,10 +3411,7 @@ mod tests {
 
         // A subsequent explicit rate writer is clamped too: the pre-outage
         // backlog must not be released at a stale high rate.
-        rl.set_send_rate(
-            PosR::new(10_000.0).unwrap(),
-            restore_time + Duration::from_millis(1),
-        );
+        rl.set_send_rate(10_000.0, restore_time + Duration::from_millis(1));
         assert_eq!(
             rl.send_rate.get(),
             INIT_SEND_RATE,
@@ -3547,7 +3573,7 @@ mod tests {
         let stalled_at = t + Duration::from_millis(40);
         assert!(send_max(&mut rl, stalled_at) > 0);
         rl.sample_rtt(Duration::from_secs(1), stalled_at);
-        rl.set_send_rate(PosR::new(INIT_SEND_RATE).unwrap(), stalled_at);
+        rl.set_send_rate(INIT_SEND_RATE, stalled_at);
         assert_eq!(rl.send_rate.get(), INIT_SEND_RATE);
         assert!(
             rl.metrics_at(stalled_at).congestion_window_packets > OUTAGE_RECOVERY_CWND,
