@@ -39,4 +39,5 @@ pub(crate) use probe_base::peak_scaled_probe_base;
 #[cfg(test)]
 pub(crate) use tuning::{
     DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN, GENTLE_DRAIN_FRAC,
+    SHARED_ADDITIVE_PROBE_ACCEL, SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION,
 };

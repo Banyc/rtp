@@ -269,11 +269,23 @@ impl CongestionResponse {
         input: CongestionInput,
         gentle_exit: Option<GentleExitCause>,
     ) -> CongestionOutcome {
+        // A sparse, application-limited flow has no competing flow to converge
+        // against and its delivery sample reflects the application's sending,
+        // not the path's capacity; adding headroom on such a sample would
+        // ratchet a periodic flow's rate without bound.  Only a genuinely
+        // backlogged shared flow gets the additive step.
+        let additive = if input.app_limited {
+            0.0
+        } else {
+            self.lane
+                .ordinary_additive_probe_step(input.control_rtt, input.current_rate)
+        };
         let target = self.bandwidth_probe.target(
             input.current_rate,
             input.delivery_rate,
             input.loss_event_rate,
             input.control_rtt,
+            additive,
             input.now,
         );
         CongestionOutcome::new(
@@ -305,7 +317,10 @@ impl CongestionResponse {
 mod tests {
     use std::time::Instant;
 
-    use super::lane::{DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC};
+    use super::lane::{
+        DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC, SHARED_ADDITIVE_PROBE_ACCEL,
+        SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION,
+    };
     use super::*;
     use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 
@@ -612,6 +627,29 @@ mod tests {
         assert!(
             c.queue_growth().gentle_block_until().is_none(),
             "no ineffective-drain cooldown may be minted across an idle gap"
+        );
+    }
+
+    /// The shared lane adds an RTT-scaled additive step to an accepted ordinary
+    /// probe so a starved flow can climb back toward its fair share; the step is
+    /// capped at a fraction of the current rate and the dedicated lane keeps the
+    /// historical purely multiplicative probe.
+    #[test]
+    fn shared_lane_ordinary_probe_adds_an_rtt_scaled_capped_additive_step() {
+        let rtt = Duration::from_millis(40);
+        assert_eq!(
+            CongestionLane::Shared.ordinary_additive_probe_step(rtt, 1000.0),
+            SHARED_ADDITIVE_PROBE_ACCEL * rtt.as_secs_f64(),
+        );
+        assert_eq!(
+            CongestionLane::Shared.ordinary_additive_probe_step(rtt, 50.0),
+            SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION * 50.0,
+            "the additive step must be capped at a fraction of the current rate"
+        );
+        assert_eq!(
+            CongestionLane::Dedicated.ordinary_additive_probe_step(rtt, 1000.0),
+            0.0,
+            "the dedicated lane must keep a purely multiplicative probe"
         );
     }
 }

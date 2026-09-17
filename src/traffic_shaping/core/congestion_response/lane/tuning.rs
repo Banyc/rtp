@@ -6,6 +6,7 @@
 //! against a variant.
 
 use super::CongestionLane;
+use std::time::Duration;
 
 /// Gentle-mode multiplicative probe gain for the shared lane.  A shared lane
 /// keeps the conservative cross-traffic-protecting gain.
@@ -26,7 +27,49 @@ pub(crate) const GENTLE_DRAIN_FRAC: f64 = 0.75;
 /// mode, and that a dedicated lane keeps even while gentle mode is active.
 pub(crate) const DRAIN_RATE_FRACTION: f64 = 0.9;
 
+/// Additive-increase acceleration for the shared lane's ordinary probe, in
+/// rate units per second of path RTT (`pkt/s` per second).
+///
+/// The ordinary probe is purely multiplicative (`delivery * 1.5`), which has no
+/// convergence force: two flows sharing a bottleneck keep whatever rate ratio
+/// they first acquire, so a flow that captured the link early (or a low-RTT
+/// flow whose per-RTT probe fires more often) keeps its share indefinitely.
+/// The shared lane adds this RTT-scaled rate step on every accepted probe so
+/// the increase is a fixed amount per unit time regardless of path RTT, giving
+/// a starved flow an absolute headroom to climb back toward its fair share.  A
+/// dedicated lane has no competing flow to converge against, so it keeps the
+/// historical purely multiplicative probe.
+pub(crate) const SHARED_ADDITIVE_PROBE_ACCEL: f64 = 3000.0;
+
+/// Largest fraction of the current rate the shared lane's additive probe step
+/// may add.
+///
+/// Capping the step at `0.6 * current_rate` bounds the probe target at `1.6x`,
+/// just above the historical `1.5x` multiplicative probe, so a late joiner can
+/// close the fairness gap at an RTT-independent rate without overshooting into
+/// starving the incumbent.  A step of `0.65x` or more occasionally does starve
+/// the incumbent, so the cap stays below that edge.
+pub(crate) const SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION: f64 = 0.6;
+
 impl CongestionLane {
+    /// The additive rate step this lane adds to one accepted ordinary probe.
+    ///
+    /// Expressed as an acceleration times the path's control RTT so the
+    /// per-second increase is RTT-independent, then capped at a fraction of the
+    /// current rate so the probe target stays just above the multiplicative
+    /// probe.  A dedicated lane adds nothing.
+    pub(crate) fn ordinary_additive_probe_step(
+        self,
+        control_rtt: Duration,
+        current_rate: f64,
+    ) -> f64 {
+        match self {
+            Self::Dedicated => 0.0,
+            Self::Shared => (SHARED_ADDITIVE_PROBE_ACCEL * control_rtt.as_secs_f64())
+                .min(SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION * current_rate),
+        }
+    }
+
     /// The multiplicative gain the gentle probe creeps at on this lane.
     pub(crate) fn gentle_probe_gain(self) -> f64 {
         match self {

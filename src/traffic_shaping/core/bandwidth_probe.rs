@@ -50,6 +50,14 @@ impl OrdinaryBandwidthProbe {
 
     /// Return the rate target for one ordinary probe decision.
     ///
+    /// `additive` is the lane's additive-increase step in rate units; the
+    /// multiplicate probe is raised to at least `current + additive` so a
+    /// starving flow can still grow toward its fair share instead of being
+    /// pinned at a fraction of its own (depressed) delivery rate.  The target
+    /// still cannot exceed `current + additive`, and the feedback interval
+    /// still gates every accepted increase.  A dedicated lane passes `0.0`,
+    /// keeping the historical purely multiplicative probe.
+    ///
     /// Targets that cannot raise the current rate do not consume the feedback
     /// interval.  An accepted increase starts a new interval at `now`.
     pub(crate) fn target(
@@ -58,9 +66,10 @@ impl OrdinaryBandwidthProbe {
         delivery_rate: f64,
         loss_event_rate: Option<f64>,
         control_rtt: Duration,
+        additive: f64,
         now: Instant,
     ) -> f64 {
-        let probed = Self::proposed_rate(delivery_rate, loss_event_rate);
+        let probed = Self::proposed_rate(delivery_rate, loss_event_rate).max(current + additive);
         if probed <= current {
             return current;
         }
@@ -100,7 +109,7 @@ mod tests {
         let t0 = Instant::now();
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.0), Duration::from_millis(100), t0),
+            probe.target(100.0, 100.0, Some(0.0), Duration::from_millis(100), 0.0, t0),
             150.0
         );
         assert_eq!(
@@ -109,6 +118,7 @@ mod tests {
                 100.0,
                 Some(0.0),
                 Duration::from_millis(100),
+                0.0,
                 t0 + Duration::from_millis(99),
             ),
             140.0
@@ -119,6 +129,7 @@ mod tests {
                 100.0,
                 Some(0.0),
                 Duration::from_millis(100),
+                0.0,
                 t0 + Duration::from_millis(100),
             ),
             150.0
@@ -130,7 +141,7 @@ mod tests {
         let t0 = Instant::now();
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.0), Duration::from_millis(10), t0),
+            probe.target(100.0, 100.0, Some(0.0), Duration::from_millis(10), 0.0, t0),
             150.0
         );
         assert_eq!(
@@ -139,6 +150,7 @@ mod tests {
                 100.0,
                 Some(0.0),
                 Duration::from_millis(30),
+                0.0,
                 t0 + Duration::from_millis(10),
             ),
             140.0
@@ -149,6 +161,7 @@ mod tests {
                 100.0,
                 Some(0.0),
                 Duration::from_millis(30),
+                0.0,
                 t0 + Duration::from_millis(30),
             ),
             150.0
@@ -160,11 +173,11 @@ mod tests {
         let t0 = Instant::now();
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
-            probe.target(300.0, 100.0, Some(0.0), Duration::from_secs(1), t0),
+            probe.target(300.0, 100.0, Some(0.0), Duration::from_secs(1), 0.0, t0),
             300.0
         );
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), 0.0, t0),
             150.0
         );
     }
@@ -174,12 +187,12 @@ mod tests {
         let t0 = Instant::now();
         let mut probe = OrdinaryBandwidthProbe::new();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), 0.0, t0),
             150.0
         );
         probe.reset();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), 0.0, t0),
             150.0
         );
     }
@@ -190,31 +203,31 @@ mod tests {
         let mut probe = OrdinaryBandwidthProbe::new();
         // At zero loss the historical full gain holds: target = D * 1.5.
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(0.0), Duration::from_secs(1), 0.0, t0),
             150.0
         );
         // A missing loss sample means no evidence of loss: same full gain.
         probe.reset();
         assert_eq!(
-            probe.target(100.0, 100.0, None, Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, None, Duration::from_secs(1), 0.0, t0),
             150.0
         );
         // 10% loss: target = D * (1 + 0.5 * 0.9) = 1.45 D.
         probe.reset();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.1), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(0.1), Duration::from_secs(1), 0.0, t0),
             145.0
         );
         // Loss at the delay-control block threshold: target = 1.4 D.
         probe.reset();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(0.2), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(0.2), Duration::from_secs(1), 0.0, t0),
             140.0
         );
         // A malformed rate above 1 cannot invert the gain: target stays >= D.
         probe.reset();
         assert_eq!(
-            probe.target(100.0, 100.0, Some(2.0), Duration::from_secs(1), t0),
+            probe.target(100.0, 100.0, Some(2.0), Duration::from_secs(1), 0.0, t0),
             100.0
         );
         assert_eq!(
