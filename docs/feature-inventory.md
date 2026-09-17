@@ -446,8 +446,10 @@ force-flush fresh interactive tail.
 ### O4 — CSV `MetricsRow` not extended [HIDDEN gap]
 The rejected-recovered counter (and the widened armor event) were deliberately
 kept out of the CSV trace schema because it changes the pinned header width
-and every reader.  The decision is recorded only in commit a8fb21f's body; the
-code has no TODO.  This is a genuine planned-but-unimplemented gap.
+and every reader.  The decision was recorded only in commit a8fb21f's body; the
+code has no TODO.  The omission was judged deliberate (the row is a
+fixed-width external schema) and is now documented on `MetricsRow` itself, so
+it is no longer an undocumented gap.
 
 ---
 
@@ -525,22 +527,36 @@ These override production decisions when compiled/enabled:
   and it is read per-config, not once per process.  Same pattern for
   `RetransmissionArmorConfig::default()` (`config.rs:35`) whose doctext says
   the config `Default` reads `RTP_RTX_DUP` "exactly once".
+  **Resolved:** `fec_tuning_from_env`, `frame_delivery_from_env`,
+  `RetransmissionArmorConfig::default`, and `instream_group_fec_from_env` now
+  sample the environment once per process through `LazyLock` caches, and the
+  module / field / `udp.rs` docs state that the env only supplies the
+  `Default` (the explicit per-connection field overrides it).
 - **M2 — `pkt_send_space.rs` fast-loss doc vs the `RTP_JITTER_CAP` path.**
   The `fast_loss_armed` doc (`:241`) says "Always-on when armed; there is no
   env toggle — the gates are the safety."  That is true of the fast-loss
   *declaration* gate, but a separate `RTP_JITTER_CAP` toggle changes the
   reorder window that schedules the retransmit; the two are described in
   different files without a cross-reference.
+  **Deferred:** the cross-reference would live in `pkt_send_space.rs`, which a
+  concurrent change owns; it is not closed here.
 - **M3 — `fec.rs` `MAX_DATA_PER_GROUP` doc.**  The doc at `fec.rs:443`
   explicitly says the cap was "documented as a forced-flush point but
   previously unenforced"; R4 now enforces it.  Not a live mismatch, but the
   doc is written as a correction of an earlier claim.
+  **Verified:** the enforcement at `encode_data` is in place (the cap check
+  runs before the push and `force_flush_capped_group` queues the parity), so
+  the comment reads correctly; no change needed.
 
 ## Planned-but-unimplemented gaps observed in the code
 
 - **G1 — CSV trace schema.**  a8fb21f/37f0fa8 deliberately deferred adding
   `rejected_recovered_symbols` (and the widened armor event) to `MetricsRow`;
   only the typed observation schema gained it (O4).  No TODO in code.
+  **Resolved as deliberate:** the omission is now documented on the CSV
+  `MetricsRow` (`transmission_layer.rs`) — the row is a fixed-width external
+  schema, the FEC counters stay in the typed observation, and the armor event
+  is already carried by the generic `op` column.
 - **G2 — Dedicated cold-start app-limited hold.**  Explicitly "evaluated and
   dropped" (`reliable_layer.rs:225-231`); the shared-lane path is the only
   one that exits on app-limited samples.
@@ -554,6 +570,8 @@ These override production decisions when compiled/enabled:
   (`MAX_INTERACTIVE_PARITY_DEPTH`) clamps the depth to the decoder group size;
   the deeper-diversity `max_diversity()` (depth 3) is only safe because of
   this clamp — the coupling is not documented.
+  **Resolved:** the coupling is now documented on
+  `MAX_INTERACTIVE_PARITY_DEPTH` and at the `FecState::new` clamp.
 
 ---
 
