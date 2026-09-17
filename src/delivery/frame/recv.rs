@@ -2,6 +2,7 @@
 
 use primitive::arena::obj_pool::ObjPool;
 
+use super::capture;
 use crate::sequence::{SequenceMap, SequenceNumber};
 
 /// A slot in the receive queue.
@@ -160,21 +161,14 @@ fn find_complete_frame(
         }
         match slot {
             RecvSlot::Data(pkt) => {
-                // A foreign frame start (a packet carrying its own frame_len)
-                // landing exactly on the in-progress frame's next continuation
-                // sequence captures that slot forever: the continuation packet
-                // can never be inserted (recv_bytes treats an occupied slot as
-                // a duplicate), so the in-progress frame can never reassemble.
-                // A legitimate sender never interleaves frames (frame
-                // boundaries are contiguous), so this only arises from a
-                // hostile peer's overlapping frame or a defective sender that
-                // abandoned the frame mid-flight. Abandon the frame the same
-                // way a tombstone inside its range would: record its collected
-                // seqs so the caller can tombstone them and the in-order
-                // cursor can advance past it.
+                // A foreign frame start landing exactly on the in-progress
+                // frame's next continuation captures that slot forever;
+                // record its collected seqs so the caller can tombstone them
+                // and the cursor can advance. See
+                // [`capture::captures_next_continuation`] for the boundary.
                 if let Some(start) = locals.frame_start
                     && pkt.frame_len.is_some()
-                    && seq == locals.frame_end.unwrap().advance(1)
+                    && capture::captures_next_continuation(locals.frame_end, seq)
                 {
                     locals.abandoned.push((start, locals.packet_count));
                     locals.frame_start = None;
@@ -214,27 +208,13 @@ fn find_complete_frame(
                 }
             }
             RecvSlot::Tombstone => {
-                // A tombstone captures a sequence forever (recv_bytes treats
-                // an occupied slot as a duplicate), so a tombstone landing
-                // *exactly* on the in-progress frame's next continuation
-                // means the frame can never reassemble: its retransmission
-                // is swallowed by the tombstone, so the cursor would stay
-                // pinned at the frame's start forever. Record it so the
-                // caller can tombstone its collected seqs and let the cursor
-                // advance.
-                //
-                // A tombstone *beyond* that next continuation lies past a
-                // still-vacant hole inside the frame; it captures nothing the
-                // frame needs yet (the hole can still be filled by an
-                // in-flight or retransmitted packet) and so belongs to a
-                // later frame that was already delivered — notably a frame
-                // fast-forwarded past the hole. Abandoning the earlier frame
-                // here would tombstone its collected packets and lose it
-                // permanently even though its missing symbol later arrives.
-                // Reset the in-progress run instead and keep scanning,
-                // exactly as an absent slot (a hole) does.
+                // A tombstone landing exactly on the frame's next
+                // continuation captures it forever and abandons the frame;
+                // one beyond that point leaves a fillable hole, so it only
+                // resets the in-progress run. See
+                // [`capture::captures_next_continuation`] for the boundary.
                 if let Some(start) = locals.frame_start
-                    && seq == locals.frame_end.unwrap().advance(1)
+                    && capture::captures_next_continuation(locals.frame_end, seq)
                 {
                     locals.abandoned.push((start, locals.packet_count));
                 }
@@ -307,27 +287,9 @@ pub(crate) fn pop_complete_frame(
         *resume = refresh;
         return None;
     };
-    // Ordered-delivery gate. By default a frame may only be handed up when it
-    // begins at the in-order front — the first not-yet-delivered sequence. The
-    // scan skips sequence holes (a missing slot is simply absent from the
-    // map), so without this gate a complete later frame would be delivered
-    // past an unrepaired hole, violating the ordered, gap-free delivery
-    // contract. A complete frame past a hole is WITHHELD: its slots stay in
-    // place and the scan resume cached above makes the next call continue past
-    // it instead of re-walking it. When the hole fills (retransmission or
-    // reordering), the insertion drops the resume and the full rescan
-    // re-finds the frame, now at the front, and delivers it.
-    //
-    // With `allow_reorder` (opt-in receiver-side fast-forward) the complete
-    // frame is delivered even though it starts past the hole. Delivery below
-    // tombstones the frame's sequence numbers exactly as in the strict path,
-    // but `next` is left pinned at the hole: an absent head slot keeps
-    // `collapse_tombstone_prefix` from advancing the cursor, so the ACK
-    // cumulative front and the liveness watchdog are unaffected. When the
-    // hole finally fills, the cursor reaches the frame's tombstones and
-    // collapses them, advancing without redelivering. Consumers that opt in
-    // must restore ordering themselves (e.g. a per-stream reorder buffer);
-    // the default `false` is byte-for-byte the strict behaviour.
+    // Ordered-delivery gate: a complete frame past the in-order front is
+    // withheld unless the opt-in fast-forward lets it through (the front
+    // itself stays pinned). See [`capture::may_deliver_past_front`].
     let Some(mut front) = next else {
         *resume = refresh;
         return None;
@@ -337,7 +299,7 @@ pub(crate) fn pop_complete_frame(
     while matches!(slots.get(&front), Some(RecvSlot::Tombstone)) {
         front = front.advance(1);
     }
-    if frame_start != front && !allow_reorder {
+    if !capture::may_deliver_past_front(frame_start, front, allow_reorder) {
         *resume = refresh;
         return None;
     }
