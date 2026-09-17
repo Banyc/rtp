@@ -77,8 +77,16 @@ pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 const FAST_LOSS_DISABLE_ROUND_TRIPS: u32 = 3;
 
 /// Whether the jitter-tolerant fast-retransmit ("jitter cap") path is
-/// enabled at process startup.  Reads `RTP_JITTER_CAP` once; `1`/`true`
-/// enables it, anything else preserves stock behaviour byte-for-byte.
+/// enabled.  The `RTP_JITTER_CAP` toggle is **default ON**: an unset variable
+/// enables the path, and only an explicit `0` / `false` (case-insensitive)
+/// turns it off to preserve the stock reorder window byte-for-byte.  The
+/// variable is sampled per `PktSendSpace` construction (see
+/// `jitter_cap_from_env`) and stored in its `jitter_cap` field, so a test can
+/// pin the path on or off per instance without racing the process environment.
+///
+/// This toggle is *not* the fast-loss arming switch: it selects the faster
+/// reorder *window* that schedules an already-armed retransmit and defers its
+/// congestion-control loss event; see `PktSendSpace::fast_loss_armed`.
 ///
 /// When enabled, the retransmission of an out-of-order-passed packet is
 /// scheduled on a fast reorder window `srtt + max(rttvar, srtt/4)` (rttvar
@@ -268,8 +276,12 @@ impl PktSendSpace {
     /// bottleneck queue (queueing inflates srtt and rttvar together); the
     /// lifetime minimum RTT is captured while the path is uncongested, so the
     /// min-RTT gate keeps the fast path armed under bulk + loss.  Always-on
-    /// when armed; there is no env toggle — the gates are the safety.  The
-    /// observed-reordering disable is *bounded*: it expires after
+    /// when armed, and gated by no environment variable: the two gates above
+    /// are the whole safety.  (The neighbouring `RTP_JITTER_CAP` toggle is a
+    /// different switch — it is never read here and neither arms nor disarms
+    /// this path; it only selects the faster reorder *window* used to schedule
+    /// an already-armed retransmit.)  The observed-reordering disable is
+    /// *bounded*: it expires after
     /// [`FAST_LOSS_DISABLE_ROUND_TRIPS`] smoothed round trips and is cleared
     /// by the next now-bearing state transition (`ack` / `sample_rtt` /
     /// retransmit), so a clean link re-enables fast loss.
