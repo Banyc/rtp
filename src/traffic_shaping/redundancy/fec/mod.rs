@@ -1,3 +1,7 @@
+pub(crate) mod gate;
+pub(crate) mod in_stream_group;
+pub(crate) mod parity_burst;
+
 use std::{
     cell::Cell,
     collections::VecDeque,
@@ -14,9 +18,9 @@ use fec::{de::FecDecoder, en::FecEncoder};
 use primitive::io::token_bucket::TokenBucket;
 
 #[cfg(test)]
-pub(crate) use super::in_stream_group::parity::INSTREAM_PARITY_PER_GROUP;
-use super::in_stream_group::parity::{self, CapParityStash, InStreamParity};
-pub(crate) use super::in_stream_group::parity::{INSTREAM_DATA_PER_GROUP, MAX_DATA_PER_GROUP};
+pub(crate) use in_stream_group::parity::INSTREAM_PARITY_PER_GROUP;
+use in_stream_group::parity::{self, CapParityStash, InStreamParity};
+pub(crate) use in_stream_group::parity::{INSTREAM_DATA_PER_GROUP, MAX_DATA_PER_GROUP};
 
 const FEC_DEBUG: bool = false;
 

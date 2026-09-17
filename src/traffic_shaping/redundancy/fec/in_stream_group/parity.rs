@@ -7,7 +7,7 @@
 //! group full, how many parity symbols a flush emits, and how much of the
 //! available send budget parity may consume.  The encoder/decoder underlay
 //! that actually encodes the symbols and the token bucket it is paced by stay
-//! in [`super::super::fec`]; only the numeric decision is made here.
+//! in [`super::super`]; only the numeric decision is made here.
 //!
 //! The decision is budget-adaptive and non-destructive: emit as many parity
 //! symbols as the spare-budget share allows (one is enough to recover a

@@ -21,9 +21,9 @@ use crate::traffic_shaping::core::{SendPacer, SendWake};
 use crate::traffic_shaping::redundancy::{
     ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig,
     fec::FecEncoderState,
+    fec::in_stream_group::{CapacityGate, InStreamGroupFlush},
+    fec::parity_burst::PendingParityBurst,
     fec_gate::{FecConditionGate, FecGateDecision, FecLossGateThresholds},
-    in_stream_group::{CapacityGate, InStreamGroupFlush},
-    parity_burst::PendingParityBurst,
 };
 
 /// Shims the fresh-tail armour, which now lives in
