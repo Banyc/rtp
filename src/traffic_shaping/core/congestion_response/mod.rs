@@ -193,7 +193,7 @@ impl CongestionResponse {
             ResponsePath::Drain => {
                 let decision = self.queue_response.decide_drain(DrainInput {
                     delivery_rate: input.delivery_rate,
-                    drain_fraction: self.drain_fraction(),
+                    drain_fraction: self.queue_growth.drain_frac(),
                     peak_delivery: observation.peak_delivery,
                     current_rate: input.current_rate,
                     minimum_rate: input.minimum_rate,
@@ -247,9 +247,9 @@ impl CongestionResponse {
         self.queue_growth.reorder_tolerant()
     }
 
-    /// Whether this connection declared the dedicated bulk lane.
-    pub(crate) fn dedicated(&self) -> bool {
-        self.lane.owns_fast_start()
+    /// The connection's declared congestion lane.
+    pub(crate) fn lane(&self) -> CongestionLane {
+        self.lane
     }
 
     /// The stale-peak protection floor is currently limiting a drain.
@@ -283,14 +283,6 @@ impl CongestionResponse {
         )
     }
 
-    /// The drain fraction for the current lane.  A [`CongestionLane::Dedicated`]
-    /// lane has no cross-traffic to protect and drains at the ordinary
-    /// fraction; a [`CongestionLane::Shared`] lane uses gentle mode's deeper
-    /// fraction while gentle mode is active.
-    fn drain_fraction(&self) -> f64 {
-        self.queue_growth.drain_frac()
-    }
-
     #[cfg(test)]
     pub(crate) fn queue_growth(&mut self) -> &mut QueueGrowth {
         &mut self.queue_growth
@@ -313,7 +305,7 @@ impl CongestionResponse {
 mod tests {
     use std::time::Instant;
 
-    use super::super::gentle::{DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC};
+    use super::lane::{DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC};
     use super::*;
     use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 

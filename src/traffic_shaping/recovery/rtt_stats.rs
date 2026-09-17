@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use super::fast_loss;
 use super::reorder_tolerance::gate_variance::GateVarianceState;
 use super::rto::RtxTimer;
 
@@ -69,7 +68,7 @@ pub(crate) struct RttStats {
     /// smoothed RTT overshooting while a queue drains) is not evidence of
     /// queue growth.  The RTO's two-sided `smooth_rtt_var` counts those
     /// downward excursions and so inflates the gate tolerance on a
-    /// reorder-tolerant lane; [`Self::gate_rtt_var`] caps the gate at twice
+    /// reorder-tolerant lane; [`GateVarianceState::steady`] caps the gate at twice
     /// this upward component so a downward-only overshoot cannot license a
     /// larger queue than the upward evidence justifies, while symmetric
     /// jitter and a genuine latency step keep the full two-sided margin.
@@ -80,7 +79,7 @@ pub(crate) struct RttStats {
     /// oldest first.  The reorder lane's gate margin is their minimum: the
     /// steady-state jitter of the quietest recent stretch, which a transient
     /// queue can raise for at most one window before the quiet samples age
-    /// out.  See [`Self::gate_rtt_var`].
+    /// out.  See [`GateVarianceState::steady`].
     gate_var_samples: VecDeque<Duration>,
     /// Samples remaining in a raw step transient, during which the windowed
     /// steady-state jitter is not trusted because the floor window has not yet
@@ -229,27 +228,17 @@ impl RttStats {
         self.rto.smooth_rtt_var()
     }
 
-    /// Robust RTT variance for the delay-based queue gate: the windowed
-    /// steady-state jitter floor.  The selection lives in the reorder-tolerance
-    /// policy ([`GateVarianceState::steady`]); the raw estimator stays here
-    /// because the same filter feeds the RTO.
-    pub(crate) fn gate_rtt_var(&self) -> Duration {
-        self.gate_variance_state().steady(self.rto.smooth_rtt_var())
-    }
-
-    /// The trending two-sided margin with the `2 * up` cap applied: reacts
-    /// immediately to a path step, but is inflated by a self-inflicted queue.
-    /// See [`GateVarianceState::trending`].
-    pub(crate) fn trending_gate_rtt_var(&self) -> Duration {
-        self.gate_variance_state()
-            .trending(self.rto.smooth_rtt_var())
-    }
-
     /// Both jitter estimates for the delay gate; see [`GateJitter`].
+    ///
+    /// The selection lives in the reorder-tolerance policy
+    /// ([`GateVarianceState::steady`] / [`GateVarianceState::trending`]); the
+    /// raw estimator stays here because the same filter feeds the RTO.
     pub(crate) fn gate_jitter(&self) -> GateJitter {
+        let smooth_rtt_var = self.rto.smooth_rtt_var();
+        let state = self.gate_variance_state();
         GateJitter {
-            steady: self.gate_rtt_var(),
-            trending: self.trending_gate_rtt_var(),
+            steady: state.steady(smooth_rtt_var),
+            trending: state.trending(smooth_rtt_var),
         }
     }
 
@@ -288,12 +277,6 @@ impl RttStats {
         self.rto.fast_loss_armed()
     }
 
-    /// Queue-independent fast-loss arming; the policy lives in
-    /// [`fast_loss::armed_against_min_rtt`].
-    pub(crate) fn fast_loss_armed_against_min_rtt(&self) -> bool {
-        fast_loss::armed_against_min_rtt(self.min_rtt, self.smooth_rtt_var())
-    }
-
     pub(crate) fn reset_rto(&mut self, rtt: Duration) {
         self.rto.reset_to(rtt);
     }
@@ -310,9 +293,21 @@ mod tests {
     use std::time::Duration;
 
     use super::{GATE_VAR_MATURE_SAMPLES, RttStats};
+    use crate::traffic_shaping::recovery::fast_loss::armed_against_min_rtt;
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    /// The steady-state gate variance the policy selects (see
+    /// [`GateVarianceState::steady`]).
+    fn gate_rtt_var(stats: &RttStats) -> Duration {
+        stats.gate_variance_state().steady(stats.smooth_rtt_var())
+    }
+
+    /// The trending gate variance (see [`GateVarianceState::trending`]).
+    fn trending_gate_rtt_var(stats: &RttStats) -> Duration {
+        stats.gate_variance_state().trending(stats.smooth_rtt_var())
     }
 
     /// Bulk + loss fills the bottleneck queue: echoed-timestamp RTT samples
@@ -341,7 +336,7 @@ mod tests {
             "srtt-relative gate must be disarmed by queue inflation"
         );
         assert!(
-            stats.fast_loss_armed_against_min_rtt(),
+            armed_against_min_rtt(stats.min_rtt(), stats.smooth_rtt_var()),
             "queue-independent min-RTT gate must be armed"
         );
     }
@@ -355,7 +350,7 @@ mod tests {
         }
         assert!(!stats.fast_loss_armed(), "srtt-relative gate disarmed");
         assert!(
-            !stats.fast_loss_armed_against_min_rtt(),
+            !armed_against_min_rtt(stats.min_rtt(), stats.smooth_rtt_var()),
             "min-RTT gate must stay off when jitter dwarfs the propagation floor"
         );
     }
@@ -364,7 +359,10 @@ mod tests {
     fn min_rtt_gate_abstains_before_any_sample() {
         let stats = RttStats::new();
         assert!(stats.min_rtt().is_none());
-        assert!(!stats.fast_loss_armed_against_min_rtt());
+        assert!(!armed_against_min_rtt(
+            stats.min_rtt(),
+            stats.smooth_rtt_var()
+        ));
     }
 
     /// A genuine latency step is upward-only: every sample sits above the
@@ -382,7 +380,7 @@ mod tests {
             stats.record_rtt(ms(200));
         }
         assert_eq!(
-            stats.gate_rtt_var(),
+            gate_rtt_var(&stats),
             stats.smooth_rtt_var(),
             "an upward step must keep the two-sided gate margin"
         );
@@ -412,9 +410,9 @@ mod tests {
             stats.smooth_rtt_var()
         );
         assert!(
-            stats.gate_rtt_var() < stats.smooth_rtt_var(),
+            gate_rtt_var(&stats) < stats.smooth_rtt_var(),
             "the gate must discount the downward overshoot: gate={:?} two-sided={:?}",
-            stats.gate_rtt_var(),
+            gate_rtt_var(&stats),
             stats.smooth_rtt_var()
         );
     }
@@ -441,15 +439,15 @@ mod tests {
             stats.smooth_rtt_var()
         );
         assert!(
-            stats.trending_gate_rtt_var() > ms(30),
+            trending_gate_rtt_var(&stats) > ms(30),
             "the trending margin is what the queue would inflate: {:?}",
-            stats.trending_gate_rtt_var()
+            trending_gate_rtt_var(&stats)
         );
         assert!(
-            stats.gate_rtt_var() < stats.trending_gate_rtt_var() / 2,
+            gate_rtt_var(&stats) < trending_gate_rtt_var(&stats) / 2,
             "the windowed steady-state floor must ignore the ramp: gate={:?} trending={:?}",
-            stats.gate_rtt_var(),
-            stats.trending_gate_rtt_var()
+            gate_rtt_var(&stats),
+            trending_gate_rtt_var(&stats)
         );
     }
 
@@ -463,8 +461,8 @@ mod tests {
             stats.record_rtt(ms(50));
         }
         assert_eq!(
-            stats.gate_rtt_var(),
-            stats.trending_gate_rtt_var(),
+            gate_rtt_var(&stats),
+            trending_gate_rtt_var(&stats),
             "an immature connection must keep the trending margin"
         );
     }

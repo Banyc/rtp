@@ -288,7 +288,10 @@ impl PktSendSpace {
     pub fn fast_loss_armed(&self) -> bool {
         !self.fast_loss_disabled()
             && (self.rtt_stats.fast_loss_armed()
-                || self.rtt_stats.fast_loss_armed_against_min_rtt())
+                || crate::traffic_shaping::recovery::fast_loss::armed_against_min_rtt(
+                    self.rtt_stats.min_rtt(),
+                    self.rtt_stats.smooth_rtt_var(),
+                ))
     }
 
     /// Whether the observed-reordering disable is currently armed (regardless

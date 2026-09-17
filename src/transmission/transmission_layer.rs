@@ -4,19 +4,17 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::ack::AckInterval;
-use crate::delivery::frame::FrameMode;
+use crate::delivery::frame::mode::FrameMode;
 use crate::io_err::IoErr;
 use crate::obfuscate::padding::AckPaddingMode;
 use crate::sequence::InitialSequences;
 use crate::traffic_shaping::redundancy::{
-    RetransmissionArmorConfig, fec::FecState, fec_tuning::FecTuning,
+    RetransmissionArmorConfig, fec::FecState, fec::gate::FecTuning,
 };
 
 pub(crate) const PRINT_DEBUG_MSGS: bool = false;
 pub(crate) const FEC_DEBUG: bool = false;
 const BUF_SIZE: usize = 1024 * 64;
-
-pub(crate) use crate::transmission::ack_feedback::MAX_NUM_ACK;
 
 pub(crate) type ReliableLayerLogger = Mutex<csv::Writer<std::fs::File>>;
 
@@ -132,7 +130,7 @@ pub struct UnreliableLayer {
     /// Test-only override for the fresh interactive tail's armor duplicate
     /// copy count, so a probe can sweep the count independently of the
     /// loss-adaptive ladder.  Production leaves this `None`: the ladder in
-    /// [`crate::transmission::write_half::fresh_tail_armor_copies`] decides,
+    /// [`crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::fresh_tail_armor_copies`] decides,
     /// and only the interactive lane (`fec_instream_flush`) consults it.
     pub(crate) fresh_tail_armor_copies_override: Option<usize>,
 }

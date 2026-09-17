@@ -1,13 +1,8 @@
 use std::time::{Duration, Instant};
 
-use super::CongestionLane;
 use super::bandwidth_probe::loss_scaled_gain;
+use super::congestion_response::lane::CongestionLane;
 use super::idle_gap::{IdleContinuity, idle_gap_threshold};
-
-#[cfg(test)]
-pub(crate) use super::congestion_response::lane::{
-    DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN, GENTLE_DRAIN_FRAC,
-};
 
 // Gentle-mode parameters for the delay-gated congestion controller.  These are
 // intentionally conservative: they let a bulk flow drain a self-inflicted
@@ -304,10 +299,12 @@ impl GentleMode {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{
+    use super::super::congestion_response::lane::{
         DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN,
-        GENTLE_DRAIN_CHECK_RTTS, GENTLE_DRAIN_FRAC, GENTLE_ENTER_MIN, GentleExitCause, GentleMode,
-        GentleProbeOutcome,
+        GENTLE_DRAIN_FRAC,
+    };
+    use super::{
+        GENTLE_DRAIN_CHECK_RTTS, GENTLE_ENTER_MIN, GentleExitCause, GentleMode, GentleProbeOutcome,
     };
 
     #[test]
@@ -385,7 +382,7 @@ mod tests {
     fn dedicated_gentle_probe_uses_its_shallower_gain() {
         let t0 = Instant::now();
         let mut gentle = GentleMode::new();
-        gentle.set_lane(super::super::CongestionLane::Dedicated);
+        gentle.set_lane(super::super::congestion_response::lane::CongestionLane::Dedicated);
         let control_rtt = Duration::from_millis(100);
         let _ = gentle.update_mode(
             Some(GENTLE_ENTER_MIN),

@@ -1,8 +1,6 @@
 pub(crate) mod fec;
-pub(crate) mod fec_gate;
-pub mod fec_tuning;
 pub(crate) mod retransmission_armor;
-pub use fec_tuning::{FecTuning, fec_tuning_from_env};
+pub use fec::gate::{FecTuning, fec_tuning_from_env};
 pub(crate) use retransmission_armor::{ArmorDecision, RetransmissionArmor};
 pub use retransmission_armor::{RETRANSMISSION_ARMOR_ENV, RetransmissionArmorConfig};
 pub(crate) fn instream_group_fec_from_env() -> bool {

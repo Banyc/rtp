@@ -5,14 +5,14 @@ use crate::mss::MAX_MSS;
 
 #[cfg(test)]
 use super::NO_FEC_MSS;
-use crate::delivery::frame::FrameMode;
+use crate::delivery::frame::mode::FrameMode;
 use crate::mss::{Mss, MssError};
 use crate::obfuscate::padding::AckPaddingMode;
-use crate::traffic_shaping::core::CongestionLane;
+use crate::traffic_shaping::core::congestion_response::lane::CongestionLane;
 use crate::traffic_shaping::redundancy::{
     RetransmissionArmorConfig,
+    fec::gate::FecTuning,
     fec::{FecConfig, FecState},
-    fec_tuning::FecTuning,
 };
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 

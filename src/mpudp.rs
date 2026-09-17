@@ -5,9 +5,9 @@ use mpudp::{conn::MpUdpConn, listen::MpUdpListener, read::MpUdpRead, write::MpUd
 
 use crate::io_err::IoErr;
 use crate::{
-    delivery::frame::FrameMode,
+    delivery::frame::mode::FrameMode,
     socket::{ConnReader, ConnWriter, SessionHandle, socket},
-    traffic_shaping::redundancy::{RetransmissionArmorConfig, fec_tuning::FecTuning},
+    traffic_shaping::redundancy::{RetransmissionArmorConfig, fec::gate::FecTuning},
     transmission::transmission_layer::{UnreliableRead, UnreliableWrite},
     udp::{
         AcceptConfig, ConnectConfig, HarmfulPaddingPolicy, LogConfig, Mss, MssConfig,

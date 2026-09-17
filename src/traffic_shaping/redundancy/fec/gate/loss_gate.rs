@@ -38,7 +38,7 @@ const RECOVERY_WINDOW: usize = 64;
 /// stock bulk/agnostic traffic keeps [`STOCK`](Self::STOCK), while the
 /// interactive prompt-parity presets use [`INTERACTIVE`](Self::INTERACTIVE).
 ///
-/// [`FecTuning`]: crate::traffic_shaping::redundancy::fec_tuning::FecTuning
+/// [`FecTuning`]: crate::traffic_shaping::redundancy::fec::gate::FecTuning
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FecLossGateThresholds {
     /// Loss ratio at which a closed loss gate opens.

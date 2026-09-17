@@ -8,15 +8,13 @@ use std::time::{Duration, Instant};
 
 use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 
-use super::CongestionLane;
+use super::congestion_response::lane::CongestionLane;
 #[cfg(test)]
 use super::gentle::DrainEpisode;
 use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
 use super::idle_gap::{IdleGap, QueueGrowthContinuity};
-use crate::traffic_shaping::recovery::reorder_tolerance::{FloorBucket, floor_bucket};
-
-pub(crate) use crate::traffic_shaping::recovery::reorder_tolerance::{
-    RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE,
+use crate::traffic_shaping::recovery::reorder_tolerance::{
+    FloorBucket, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, floor_bucket,
 };
 
 pub(crate) const QUEUE_RTT_FACTOR: f64 = 2.0;

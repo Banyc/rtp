@@ -345,20 +345,20 @@ mod tests {
         harness_with_tuning(
             fec,
             enabled,
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
         )
     }
     fn harness_with_tuning(
         fec: bool,
         enabled: bool,
-        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        tuning: crate::traffic_shaping::redundancy::fec::gate::FecTuning,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         harness_with_tuning_and_ack_padding(fec, enabled, tuning, AckPaddingMode::None)
     }
     fn harness_with_tuning_and_ack_padding(
         fec: bool,
         enabled: bool,
-        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        tuning: crate::traffic_shaping::redundancy::fec::gate::FecTuning,
         ack_padding: AckPaddingMode,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         harness_with_tuning_ack_padding_and_frame(
@@ -366,7 +366,7 @@ mod tests {
             enabled,
             tuning,
             ack_padding,
-            crate::delivery::frame::FrameMode::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
         )
     }
 
@@ -376,9 +376,9 @@ mod tests {
     fn harness_with_tuning_ack_padding_and_frame(
         fec: bool,
         enabled: bool,
-        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        tuning: crate::traffic_shaping::redundancy::fec::gate::FecTuning,
         ack_padding: AckPaddingMode,
-        frame_mode: crate::delivery::frame::FrameMode,
+        frame_mode: crate::delivery::frame::mode::FrameMode,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
@@ -439,8 +439,8 @@ mod tests {
             }),
             true,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::max_diversity(),
-            crate::delivery::frame::FrameMode::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::max_diversity(),
+            crate::delivery::frame::mode::FrameMode::default(),
         )
         .unwrap();
         (TransmissionLayer::new(unreliable, None), attempts)
@@ -473,7 +473,7 @@ mod tests {
     fn harness_with_writer(
         fec: bool,
         writer: Box<dyn UnreliableWrite>,
-        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        tuning: crate::traffic_shaping::redundancy::fec::gate::FecTuning,
     ) -> TransmissionLayer {
         let unreliable = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(BlackholeRead),
@@ -481,7 +481,7 @@ mod tests {
             fec,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             tuning,
-            crate::delivery::frame::FrameMode::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
         )
         .unwrap();
         let tl = TransmissionLayer::new(unreliable, None);
@@ -593,7 +593,7 @@ mod tests {
     /// duplication, no reordering).
     #[tokio::test]
     async fn would_block_parity_is_retried_without_loss_or_reorder() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
 
         // Control: the uninterrupted burst. `BlackholeRead` means no ACKs are
         // due, so the parity tail is the last datagrams `send_pkts` emits.
@@ -749,13 +749,13 @@ mod tests {
     /// parity trails) and the duplicates reuse the exact encoded symbol bytes.
     #[tokio::test]
     async fn interactive_single_symbol_frame_after_group_data_gets_armor() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let (mut tl, recorder) = harness_with_tuning_ack_padding_and_frame(
             true,
             false,
             FecTuning::interactive_prompt(),
             AckPaddingMode::None,
-            crate::delivery::frame::FrameMode::enabled(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
         );
         let max_pkt = tl
             .shared_for_test()
@@ -806,7 +806,7 @@ mod tests {
     /// the same round trip instead of waiting for a repair round trip.
     #[tokio::test]
     async fn fresh_interactive_single_symbol_tail_gets_an_armor_duplicate() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::interactive_prompt());
         let mut bufs = SendBufs::new();
         stage_small_message(&tl);
@@ -835,7 +835,7 @@ mod tests {
     /// hostile link must never see more packets per message than a clean one.
     #[tokio::test]
     async fn fresh_tail_armor_copies_shrink_as_loss_rises() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let mut previous = usize::MAX;
         for (loss, expected) in [(0.05, 6usize), (0.20, 4), (0.40, 2)] {
             let (mut tl, recorder) =
@@ -868,7 +868,7 @@ mod tests {
     /// trailing message-sized parity).
     #[tokio::test]
     async fn fresh_tail_armor_override_forces_the_copy_count() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         for forced in [0usize, 3, 7] {
             let (mut tl, recorder) =
                 harness_with_tuning(true, false, FecTuning::interactive_prompt());
@@ -896,7 +896,7 @@ mod tests {
     /// message-sized wire slot rather than an 8 KB full-MSS flush.
     #[tokio::test]
     async fn interactive_single_symbol_parity_is_message_sized() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::interactive_prompt());
         tl.shared_for_test()
             .reliable_layer_for_test()
@@ -938,7 +938,7 @@ mod tests {
     /// the no-loss budget, and never more than a lower loss did.
     #[tokio::test]
     async fn fresh_tail_datagram_budget_is_bounded_and_non_increasing_in_loss() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         const BUDGET: usize = 6;
         let mut previous = usize::MAX;
         for loss in [0.0, 0.005, 0.01, 0.05, 0.14, 0.15, 0.29, 0.30, 1.0] {
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_symbol_depth_uses_spare_capacity_after_loss_gate_opens() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
         // Measured congestion loss above the enable threshold opens the loss
         // gate; the single-symbol depth-3 parity then flows because the
@@ -1077,7 +1077,7 @@ mod tests {
             enabled,
             instream_group_fec,
             mss,
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
         )
     }
 
@@ -1086,7 +1086,7 @@ mod tests {
         enabled: bool,
         instream_group_fec: bool,
         mss: usize,
-        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+        tuning: crate::traffic_shaping::redundancy::fec::gate::FecTuning,
     ) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         struct SharedWrite(Arc<Mutex<RecordingWrite>>);
@@ -1110,7 +1110,7 @@ mod tests {
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
             tuning,
-            crate::delivery::frame::FrameMode::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
         )
         .unwrap();
         ul.retransmission_armor = RetransmissionArmorConfig::from(enabled);
@@ -1149,7 +1149,7 @@ mod tests {
     /// separate connection-level `instream_group_fec` flag.
     #[tokio::test]
     async fn interactive_tuning_enables_in_stream_group_parity_mid_burst() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         // MSS 8192 fits the 8 staged packets needed to fill one in-stream
         // group; the separate connection flag is left OFF so the tuning alone
         // must enable the group path.
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn fec_waits_for_loss_feedback_even_with_spare_capacity() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
         // Fresh connection: no congestion feedback and no recovery samples
         // yet, so the loss gate stays closed even though capacity is spare
@@ -1228,7 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_growth_closes_fec_spare_capacity_gate() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         let (mut tl, recorder) = harness_with_tuning(true, false, FecTuning::max_diversity());
         // Loss evidence is present (gate open) but the bottleneck queue is
         // building: parity must not spend capacity on a growing queue.
@@ -1497,7 +1497,7 @@ mod tests {
 
     #[tokio::test]
     async fn ack_flush_never_sends_an_empty_page() {
-        use crate::transmission::transmission_layer::MAX_NUM_ACK;
+        use crate::transmission::ack_feedback::MAX_NUM_ACK;
         let (mut transmission, recorder) = harness(false, false);
         {
             let mut reliable = transmission
@@ -1544,7 +1544,7 @@ mod tests {
         let (mut transmission, recorder) = harness_with_tuning_and_ack_padding(
             false,
             false,
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             AckPaddingMode::Fitted,
         );
         let now = Instant::now();
@@ -1611,7 +1611,7 @@ mod tests {
         let (mut transmission, recorder) = harness_with_tuning_and_ack_padding(
             false,
             false,
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             AckPaddingMode::Jitter,
         );
         // A small recv history so each flush has a claimable page with the
@@ -1852,8 +1852,8 @@ mod tests {
 
     #[tokio::test]
     async fn deep_history_piggyback_sends_page_one_standalone() {
+        use crate::transmission::ack_feedback::MAX_NUM_ACK;
         use crate::transmission::ack_feedback::ReceivedAckWork;
-        use crate::transmission::transmission_layer::MAX_NUM_ACK;
         let (mut transmission, recorder) = harness(false, false);
         let now = Instant::now();
         // Stage one data packet (the piggyback carrier).
@@ -2099,7 +2099,7 @@ mod tests {
 
     #[tokio::test]
     async fn proactive_watchdog_aborts_locally_before_best_effort_kill_completes() {
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::transmission::watchdog_tuning::WatchdogTuning;
         let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
         let kill_started = Arc::new(tokio::sync::Notify::new());
@@ -2139,7 +2139,7 @@ mod tests {
             false,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             FecTuning::default(),
-            crate::delivery::frame::FrameMode::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
         )
         .unwrap();
         let mut tl = TransmissionLayer::new_with_watchdog_tuning(ul, None, tuning);
@@ -2397,7 +2397,7 @@ mod tests {
 
     #[tokio::test]
     async fn ack_flush_pages_share_one_history_snapshot_across_await() {
-        use crate::transmission::transmission_layer::MAX_NUM_ACK;
+        use crate::transmission::ack_feedback::MAX_NUM_ACK;
         let recorder = Arc::new(Mutex::new(Vec::new()));
         let first_started = Arc::new(tokio::sync::Notify::new());
         let release_first = Arc::new(tokio::sync::Notify::new());

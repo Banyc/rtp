@@ -13,7 +13,7 @@
 //! delivery rate stops growing (the pipe is full).  Both the rate and the exit
 //! are bounded by what the path actually delivered, so the ramp cannot drive
 //! an unbounded pacer rate or a deeper standing queue.  It is used only on the
-//! [`CongestionLane::Dedicated`](super::CongestionLane::Dedicated) lane, which
+//! [`CongestionLane::Dedicated`](super::congestion_response::lane::CongestionLane::Dedicated) lane, which
 //! has no cross-traffic to protect; the shared lane keeps the conservative
 //! stock exit.
 

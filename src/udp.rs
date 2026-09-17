@@ -19,7 +19,7 @@ use crate::io_err::IoErr;
 use crate::transmission::transmission_layer::UnreliableLayer;
 use crate::{
     CongestionLane,
-    delivery::frame::{FrameMode, frame_delivery_from_env},
+    delivery::frame::mode::{FrameMode, frame_delivery_from_env},
     socket::{
         ConnReader, ConnWriter, FrameByteReader, FrameByteWriter, SessionHandle,
         into_frame_io_parts, socket, socket_with_watchdog_tuning,
@@ -28,7 +28,7 @@ use crate::{
         control::handshake::{client_opening_handshake, server_opening_handshake},
         redundancy::{
             RetransmissionArmorConfig,
-            fec_tuning::{FecTuning, fec_tuning_from_env},
+            fec::gate::{FecTuning, fec_tuning_from_env},
             instream_group_fec_from_env,
         },
     },
@@ -1646,7 +1646,7 @@ mod tests {
     /// payload first packets.
     #[test]
     fn frame_delivery_mss_to_small_for_first_frame_header_errors() {
-        use crate::delivery::frame::FrameMode;
+        use crate::delivery::frame::mode::FrameMode;
         // An MSS that is large enough for `data_overhead` but too small for
         // `frame_data_overhead` (data_overhead + 4).
         let mss = crate::codec::data_overhead() + 1;
@@ -1655,7 +1655,7 @@ mod tests {
             Box::new(Dummy),
             false,
             Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             FrameMode::enabled(),
         );
         assert!(matches!(

@@ -17,19 +17,19 @@ use crate::obfuscate::padding::AckPaddingMode;
 use crate::obfuscate::sampler::DataSizeSampler;
 use crate::reliable::reliable_layer::DataPkt;
 use crate::traffic_shaping::control::handshake::padding::pad_handshake;
-use crate::traffic_shaping::core::{SendPacer, SendWake};
+use crate::traffic_shaping::core::{
+    SendPacer, SendWake, has_spare_capacity, has_spare_capacity_interactive,
+};
 use crate::traffic_shaping::redundancy::{
     ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig,
     fec::FecEncoderState,
+    fec::gate::{FecConditionGate, FecGateDecision, FecLossGateThresholds},
     fec::in_stream_group::{CapacityGate, InStreamGroupFlush},
     fec::parity_burst::PendingParityBurst,
-    fec_gate::{FecConditionGate, FecGateDecision, FecLossGateThresholds},
+    retransmission_armor::fresh_tail::{
+        fresh_tail_armor_copy_count, is_fresh_interactive_tail, is_single_symbol_frame,
+    },
 };
-
-/// Shims the fresh-tail armour, which now lives in
-/// [`crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail`], so
-/// the old `write_half` path keeps resolving.
-pub(crate) use crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendLoopResult {
@@ -516,8 +516,20 @@ impl WriteHalf {
         let capacity = CapacityGate::for_instream_flush(self.fec_instream_flush);
         let spare = self.shared.with_reliable_layer(|layer| {
             capacity.spare(
-                || layer.fec_has_spare_capacity(now),
-                || layer.fec_has_spare_capacity_interactive(),
+                || {
+                    has_spare_capacity(
+                        layer.can_send_tail_fec(now),
+                        layer.application_write_waiters(),
+                        layer.queue_building(),
+                    )
+                },
+                || {
+                    has_spare_capacity_interactive(
+                        layer.pkt_send_space().accepts_new_pkt(),
+                        layer.application_write_waiters(),
+                        layer.queue_building(),
+                    )
+                },
             )
         });
         self.fec_gate.decide(spare, tail_requested)
@@ -904,7 +916,7 @@ impl WriteHalf {
                         // so a single copy still falls through to the
                         // one-reorder-window ARQ repair when it is lost.  The
                         // count is monotone non-increasing in the measured
-                        // loss (see [`fresh_tail_armor_copies`]): the extra
+                        // loss (see [`fresh_tail_armor_copies`](crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::fresh_tail_armor_copies)): the extra
                         // burst-cover copy is only paid while the link is
                         // low/moderate loss and is withdrawn as loss rises, so
                         // redundancy never amplifies a hostile link.  At the
@@ -1386,12 +1398,12 @@ impl WriteHalf {
 
 #[cfg(test)]
 mod tests {
-    use crate::delivery::frame::FrameMode;
+    use crate::delivery::frame::mode::FrameMode;
     use crate::metrics::{MetricsEvent, MetricsObserver, MetricsTerminationCause};
     use crate::obfuscate::padding::AckPaddingMode;
     use crate::traffic_shaping::recovery::liveness::PeerLiveness;
     use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
-    use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+    use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
     use crate::transmission::connection::new_connection_with_watchdog_tuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;

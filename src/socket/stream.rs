@@ -555,13 +555,13 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let frame_delivery = crate::delivery::frame::FrameMode::enabled();
+        let frame_delivery = crate::delivery::frame::mode::FrameMode::enabled();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
             false,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             frame_delivery,
         )
         .unwrap();
@@ -570,7 +570,7 @@ mod tests {
             Box::new(b),
             false,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             frame_delivery,
         )
         .unwrap();
@@ -744,7 +744,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fec_recovers_under_loss_with_mss_8192() {
         use crate::socket::socket;
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
         // 8% loss: the FEC condition gate enables at 5% measured congestion
         // loss.  A wired-but-inert gate (configured yet never opened) would
@@ -862,7 +862,7 @@ mod tests {
     #[ignore = "in-process FEC-repair measurement probe; ~45 s; run with --ignored --nocapture"]
     async fn probe_single_symbol_interactive_fec_repair() {
         use crate::socket::socket;
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -964,7 +964,7 @@ mod tests {
     #[ignore = "in-process interactive repair-latency probe; ~25 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_armor_latency() {
         use crate::socket::socket;
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1081,7 +1081,7 @@ mod tests {
     #[ignore = "in-process burst-loss interactive repair probe; ~145 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_burst_loss_latency() {
         use crate::socket::socket;
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::udp::testing::{
             BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
             wrap_fec_delayed_with_mss_and_fec_tuning,
@@ -1255,7 +1255,7 @@ mod tests {
     #[ignore = "in-process armor-frontier cell; ~10 s per cell; run with --ignored --nocapture"]
     async fn probe_armor_copy_cell() {
         use crate::socket::socket;
-        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::udp::testing::{
             BasisPoints, BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
             wrap_fec_delayed_with_mss_and_fec_tuning, wrap_fec_iid_delayed_with_mss_and_fec_tuning,
@@ -1475,8 +1475,8 @@ mod tests {
             Box::new(a),
             false,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
-            crate::delivery::frame::FrameMode::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
         )
         .unwrap();
         let (_a_r, a_w, _a_supervisor) = socket(a, None);
@@ -1533,7 +1533,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_mode_async_write_produces_one_frame() {
-        use crate::delivery::frame::FrameMode;
+        use crate::delivery::frame::mode::FrameMode;
         use tokio::io::AsyncWriteExt;
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
@@ -1547,7 +1547,7 @@ mod tests {
             Box::new(a),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             fd,
         )
         .unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
             Box::new(b),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             fd,
         )
         .unwrap();
@@ -1589,7 +1589,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_mode_oversized_write_errors_instead_of_splitting() {
-        use crate::delivery::frame::FrameMode;
+        use crate::delivery::frame::mode::FrameMode;
         use tokio::io::AsyncWriteExt;
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
@@ -1603,7 +1603,7 @@ mod tests {
             Box::new(a),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             fd,
         )
         .unwrap();
@@ -1612,7 +1612,7 @@ mod tests {
             Box::new(b),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             fd,
         )
         .unwrap();
@@ -1714,7 +1714,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn frame_delivery_io_preserves_frames_across_async_io() {
-        use crate::delivery::frame::FrameMode;
+        use crate::delivery::frame::mode::FrameMode;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let fec = false;
         let mss = crate::udp::NO_FEC_MSS;
@@ -1728,7 +1728,7 @@ mod tests {
             Box::new(a),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             fd,
         )
         .unwrap();
@@ -1737,7 +1737,7 @@ mod tests {
             Box::new(b),
             fec,
             crate::udp::Mss::try_new(mss).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             fd,
         )
         .unwrap();
@@ -1816,13 +1816,13 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let frame_delivery = crate::delivery::frame::FrameMode::enabled();
+        let frame_delivery = crate::delivery::frame::mode::FrameMode::enabled();
         let a_layer = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
             Box::new(a.clone()),
             Box::new(a),
             false,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             frame_delivery,
         )
         .unwrap();
@@ -1831,7 +1831,7 @@ mod tests {
             Box::new(b),
             false,
             crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
-            crate::traffic_shaping::redundancy::fec_tuning::FecTuning::default(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
             frame_delivery,
         )
         .unwrap();

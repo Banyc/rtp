@@ -1,10 +1,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::ack_feedback::MAX_NUM_ACK;
 use super::connection::{Connection, ReceivedBatch};
-use super::transmission_layer::{
-    FEC_DEBUG, MAX_NUM_ACK, RecvBufs, RecvPkts, SendKillPkt, UnreliableRead,
-};
+use super::transmission_layer::{FEC_DEBUG, RecvBufs, RecvPkts, SendKillPkt, UnreliableRead};
 use super::ts_echo::{RecentEchoes, TsEcho};
 use crate::io_err::IoErr;
 use crate::metrics::{MetricsSendDriverResumeSource, MetricsTerminationCause};

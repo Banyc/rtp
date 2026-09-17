@@ -19,11 +19,11 @@ pub mod testing;
 pub mod traffic_shaping;
 mod transmission;
 pub mod udp;
-pub use traffic_shaping::adjacent::metrics;
+pub use traffic_shaping::adjacent::observability::schema as metrics;
 pub use traffic_shaping::control::probe;
-pub use traffic_shaping::core::CongestionLane;
+pub use traffic_shaping::core::congestion_response::lane::CongestionLane;
 
-pub use delivery::frame::{FrameMode, frame_delivery_from_env};
+pub use delivery::frame::mode::{FrameMode, frame_delivery_from_env};
 pub use io_err::IoErr;
 pub use keyed_udp::{
     Accepted as KeyedAccepted, Connected as KeyedConnected, Connector as KeyedConnector,

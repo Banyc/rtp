@@ -10,10 +10,10 @@ use tokio::net::UdpSocket;
 use tokio_util::bytes::Buf;
 use udp_listener::{Classified, ConnWrite, DispatchPolicy, Packet, UtpListener};
 
-use crate::delivery::frame::FrameMode;
+use crate::delivery::frame::mode::FrameMode;
 use crate::{
     socket::{ConnReader, ConnWriter, SessionHandle, socket},
-    traffic_shaping::redundancy::fec_tuning::FecTuning,
+    traffic_shaping::redundancy::fec::gate::FecTuning,
     transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite},
     udp::{
         self, AcceptConfig, DISPATCHER_BUF_SIZE, MaybeRawFd, Mss, MssError, maybe_raw_fd,
@@ -498,8 +498,8 @@ fn dispatch<K: DispatchKey>(_addr: &SocketAddr, mut pkt: Packet) -> Option<Class
 mod tests {
     use super::*;
 
-    use crate::delivery::frame::FrameMode;
-    use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+    use crate::delivery::frame::mode::FrameMode;
+    use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
     use crate::transmission::transmission_layer::UnreliableRead;
 
     #[derive(Debug)]

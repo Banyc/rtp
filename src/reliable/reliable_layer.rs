@@ -28,25 +28,24 @@ use crate::{
             send::{MAX_SEND_DATA_BUF_LEN, StockSendStage},
         },
         frame::{
-            FrameMode,
+            mode::FrameMode,
             send::{FrameSendStage, MAX_FRAME_LEN},
         },
     },
     recv_queue::pkt_recv_space::PktRecvSpace,
+    traffic_shaping::core::congestion_response::lane::CongestionLane,
+    traffic_shaping::core::fast_start::should_exit_slow_start,
     traffic_shaping::core::{
-        CongestionDecision, CongestionInput, CongestionLane, CongestionResponse, FastStartEpisode,
-        FastStartStep, GentleExitCause, ProbeKind, SendPacer, cap_probe_target, has_spare_capacity,
-        has_spare_capacity_interactive, linear_backoff_step, select_gate_jitter,
-        settle_computed_rate,
+        CongestionDecision, CongestionInput, CongestionResponse, FastStartEpisode, FastStartStep,
+        GentleExitCause, ProbeKind, SendPacer, linear_backoff_step, settle_computed_rate,
     },
     traffic_shaping::recovery::pkt_send_space::{
         CWND_BDP_CAP_ENGAGE_RTT_FACTOR, CWND_BDP_CAP_SCALE, CWND_SEND_RATE_SCALE, INIT_CWND,
         PktSendSpace,
     },
+    traffic_shaping::recovery::reorder_tolerance::{cap_probe_target, select_gate_jitter},
     transmission::watchdog_tuning::WatchdogTuning,
 };
-
-pub(crate) use crate::traffic_shaping::core::should_exit_slow_start;
 
 /// The frame-delivery [`MAX_FRAME_LEN`] is defined in
 /// [`crate::delivery::frame::send`] and must stay equal to the stock
@@ -87,8 +86,7 @@ fn metrics_gentle_exit_cause(cause: GentleExitCause) -> MetricsGentleExitCause {
 use crate::traffic_shaping::core::{
     DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_REENTRY_COOLDOWN,
     GENTLE_REENTRY_COOLDOWN_RTTS, ORDINARY_PROBE_MAX_GAIN, PERSISTENT_QUEUE_RTTVAR_FACTOR,
-    QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET,
-    RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
+    QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, WindowedRttMin,
 };
 
 #[derive(Debug, Clone)]
@@ -390,6 +388,12 @@ impl ReliableLayer {
         self.application_write_waiters.load(Ordering::Relaxed) > 0
     }
 
+    /// Number of application writers currently blocked waiting for send stage
+    /// space (the raw input to the FEC spare-capacity gates).
+    pub(crate) fn application_write_waiters(&self) -> usize {
+        self.application_write_waiters.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn next_pacing_deadline(&self, now: Instant) -> Option<Instant> {
         let max_sendable_packets =
             if self.pkt_send_space.in_outage_recovery() && self.pkt_send_space.has_rtx(now) {
@@ -433,27 +437,6 @@ impl ReliableLayer {
             // A due tail-loss probe is a pending (re)transmission, so the tail
             // is not settled and the tail parity must wait.
             && !self.pkt_send_space.has_tail_probe(now)
-    }
-
-    /// Whether the sender has genuinely spare capacity for a FEC parity burst
-    /// with a settled tail (the stock/bulk gate).
-    pub(crate) fn fec_has_spare_capacity(&self, now: Instant) -> bool {
-        has_spare_capacity(
-            self.can_send_tail_fec(now),
-            self.application_write_waiters.load(Ordering::Relaxed),
-            self.congestion_response.queue_building(),
-        )
-    }
-
-    /// Interactive-lane FEC parity-burst gate: genuinely spare capacity, but a
-    /// pending repair or tail-loss probe does not close it and the send stage
-    /// need not be empty.
-    pub(crate) fn fec_has_spare_capacity_interactive(&self) -> bool {
-        has_spare_capacity_interactive(
-            self.pkt_send_space.accepts_new_pkt(),
-            self.application_write_waiters.load(Ordering::Relaxed),
-            self.congestion_response.queue_building(),
-        )
     }
 
     pub fn pkt_send_space(&self) -> &PktSendSpace {
@@ -916,7 +899,7 @@ impl ReliableLayer {
             if self.congestion_metrics_enabled {
                 self.congestion_metrics.clear_decision_gauges();
             }
-            if self.congestion_response.dedicated() {
+            if self.congestion_response.lane().owns_fast_start() {
                 let fresh = self.pkt_send_space.fresh_acked_count();
                 let control_rtt = self.control_rtt();
                 let current = self.send_rate.get();
@@ -1044,7 +1027,7 @@ impl ReliableLayer {
             observation.peak_delivery,
         );
         if self.slow_start {
-            if self.congestion_response.dedicated() {
+            if self.congestion_response.lane().owns_fast_start() {
                 if FastStartEpisode::exits_on_rate_sample(
                     observation.loss_blocks_delay_control,
                     observation.queue_building,
@@ -1090,13 +1073,21 @@ impl ReliableLayer {
                 ProbeKind::Gentle => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::GentleProbe);
-                    let target = self.bounded_probe_target(current, target);
+                    let target = cap_probe_target(
+                        self.congestion_response.reorder_tolerant(),
+                        current,
+                        target,
+                    );
                     self.set_smooth_send_rate(target, now);
                 }
                 ProbeKind::Bandwidth => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::BandwidthProbe);
-                    let target = self.bounded_probe_target(current, target);
+                    let target = cap_probe_target(
+                        self.congestion_response.reorder_tolerant(),
+                        current,
+                        target,
+                    );
                     self.record_bandwidth_probe(now, current, target);
                     self.set_smooth_send_rate(target, now);
                 }
@@ -1137,10 +1128,6 @@ impl ReliableLayer {
             }
         }
         outcome.gentle_exit()
-    }
-
-    fn bounded_probe_target(&self, current: f64, target: f64) -> f64 {
-        cap_probe_target(self.congestion_response.reorder_tolerant(), current, target)
     }
 
     fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
@@ -1754,9 +1741,13 @@ mod tests {
         GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS, HUGE_DATA_LOSS_CHECK_INTERVAL,
         INIT_SEND_RATE, MAX_SEND_DATA_BUF_LEN, MetricsGentleExitCause, ORDINARY_PROBE_MAX_GAIN,
         PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
-        RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin, should_exit_slow_start,
+        WindowedRttMin, should_exit_slow_start,
     };
     use crate::delivery::byte_stream::send::send_data_buf_len;
+    use crate::traffic_shaping::core::{has_spare_capacity, has_spare_capacity_interactive};
+    use crate::traffic_shaping::recovery::reorder_tolerance::{
+        RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, cap_probe_target,
+    };
 
     const TEST_MSS: usize = 1200;
     use crate::{
@@ -1774,33 +1765,49 @@ mod tests {
         let now = Instant::now();
         let (reorder, _) = super::ReliableLayer::new(
             crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::enabled_reordering(),
+            crate::delivery::frame::mode::FrameMode::enabled_reordering(),
             now,
         );
         let (stock, _) = super::ReliableLayer::new(
             crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::enabled(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
             now,
         );
         let current = 400.0;
         let spurious = 6000.0;
         assert_eq!(
-            reorder.bounded_probe_target(current, spurious),
+            cap_probe_target(
+                reorder.congestion_response.reorder_tolerant(),
+                current,
+                spurious
+            ),
             current * ORDINARY_PROBE_MAX_GAIN,
             "the reorder lane must cap a spurious per-probe rate jump",
         );
         assert_eq!(
-            stock.bounded_probe_target(current, spurious),
+            cap_probe_target(
+                stock.congestion_response.reorder_tolerant(),
+                current,
+                spurious
+            ),
             spurious,
             "the stock/bulk lane must keep the unbounded probe",
         );
         assert_eq!(
-            reorder.bounded_probe_target(current, 500.0),
+            cap_probe_target(
+                reorder.congestion_response.reorder_tolerant(),
+                current,
+                500.0
+            ),
             500.0,
             "a legitimate target below the cap is unchanged",
         );
         assert_eq!(
-            reorder.bounded_probe_target(current, current * ORDINARY_PROBE_MAX_GAIN),
+            cap_probe_target(
+                reorder.congestion_response.reorder_tolerant(),
+                current,
+                current * ORDINARY_PROBE_MAX_GAIN
+            ),
             current * ORDINARY_PROBE_MAX_GAIN,
             "the cap must not clip the ordinary probe's own legitimate maximum",
         );
@@ -1928,7 +1935,7 @@ mod tests {
     fn test_layer(now: Instant) -> super::ReliableLayer {
         let (layer, pacer) = super::ReliableLayer::new(
             crate::mss::Mss::try_new(TEST_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
             now,
         );
         pacer.set_min_burst_for_test(64, now);
@@ -1940,7 +1947,7 @@ mod tests {
         // byte-stream send path so `send_max`/`ack_all` drive it directly.
         let (layer, pacer) = super::ReliableLayer::new(
             crate::mss::Mss::try_new(TEST_MSS).unwrap(),
-            crate::delivery::frame::FrameMode {
+            crate::delivery::frame::mode::FrameMode {
                 enabled: false,
                 allow_reorder: true,
             },
@@ -1953,7 +1960,7 @@ mod tests {
     fn test_layer_dedicated(now: Instant) -> super::ReliableLayer {
         let (layer, pacer) = super::ReliableLayer::new_at(
             crate::mss::Mss::try_new(TEST_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
             crate::CongestionLane::Dedicated,
             now,
             crate::sequence::InitialSequences::ZERO,
@@ -2098,13 +2105,20 @@ mod tests {
     fn application_write_waiter_registration_is_drop_scoped() {
         let now = Instant::now();
         let layer = test_layer(now);
+        let stock = |layer: &super::ReliableLayer| {
+            has_spare_capacity(
+                layer.can_send_tail_fec(now),
+                layer.application_write_waiters(),
+                layer.queue_building(),
+            )
+        };
         assert_eq!(layer.metrics_at(now).application_write_waiters, 0);
-        assert!(layer.fec_has_spare_capacity(now));
+        assert!(stock(&layer));
         {
             let _first = layer.application_write_waiter();
             assert_eq!(layer.metrics_at(now).application_write_waiters, 1);
             assert!(
-                !layer.fec_has_spare_capacity(now),
+                !stock(&layer),
                 "a waiting application writer means the empty staging queue is not spare capacity"
             );
             {
@@ -2127,23 +2141,37 @@ mod tests {
     fn interactive_spare_capacity_ignores_a_nonempty_stage_but_not_waiters() {
         let now = Instant::now();
         let mut layer = test_layer(now);
-        assert!(layer.fec_has_spare_capacity(now));
-        assert!(layer.fec_has_spare_capacity_interactive());
+        let stock = |layer: &super::ReliableLayer| {
+            has_spare_capacity(
+                layer.can_send_tail_fec(now),
+                layer.application_write_waiters(),
+                layer.queue_building(),
+            )
+        };
+        let interactive = |layer: &super::ReliableLayer| {
+            has_spare_capacity_interactive(
+                layer.pkt_send_space().accepts_new_pkt(),
+                layer.application_write_waiters(),
+                layer.queue_building(),
+            )
+        };
+        assert!(stock(&layer));
+        assert!(interactive(&layer));
 
         let payload = vec![0u8; 64];
         assert!(layer.send_data_buf(&payload, now).unwrap() > 0);
         assert!(
-            !layer.fec_has_spare_capacity(now),
+            !stock(&layer),
             "a non-empty stage must close the stock tail gate"
         );
         assert!(
-            layer.fec_has_spare_capacity_interactive(),
+            interactive(&layer),
             "the interactive gate must stay open with a non-empty stage"
         );
 
         let _waiter = layer.application_write_waiter();
         assert!(
-            !layer.fec_has_spare_capacity_interactive(),
+            !interactive(&layer),
             "application backpressure must close the interactive gate too"
         );
     }
@@ -2293,7 +2321,7 @@ mod tests {
         );
         let (mut frame, _) = super::ReliableLayer::new(
             crate::mss::Mss::try_new(TEST_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::enabled(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
             now,
         );
         frame.send_fin_buf();
@@ -3170,7 +3198,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             crate::mss::Mss::try_new(mss).unwrap(),
-            crate::delivery::frame::FrameMode::enabled(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
             now,
         )
         .0;
@@ -3210,7 +3238,7 @@ mod tests {
         let mss = NO_FEC_MSS;
         let mut rl = super::ReliableLayer::new(
             crate::mss::Mss::try_new(mss).unwrap(),
-            crate::delivery::frame::FrameMode::enabled(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
             now,
         )
         .0;
@@ -3248,7 +3276,7 @@ mod tests {
         let now = Instant::now();
         let mut rl = super::ReliableLayer::new(
             crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::enabled(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
             now,
         )
         .0;
@@ -3302,7 +3330,7 @@ mod tests {
         let now = Instant::now();
         let mut rl = super::ReliableLayer::new(
             crate::mss::Mss::try_new(NO_FEC_MSS).unwrap(),
-            crate::delivery::frame::FrameMode::enabled_reordering(),
+            crate::delivery::frame::mode::FrameMode::enabled_reordering(),
             now,
         )
         .0;

@@ -35,5 +35,3 @@ pub(crate) mod mode;
 pub(crate) mod recv;
 pub(crate) mod send;
 pub(crate) mod wire;
-
-pub use mode::{FrameMode, frame_delivery_from_env};

@@ -3,13 +3,13 @@ use std::time::{Duration, Instant};
 
 use super::ack_feedback::{AckFeedback, ReceivedAckWork};
 use super::coordination::Signals;
-use super::observability::ConnectionObservability;
 use super::post_open_recovery::PostOpenRecovery;
 use super::read_half::ReadHalf;
 use super::termination::{KillPolicy, TerminationPresser, TerminationReaper, new_termination};
 use super::transmission_layer::{LogConfig, PRINT_DEBUG_MSGS, UnreliableLayer};
 use super::watchdog_tuning::WatchdogTuning;
 use super::write_half::{WriteHalf, WriteHalfSettings};
+use crate::traffic_shaping::adjacent::observability::sink::ConnectionObservability;
 
 use crate::io_err::IoErr;
 use crate::metrics::{
@@ -881,7 +881,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use crate::delivery::frame::FrameMode;
+    use crate::delivery::frame::mode::FrameMode;
     use crate::delivery::frame::send::MAX_FRAME_LEN;
     use crate::metrics::{
         MetricsEvent, MetricsInterest, MetricsObserver, MetricsSendDriverResumeSource,
@@ -890,7 +890,7 @@ mod tests {
     use crate::obfuscate::padding::AckPaddingMode;
     use crate::traffic_shaping::core::SendWake;
     use crate::traffic_shaping::redundancy::RetransmissionArmorConfig;
-    use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+    use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
     use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
     use crate::transmission::transmission_layer::UnreliableLayer;
 
