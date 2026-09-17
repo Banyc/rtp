@@ -81,12 +81,21 @@ mod tests {
                 .unwrap();
         assert_eq!(len, PACKET_LEN);
         assert_eq!(&decoded, &core);
-        let mut other = vec![0u8; mss.get()];
-        let m = pad_handshake(&core, &mut other, mss);
-        assert_ne!(
-            &padded[..n],
-            &other[..m],
-            "two pads of the same core must differ"
+        // A single pair of uniform random draws can legitimately coincide
+        // (the tail is zero-filled, so equality reduces to equal lengths: a
+        // ~1-in-200 event at this MSS).  Draw a batch instead: randomness
+        // means the batch is not constant, which only fails if the length
+        // draw is actually broken.
+        let mut variants = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            let mut out = vec![0u8; mss.get()];
+            let len = pad_handshake(&core, &mut out, mss);
+            variants.insert(out[..len].to_vec());
+        }
+        assert!(
+            variants.len() > 1,
+            "the handshake pad must vary across draws (all {} draws equal)",
+            variants.len()
         );
     }
 

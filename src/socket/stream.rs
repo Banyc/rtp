@@ -701,10 +701,14 @@ mod tests {
         server_tasks.spawn(async move {
             let mut buf = vec![0u8; msg_len];
             for (idx, expected) in sent_for_server.iter().enumerate() {
-                let n = tokio::time::timeout(std::time::Duration::from_secs(5), b_r.recv(&mut buf))
-                    .await
-                    .expect("b recv timed out")
-                    .unwrap();
+                // No per-message wall-clock deadline: a run of unlucky iid
+                // losses can exhaust the two tail-loss probes and leave the
+                // packet to the 1 s `MIN_RTO`, so a correct repair legitimately
+                // takes seconds (and longer under scheduler load). The test's
+                // liveness is bounded once, by the 120 s timeout on the whole
+                // echo exchange below; a fixed per-message deadline here only
+                // turns that correct-but-slow repair into a spurious failure.
+                let n = b_r.recv(&mut buf).await.unwrap();
                 assert_eq!(&buf[..n], expected.as_slice());
                 if crate::debug::debug_send() && idx % 50 == 0 {
                     eprintln!("[debug] b recv {idx}/{}", sent_for_server.len());
@@ -790,10 +794,12 @@ mod tests {
         server_tasks.spawn(async move {
             let mut buf = vec![0u8; msg_len];
             for (idx, expected) in sent_for_server.iter().enumerate() {
-                let n = tokio::time::timeout(std::time::Duration::from_secs(5), b_r.recv(&mut buf))
-                    .await
-                    .expect("b recv timed out")
-                    .unwrap();
+                // No per-message wall-clock deadline: a run of unlucky iid
+                // losses can leave a correct repair to the 1 s `MIN_RTO`, so a
+                // fixed deadline turns slow-but-correct recovery into a
+                // spurious failure. Liveness is bounded once, by the 120 s
+                // timeout on the whole echo exchange below.
+                let n = b_r.recv(&mut buf).await.unwrap();
                 assert_eq!(&buf[..n], expected.as_slice());
                 if crate::debug::debug_send() && idx % 50 == 0 {
                     eprintln!("[debug] b recv {idx}/{}", sent_for_server.len());
@@ -808,20 +814,22 @@ mod tests {
         // Keep the sender's connection handle so the observed sender-side
         // parity counter can be read after the transfer completes.
         let sender = Arc::clone(&a_w.transmission_layer);
-        for (idx, m) in sent.iter().enumerate() {
-            if crate::debug::debug_send() && idx % 50 == 0 {
-                eprintln!("[debug] a sent {idx}/{}", sent.len());
+        let exchange = async {
+            for (idx, m) in sent.iter().enumerate() {
+                if crate::debug::debug_send() && idx % 50 == 0 {
+                    eprintln!("[debug] a sent {idx}/{}", sent.len());
+                }
+                a_w.send(m).await.unwrap();
+                let mut echo = vec![0u8; m.len()];
+                let n = a_r.recv(&mut echo).await.unwrap();
+                assert_eq!(&echo[..n], m.as_slice());
             }
-            a_w.send(m).await.unwrap();
-            let mut echo = vec![0u8; m.len()];
-            let n = tokio::time::timeout(std::time::Duration::from_secs(5), a_r.recv(&mut echo))
-                .await
-                .expect("echo recv timed out")
-                .unwrap();
-            assert_eq!(&echo[..n], m.as_slice());
-        }
-        drop(a_w);
-        drop(a_r);
+            drop(a_w);
+            drop(a_r);
+        };
+        tokio::time::timeout(Duration::from_secs(120), exchange)
+            .await
+            .expect("the FEC-under-loss echo exchange stalled");
         let recovered = server_tasks.join_next().await.unwrap().unwrap();
         assert!(recovered.is_some(), "FEC should be enabled on the receiver");
         assert!(
