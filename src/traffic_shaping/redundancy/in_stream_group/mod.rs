@@ -4,6 +4,7 @@
 
 mod flush;
 mod gate;
+pub(crate) mod parity;
 
 pub(crate) use flush::InStreamGroupFlush;
 pub(crate) use gate::CapacityGate;

@@ -13,6 +13,11 @@ use std::{
 use fec::{de::FecDecoder, en::FecEncoder};
 use primitive::io::token_bucket::TokenBucket;
 
+#[cfg(test)]
+pub(crate) use super::in_stream_group::parity::INSTREAM_PARITY_PER_GROUP;
+use super::in_stream_group::parity::{self, CapParityStash, InStreamParity};
+pub(crate) use super::in_stream_group::parity::{INSTREAM_DATA_PER_GROUP, MAX_DATA_PER_GROUP};
+
 const FEC_DEBUG: bool = false;
 
 fn fec_hdr_size() -> usize {
@@ -22,8 +27,6 @@ fn fec_hdr_size() -> usize {
 
 const WINDOW_SIZE: NonZeroU64 = NonZeroU64::new(32).unwrap();
 const MAX_GROUP_SIZE: usize = MAX_DATA_PER_GROUP + MAX_PARITY_PER_GROUP;
-/// Maximum data symbols accumulated before a group is forcibly flushed.
-const MAX_DATA_PER_GROUP: usize = 20;
 /// Parity overhead target: ~25% (1 parity per 4 data), at least 1 per group.
 const PARITY_RATIO_NUM: usize = 1;
 const PARITY_RATIO_DEN: usize = 4;
@@ -39,15 +42,6 @@ const MAX_INTERACTIVE_PARITY_DEPTH: u8 = (MAX_GROUP_SIZE - 1) as u8;
 /// Groups with at most this many data symbols get parity protection.
 /// Larger groups skip parity to avoid impacting throughput of big traffic.
 const PARITY_DATA_THRESHOLD: usize = 4;
-/// In-stream group FEC: a data group accumulates up to this many data symbols
-/// before a full-group inline parity flush is emitted mid-burst.  Stock
-/// (toggle off) force-skips at `PARITY_DATA_THRESHOLD` instead, so groups never
-/// reach this size.
-const INSTREAM_DATA_PER_GROUP: usize = 8;
-/// Parity symbols emitted for a full in-stream group (`INSTREAM_DATA_PER_GROUP`
-/// data symbols).  8+4 = 12 fits the stock decoder `MAX_GROUP_SIZE` (25) and
-/// `WINDOW_SIZE` (32) without bumping either constant.
-const INSTREAM_PARITY_PER_GROUP: usize = 4;
 /// Parity must consume at most this fraction of the currently-available send
 /// budget. Parity is spare-bandwidth-only: it must never compete with data
 /// traffic, so a parity burst is only flushed when it fits within 1/3 of the
@@ -119,11 +113,9 @@ pub(crate) struct FecEncoderState {
     /// Guards against re-recording the same group's wait on repeated
     /// gate-closed passes.
     deferred_no_spare_capacity: bool,
-    /// Parity packets already encoded by a forced flush at
-    /// `MAX_DATA_PER_GROUP` (see `encode_data`), waiting for the next
-    /// budgeted `maybe_flush_parities`.  Bounded: at most
-    /// `MAX_PARITY_PER_GROUP` packets per capped group.
-    pending_cap_parity: VecDeque<Vec<u8>>,
+    /// Cap-forced full-group parity held until the next budgeted
+    /// `maybe_flush_parities` (see [`CapParityStash`]).
+    cap_parity: CapParityStash,
 }
 
 /// Read-actor FEC state: decodes incoming symbols and drains recovered
@@ -331,7 +323,7 @@ impl FecState {
                     .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
                 stats: Arc::clone(&stats),
                 deferred_no_spare_capacity: false,
-                pending_cap_parity: VecDeque::new(),
+                cap_parity: CapParityStash::new(),
             },
             decoder: FecDecoderState {
                 decoder: FecDecoder::builder()
@@ -466,7 +458,7 @@ impl FecEncoderState {
             self.encoder.skip_group();
             self.deferred_no_spare_capacity = false;
         }
-        if self.encoder.group_data_count() >= MAX_DATA_PER_GROUP {
+        if parity::cap_reached(self.encoder.group_data_count()) {
             self.force_flush_capped_group();
         }
         self.encoder.encode_data(data, out)
@@ -490,7 +482,7 @@ impl FecEncoderState {
         while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
             pkts.push(self.enc_buf[..n].to_vec());
         }
-        self.pending_cap_parity.extend(pkts);
+        self.cap_parity.hold(pkts);
     }
 
     /// Whether the open FEC group is a full in-stream group ready for an inline
@@ -501,7 +493,7 @@ impl FecEncoderState {
     /// (8 data symbols → 4 parity symbols).  Stock path passes `false` and
     /// always gets `false`, so the inline flush never fires.
     pub fn group_data_full(&self, instream: bool) -> bool {
-        instream && self.encoder.group_data_count() >= INSTREAM_DATA_PER_GROUP
+        parity::group_is_full(instream, self.encoder.group_data_count())
     }
 
     /// Number of data symbols currently in the open FEC group.  The write
@@ -575,19 +567,17 @@ impl FecEncoderState {
         // token-budget gate as any other parity burst: on a tight budget the
         // stash HOLDS for the next pass instead of being dropped (the group
         // is already closed, so this is its only chance to be protected).
-        if !self.pending_cap_parity.is_empty() {
-            let need = self.pending_cap_parity.len();
+        if !self.cap_parity.is_empty() {
+            let need = self.cap_parity.len();
             let available_tokens = send_rate_limiter.gen_tokens(now);
             let parity_budget = available_tokens / PARITY_BUDGET_DEN;
-            if need > parity_budget {
+            if !self.cap_parity.affordable(parity_budget) {
                 return vec![];
             }
             assert!(send_rate_limiter.take_exact_tokens(need, now));
             self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
             inc_hist(&self.stats.group_size_flushed, MAX_DATA_PER_GROUP);
-            let pkts: Vec<Vec<u8>> = std::mem::take(&mut self.pending_cap_parity)
-                .into_iter()
-                .collect();
+            let pkts: Vec<Vec<u8>> = self.cap_parity.take();
             self.stats
                 .parity_sent
                 .fetch_add(pkts.len(), Ordering::Relaxed);
@@ -654,42 +644,36 @@ impl FecEncoderState {
         // interactive exception above when `small_group_parity_count > 1`,
         // or fall through to the stock path below.
         if instream && data_count >= 2 {
-            let parity_count = INSTREAM_PARITY_PER_GROUP as u8;
             let available_tokens = send_rate_limiter.gen_tokens(now);
             let parity_budget = available_tokens / PARITY_BUDGET_DEN;
-            // Budget-adaptive, non-destructive: emit as many parity symbols as
-            // the 1/3 spare-budget share allows (one is enough to recover a
-            // single lost data symbol), and HOLD the group open when none is
-            // affordable rather than destroying it.  The all-or-nothing gate
-            // destroyed the whole group's parity the moment the pacer was
-            // momentarily drained — on a batched interactive lane that is the
-            // common case, and the group then had no parity at all, so its
-            // loss fell through to RTO/reorder ARQ.  Holding preserves the
-            // accumulated data symbols so the next pass (after the token
-            // refill) still emits their parity.
-            if parity_budget == 0 {
-                self.stats
-                    .groups_skipped_no_surplus_tokens
-                    .fetch_add(1, Ordering::Relaxed);
-                inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
-                return vec![];
+            match parity::decide_in_stream_parity(parity_budget) {
+                InStreamParity::Hold => {
+                    self.stats
+                        .groups_skipped_no_surplus_tokens
+                        .fetch_add(1, Ordering::Relaxed);
+                    inc_hist(&self.stats.group_size_skipped_no_surplus_tokens, data_count);
+                    return vec![];
+                }
+                InStreamParity::Emit(depth) => {
+                    assert!(send_rate_limiter.take_exact_tokens(usize::from(depth), now));
+                    if FEC_DEBUG {
+                        eprintln!(
+                            "FEC: flushing {depth} parities for in-stream group of {data_count}"
+                        );
+                    }
+                    self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
+                    inc_hist(&self.stats.group_size_flushed, data_count);
+                    let mut parity_encoder = self.encoder.flush_parities(depth);
+                    let mut pkts = vec![];
+                    while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
+                        pkts.push(self.enc_buf[..n].to_vec());
+                    }
+                    self.stats
+                        .parity_sent
+                        .fetch_add(pkts.len(), Ordering::Relaxed);
+                    return pkts;
+                }
             }
-            let depth = u8::try_from(usize::from(parity_count).min(parity_budget)).unwrap();
-            assert!(send_rate_limiter.take_exact_tokens(usize::from(depth), now));
-            if FEC_DEBUG {
-                eprintln!("FEC: flushing {depth} parities for in-stream group of {data_count}");
-            }
-            self.stats.groups_flushed.fetch_add(1, Ordering::Relaxed);
-            inc_hist(&self.stats.group_size_flushed, data_count);
-            let mut parity_encoder = self.encoder.flush_parities(depth);
-            let mut pkts = vec![];
-            while let Some(n) = parity_encoder.encode_parity(&mut self.enc_buf) {
-                pkts.push(self.enc_buf[..n].to_vec());
-            }
-            self.stats
-                .parity_sent
-                .fetch_add(pkts.len(), Ordering::Relaxed);
-            return pkts;
         }
         // Stock path: groups above `PARITY_DATA_THRESHOLD` are skipped so
         // parity never impacts throughput of big traffic.  When `instream` is
