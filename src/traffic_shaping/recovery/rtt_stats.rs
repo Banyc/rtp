@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use super::fast_loss;
+use super::reorder_tolerance::gate_variance::GateVarianceState;
 use super::rto::RtxTimer;
 
 /// Number of most recent RTT samples spanned by the rolling minimum — the
@@ -41,7 +43,10 @@ const GATE_STEP_TRANSIENT_SAMPLES: usize = 3;
 /// a queue.  Until the window has this much history the trending margin is
 /// used, exactly as before the steady-state estimate existed.  The interactive
 /// lane's early history is sparse, so this spans well past connection setup.
-const GATE_VAR_MATURE_SAMPLES: usize = 128;
+///
+/// Consumed by the reorder-tolerance policy
+/// ([`GateVarianceState::steady`]).
+pub(crate) const GATE_VAR_MATURE_SAMPLES: usize = 128;
 
 /// Bundle of RTT statistics: the smoothed-RTT / RTO timer, the lifetime
 /// minimum RTT, and a rolling minimum over the most recent samples.
@@ -224,44 +229,20 @@ impl RttStats {
         self.rto.smooth_rtt_var()
     }
 
-    /// Robust RTT variance for the delay-based queue gate: the *steady-state*
-    /// jitter floor, capped at twice the one-sided upward component.
-    ///
-    /// A self-inflicted queue raises the smoothed variance with the very
-    /// backlog the delay gate must detect, so the trending two-sided
-    /// `smooth_rtt_var` lets the gate hold a queue at the depth that inflated
-    /// its own tolerance.  Instead the margin is the minimum two-sided
-    /// variance over the last [`GATE_VAR_WINDOW_SAMPLES`] samples: the
-    /// quietest recent stretch, which a rising queue cannot raise until its
-    /// own inflation has displaced every quiet sample in the window.  On a
-    /// genuinely jittery path (the reorder lane's reorder echoes) every window
-    /// still contains an excursion, so the minimum stays at the real jitter
-    /// and no spurious drain appears.  The separate `2 * up` cap still
-    /// discounts a downward-only overshoot (see [`Self::gate_up_rtt_var`]).
-    ///
-    /// During a raw step transient the trending value is returned because the
-    /// floor window has not begun to move yet; the caller's floor-rise check
-    /// covers the rest of the transition.  See [`Self::gate_jitter`].
+    /// Robust RTT variance for the delay-based queue gate: the windowed
+    /// steady-state jitter floor.  The selection lives in the reorder-tolerance
+    /// policy ([`GateVarianceState::steady`]); the raw estimator stays here
+    /// because the same filter feeds the RTO.
     pub(crate) fn gate_rtt_var(&self) -> Duration {
-        if self.step_transient_remaining > 0 || self.samples_recorded < GATE_VAR_MATURE_SAMPLES {
-            return self.trending_gate_rtt_var();
-        }
-        let steady_state = self
-            .gate_var_samples
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or_else(|| self.rto.smooth_rtt_var());
-        self.gate_up_rtt_var.mul_f64(2.0).min(steady_state)
+        self.gate_variance_state().steady(self.rto.smooth_rtt_var())
     }
 
-    /// The trending two-sided margin with the `2 * up` cap applied (it42):
-    /// reacts immediately to a path step, but is inflated by a self-inflicted
-    /// queue.
+    /// The trending two-sided margin with the `2 * up` cap applied: reacts
+    /// immediately to a path step, but is inflated by a self-inflicted queue.
+    /// See [`GateVarianceState::trending`].
     pub(crate) fn trending_gate_rtt_var(&self) -> Duration {
-        self.gate_up_rtt_var
-            .mul_f64(2.0)
-            .min(self.rto.smooth_rtt_var())
+        self.gate_variance_state()
+            .trending(self.rto.smooth_rtt_var())
     }
 
     /// Both jitter estimates for the delay gate; see [`GateJitter`].
@@ -269,6 +250,17 @@ impl RttStats {
         GateJitter {
             steady: self.gate_rtt_var(),
             trending: self.trending_gate_rtt_var(),
+        }
+    }
+
+    /// A read-only view of the raw gate estimators handed to the reorder-lane
+    /// policy ([`GateVarianceState`]).
+    fn gate_variance_state(&self) -> GateVarianceState<'_> {
+        GateVarianceState {
+            upward: self.gate_up_rtt_var,
+            step_transient_remaining: self.step_transient_remaining,
+            samples_recorded: self.samples_recorded,
+            window: &self.gate_var_samples,
         }
     }
 
@@ -296,22 +288,10 @@ impl RttStats {
         self.rto.fast_loss_armed()
     }
 
-    /// Queue-independent fast-loss arming: the smoothed RTT variation is
-    /// below the lifetime minimum RTT — the propagation floor recorded while
-    /// the path was still uncongested — so a SACK gap is evidence of loss
-    /// rather than jitter-driven reordering.
-    ///
-    /// The srtt-relative gate [`Self::fast_loss_armed`] (`K*rttvar <
-    /// srtt/4`) is disarmed exactly when a bulk sender fills the bottleneck
-    /// queue, because queueing inflates both `srtt` and `rttvar`.  The
-    /// lifetime `min_rtt` does not inflate with queue depth (it is a minimum
-    /// over samples, including the uncongested ones), so this gate keeps the
-    /// evidence-gated fast-loss path armed under the bulk + loss conditions
-    /// where repair latency matters most.  `false` before any sample exists
-    /// (the gate abstains; the caller keeps the structural gate).
+    /// Queue-independent fast-loss arming; the policy lives in
+    /// [`fast_loss::armed_against_min_rtt`].
     pub(crate) fn fast_loss_armed_against_min_rtt(&self) -> bool {
-        self.min_rtt
-            .is_some_and(|min_rtt| self.smooth_rtt_var() < min_rtt)
+        fast_loss::armed_against_min_rtt(self.min_rtt, self.smooth_rtt_var())
     }
 
     pub(crate) fn reset_rto(&mut self, rtt: Duration) {
