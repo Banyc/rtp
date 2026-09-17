@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use super::CongestionLane;
 use super::bandwidth_probe::loss_scaled_gain;
+use super::idle_gap::{IdleContinuity, idle_gap_threshold};
 
 // Gentle-mode parameters for the delay-gated congestion controller.  These are
 // intentionally conservative: they let a bulk flow drain a self-inflicted
@@ -140,7 +141,7 @@ impl GentleMode {
             .gentle_block_until
             .map(|until| now >= until)
             .unwrap_or(true);
-        let enter_after = control_rtt.mul_f64(GENTLE_ENTER_RTTS).max(GENTLE_ENTER_MIN);
+        let enter_after = idle_gap_threshold(control_rtt);
         if let Some(stretch) = persistent_queue_for
             && !self.gentle_mode
             && stretch >= enter_after
@@ -186,7 +187,15 @@ impl GentleMode {
     pub(crate) fn restart_drain_episode(&mut self) {
         self.drain_episode = None;
     }
+}
 
+impl IdleContinuity for GentleMode {
+    fn break_idle_continuity(&mut self) {
+        self.restart_drain_episode();
+    }
+}
+
+impl GentleMode {
     /// Attempt a gentle-mode probe.
     ///
     /// Distinguishes an inactive controller, an applied gentle probe, and the

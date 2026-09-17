@@ -2,6 +2,7 @@ mod bandwidth_probe;
 mod congestion_response;
 mod fast_start;
 mod gentle;
+mod idle_gap;
 mod pacing;
 mod queue_growth;
 mod rate_window;

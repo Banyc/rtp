@@ -11,9 +11,8 @@ use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 use super::CongestionLane;
 #[cfg(test)]
 use super::gentle::DrainEpisode;
-use super::gentle::{
-    GENTLE_ENTER_MIN, GENTLE_ENTER_RTTS, GentleExitCause, GentleMode, GentleProbeOutcome,
-};
+use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
+use super::idle_gap::IdleGap;
 
 pub(crate) const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
 /// Shorter RTT-floor bucket for a reorder-tolerant connection (the interactive
@@ -160,10 +159,9 @@ pub(crate) struct QueueGrowth {
     /// baseline.
     reorder_tolerant: bool,
     persistent_since: Option<Instant>,
-    /// Time of the previous `observe`, used to detect an observation gap that
-    /// breaks the continuity of a standing-queue episode (see
-    /// [`Self::observe`]).
-    last_observe: Option<Instant>,
+    /// The single observation clock that voids every timer's continuity across
+    /// an idle gap (see [`IdleGap`]).
+    idle_gap: IdleGap,
     building: bool,
     gentle: GentleMode,
 }
@@ -177,7 +175,7 @@ impl QueueGrowth {
             floor_step_hold: 0,
             reorder_tolerant,
             persistent_since: None,
-            last_observe: None,
+            idle_gap: IdleGap::new(),
             building: false,
             gentle: GentleMode::new(),
         }
@@ -197,7 +195,7 @@ impl QueueGrowth {
         self.prev_floor = None;
         self.floor_step_hold = 0;
         self.persistent_since = None;
-        self.last_observe = None;
+        self.idle_gap.reset();
         self.building = false;
         self.gentle.reset()
     }
@@ -205,6 +203,19 @@ impl QueueGrowth {
     /// Declare this controller's congestion lane.
     pub(crate) fn set_lane(&mut self, lane: CongestionLane) {
         self.gentle.set_lane(lane);
+    }
+
+    /// Observe the shared idle-gap clock and, on a gap, void the continuity of
+    /// every timer registered with it.  This bundle is the one place a new
+    /// continuity timer is added, so registration and reset cannot drift apart.
+    fn break_idle_continuity(&mut self, now: Instant, control_rtt: Duration) {
+        let Self {
+            idle_gap,
+            persistent_since,
+            gentle,
+            ..
+        } = self;
+        idle_gap.observe(&mut (persistent_since, gentle), now, control_rtt);
     }
 
     pub(crate) fn observe(
@@ -218,28 +229,11 @@ impl QueueGrowth {
         // The floor is deliberately fed by smoothed RTT.  The raw-min variant
         // measured worse; the separate RTT-variance terms protect jitter.
         let floor = self.floor.update(now, smooth);
-        // A gap in observations voids the continuity of a standing-queue
-        // episode: the persistent-queue timer must not count a quiet stretch
-        // as queue persistence, or the first sample after an idle gap reports
-        // a multi-second "persistent" queue and trips gentle-mode entry
-        // immediately.  The threshold is the gentle-entry stretch itself, so a
-        // gap at least that long -- long enough to have satisfied the entry on
-        // its own -- restarts the timer.  A backlogged lane samples far more
-        // often than this, so a genuine standing queue is unaffected.
-        let idle_gap_breaks_queue = self.last_observe.is_some_and(|previous| {
-            now.saturating_duration_since(previous)
-                >= control_rtt.mul_f64(GENTLE_ENTER_RTTS).max(GENTLE_ENTER_MIN)
-        });
-        self.last_observe = Some(now);
-        // A gap in observations also voids the drain-episode continuity: the
-        // ineffective-drain guard measures a continuous drain over the last
-        // twelve control RTTs, and a lane that went quiet during the episode
-        // was not draining at all.  Restart the measurement so the first
-        // post-idle drain cannot exit gentle mode (with its re-entry cooldown)
-        // on the strength of the idle stretch.
-        if idle_gap_breaks_queue {
-            self.gentle.restart_drain_episode();
-        }
+        // A gap in observations voids the continuity of every timer this
+        // controller owns -- the persistent-queue timer and the gentle
+        // drain episode -- in one step, so neither can count a quiet stretch
+        // as a continuous episode.  See `idle_gap`.
+        self.break_idle_continuity(now, control_rtt);
         // A large fractional rise of the floor is a path step, not queue
         // growth: use the trending margin so the pre-step steady-state floor
         // cannot license a drain during the floor transition.  A queue raises
@@ -265,11 +259,7 @@ impl QueueGrowth {
             QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
         );
         if smooth > floor + persistent_tolerance {
-            if idle_gap_breaks_queue {
-                self.persistent_since = Some(now);
-            } else {
-                self.persistent_since.get_or_insert(now);
-            }
+            self.persistent_since.get_or_insert(now);
         } else {
             self.persistent_since = None;
         }
