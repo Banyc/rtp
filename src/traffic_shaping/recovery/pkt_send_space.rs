@@ -28,6 +28,29 @@ pub const INIT_CWND: usize = 32;
 pub(crate) const OUTAGE_RECOVERY_CWND: usize = 16;
 pub(super) const LOSS_RATE_MIN_SAMPLES: usize = 16;
 pub(crate) const CWND_SEND_RATE_SCALE: usize = 8;
+
+/// Headroom multiple applied to the minimum-RTT bandwidth-delay product when
+/// bounding the in-flight window.  The rate-based window above scales the
+/// *smoothed* RTT, which on a starved host absorbs ACK-processing delay (and
+/// on any host absorbs a standing queue), so it can inflate the allowed
+/// in-flight far beyond the path's own capacity.  The ceiling is derived from
+/// the peer-echoed lifetime minimum RTT and the windowed delivery peak, both
+/// of which the ceiling does not control, and so cannot be inflated by the
+/// live ACK timing it exists to correct.
+///
+/// It is deliberately below [`CWND_SEND_RATE_SCALE`]: the ceiling only has to
+/// hold in-flight within a few minimum-RTT bandwidth-delay products, while the
+/// rate-based window keeps eight round trips of headroom when the path is
+/// quiet.
+pub(crate) const CWND_BDP_CAP_SCALE: usize = 6;
+
+/// The smoothed RTT must exceed the peer-echoed lifetime minimum by this
+/// factor before the bandwidth-delay-product ceiling engages.  A quiet path
+/// (smoothed RTT at its floor) is never capped, so the ceiling cannot perturb
+/// the deterministic clean lanes; it engages only once the RTT has left the
+/// propagation floor, which is exactly the overshoot evidence it corrects.
+pub(crate) const CWND_BDP_CAP_ENGAGE_RTT_FACTOR: f64 = 3.0;
+
 /// Cumulative repair transmissions and the independent scheduler reasons
 /// armed when a retransmission was selected.  Reason counters are deliberately
 /// non-exclusive: one retransmission can be both RTO- and reorder-ready.
@@ -90,6 +113,12 @@ pub struct PktSendSpace {
     num_in_flight: usize,
     reused_buf: ObjPool<Vec<u8>>,
     cwnd: NonZeroUsize,
+    /// Optional ceiling on `cwnd`, in packets, applied after the rate-based
+    /// estimate.  The owner supplies a minimum-RTT bandwidth-delay product so
+    /// an ACK-timing-inflated smoothed RTT cannot raise the in-flight window
+    /// above the path's observed minimum capacity.  `None` disables the
+    /// ceiling (the unit-test default).
+    cwnd_bdp_cap: Option<usize>,
     out_of_order_seq_end: Option<SequenceNumber>,
     /// Any sequence after this does not participate in data loss analysis.
     max_pipe_seq: Option<SequenceNumber>,
@@ -186,6 +215,7 @@ impl PktSendSpace {
             num_in_flight: 0,
             reused_buf: buf_pool(Some(MAX_NUM_RECVING_PKTS)),
             cwnd: NonZeroUsize::new(INIT_CWND).unwrap(),
+            cwnd_bdp_cap: None,
             out_of_order_seq_end: None,
             max_pipe_seq: None,
             loss_event_window: LossEventWindow::new(),
@@ -1204,6 +1234,13 @@ impl PktSendSpace {
         self.rtt_stats.min_rtt()
     }
 
+    /// Install (or clear) the minimum-RTT bandwidth-delay product ceiling on
+    /// the in-flight window, in packets.  The next [`Self::set_send_rate`]
+    /// applies it; the owner recomputes and reinstalls it on every rate write.
+    pub(crate) fn set_cwnd_bdp_cap(&mut self, cap: Option<usize>) {
+        self.cwnd_bdp_cap = cap;
+    }
+
     pub fn set_send_rate(&mut self, send_rate: PosR<f64>) {
         let previous_cwnd = self.cwnd;
         let cwnd = self.rtt_stats.smooth_rtt().as_secs_f64() * send_rate.get();
@@ -1220,6 +1257,16 @@ impl PktSendSpace {
         // is the peer's window; it must stay large enough that this bound
         // does not fall below what the path delivers (see the crate README).
         let cwnd = cwnd.min(MAX_NUM_RECVING_PKTS);
+        // Bound the window by the minimum-RTT bandwidth-delay product: the
+        // rate-based estimate scales the smoothed RTT, so a starved ACK path
+        // (or a standing queue) must not be able to inflate the allowed
+        // in-flight without bound.  The ceiling is floored at the initial
+        // window so a low-rate cold start on a short-RTT path can always
+        // bootstrap (a sub-packet bandwidth-delay product rounds to zero).
+        let cwnd = match self.cwnd_bdp_cap {
+            Some(cap) => cwnd.min(cap.max(INIT_CWND)),
+            None => cwnd,
+        };
         // While an outage-recovery epoch is open, clamp cwnd to
         // OUTAGE_RECOVERY_CWND so a just-restored path is not flooded before
         // fresh RTT samples can seed the congestion state.
@@ -2093,6 +2140,45 @@ mod tests {
             space.cwnd().get(),
             crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
             "an extreme rate must clamp cwnd to the receive window"
+        );
+    }
+
+    /// The optional minimum-RTT bandwidth-delay-product ceiling bounds the
+    /// rate-based in-flight window, but never below the initial window: a
+    /// sub-packet bandwidth-delay product (a short-RTT path at a low cold-start
+    /// rate) must not collapse the window to one packet.  Clearing the ceiling
+    /// restores the rate-based window exactly.
+    #[test]
+    fn cwnd_bdp_cap_bounds_the_rate_based_window_with_an_initial_window_floor() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        space.set_send_rate(PosR::new(10_000.0).unwrap());
+        let uncapped = space.cwnd().get();
+        assert!(uncapped > INIT_CWND, "cwnd={uncapped}");
+
+        space.set_cwnd_bdp_cap(Some(INIT_CWND + 5));
+        space.set_send_rate(PosR::new(10_000.0).unwrap());
+        assert_eq!(
+            space.cwnd().get(),
+            INIT_CWND + 5,
+            "a tight ceiling must bound the rate-based window"
+        );
+
+        space.set_cwnd_bdp_cap(Some(1));
+        space.set_send_rate(PosR::new(10_000.0).unwrap());
+        assert_eq!(
+            space.cwnd().get(),
+            INIT_CWND,
+            "a sub-initial ceiling must be floored at the initial window"
+        );
+
+        space.set_cwnd_bdp_cap(None);
+        space.set_send_rate(PosR::new(10_000.0).unwrap());
+        assert_eq!(
+            space.cwnd().get(),
+            uncapped,
+            "clearing the ceiling must restore the rate-based window"
         );
     }
 

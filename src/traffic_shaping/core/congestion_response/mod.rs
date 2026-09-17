@@ -104,6 +104,14 @@ impl CongestionResponse {
         self.delivery_peak = WindowedDeliveryMax::new(now);
     }
 
+    /// The recent windowed delivery peak, if any sample has been observed.
+    /// Unlike the live send rate this is a windowed maximum of measured
+    /// delivery, so it tracks the path's own timescale and is not depressed
+    /// by the controller's own momentary drain.
+    pub(crate) fn delivery_peak_rate(&self) -> Option<f64> {
+        self.delivery_peak.peek()
+    }
+
     pub(crate) fn observe(
         &mut self,
         smooth_rtt: Duration,

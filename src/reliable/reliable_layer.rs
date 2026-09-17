@@ -38,7 +38,10 @@ use crate::{
         FastStartStep, GentleExitCause, ORDINARY_PROBE_MAX_GAIN, ProbeKind, SendPacer,
         linear_backoff_step,
     },
-    traffic_shaping::recovery::pkt_send_space::{CWND_SEND_RATE_SCALE, PktSendSpace},
+    traffic_shaping::recovery::pkt_send_space::{
+        CWND_BDP_CAP_ENGAGE_RTT_FACTOR, CWND_BDP_CAP_SCALE, CWND_SEND_RATE_SCALE, INIT_CWND,
+        PktSendSpace,
+    },
     traffic_shaping::recovery::rtt_stats::GateJitter,
     transmission::watchdog_tuning::WatchdogTuning,
 };
@@ -1408,6 +1411,39 @@ impl ReliableLayer {
         );
     }
 
+    /// Ceiling on the in-flight window, in packets, derived from the
+    /// peer-echoed lifetime minimum RTT and the windowed delivery peak.
+    ///
+    /// The rate-based window scales the *smoothed* RTT, which a standing
+    /// queue or a starved ACK path inflates; this ceiling instead bounds
+    /// in-flight against the path's observed minimum-RTT bandwidth-delay
+    /// product.  The peak is a maximum over a multi-second window, so a
+    /// momentary drain of the controller cannot depress it — and the ceiling
+    /// itself cannot reduce the peak within that window, so it cannot
+    /// self-limit the window it bounds.  It engages only once the smoothed
+    /// RTT has left its propagation floor, so a quiet deterministic lane is
+    /// never capped.
+    fn cwnd_bdp_cap(&self) -> Option<usize> {
+        // The interactive reorder-tolerant lane keeps its own tuned gate and
+        // is deliberately excluded so this bulk-path safety cannot change its
+        // latency floor.
+        if self.congestion_response.reorder_tolerant() {
+            return None;
+        }
+        let min_rtt = self.pkt_send_space.min_rtt()?;
+        let peak = self.congestion_response.delivery_peak_rate()?;
+        let smooth_rtt = self.pkt_send_space.smooth_rtt();
+        if smooth_rtt < min_rtt.mul_f64(CWND_BDP_CAP_ENGAGE_RTT_FACTOR) {
+            return None;
+        }
+        let bdp = min_rtt.as_secs_f64() * peak;
+        if !bdp.is_finite() || bdp <= 0.0 {
+            return None;
+        }
+        let cap = (bdp * CWND_BDP_CAP_SCALE as f64).round() as usize;
+        Some(cap.max(INIT_CWND))
+    }
+
     /// Apply a computed sender rate.
     ///
     /// This is the single bridge from a computed `f64` into the validated
@@ -1426,6 +1462,15 @@ impl ReliableLayer {
         } else {
             PosR::new(rate).unwrap_or(self.send_rate)
         };
+        // The in-flight window is re-derived from the smoothed RTT, which a
+        // starved or slow ACK path inflates.  Install a minimum-RTT
+        // bandwidth-delay-product ceiling before the rate write so the ACK
+        // path cannot raise the allowed in-flight without bound.  The ceiling
+        // is derived from the peer-echoed lifetime minimum RTT and the
+        // windowed delivery peak — neither of which the ceiling controls —
+        // and engages only once the RTT has left its propagation floor.
+        let cwnd_cap = self.cwnd_bdp_cap();
+        self.pkt_send_space.set_cwnd_bdp_cap(cwnd_cap);
         // Reapply the rate to the send space even when its numeric value did
         // not change: cwnd also depends on the latest RTT and outage state.
         // The pacer, however, needs no rebuild for an unchanged effective
