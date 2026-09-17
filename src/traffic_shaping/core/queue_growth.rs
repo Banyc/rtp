@@ -12,19 +12,10 @@ use super::CongestionLane;
 #[cfg(test)]
 use super::gentle::DrainEpisode;
 use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
-use super::idle_gap::IdleGap;
+use super::idle_gap::{IdleGap, QueueGrowthContinuity};
+use super::reorder_floor::{FloorBucket, floor_bucket};
 
-pub(crate) const RTT_MIN_BUCKET: Duration = Duration::from_secs(5);
-/// Shorter RTT-floor bucket for a reorder-tolerant connection (the interactive
-/// frame fast-forward lane). A long bucket lets an isolated low RTT sample —
-/// the receiver echoes the send timestamp of a reordered packet that took a
-/// faster path — pin the propagation floor for the whole bucket, so the
-/// ordinary RTT then reads as a standing queue and the delay controller
-/// drains the send rate. The interactive lane opts into out-of-order frame
-/// delivery, so its floor must track the recent baseline instead of holding
-/// one outlier. Bulk and strict paths keep [`RTT_MIN_BUCKET`].
-pub(crate) const RTT_MIN_BUCKET_REORDER: Duration = Duration::from_millis(200);
-pub(crate) const RTT_MIN_BUCKET_RTT_SCALE: u32 = 10;
+pub(crate) use super::reorder_floor::{RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE};
 
 pub(crate) const QUEUE_RTT_FACTOR: f64 = 2.0;
 /// The persistent-queue timer uses a wider RTT-variance margin than the
@@ -182,11 +173,10 @@ impl QueueGrowth {
     }
 
     fn fresh_floor(now: Instant, reorder_tolerant: bool) -> WindowedRttMin {
-        let (min_bucket, baseline_scaled) = if reorder_tolerant {
-            (RTT_MIN_BUCKET_REORDER, true)
-        } else {
-            (RTT_MIN_BUCKET, false)
-        };
+        let FloorBucket {
+            min_bucket,
+            baseline_scaled,
+        } = floor_bucket(reorder_tolerant);
         WindowedRttMin::with_min_bucket(now, min_bucket, baseline_scaled)
     }
 
@@ -215,7 +205,14 @@ impl QueueGrowth {
             gentle,
             ..
         } = self;
-        idle_gap.observe(&mut (persistent_since, gentle), now, control_rtt);
+        idle_gap.observe_queue_growth(
+            QueueGrowthContinuity {
+                persistent_since,
+                gentle,
+            },
+            now,
+            control_rtt,
+        );
     }
 
     pub(crate) fn observe(

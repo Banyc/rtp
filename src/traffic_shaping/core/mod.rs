@@ -9,6 +9,7 @@ mod probe_cap;
 mod queue_growth;
 mod rate_bridge;
 mod rate_window;
+mod reorder_floor;
 mod spare_capacity;
 
 /// Congestion-controller lane intent declared by the connection's owner.

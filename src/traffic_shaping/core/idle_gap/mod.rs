@@ -15,6 +15,10 @@
 //! cannot be observed without being reset; registering a new timer is adding
 //! it to the reset bundle.
 
+mod bundle;
+
+pub(crate) use bundle::QueueGrowthContinuity;
+
 use std::time::{Duration, Instant};
 
 use super::gentle::{GENTLE_ENTER_MIN, GENTLE_ENTER_RTTS};
