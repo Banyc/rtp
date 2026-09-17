@@ -1,0 +1,617 @@
+//! The typed observation schema: what one observation contains and the
+//! compatibility contract its version carries.
+//!
+//! Observers run synchronously on the thread that produced the event. They
+//! should copy or aggregate the observation quickly and must not block. Calls
+//! can overlap across the connection's read and write tasks; 'event_index'
+//! supplies a connection-local total order for delivered observations.
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// The typed observation schema's append-only compatibility contract.
+///
+/// Revisions are listed oldest-first in [`Self::APPEND_ONLY`].  A revision is
+/// admitted to that table only when it **appended** fields to the typed
+/// observation types and did not remove, rename, retype, or reorder any
+/// existing field.  A consumer built against revision `R` therefore reads
+/// every record stamped `writer >= R`: the fields it knows are unchanged and
+/// an appended field it does not know is ignored (see [`Self::readable_by`]).
+///
+/// [`Self::CURRENT`] is derived from the table — there is no independent
+/// version literal to edit — so advancing the schema requires adding a
+/// revision here, and adding a revision is itself the declaration that the
+/// step was additive.  A change that cannot be expressed that way is a
+/// different, non-append-only series and must not be smuggled into this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaCompatibility;
+
+impl SchemaCompatibility {
+    /// Revisions covered by the append-only contract, oldest first.  Revision
+    /// 29 extended 28 with
+    /// [`MetricsFecCounters::rejected_recovered_symbols`] and touched nothing
+    /// else.
+    pub const APPEND_ONLY: &'static [u16] = &[28, 29];
+
+    /// The revision this build stamps on every typed observation; it is the
+    /// last entry of [`Self::APPEND_ONLY`], never a separate literal.
+    pub const CURRENT: u16 = Self::APPEND_ONLY[Self::APPEND_ONLY.len() - 1];
+
+    /// Whether a consumer built against `reader` can read a record stamped
+    /// `writer`.  The append-only contract makes reading forward-compatible:
+    /// a consumer accepts the revision it was built against and every later
+    /// revision.
+    pub const fn readable_by(reader: u16, writer: u16) -> bool {
+        writer >= reader
+    }
+}
+
+/// Version of the typed observation schema.
+///
+/// A consumer that matches a revision exactly must accept every revision in
+/// `reader..=`[`SCHEMA_VERSION`], because revisions only append fields: the
+/// fields the consumer knows are still present and identically laid out, and
+/// the appended ones are ignored.  The number and this rule cannot drift
+/// apart: `SCHEMA_VERSION` is [`SchemaCompatibility::CURRENT`], derived from
+/// the append-only revision table.
+pub const SCHEMA_VERSION: u16 = SchemaCompatibility::CURRENT;
+
+/// Why the session reached its first terminal error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsTerminationCause {
+    LocalAbort,
+    UnreadPayloadAfterReadClose,
+    PeerKill,
+    UnreliableRead,
+    DataWrite,
+    AckWrite,
+    FecParityWrite,
+    HandshakeWrite,
+    ProactiveStall,
+}
+
+impl MetricsTerminationCause {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalAbort => "local_abort",
+            Self::UnreadPayloadAfterReadClose => "unread_payload_after_read_close",
+            Self::PeerKill => "peer_kill",
+            Self::UnreliableRead => "unreliable_read",
+            Self::DataWrite => "data_write",
+            Self::AckWrite => "ack_write",
+            Self::FecParityWrite => "fec_parity_write",
+            Self::HandshakeWrite => "handshake_write",
+            Self::ProactiveStall => "proactive_stall",
+        }
+    }
+}
+
+/// The typed first terminal error recorded for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsTermination {
+    pub cause: MetricsTerminationCause,
+    pub error_kind: std::io::ErrorKind,
+    pub raw_os_error: Option<i32>,
+}
+
+impl MetricsTermination {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn error_kind_str(self) -> &'static str {
+        match self.error_kind {
+            std::io::ErrorKind::BrokenPipe => "broken_pipe",
+            std::io::ErrorKind::ConnectionReset => "connection_reset",
+            std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+            std::io::ErrorKind::NotConnected => "not_connected",
+            std::io::ErrorKind::TimedOut => "timed_out",
+            std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+            std::io::ErrorKind::WouldBlock => "would_block",
+            _ => "other",
+        }
+    }
+}
+
+/// Most recent congestion-controller branch evaluated for the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsCongestionAction {
+    OutageReset,
+    CensoredOutageSample,
+    BandwidthProbe,
+    SlowStartAck,
+    GentleProbe,
+    QueueHold,
+    DelayDrain,
+    HugeLossBackoff,
+    LossBackoff,
+}
+/// Why one delay-gated gentle-mode episode ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsGentleExitCause {
+    Loss,
+    GateOpen,
+    DrainGuard,
+    OutageReset,
+}
+
+impl MetricsGentleExitCause {
+    pub const ALL: [Self; 4] = [
+        Self::Loss,
+        Self::GateOpen,
+        Self::DrainGuard,
+        Self::OutageReset,
+    ];
+
+    /// Stable suffix used by aggregate export labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loss => "loss",
+            Self::GateOpen => "gate_open",
+            Self::DrainGuard => "drain_guard",
+            Self::OutageReset => "outage_reset",
+        }
+    }
+
+    const fn event_str(self) -> &'static str {
+        match self {
+            Self::Loss => "gentle_mode_exit_loss",
+            Self::GateOpen => "gentle_mode_exit_gate_open",
+            Self::DrainGuard => "gentle_mode_exit_drain_guard",
+            Self::OutageReset => "gentle_mode_exit_outage_reset",
+        }
+    }
+}
+
+impl MetricsCongestionAction {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutageReset => "outage_reset",
+            Self::CensoredOutageSample => "censored_outage_sample",
+            Self::SlowStartAck => "slow_start_ack",
+            Self::BandwidthProbe => "bandwidth_probe",
+            Self::GentleProbe => "gentle_probe",
+            Self::QueueHold => "queue_hold",
+            Self::DelayDrain => "delay_drain",
+            Self::HugeLossBackoff => "huge_loss_backoff",
+            Self::LossBackoff => "loss_backoff",
+        }
+    }
+}
+
+/// Amount of work requested for one metrics event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsInterest {
+    /// Do not notify the callback.
+    Skip,
+    /// Notify with event metadata only, avoiding a transport-state scan.
+    EventOnly,
+    /// Capture and attach the full transport-state snapshot.
+    Snapshot,
+}
+
+/// Why the proactive peer-liveness watchdog currently considers the session
+/// stalled. This is distinct from congestion-controller outage recovery:
+/// recovery may be active well before the watchdog's termination deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsStallReason {
+    NoResponse,
+    NoProgress,
+}
+/// What resumed the send driver after a completed send pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsSendDriverWake {
+    ResumeSignal,
+    AckScheduleSignal,
+    PacingTimer,
+    ProtocolTimer,
+    KillRequested,
+}
+
+impl MetricsSendDriverWake {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResumeSignal => "send_driver_resume_signal",
+            Self::AckScheduleSignal => "send_driver_ack_schedule_signal",
+            Self::PacingTimer => "send_driver_pacing_timer",
+            Self::ProtocolTimer => "send_driver_protocol_timer",
+            Self::KillRequested => "send_driver_kill_requested",
+        }
+    }
+}
+
+impl MetricsStallReason {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoResponse => "no_response",
+            Self::NoProgress => "no_progress",
+        }
+    }
+}
+
+/// The operation after which a transport-state snapshot was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsEvent {
+    SendDataBuffer,
+    SendFrameBuffer,
+    ReceiveDataBuffer,
+    ReceiveFrameBuffer,
+    ReceiveAckPacket,
+    ReceiveDataPacket,
+    /// A send-loop packet attempt, including attempts that find no sendable
+    /// packet because pacing, congestion control, or the queue blocks them.
+    SendDataPacketAttempt,
+    /// The retransmission-armor duplicate copy of a datagram was emitted:
+    /// either a recovery datagram (env-gated) or a fresh interactive
+    /// single-symbol tail (the force-flush interactive tuning).  Rare event:
+    /// counted, never a state row.
+    RetransmissionArmorDuplicate,
+    /// The send path returned `WouldBlock` while trying to write a datagram.
+    /// Rare event: counted, never a state row.
+    DataSendWouldBlock,
+    /// The event that resumed the send driver after its previous send pass.
+    SendDriverWake(MetricsSendDriverWake),
+    /// A request to resume the send driver, before Notify coalescing.
+    SendDriverResumeRequest(MetricsSendDriverResumeSource),
+    /// An exact transition that ended a delay-gated gentle-mode episode.
+    GentleModeExit(MetricsGentleExitCause),
+    /// A raw timestamp-echo RTT sample was accepted by the estimator.
+    RttSample,
+    /// A successful transactional ACK-flush claim was taken by the writer,
+    /// naming why the flush was due (initial, age, count, fin, or explicit).
+    /// Distinct from wake requests: only a successful claim is a claim event.
+    AckFlush(MetricsAckFlushReason),
+    /// The first terminal error that owns the session failure.
+    SessionTermination(MetricsTermination),
+}
+
+/// Why a transactional ACK-flush claim became due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsAckFlushReason {
+    /// No prior flush this connection: the first claim sends immediately.
+    Initial,
+    /// The three-millisecond coalescing age deadline elapsed.
+    Age,
+    /// The count threshold (`ACK_FLUSH_COUNT`) of pending ACKs was reached.
+    Count,
+    /// The peer's FIN is pending acknowledgement (FIN outranks count).
+    Fin,
+    /// An explicit writer call claimed the flush outside the schedule.
+    Explicit,
+}
+
+impl MetricsAckFlushReason {
+    /// All five flush reasons in policy order.
+    pub const ALL: [Self; 5] = [
+        Self::Initial,
+        Self::Age,
+        Self::Count,
+        Self::Fin,
+        Self::Explicit,
+    ];
+
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::Age => "age",
+            Self::Count => "count",
+            Self::Fin => "fin",
+            Self::Explicit => "explicit",
+        }
+    }
+
+    /// Stable event string: ``ack_flush_<reason>``.
+    pub const fn event_str(self) -> &'static str {
+        match self {
+            Self::Initial => "ack_flush_initial",
+            Self::Age => "ack_flush_age",
+            Self::Count => "ack_flush_count",
+            Self::Fin => "ack_flush_fin",
+            Self::Explicit => "ack_flush_explicit",
+        }
+    }
+}
+/// Producer that requested a resume-signal wake for the RTP send driver.
+///
+/// Requests and consumed wakes are deliberately separate observations:
+/// [`tokio::sync::Notify`] may coalesce several requests into one
+/// [`MetricsSendDriverWake::ResumeSignal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsSendDriverResumeSource {
+    ApplicationData,
+    ApplicationFrame,
+    ApplicationFinish,
+    PeerAck,
+    AckFlush,
+    PostOpenHandshake,
+    ReceiveOpportunity,
+}
+
+impl MetricsSendDriverResumeSource {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplicationData => "send_driver_resume_request_application_data",
+            Self::ApplicationFrame => "send_driver_resume_request_application_frame",
+            Self::ApplicationFinish => "send_driver_resume_request_application_finish",
+            Self::PeerAck => "send_driver_resume_request_peer_ack",
+            Self::AckFlush => "send_driver_resume_request_ack_flush",
+            Self::PostOpenHandshake => "send_driver_resume_request_post_open_handshake",
+            Self::ReceiveOpportunity => "send_driver_resume_request_receive_opportunity",
+        }
+    }
+}
+
+/// Cumulative repair activity for one connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsRetransmissionCounters {
+    /// Calls that selected and emitted a retransmission-ready packet.
+    pub attempts: u64,
+    /// Retransmission attempts for packets that had not previously been repaired.
+    pub first_attempts: u64,
+    /// Retransmission attempts for packets already repaired at least once.
+    pub repeat_attempts: u64,
+    /// Attempts where an RTO reason was armed.
+    pub rto_reason: u64,
+    /// Attempts where the time-based reordering deadline was armed.
+    pub reorder_reason: u64,
+    /// Attempts where SACK-count fast-loss evidence was armed.
+    pub fast_loss_reason: u64,
+    /// Attempts where outage recovery marked the packet pre-outage.
+    pub pre_outage_reason: u64,
+    /// Tail-loss probes emitted outside the retransmission-ready path.
+    pub tail_probes: u64,
+}
+
+/// Cumulative FEC group-size histogram buckets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsFecGroupSizeBuckets {
+    pub one: u64,
+    pub two_to_four: u64,
+    pub five_to_seven: u64,
+    pub full_eight: u64,
+}
+
+/// Cumulative forward-error-correction activity for one connection.
+/// `None` for the whole `MetricsFecCounters` is the exact meaning of
+/// disabled FEC.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsFecCounters {
+    pub parity_sent: u64,
+    pub groups_flushed: u64,
+    pub flushed_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_no_surplus_tokens: u64,
+    pub no_surplus_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_burst_end: u64,
+    pub burst_end_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_loss_gate: u64,
+    pub loss_gate_group_sizes: MetricsFecGroupSizeBuckets,
+    pub groups_skipped_no_spare_capacity: u64,
+    pub no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets,
+    pub recovered_symbols: u64,
+    pub dropped_malformed_packets: u64,
+    pub dropped_decoder_panics: u64,
+    /// Reconstructed symbols rejected because they claim more bytes than their
+    /// shard holds.  The decoder is the only witness, so this is the sole
+    /// signal that a hostile or corrupt parity reached reconstruction.
+    pub rejected_recovered_symbols: u64,
+}
+
+impl MetricsEvent {
+    /// Stable snake-case label used by text and CSV exporters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SendDataBuffer => "send_data_buf",
+            Self::SendFrameBuffer => "send_frame_buf",
+            Self::ReceiveDataBuffer => "recv_data_buf",
+            Self::ReceiveFrameBuffer => "recv_frame_buf",
+            Self::ReceiveAckPacket => "recv_ack_pkt",
+            Self::ReceiveDataPacket => "recv_data_pkt",
+            Self::SendDataPacketAttempt => "send_data_pkt",
+            Self::RetransmissionArmorDuplicate => "retransmission_armor_duplicate",
+            Self::DataSendWouldBlock => "data_send_would_block",
+            Self::SendDriverWake(wake) => wake.as_str(),
+            Self::SendDriverResumeRequest(source) => source.as_str(),
+            Self::GentleModeExit(cause) => cause.event_str(),
+            Self::RttSample => "rtt_sample",
+            Self::AckFlush(reason) => reason.event_str(),
+            Self::SessionTermination(_) => "session_termination",
+        }
+    }
+}
+
+/// A point-in-time snapshot of the reliable transport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricsSnapshot {
+    pub pacer_tokens_packets: f64,
+    pub send_rate_packets_per_second: f64,
+    pub loss_ratio: Option<f64>,
+    pub congestion_loss_ratio: Option<f64>,
+    pub congestion_action: Option<MetricsCongestionAction>,
+    pub in_flight_packets: usize,
+    pub packets_in_pipe: usize,
+    pub retransmission_active_packets: usize,
+    pub retransmission_ready_packets: usize,
+    pub retransmitted_packets: usize,
+    pub retransmission_counters: MetricsRetransmissionCounters,
+    pub fec_counters: Option<MetricsFecCounters>,
+    pub next_send_sequence: u64,
+    pub minimum_rtt: Option<Duration>,
+    pub smoothed_rtt: Duration,
+    pub retransmission_timeout: Duration,
+    pub oldest_pipe_packet_age: Option<Duration>,
+    pub maximum_packet_rto_overdue: Option<Duration>,
+    pub rto_deadline_postponements: u64,
+    pub congestion_window_packets: usize,
+    pub received_packets: usize,
+    pub next_receive_sequence: Option<u64>,
+    pub delivery_rate_packets_per_second: Option<f64>,
+    pub delivery_sample_app_limited: Option<bool>,
+    pub application_write_waiters: usize,
+    pub application_limited_detections: u64,
+    pub application_limited_detections_suppressed_by_waiting_writer: u64,
+    pub congestion_control_rtt: Option<Duration>,
+    pub congestion_rtt_floor: Option<Duration>,
+    pub congestion_queue_tolerance: Option<Duration>,
+    pub congestion_persistent_queue_for: Option<Duration>,
+    pub congestion_persistent_queue_resets: u64,
+    pub congestion_delivery_peak_packets_per_second: Option<f64>,
+    pub congestion_drain_floor_packets_per_second: Option<f64>,
+    pub congestion_drain_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_floor_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_raw_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoff_target_packets_per_second: Option<f64>,
+    pub congestion_loss_backoffs: u64,
+    pub congestion_loss_backoff_floor_bindings: u64,
+    pub congestion_rate_samples: u64,
+    pub congestion_bandwidth_probe_decisions: u64,
+    pub congestion_bandwidth_probe_increases: u64,
+    pub congestion_bandwidth_probe_before_feedback: u64,
+    pub congestion_last_bandwidth_probe_interval: Option<Duration>,
+    pub congestion_delay_drains: u64,
+    pub pending_send_bytes: usize,
+    pub send_stage_capacity_bytes: usize,
+    pub accepts_new_packet: bool,
+    pub slow_start: bool,
+    pub gentle_mode: bool,
+    pub gentle_draining: bool,
+    pub queue_building: bool,
+    pub drain_floor_binding: bool,
+    pub outage_recovery: bool,
+    pub no_response_for: Option<Duration>,
+    pub no_progress_for: Option<Duration>,
+    pub stall_reason: Option<MetricsStallReason>,
+}
+
+/// One connection observation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricsObservation {
+    pub schema_version: u16,
+    /// Monotonic index assigned while the connection state lock is held.
+    pub event_index: u64,
+    /// Monotonic time since this connection was constructed.
+    pub elapsed: Duration,
+    pub event: MetricsEvent,
+    /// Present only for [`MetricsEvent::RttSample`]; this is the raw sample,
+    /// while 'snapshot.smoothed_rtt' is the estimator output after sampling.
+    pub raw_rtt_sample: Option<Duration>,
+    /// Full transport state when requested by the observer filter.
+    pub snapshot: Option<MetricsSnapshot>,
+}
+
+/// A cheap-to-clone synchronous callback for typed connection observations.
+///
+/// No callback or observer-side synchronization is performed when this value
+/// is absent from the connection config. If a callback forwards observations
+/// across an asynchronous boundary, it should use bounded delivery.
+#[derive(Clone)]
+pub struct MetricsObserver {
+    filter: Arc<dyn Fn(MetricsEvent, Duration) -> MetricsInterest + Send + Sync + 'static>,
+    callback: Arc<dyn Fn(MetricsObservation) + Send + Sync + 'static>,
+}
+
+impl MetricsObserver {
+    /// Observe every metrics event.
+    pub fn new(callback: impl Fn(MetricsObservation) + Send + Sync + 'static) -> Self {
+        Self {
+            filter: Arc::new(|_, _| MetricsInterest::Snapshot),
+            callback: Arc::new(callback),
+        }
+    }
+
+    /// Construct an observer that decides whether a state snapshot is needed.
+    ///
+    /// 'filter' receives the event and monotonic elapsed time before RTP locks
+    /// or scans reliable state. It can therefore downsample hot events without
+    /// paying snapshot cost. It may be called concurrently and should be
+    /// constant-time and non-blocking.
+    pub fn filtered(
+        filter: impl Fn(MetricsEvent, Duration) -> bool + Send + Sync + 'static,
+        callback: impl Fn(MetricsObservation) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            filter: Arc::new(move |event, elapsed| {
+                if filter(event, elapsed) {
+                    MetricsInterest::Snapshot
+                } else {
+                    MetricsInterest::Skip
+                }
+            }),
+            callback: Arc::new(callback),
+        }
+    }
+
+    /// Construct an observer that independently chooses event-only or full
+    /// snapshot capture. Event-only capture is appropriate for high-rate raw
+    /// RTT samples: it preserves the sample without scanning send/receive
+    /// windows merely to attach unrelated state.
+    pub fn selective(
+        filter: impl Fn(MetricsEvent, Duration) -> MetricsInterest + Send + Sync + 'static,
+        callback: impl Fn(MetricsObservation) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            filter: Arc::new(filter),
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub(crate) fn interest(&self, event: MetricsEvent, elapsed: Duration) -> MetricsInterest {
+        (self.filter)(event, elapsed)
+    }
+
+    /// Whether the observer wants a reliable-layer snapshot for `event` at
+    /// `elapsed`. Consults the filter exactly once; the filter's side effects
+    /// (event counters, state-sample claim) run here, so the caller must not
+    /// consult the filter again for the same event.
+    pub(crate) fn wants_snapshot(&self, event: MetricsEvent, elapsed: Duration) -> bool {
+        (self.filter)(event, elapsed) == MetricsInterest::Snapshot
+    }
+
+    pub(crate) fn observe(&self, observation: MetricsObservation) {
+        (self.callback)(observation);
+    }
+}
+
+impl fmt::Debug for MetricsObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetricsObserver").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_version_is_derived_from_the_append_only_series() {
+        assert_eq!(SCHEMA_VERSION, 29);
+        assert_eq!(SCHEMA_VERSION, SchemaCompatibility::CURRENT);
+        assert_eq!(
+            SchemaCompatibility::APPEND_ONLY.last().copied(),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(
+            SchemaCompatibility::APPEND_ONLY
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "the append-only series must be strictly increasing"
+        );
+    }
+
+    #[test]
+    fn append_only_contract_is_forward_compatible() {
+        assert!(SchemaCompatibility::readable_by(28, 29));
+        assert!(SchemaCompatibility::readable_by(28, 28));
+        assert!(SchemaCompatibility::readable_by(29, 29));
+        assert!(
+            !SchemaCompatibility::readable_by(29, 28),
+            "a consumer must not read a revision that predates its known fields"
+        );
+        assert!(
+            SchemaCompatibility::readable_by(28, 30),
+            "append-only revisions stay readable from every earlier revision"
+        );
+    }
+}
