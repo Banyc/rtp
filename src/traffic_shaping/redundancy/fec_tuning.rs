@@ -13,9 +13,12 @@
 //!
 //! The real configuration is the per-connection `FecTuning` argument threaded
 //! through the `*_with_mss_and_fec_tuning` connect/accept APIs.  The env var
-//! `RTP_MAX_DIVERSITY=1` only feeds the default for A/B comparison — it is
-//! never read as the live setting, so it cannot silently apply to every
-//! connection in the process.
+//! `RTP_MAX_DIVERSITY=1` only feeds the `Default` tuning for A/B comparison:
+//! it is sampled **once per process**, never per connection, so every
+//! connection built from `ConnectConfig::default()` / `AcceptConfig::default()`
+//! sees the same value, and a caller that sets the `fec_tuning` field
+//! explicitly overrides it.  Sampling once stops the default from silently
+//! depending on when the process environment is mutated.
 //!
 //! # Both peers must agree
 //!
@@ -24,6 +27,8 @@
 //! loopback / jumbo / fragmentation-tolerant paths.  Real WANs IP-fragment an
 //! 8 KiB UDP datagram, and one lost fragment kills the whole symbol — which
 //! inverts the benefit.  Use the default MSS for WAN paths.
+
+use std::sync::LazyLock;
 
 use super::fec_gate::FecLossGateThresholds;
 
@@ -109,24 +114,65 @@ impl FecTuning {
     }
 }
 
-/// Read `RTP_MAX_DIVERSITY` (falling back to the legacy `RTP_MINDIV` for one
-/// release) once at process startup to feed the *default* FEC tuning for A/B
-/// comparison.  `1`/`true` selects `FecTuning::max_diversity()`; anything
-/// else (including unset) selects `FecTuning::default()`.  This is
-/// **not** the live configuration — the real setting is the per-connection
-/// `FecTuning` argument threaded through the `*_with_mss_and_fec_tuning`
-/// APIs, so env-var state can never silently apply to every connection in
-/// the process.
-pub fn fec_tuning_from_env() -> FecTuning {
+/// `RTP_MAX_DIVERSITY` (falling back to the legacy `RTP_MINDIV` for one
+/// release) sampled **once per process**.  The connect/accept config `Default`
+/// reads it through this cache so a config built later cannot observe a
+/// mid-run environment mutation.
+static ENV_TUNING: LazyLock<FecTuning> = LazyLock::new(|| {
+    #[cfg(test)]
+    ENV_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match std::env::var("RTP_MAX_DIVERSITY").or_else(|_| std::env::var("RTP_MINDIV")) {
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FecTuning::max_diversity(),
         _ => FecTuning::default(),
     }
+});
+
+/// Number of times the `RTP_MAX_DIVERSITY`/`RTP_MINDIV` environment was
+/// actually read.  Only observable in tests, where it backs
+/// [`tests::env_tuning_reads_the_environment_at_most_once`].
+#[cfg(test)]
+static ENV_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only count of how many times the tuning environment was sampled.
+#[cfg(test)]
+fn env_tuning_env_reads() -> usize {
+    ENV_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The *default* FEC tuning derived from `RTP_MAX_DIVERSITY` (falling back to
+/// the legacy `RTP_MINDIV` for one release): `1`/`true` selects
+/// `FecTuning::max_diversity()`; anything else (including unset) selects
+/// `FecTuning::default()`.
+///
+/// The environment is sampled once per process and cached (see the private
+/// `ENV_TUNING` cache); this only supplies the `Default`.  The live
+/// configuration is the per-connection `FecTuning` argument threaded through
+/// the `*_with_mss_and_fec_tuning` APIs, which overrides it.
+pub fn fec_tuning_from_env() -> FecTuning {
+    *ENV_TUNING
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every construction of the connect/accept config calls
+    /// [`fec_tuning_from_env`]; if that re-read the environment each time, the
+    /// default tuning would silently depend on when the process environment is
+    /// mutated.  The cache must collapse that to at most one read for the life
+    /// of the process, no matter how many calls (or tests) ask for it.
+    #[test]
+    fn env_tuning_reads_the_environment_at_most_once() {
+        for _ in 0..10_000 {
+            let _ = fec_tuning_from_env();
+        }
+        let reads = env_tuning_env_reads();
+        assert!(
+            reads <= 1,
+            "RTP_MAX_DIVERSITY must be sampled once and cached, not per call; \
+             saw {reads} environment reads after 10,000 calls"
+        );
+    }
 
     #[test]
     fn default_is_stock() {

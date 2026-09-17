@@ -30,6 +30,8 @@
 //! `*_with_mss_fec_tuning_and_frame_delivery` constructor; a mismatch
 //! produces a framing desync.
 
+use std::sync::LazyLock;
+
 pub(crate) mod recv;
 pub(crate) mod send;
 pub(crate) mod wire;
@@ -81,14 +83,21 @@ impl FrameMode {
     }
 }
 
-/// Read `RTP_FRAME_DELIVERY` once at process startup for the *default*
-/// frame-delivery mode.  `1`/`true` selects `FrameMode::enabled()`;
-/// anything else selects `FrameMode::default()`.
-pub fn frame_delivery_from_env() -> FrameMode {
-    match std::env::var("RTP_FRAME_DELIVERY") {
+/// `RTP_FRAME_DELIVERY` sampled once per process for the *default*
+/// frame-delivery mode.  `1`/`true` selects `FrameMode::enabled()`; anything
+/// else selects `FrameMode::default()`.  The connect/accept config `Default`
+/// reads it through this cache so a later construction cannot observe a
+/// mid-run environment mutation.
+static ENV_FRAME_DELIVERY: LazyLock<FrameMode> =
+    LazyLock::new(|| match std::env::var("RTP_FRAME_DELIVERY") {
         Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => FrameMode::enabled(),
         _ => FrameMode::default(),
-    }
+    });
+
+/// The *default* frame-delivery mode derived from `RTP_FRAME_DELIVERY`,
+/// sampled once per process (see `ENV_FRAME_DELIVERY`).
+pub fn frame_delivery_from_env() -> FrameMode {
+    *ENV_FRAME_DELIVERY
 }
 
 #[cfg(test)]

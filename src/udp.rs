@@ -419,10 +419,11 @@ pub type FrameDeliveryAccept =
 
 /// Tuning for [`Listener::accept_with`] / [`Listener::accept_without_handshake_with`].
 ///
-/// `Default` reads the process environment once: `fec_tuning` and
-/// `frame_delivery` come from `RTP_FEC_TUNING` / `RTP_FRAME_DELIVERY`,
-/// `retransmission_armor` from `RTP_RTX_DUP`, and `instream_group_fec` from
-/// `RTP_INSTREAM_GROUP_FEC`.  Override the fields explicitly to opt out.
+/// `Default` samples the process environment once per process: `fec_tuning`
+/// comes from `RTP_MAX_DIVERSITY` (legacy `RTP_MINDIV`), `frame_delivery` from
+/// `RTP_FRAME_DELIVERY`, `retransmission_armor` from `RTP_RTX_DUP`, and
+/// `instream_group_fec` from `RTP_INSTREAM_GROUP_FEC`.  Override the fields
+/// explicitly to opt out.
 #[derive(Debug, Clone)]
 pub struct AcceptConfig {
     pub fec: bool,
