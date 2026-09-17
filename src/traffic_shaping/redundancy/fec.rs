@@ -29,6 +29,12 @@ const PARITY_RATIO_NUM: usize = 1;
 const PARITY_RATIO_DEN: usize = 4;
 const MAX_PARITY_PER_GROUP: usize =
     (MAX_DATA_PER_GROUP * PARITY_RATIO_NUM).div_ceil(PARITY_RATIO_DEN);
+/// Deepest single-symbol interactive parity the decoder can accept.  A
+/// single-symbol group carries one data symbol plus its parity, and the
+/// decoder rejects any group wider than `MAX_GROUP_SIZE`, so the depth is
+/// bounded by `MAX_GROUP_SIZE - 1`.  `FecState::new` clamps
+/// `small_group_parity_count` to this, which is why a tuning may request
+/// `max_diversity()`'s depth 3 without risking an over-wide group.
 const MAX_INTERACTIVE_PARITY_DEPTH: u8 = (MAX_GROUP_SIZE - 1) as u8;
 /// Groups with at most this many data symbols get parity protection.
 /// Larger groups skip parity to avoid impacting throughput of big traffic.
@@ -316,6 +322,12 @@ impl FecState {
                 enc_buf: vec![0; config.symbol_size * 2],
                 small_group_parity_count: config
                     .small_group_parity_count
+                    // The decoder's `max_group_size(MAX_GROUP_SIZE)` caps the
+                    // data+parity symbols a group may carry; a single-symbol
+                    // group emits `depth` parity symbols, so `depth` must stay
+                    // <= `MAX_GROUP_SIZE - 1` (see
+                    // `MAX_INTERACTIVE_PARITY_DEPTH`).  Clamping here is what
+                    // makes a caller's deeper `max_diversity()` request safe.
                     .clamp(1, MAX_INTERACTIVE_PARITY_DEPTH),
                 stats: Arc::clone(&stats),
                 deferred_no_spare_capacity: false,
