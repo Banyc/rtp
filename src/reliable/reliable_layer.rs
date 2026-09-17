@@ -34,17 +34,19 @@ use crate::{
     },
     recv_queue::pkt_recv_space::PktRecvSpace,
     traffic_shaping::core::{
-        CongestionDecision, CongestionInput, CongestionLane, CongestionResponse, FastStart,
-        FastStartStep, GentleExitCause, ORDINARY_PROBE_MAX_GAIN, ProbeKind, SendPacer,
-        linear_backoff_step,
+        CongestionDecision, CongestionInput, CongestionLane, CongestionResponse, FastStartEpisode,
+        FastStartStep, GentleExitCause, ProbeKind, SendPacer, cap_probe_target, has_spare_capacity,
+        has_spare_capacity_interactive, linear_backoff_step, select_gate_jitter,
+        settle_computed_rate,
     },
     traffic_shaping::recovery::pkt_send_space::{
         CWND_BDP_CAP_ENGAGE_RTT_FACTOR, CWND_BDP_CAP_SCALE, CWND_SEND_RATE_SCALE, INIT_CWND,
         PktSendSpace,
     },
-    traffic_shaping::recovery::rtt_stats::GateJitter,
     transmission::watchdog_tuning::WatchdogTuning,
 };
+
+pub(crate) use crate::traffic_shaping::core::should_exit_slow_start;
 
 /// The frame-delivery [`MAX_FRAME_LEN`] is defined in
 /// [`crate::delivery::frame::send`] and must stay equal to the stock
@@ -84,9 +86,9 @@ fn metrics_gentle_exit_cause(cause: GentleExitCause) -> MetricsGentleExitCause {
 #[cfg(test)]
 use crate::traffic_shaping::core::{
     DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_REENTRY_COOLDOWN,
-    GENTLE_REENTRY_COOLDOWN_RTTS, PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR,
-    QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE,
-    WindowedRttMin,
+    GENTLE_REENTRY_COOLDOWN_RTTS, ORDINARY_PROBE_MAX_GAIN, PERSISTENT_QUEUE_RTTVAR_FACTOR,
+    QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, RTT_MIN_BUCKET,
+    RTT_MIN_BUCKET_RTT_SCALE, WindowedRttMin,
 };
 
 #[derive(Debug, Clone)]
@@ -195,7 +197,7 @@ pub struct ReliableLayer {
     slow_start: bool,
     slow_start_acked_pkts: usize,
     /// Windowed ACK-clock ramp for the dedicated lane's bounded fast start.
-    fast_start: FastStart,
+    fast_start: FastStartEpisode,
     last_congestion_loss_ratio: Option<f64>,
     last_congestion_action: Option<crate::metrics::MetricsCongestionAction>,
     /// Whether congestion-controller interval accounting is on.  Set once at
@@ -217,25 +219,6 @@ pub struct ReliableLayer {
     frame_send_stage: FrameSendStage,
     pkt_stats_buf: Vec<PacketState>,
     pkt_buf: Vec<dre::Packet>,
-}
-
-/// Decide whether one delivery-rate sample leaves slow start on the shared
-/// lane.
-///
-/// The shared lane keeps the stock exit. The dedicated lane instead owns its
-/// ramp with the windowed ACK-clock in [`FastStart`] and exits on loss or a
-/// built queue (see `on_rate_sample`); the dedicated cold-start hold that
-/// ignored transient app-limited samples was evaluated and dropped, because on
-/// a lossy link it kept the lane ramping past the point where the stock exit
-/// would have shed the flight, and the hostile goodput collapsed on some seeds.
-fn should_exit_slow_start(
-    send_rate: f64,
-    probed: f64,
-    app_limited: bool,
-    loss_blocks_delay_control: bool,
-    queue_building: bool,
-) -> bool {
-    loss_blocks_delay_control || queue_building || send_rate <= probed || app_limited
 }
 
 impl ReliableLayer {
@@ -289,7 +272,7 @@ impl ReliableLayer {
             ),
             slow_start: true,
             slow_start_acked_pkts: 0,
-            fast_start: FastStart::new(now),
+            fast_start: FastStartEpisode::new(now),
             last_congestion_loss_ratio: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
@@ -339,7 +322,7 @@ impl ReliableLayer {
             ),
             slow_start: true,
             slow_start_acked_pkts: 0,
-            fast_start: FastStart::new(now),
+            fast_start: FastStartEpisode::new(now),
             last_congestion_loss_ratio: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
@@ -452,45 +435,25 @@ impl ReliableLayer {
             && !self.pkt_send_space.has_tail_probe(now)
     }
 
-    /// Whether the sender currently has *genuinely spare* capacity for a FEC
-    /// parity burst: the stock tail gate plus zero application write waiters
-    /// and no queue-building signal.  Pacer tokens alone are not spare
-    /// capacity — queued/waiting application work, queue growth, cwnd
-    /// pressure, retransmission, and a pending tail probe must win over
-    /// parity.
+    /// Whether the sender has genuinely spare capacity for a FEC parity burst
+    /// with a settled tail (the stock/bulk gate).
     pub(crate) fn fec_has_spare_capacity(&self, now: Instant) -> bool {
-        self.can_send_tail_fec(now)
-            && self.application_write_waiters.load(Ordering::Relaxed) == 0
-            && !self.congestion_response.queue_building()
+        has_spare_capacity(
+            self.can_send_tail_fec(now),
+            self.application_write_waiters.load(Ordering::Relaxed),
+            self.congestion_response.queue_building(),
+        )
     }
 
-    /// Interactive-lane variant of [`Self::fec_has_spare_capacity`]: the
-    /// genuinely-spare-bandwidth conditions (empty stage, a sendable window,
-    /// no pending application write, no queue growth) still hold, but a
-    /// pending retransmission or tail-loss probe does NOT close the gate.
-    ///
-    /// On a lossy, batched interactive lane the tail-settled conditions are
-    /// effectively always false — the lane is either repairing a loss or
-    /// waiting for its tail probe — so the interactive parity that exists to
-    /// avoid those repairs was deferred until after the repair and never
-    /// emitted.  The parity is still bounded: the loss condition gate must be
-    /// open, the burst is capped at 1/3 of the send budget, and it is emitted
-    /// only at a group/burst boundary, so it never competes with the data
-    /// stream.  Used only by tunings that force-flush every burst tail
-    /// (`instream_flush`); stock/bulk traffic keeps [`Self::fec_has_spare_capacity`]
-    /// byte-for-byte.
+    /// Interactive-lane FEC parity-burst gate: genuinely spare capacity, but a
+    /// pending repair or tail-loss probe does not close it and the send stage
+    /// need not be empty.
     pub(crate) fn fec_has_spare_capacity_interactive(&self) -> bool {
-        // Deliberately does NOT require the send stage to be empty: the
-        // in-stream full-group flush is designed to fire mid-burst (at
-        // `INSTREAM_DATA_PER_GROUP` symbols) while later application symbols
-        // are still staged, and requiring an empty stage defeated it, leaving
-        // the batched interactive lane with no parity.  The send window must
-        // still have room (`accepts_new_pkt`) and the queue must not be
-        // building, so parity never competes with a congestion-limited data
-        // stream.
-        self.pkt_send_space.accepts_new_pkt()
-            && self.application_write_waiters.load(Ordering::Relaxed) == 0
-            && !self.congestion_response.queue_building()
+        has_spare_capacity_interactive(
+            self.pkt_send_space.accepts_new_pkt(),
+            self.application_write_waiters.load(Ordering::Relaxed),
+            self.congestion_response.queue_building(),
+        )
     }
 
     pub fn pkt_send_space(&self) -> &PktSendSpace {
@@ -955,34 +918,34 @@ impl ReliableLayer {
             }
             if self.congestion_response.dedicated() {
                 let fresh = self.pkt_send_space.fresh_acked_count();
-                // The window is one control RTT, so it is only meaningful once
-                // a real RTT estimate exists. The 5 ms floor before the first
-                // sample would otherwise close several tiny windows that corrupt
-                // the previous-delivery baseline.
-                if self.pkt_send_space.min_rtt().is_some() {
-                    let control_rtt = self.control_rtt();
-                    let current = self.send_rate.get();
-                    match self.fast_start.on_ack(fresh, now, control_rtt, current) {
-                        FastStartStep::Hold => {}
-                        FastStartStep::Ramp(target) => {
-                            self.set_send_rate(target, now);
-                            self.last_congestion_action =
-                                Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
-                        }
-                        FastStartStep::Plateau(delivered) => {
-                            self.slow_start = false;
-                            // A zero-delivery window (idle gap, all-lost flight,
-                            // duplicate/coalesced ACK) and any non-finite
-                            // computation are not rates to settle at; the
-                            // setter substitutes the live rate in that case.
-                            self.set_send_rate(delivered, now);
-                            // A burst of ACKs during the ramp can inflate the
-                            // tracked delivery peak; drop it so the gentle probe
-                            // cannot use it as a base and creep back over capacity.
-                            self.congestion_response.clear_delivery_peak(now);
-                            self.last_congestion_action =
-                                Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
-                        }
+                let control_rtt = self.control_rtt();
+                let current = self.send_rate.get();
+                match self.fast_start.on_ack(
+                    fresh,
+                    self.pkt_send_space.min_rtt(),
+                    now,
+                    control_rtt,
+                    current,
+                ) {
+                    FastStartStep::Hold => {}
+                    FastStartStep::Ramp(target) => {
+                        self.set_send_rate(target, now);
+                        self.last_congestion_action =
+                            Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
+                    }
+                    FastStartStep::Plateau(delivered) => {
+                        self.slow_start = false;
+                        // A zero-delivery window (idle gap, all-lost flight,
+                        // duplicate/coalesced ACK) and any non-finite
+                        // computation are not rates to settle at; the
+                        // setter substitutes the live rate in that case.
+                        self.set_send_rate(delivered, now);
+                        // A burst of ACKs during the ramp can inflate the
+                        // tracked delivery peak; drop it so the gentle probe
+                        // cannot use it as a base and creep back over capacity.
+                        self.congestion_response.clear_delivery_peak(now);
+                        self.last_congestion_action =
+                            Some(crate::metrics::MetricsCongestionAction::SlowStartAck);
                     }
                 }
             } else {
@@ -1062,16 +1025,10 @@ impl ReliableLayer {
         let loss_event_rate = self.pkt_send_space.loss_event_rate(now);
         self.last_congestion_loss_ratio = loss_event_rate;
         let control_rtt = self.control_rtt();
-        // The delay gate's jitter margin discounts the downward half of the
-        // RTT variance on the reorder-tolerant lane, and tracks the
-        // windowed steady-state jitter floor rather than the queue-inflated
-        // trending variance.  The stock/bulk lane keeps the two-sided variance
-        // unchanged (both estimates equal).
-        let gate_jitter = if self.congestion_response.reorder_tolerant() {
-            self.pkt_send_space.gate_jitter()
-        } else {
-            GateJitter::uniform(self.pkt_send_space.smooth_rtt_var())
-        };
+        let gate_jitter = select_gate_jitter(
+            &self.pkt_send_space,
+            self.congestion_response.reorder_tolerant(),
+        );
         let observation = self.congestion_response.observe(
             smooth,
             gate_jitter,
@@ -1088,19 +1045,10 @@ impl ReliableLayer {
         );
         if self.slow_start {
             if self.congestion_response.dedicated() {
-                // The dedicated fast start exits on a congestion loss or on a
-                // built queue. The stock probe-target and app-limited exits
-                // would fire on the first sample, before the ramp has begun,
-                // so the windowed ACK-clock (in `recv_ack_pkt`) owns the ramp
-                // and its own delivery-plateau exit. A lone non-congestion
-                // (iid) loss is not a capacity signal: keep the bounded ramp
-                // alive so it settles at the delivered plateau instead of
-                // aborting to the ordinary probe's overshoot/drain. Settling
-                // the paced rate at the instantaneous delivery sample here
-                // would halve the pace on every loss (the sample lags the pace
-                // by about one control RTT) and strand the ramp below
-                // capacity.
-                if observation.loss_blocks_delay_control || observation.queue_building {
+                if FastStartEpisode::exits_on_rate_sample(
+                    observation.loss_blocks_delay_control,
+                    observation.queue_building,
+                ) {
                     self.slow_start = false;
                     self.congestion_response.clear_delivery_peak(now);
                 }
@@ -1191,19 +1139,8 @@ impl ReliableLayer {
         outcome.gentle_exit()
     }
 
-    /// Bound one probe target. On the reorder-tolerant interactive lane a
-    /// reorder-inflated delivery-rate sample may not raise the rate by more
-    /// than the ordinary probe's own maximum per-probe gain
-    /// ([`ORDINARY_PROBE_MAX_GAIN`], derived from the probe's gain), so a
-    /// spurious sample can only step the rate; the stock/bulk lane returns the
-    /// target unchanged. Deriving the cap from the gain keeps it from silently
-    /// falling below (and clipping) the legitimate probe it exists to allow.
     fn bounded_probe_target(&self, current: f64, target: f64) -> f64 {
-        if self.congestion_response.reorder_tolerant() {
-            target.min(current * ORDINARY_PROBE_MAX_GAIN)
-        } else {
-            target
-        }
+        cap_probe_target(self.congestion_response.reorder_tolerant(), current, target)
     }
 
     fn set_smooth_send_rate(&mut self, target_send_rate: f64, now: Instant) {
@@ -1460,7 +1397,7 @@ impl ReliableLayer {
         let send_rate = if self.pkt_send_space.in_outage_recovery() {
             PosR::new(INIT_SEND_RATE).unwrap()
         } else {
-            PosR::new(rate).unwrap_or(self.send_rate)
+            settle_computed_rate(rate, self.send_rate)
         };
         // The in-flight window is re-derived from the smoothed RTT, which a
         // starved or slow ACK path inflates.  Install a minimum-RTT

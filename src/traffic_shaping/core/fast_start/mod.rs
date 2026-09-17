@@ -17,7 +17,11 @@
 //! has no cross-traffic to protect; the shared lane keeps the conservative
 //! stock exit.
 
+mod episode;
+
 use std::time::{Duration, Instant};
+
+pub(crate) use episode::FastStartEpisode;
 
 /// Multiplicative gain applied once per window to the recently acknowledged
 /// rate.  A value of 2 doubles the pace each control RTT while the pipe is
@@ -129,6 +133,25 @@ impl FastStart {
             FastStartStep::Ramp(target)
         }
     }
+}
+
+/// Decide whether one delivery-rate sample leaves slow start on the shared
+/// lane.
+///
+/// The shared lane keeps the stock exit. The dedicated lane instead owns its
+/// ramp with the windowed ACK-clock in [`FastStart`] and exits on loss or a
+/// built queue (see `on_rate_sample`); the dedicated cold-start hold that
+/// ignored transient app-limited samples was evaluated and dropped, because on
+/// a lossy link it kept the lane ramping past the point where the stock exit
+/// would have shed the flight, and the hostile goodput collapsed on some seeds.
+pub(crate) fn should_exit_slow_start(
+    send_rate: f64,
+    probed: f64,
+    app_limited: bool,
+    loss_blocks_delay_control: bool,
+    queue_building: bool,
+) -> bool {
+    loss_blocks_delay_control || queue_building || send_rate <= probed || app_limited
 }
 
 #[cfg(test)]
