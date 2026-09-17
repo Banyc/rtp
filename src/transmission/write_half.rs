@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,13 @@ pub struct WriteHalf {
     /// (see `UnreliableLayer::fresh_tail_armor_copies_override`).  `None` in
     /// production, where the loss-adaptive ladder decides.
     fresh_tail_armor_copies_override: Option<usize>,
+    /// Residual parity of a burst whose underlay reported `WouldBlock`
+    /// mid-flight (see [`Self::flush_fec_parities`]).  At most one group's
+    /// parity is ever held: new parity is only generated once this drains, so
+    /// the queue cannot grow without bound.  Entries are stored front-to-back
+    /// in the order they were emitted and are *moved*, never copied, so a
+    /// retry can neither reorder nor duplicate a parity symbol.
+    pending_fec_parity: VecDeque<Vec<u8>>,
 }
 
 /// FEC and retransmission-armor settings for the write half, bundled so
@@ -532,6 +539,7 @@ impl WriteHalf {
             ack_padding,
             data_size_sampler: DataSizeSampler::new(),
             fresh_tail_armor_copies_override,
+            pending_fec_parity: VecDeque::new(),
         }
     }
 
@@ -1178,6 +1186,17 @@ impl WriteHalf {
         now: Instant,
         instream: bool,
     ) -> Result<(), IoErr> {
+        // A previous burst that hit `WouldBlock` left its unsent tail queued.
+        // Drain it before generating anything new so retries stay FIFO (no
+        // parity can overtake another) and no residual is lost.
+        self.drain_pending_fec_parity().await?;
+        if !self.pending_fec_parity.is_empty() {
+            // The underlay is still blocked.  Keep holding the residual and
+            // leave the open group alone: generating new parity now would grow
+            // the queue without bound and could only add datagrams the
+            // underlay cannot accept yet.  The next flush opportunity retries.
+            return Ok(());
+        }
         let send_pacer = self.send_pacer.clone();
         let Some(fec) = self.fec.as_mut() else {
             return Ok(());
@@ -1187,11 +1206,26 @@ impl WriteHalf {
         if crate::debug::debug_send() {
             eprintln!("[fec] flush_parities: {} pkts", parity_pkts.len());
         }
-        for pkt in parity_pkts {
+        self.pending_fec_parity.extend(parity_pkts);
+        self.drain_pending_fec_parity().await
+    }
+
+    /// Forward queued FEC parity packets front-to-back until the queue drains
+    /// or the underlay reports `WouldBlock`.  On `WouldBlock` the unsent tail
+    /// stays queued for the next flush opportunity; on a fatal error the tail
+    /// is abandoned (the session is terminating) and the error is returned.
+    /// The data path is never blocked: control returns to the caller as soon
+    /// as the underlay stops accepting datagrams.
+    async fn drain_pending_fec_parity(&mut self) -> Result<(), IoErr> {
+        while let Some(pkt) = self.pending_fec_parity.pop_front() {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
-                Err(error) if error == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error == std::io::ErrorKind::WouldBlock => {
+                    self.pending_fec_parity.push_front(pkt);
+                    return Ok(());
+                }
                 Err(error) => {
+                    self.pending_fec_parity.clear();
                     self.shared
                         .press_error(error, MetricsTerminationCause::FecParityWrite);
                     return Err(error);
@@ -1199,6 +1233,13 @@ impl WriteHalf {
             }
         }
         Ok(())
+    }
+
+    /// Test-only: number of parity datagrams a `WouldBlock` left queued for
+    /// the next flush opportunity.
+    #[cfg(test)]
+    pub(crate) fn pending_fec_parity_len_for_test(&self) -> usize {
+        self.pending_fec_parity.len()
     }
 
     async fn send_due_post_open_response(&mut self, now: Instant) -> Result<(), IoErr> {

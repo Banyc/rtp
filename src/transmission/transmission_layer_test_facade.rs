@@ -47,6 +47,12 @@ impl TransmissionLayer {
         self.write_half_for_test().has_pending_acks()
     }
 
+    /// Test-only: number of FEC parity datagrams held back after a `WouldBlock`
+    /// mid-burst, awaiting the next flush opportunity.
+    pub(crate) fn pending_fec_parity_len_for_test(&self) -> usize {
+        self.write_half_for_test().pending_fec_parity_len_for_test()
+    }
+
     pub async fn send_kill_pkt(&mut self, bufs: &mut SendBufs) -> Result<(), IoErr> {
         self.write_half_mut_for_test().send_kill_pkt(bufs).await
     }
@@ -440,6 +446,49 @@ mod tests {
         (TransmissionLayer::new(unreliable, None), attempts)
     }
 
+    /// A write that records every forwarded datagram but reports `WouldBlock`
+    /// on exactly one chosen attempt, so a parity burst interrupted mid-flight
+    /// can be observed and re-driven.
+    #[derive(Debug)]
+    struct WouldBlockAt {
+        recorder: Arc<Mutex<RecordingWrite>>,
+        block_at: usize,
+        attempts: Arc<AtomicUsize>,
+        blocked: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+    #[async_trait]
+    impl UnreliableWrite for WouldBlockAt {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == self.block_at {
+                *self.blocked.lock().unwrap() = Some(buf.to_vec());
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            self.recorder.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+    }
+
+    /// [`harness_with_tuning`] with a caller-supplied underlay write, so a test
+    /// can inject a `WouldBlock` at a specific point in a burst.
+    fn harness_with_writer(
+        fec: bool,
+        writer: Box<dyn UnreliableWrite>,
+        tuning: crate::traffic_shaping::redundancy::fec_tuning::FecTuning,
+    ) -> TransmissionLayer {
+        let unreliable = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(BlackholeRead),
+            writer,
+            fec,
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            tuning,
+            crate::delivery::frame::FrameMode::default(),
+        )
+        .unwrap();
+        let tl = TransmissionLayer::new(unreliable, None);
+        tl.pin_legacy_pacer_burst_for_test(Instant::now());
+        tl
+    }
+
     fn stage_small_message(tl: &TransmissionLayer) {
         let payload = [0; 100];
         let now = Instant::now();
@@ -535,6 +584,101 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             3,
             "the primary data, its fresh-tail armor duplicate, and the first parity datagrams should be attempted"
+        );
+    }
+
+    /// A `WouldBlock` in the middle of a parity burst must not silently drop
+    /// the unsent repair symbols: the residual is held and replayed on the
+    /// next flush opportunity, byte-identically and in order (no loss, no
+    /// duplication, no reordering).
+    #[tokio::test]
+    async fn would_block_parity_is_retried_without_loss_or_reorder() {
+        use crate::traffic_shaping::redundancy::fec_tuning::FecTuning;
+
+        // Control: the uninterrupted burst. `BlackholeRead` means no ACKs are
+        // due, so the parity tail is the last datagrams `send_pkts` emits.
+        let (mut control, control_rec) =
+            harness_with_tuning(true, false, FecTuning::max_diversity());
+        control
+            .shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
+        stage_small_message(&control);
+        let mut control_bufs = SendBufs::new();
+        assert!(control.send_pkts(&mut control_bufs).await.unwrap());
+        let control_datagrams = control_rec.lock().unwrap().datagrams();
+        assert!(
+            control_datagrams.len() >= 2,
+            "the burst must carry data plus parity, got {}",
+            control_datagrams.len()
+        );
+
+        // Injected: refuse the final (parity) datagram of the same burst.
+        let recorder = Arc::new(Mutex::new(RecordingWrite::default()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let blocked = Arc::new(Mutex::new(None));
+        let block_at = control_datagrams.len() - 1;
+        let mut injected = harness_with_writer(
+            true,
+            Box::new(WouldBlockAt {
+                recorder: Arc::clone(&recorder),
+                block_at,
+                attempts: Arc::clone(&attempts),
+                blocked: Arc::clone(&blocked),
+            }),
+            FecTuning::max_diversity(),
+        );
+        injected
+            .shared_for_test()
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .set_congestion_loss_ratio_for_test(Some(0.08));
+        stage_small_message(&injected);
+        let mut bufs = SendBufs::new();
+        assert!(injected.send_pkts(&mut bufs).await.unwrap());
+        assert_eq!(
+            injected.pending_fec_parity_len_for_test(),
+            1,
+            "the refused parity datagram must stay queued, not be dropped"
+        );
+        assert_eq!(
+            recorder.lock().unwrap().count(),
+            block_at,
+            "everything before the blocked parity datagram must have gone out"
+        );
+        let refused = blocked
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the injector must have refused a datagram");
+
+        // The next flush opportunity replays the residual.  No *data*
+        // progress is reported (the parity tail is not data), but the call
+        // must succeed and drain the queue.
+        injected.send_pkts(&mut bufs).await.unwrap();
+        assert_eq!(
+            injected.pending_fec_parity_len_for_test(),
+            0,
+            "the retried parity must have drained"
+        );
+        let forwarded = recorder.lock().unwrap().datagrams();
+        assert_eq!(
+            forwarded.len(),
+            control_datagrams.len(),
+            "the interrupted burst must retry to the uninterrupted datagram count"
+        );
+        assert_eq!(
+            forwarded.last(),
+            Some(&refused),
+            "the retry must be byte-identical to the refused parity datagram (no loss, no duplication)"
+        );
+        assert_eq!(
+            injected.shared_for_test().check_error(),
+            Ok(()),
+            "a WouldBlock must remain non-terminal"
         );
     }
 
