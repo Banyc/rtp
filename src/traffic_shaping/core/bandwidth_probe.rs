@@ -2,6 +2,13 @@ use std::time::{Duration, Instant};
 
 const BW_PROBE_GAIN: f64 = 0.5;
 
+/// The ordinary probe's largest possible no-loss gain factor, `1 +
+/// BW_PROBE_GAIN`: the biggest per-probe rate increase the ordinary probe
+/// itself can propose.  Exposed as the single authority for the reorder lane's
+/// spurious-sample cap, so that cap cannot silently fall below (and clip) the
+/// probe it exists to allow.
+pub(crate) const ORDINARY_PROBE_MAX_GAIN: f64 = 1.0 + BW_PROBE_GAIN;
+
 /// Scale a multiplicative probe gain by the survival fraction `(1 - loss)`.
 ///
 /// A loss-suppressed delivery rate `D ~= (1 - lr) * R` must not compound the
@@ -73,6 +80,20 @@ impl OrdinaryBandwidthProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_probe_max_gain_is_the_probe_own_no_loss_gain() {
+        // The exported cap authority must describe the probe exactly: a
+        // no-loss probe of `d` proposes `d * ORDINARY_PROBE_MAX_GAIN`, so a
+        // caller bounding a probe target from this constant can never clip the
+        // legitimate probe it exists to allow.
+        let d = 137.0;
+        assert_eq!(
+            OrdinaryBandwidthProbe::proposed_rate(d, Some(0.0)),
+            d * ORDINARY_PROBE_MAX_GAIN
+        );
+        assert!(OrdinaryBandwidthProbe::proposed_rate(d, Some(0.9)) <= d * ORDINARY_PROBE_MAX_GAIN);
+    }
 
     #[test]
     fn increase_waits_for_one_current_feedback_rtt() {
