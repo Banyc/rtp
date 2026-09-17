@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,14 @@ use crate::traffic_shaping::redundancy::{
     ArmorDecision, RetransmissionArmor, RetransmissionArmorConfig,
     fec::FecEncoderState,
     fec_gate::{FecConditionGate, FecGateDecision, FecLossGateThresholds},
+    in_stream_group::{CapacityGate, InStreamGroupFlush},
+    parity_burst::PendingParityBurst,
 };
+
+/// Shims the fresh-tail armour, which now lives in
+/// [`crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail`], so
+/// the old `write_half` path keeps resolving.
+pub(crate) use crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendLoopResult {
@@ -40,7 +47,7 @@ pub struct WriteHalf {
     utp_write: Box<dyn UnreliableWrite>,
     fec: Option<FecEncoderState>,
     fec_instream_flush: bool,
-    instream_group_fec_enabled: bool,
+    in_stream_group: InStreamGroupFlush,
     fec_gate: FecConditionGate,
     retransmission_armor: RetransmissionArmor,
     send_pacer: SendPacer,
@@ -66,12 +73,8 @@ pub struct WriteHalf {
     /// production, where the loss-adaptive ladder decides.
     fresh_tail_armor_copies_override: Option<usize>,
     /// Residual parity of a burst whose underlay reported `WouldBlock`
-    /// mid-flight (see [`Self::flush_fec_parities`]).  At most one group's
-    /// parity is ever held: new parity is only generated once this drains, so
-    /// the queue cannot grow without bound.  Entries are stored front-to-back
-    /// in the order they were emitted and are *moved*, never copied, so a
-    /// retry can neither reorder nor duplicate a parity symbol.
-    pending_fec_parity: VecDeque<Vec<u8>>,
+    /// mid-flight (see [`Self::flush_fec_parities`]).
+    pending_fec_parity: PendingParityBurst,
 }
 
 /// FEC and retransmission-armor settings for the write half, bundled so
@@ -106,70 +109,6 @@ struct PiggybackAck {
 /// parks on the next wake (resume signal / pacing / protocol deadline)
 /// instead of re-minting packets that never traverse the wire.
 const MAX_CONSECUTIVE_WOULD_BLOCK: u32 = 16;
-
-/// Armor duplicate copies emitted for a fresh interactive single-symbol tail
-/// (in addition to the primary datagram) at the burst-cover tier when the FEC
-/// loss gate is OPEN and a *message-sized* parity symbol will therefore trail
-/// the same burst as the sixth wire slot.  Primary + four copies + the small
-/// parity is six back-to-back datagrams, so a five-packet burst always leaves
-/// a survivor; the parity is a ~256 B symbol, not the 8 KB full-MSS symbol a
-/// stock flush would emit, so the sixth slot is cheap.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY: usize = 4;
-
-/// Armor duplicate copies at the burst-cover tier when the FEC loss gate is
-/// CLOSED, so no parity will trail the burst.  Five copies fill the sixth
-/// wire slot the parity would have occupied: primary + five copies is still
-/// six back-to-back 256-byte datagrams, covering a five-packet burst.  The
-/// copy count is monotone non-increasing with loss, so the closed-gate tier
-/// never grows redundancy as the link degrades.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY: usize = 5;
-
-/// Armor duplicate copies retained once the measured loss passes
-/// [`FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS`]: the two-copy coverage this
-/// lane shipped with, kept for the mid-loss band where a single loss is still
-/// the common event.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE: usize = 2;
-
-/// Armor duplicate copies retained once the measured loss passes
-/// [`FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS`].  On a hostile link the extra
-/// packets amplify queue pressure instead of helping, so the fresh tail backs
-/// off to the primary datagram alone and leaves repair to FEC/ARQ.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN: usize = 0;
-
-/// Measured effective loss ratio above which the fresh interactive tail drops
-/// from the burst-cover copy count to the historical two-copy base.
-const FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS: f64 = 0.15;
-
-/// Measured effective loss ratio above which the fresh interactive tail backs
-/// off to the primary datagram alone: a hostile link must never pay extra
-/// redundancy that amplifies congestion.
-const FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS: f64 = 0.30;
-
-/// Armor duplicate copies for a fresh interactive single-symbol tail as a
-/// function of the measured effective loss ratio and whether a parity
-/// datagram will trail the same burst (the FEC loss gate is open).  The
-/// mapping is **monotone non-increasing** in loss: it may only ever shrink
-/// the per-message packet count as the wire loss rate rises, so a hostile
-/// link never sees more redundancy than a clean one.  `None` (no loss
-/// evidence yet) is treated as the low-loss tier.  At the burst-cover tier
-/// the copy count compensates for the parity gate: with a trailing
-/// message-sized parity four copies suffice (six datagrams total), without it
-/// a fifth copy fills the same sixth slot so a five-packet burst still leaves
-/// a survivor.  The per-message datagram budget is therefore six either way
-/// and only ever shrinks with loss.  Only the interactive lane consults this:
-/// stock/bulk tuning never forces `fec_instream_flush`.
-fn fresh_tail_armor_copies(effective_loss: Option<f64>, parity_covers_burst: bool) -> usize {
-    match effective_loss {
-        Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS => {
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN
-        }
-        Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS => {
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE
-        }
-        _ if parity_covers_burst => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
-        _ => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
-    }
-}
 
 /// Convert a codec [`EncodeError`] into the session [`IoErr`] surfaced by the
 /// terminal-error paths. An encode failure is a wire-format invariant
@@ -528,7 +467,7 @@ impl WriteHalf {
             utp_write,
             fec,
             fec_instream_flush,
-            instream_group_fec_enabled,
+            in_stream_group: InStreamGroupFlush::new(instream_group_fec_enabled),
             fec_gate: FecConditionGate::with_thresholds(fec_loss_gate),
             retransmission_armor: RetransmissionArmor::new(retransmission_armor),
             send_pacer,
@@ -539,7 +478,7 @@ impl WriteHalf {
             ack_padding,
             data_size_sampler: DataSizeSampler::new(),
             fresh_tail_armor_copies_override,
-            pending_fec_parity: VecDeque::new(),
+            pending_fec_parity: PendingParityBurst::new(),
         }
     }
 
@@ -552,7 +491,7 @@ impl WriteHalf {
     /// primary recovery samples emits no parity, so the in-stream group path
     /// must not accumulate full groups while the gate is closed.
     fn instream_group_fec_enabled(&self) -> bool {
-        self.instream_group_fec_enabled && self.fec_gate.loss_active()
+        self.in_stream_group.live(self.fec_gate.loss_active())
     }
 
     /// Refresh the condition gate's loss evidence from the reliable layer's
@@ -574,13 +513,12 @@ impl WriteHalf {
     /// capacity comes from the reliable layer (tail gate + zero write waiters
     /// + no queue building); the tail policy is the caller's request.
     fn fec_gate_decision(&self, now: Instant, tail_requested: bool) -> FecGateDecision {
-        let interactive = self.fec_instream_flush;
+        let capacity = CapacityGate::for_instream_flush(self.fec_instream_flush);
         let spare = self.shared.with_reliable_layer(|layer| {
-            if interactive {
-                layer.fec_has_spare_capacity_interactive()
-            } else {
-                layer.fec_has_spare_capacity(now)
-            }
+            capacity.spare(
+                || layer.fec_has_spare_capacity(now),
+                || layer.fec_has_spare_capacity_interactive(),
+            )
         });
         self.fec_gate.decide(spare, tail_requested)
     }
@@ -894,16 +832,13 @@ impl WriteHalf {
             // frame's first packet declares a larger `frame_len` and is never
             // duplicated, so bulk traffic gains no redundancy.  Bulk/stock
             // lanes never force `fec_instream_flush`, so they are untouched.
-            let single_symbol_frame = u32::try_from(data_written)
-                .ok()
-                .is_some_and(|written| p.frame_len == Some(written));
-            let fresh_interactive_tail = !is_recovery
-                && self.fec_instream_flush
-                && (single_symbol_frame
-                    || self
-                        .fec
-                        .as_ref()
-                        .is_some_and(|fec| fec.open_group_data_count() == 1));
+            let single_symbol_frame = is_single_symbol_frame(p.frame_len, data_written);
+            let fresh_interactive_tail = is_fresh_interactive_tail(
+                is_recovery,
+                self.fec_instream_flush,
+                single_symbol_frame,
+                self.fec.as_ref().map(|fec| fec.open_group_data_count()),
+            );
             let armor_decision =
                 self.retransmission_armor
                     .decide(is_recovery, fresh_interactive_tail, || {
@@ -980,16 +915,12 @@ impl WriteHalf {
                         // datagram budget at five without an 8 KB parity.  Only
                         // this lane pays the extra pacer token (bulk/stock
                         // never force `fec_instream_flush`).
-                        let copies = if fresh_interactive_tail {
-                            self.fresh_tail_armor_copies_override.unwrap_or_else(|| {
-                                fresh_tail_armor_copies(
-                                    self.fec_gate.effective_loss_ratio(),
-                                    self.fec_gate.loss_active(),
-                                )
-                            })
-                        } else {
-                            1
-                        };
+                        let copies = fresh_tail_armor_copy_count(
+                            fresh_interactive_tail,
+                            self.fresh_tail_armor_copies_override,
+                            self.fec_gate.effective_loss_ratio(),
+                            self.fec_gate.loss_active(),
+                        );
                         for _ in 0..copies {
                             if !self.send_pacer.take_exact_tokens(1, now) {
                                 break;
@@ -1206,7 +1137,7 @@ impl WriteHalf {
         if crate::debug::debug_send() {
             eprintln!("[fec] flush_parities: {} pkts", parity_pkts.len());
         }
-        self.pending_fec_parity.extend(parity_pkts);
+        self.pending_fec_parity.hold(parity_pkts);
         self.drain_pending_fec_parity().await
     }
 
@@ -1217,15 +1148,15 @@ impl WriteHalf {
     /// The data path is never blocked: control returns to the caller as soon
     /// as the underlay stops accepting datagrams.
     async fn drain_pending_fec_parity(&mut self) -> Result<(), IoErr> {
-        while let Some(pkt) = self.pending_fec_parity.pop_front() {
+        while let Some(pkt) = self.pending_fec_parity.next() {
             match self.utp_write.send(&pkt).await {
                 Ok(_) => (),
                 Err(error) if error == std::io::ErrorKind::WouldBlock => {
-                    self.pending_fec_parity.push_front(pkt);
+                    self.pending_fec_parity.requeue(pkt);
                     return Ok(());
                 }
                 Err(error) => {
-                    self.pending_fec_parity.clear();
+                    self.pending_fec_parity.abandon();
                     self.shared
                         .press_error(error, MetricsTerminationCause::FecParityWrite);
                     return Err(error);
@@ -1469,135 +1400,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::FecSymbolCache;
-
-    /// The fresh interactive tail's armor copy count is monotone
-    /// non-increasing in the measured loss ratio: a hostile link can never
-    /// emit more redundancy per message than a clean one.  The low/unmeasured
-    /// tier pays the burst-cover copy, the mid band keeps the historical base,
-    /// and the hostile tier backs off to the primary datagram alone.  At the
-    /// burst-cover tier the count compensates for the parity gate: with a
-    /// trailing message-sized parity four copies, without it five, so the
-    /// total per-message datagram budget stays at six either way.
-    #[test]
-    fn fresh_tail_armor_copies_are_monotone_non_increasing_in_loss() {
-        use super::{
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN, fresh_tail_armor_copies,
-        };
-        for parity in [true, false] {
-            assert_eq!(
-                fresh_tail_armor_copies(None, parity),
-                if parity {
-                    FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY
-                } else {
-                    FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY
-                },
-                "no loss evidence yet must use the burst-cover tier (parity={parity})"
-            );
-            assert_eq!(
-                fresh_tail_armor_copies(Some(0.0), parity),
-                fresh_tail_armor_copies(None, parity),
-                "a clean link must use the burst-cover tier (parity={parity})"
-            );
-            assert_eq!(
-                fresh_tail_armor_copies(Some(0.14), parity),
-                fresh_tail_armor_copies(None, parity),
-                "just below the moderate threshold keeps the burst-cover tier (parity={parity})"
-            );
-        }
-        assert_eq!(
-            fresh_tail_armor_copies(
-                Some(0.14),
-                false // parity irrelevant below the moderate threshold
-            ),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
-            "the no-parity burst-cover tier pays the fifth copy"
-        );
-        assert_eq!(
-            fresh_tail_armor_copies(
-                Some(0.14),
-                true // parity irrelevant below the moderate threshold
-            ),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
-            "the with-parity burst-cover tier pays four copies"
-        );
-        assert_eq!(
-            fresh_tail_armor_copies(Some(0.15), false),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
-            "the moderate threshold drops to the two-copy base"
-        );
-        assert_eq!(
-            fresh_tail_armor_copies(Some(0.30), true),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
-            "the hostile threshold backs off to the primary alone"
-        );
-        // Non-increasing in loss for either gate state: an open gate (parity
-        // trails the burst) must never emit more copies than a closed one, and
-        // neither may grow with loss.
-        for parity in [true, false] {
-            let mut previous = usize::MAX;
-            for step in 0..=100 {
-                let loss = Some(step as f64 / 100.0);
-                let copies = fresh_tail_armor_copies(loss, parity);
-                assert!(
-                    copies <= previous,
-                    "loss {loss:?} (parity={parity}) emitted {copies} copies, more than a lower loss ({previous})"
-                );
-                previous = copies;
-            }
-        }
-    }
-
-    /// The interactive fresh tail's per-message wire is bounded by six
-    /// back-to-back datagrams at every loss tier and never grows with loss.
-    /// The primary datagram plus the armor copies plus the (at most one)
-    /// trailing message-sized parity is the whole budget; the closed-gate
-    /// tier pays one more 256-byte copy in place of the parity, so both
-    /// low-loss compositions land on six slots and the byte cost stays
-    /// bounded far below a single full-MSS parity symbol.
-    #[test]
-    fn fresh_tail_burst_cover_stays_within_the_six_datagram_budget() {
-        use super::fresh_tail_armor_copies;
-        const PRIMARY: usize = 1;
-        const PARITY_SLOT: usize = 1;
-        const MESSAGE_WIRE_BYTES: usize = 256;
-        const BUDGET_DATAGRAMS: usize = 6;
-        const BUDGET_WIRE_BYTES: usize = BUDGET_DATAGRAMS * MESSAGE_WIRE_BYTES;
-        for parity in [true, false] {
-            let mut previous = usize::MAX;
-            for step in 0..=100 {
-                let loss = Some(step as f64 / 100.0);
-                let copies = fresh_tail_armor_copies(loss, parity);
-                let total = PRIMARY + copies + usize::from(parity) * PARITY_SLOT;
-                assert!(
-                    total <= BUDGET_DATAGRAMS,
-                    "loss {loss:?} (parity={parity}) spent {total} datagrams, over the {BUDGET_DATAGRAMS}-slot budget"
-                );
-                assert!(
-                    total <= previous,
-                    "loss {loss:?} (parity={parity}) spent {total} datagrams, more than a lower loss ({previous})"
-                );
-                previous = total;
-                assert!(
-                    total * MESSAGE_WIRE_BYTES <= BUDGET_WIRE_BYTES,
-                    "the per-message wire must stay under the {BUDGET_WIRE_BYTES}-byte ceiling"
-                );
-            }
-        }
-        // The two low-loss compositions are exactly six slots: five copies
-        // when no parity trails, four copies plus the small parity when one
-        // does.
-        assert_eq!(
-            PRIMARY + fresh_tail_armor_copies(None, false),
-            BUDGET_DATAGRAMS
-        );
-        assert_eq!(
-            PRIMARY + fresh_tail_armor_copies(None, true) + PARITY_SLOT,
-            BUDGET_DATAGRAMS
-        );
-    }
 
     fn term(l: &PeerLiveness, now: Instant, has_in_flight: bool) -> bool {
         l.should_terminate_session(now, has_in_flight)

@@ -1,7 +1,9 @@
 pub(crate) mod fec;
 pub(crate) mod fec_gate;
 pub mod fec_tuning;
-mod retransmission_armor;
+pub(crate) mod in_stream_group;
+pub(crate) mod parity_burst;
+pub(crate) mod retransmission_armor;
 pub use fec_tuning::{FecTuning, fec_tuning_from_env};
 pub(crate) use retransmission_armor::{ArmorDecision, RetransmissionArmor};
 pub use retransmission_armor::{RETRANSMISSION_ARMOR_ENV, RetransmissionArmorConfig};
