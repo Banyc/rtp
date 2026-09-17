@@ -207,6 +207,35 @@ pub struct PktSendSpace {
     full_walk_ack_sync: bool,
 }
 
+/// Whether a retransmit's congestion-control loss event is recorded now,
+/// deferred to the stock reorder-window deadline of the original send (it may
+/// be repairing reordering rather than loss, so an ACK arriving first
+/// cancels it), or not a loss event at all (already retransmitted, pre-outage,
+/// or a tail-loss probe).
+#[derive(Debug, Clone, Copy)]
+enum LossAccounting {
+    NotALoss,
+    RecordNow,
+    DeferUntil(Instant),
+}
+
+fn loss_accounting(
+    is_loss_candidate: bool,
+    original_sent_time: Instant,
+    now: Instant,
+    stock_window: Duration,
+) -> LossAccounting {
+    if !is_loss_candidate {
+        return LossAccounting::NotALoss;
+    }
+    let deadline = original_sent_time + stock_window;
+    if now < deadline {
+        LossAccounting::DeferUntil(deadline)
+    } else {
+        LossAccounting::RecordNow
+    }
+}
+
 impl PktSendSpace {
     pub fn new() -> Self {
         Self::new_at(SequenceNumber::ZERO)
@@ -1131,28 +1160,16 @@ impl PktSendSpace {
         // loss would - no TLP probe accounting.
         let is_fast_loss_rtx = reasons.fast_loss_at().is_some() && !already_rtxed;
 
-        // Deferred loss-event accounting for retransmits that fired before the
-        // stock reorder-window deadline of the ORIGINAL send.  A retransmit
-        // inside that window may be repairing reordering, not loss: the CC
-        // loss event is deferred to the stock deadline (`original_sent_time +
-        // stock_window`) and recorded only if the original is still unacked
-        // then; an ACK before the deadline cancels it (reordering, not loss).
-        // This covers the jitter-tolerant fast-reorder path (`RTP_JITTER_CAP`)
-        // AND evidence-gated fast loss, whose SACK evidence can fire far
-        // before the stock window expires — a merely-reordered packet must not
-        // produce a spurious congestion response (the min-RTT-based check can
-        // only catch fast reordering, never slow reordering).  A retransmit
-        // at or past the stock deadline (RTO expiry, stock reorder-window
-        // expiry) still records its loss event immediately.
         let original_sent_time = p.sent_time;
-        let defer_loss = !already_rtxed
-            && !pre_outage_loss
-            && !tail_probe_loss
-            && now < original_sent_time + stock_window;
-        let baseline_deadline_opt = if defer_loss {
-            Some(original_sent_time + stock_window)
-        } else {
-            None
+        let accounting = loss_accounting(
+            !already_rtxed && !pre_outage_loss && !tail_probe_loss,
+            original_sent_time,
+            now,
+            stock_window,
+        );
+        let baseline_deadline_opt = match accounting {
+            LossAccounting::DeferUntil(deadline) => Some(deadline),
+            LossAccounting::NotALoss | LossAccounting::RecordNow => None,
         };
 
         // Refresh the DRE packet state on this retransmit so recovered
@@ -1184,12 +1201,15 @@ impl PktSendSpace {
                     deferred_loss_baseline_deadline: baseline_deadline_opt,
                 };
             }
-        if defer_loss {
-            self.deferred_losses
-                .insert(s, baseline_deadline_opt.unwrap());
-        } else if !already_rtxed && !pre_outage_loss && !tail_probe_loss {
-            let smooth_rtt = self.rtt_stats.smooth_rtt();
-            self.loss_event_window.record_lost(1, now, smooth_rtt);
+        match accounting {
+            LossAccounting::DeferUntil(deadline) => {
+                self.deferred_losses.insert(s, deadline);
+            }
+            LossAccounting::RecordNow => {
+                let smooth_rtt = self.rtt_stats.smooth_rtt();
+                self.loss_event_window.record_lost(1, now, smooth_rtt);
+            }
+            LossAccounting::NotALoss => {}
         }
         // After retransmission, deactivate the selected sequence so unchanged
         // SACK evidence cannot rearm fast loss, then re-activate it with the
