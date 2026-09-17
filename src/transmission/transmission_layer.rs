@@ -223,6 +223,15 @@ pub struct LogConfig {
     pub reliable_layer_log_path: PathBuf,
 }
 
+/// Flat CSV trace row written by the reliable-layer logger.
+///
+/// This is a deliberately fixed-width schema: its columns are the external
+/// contract for trace readers, so it is **not** extended with the FEC-level
+/// counters the typed [`MetricsObservation`](crate::metrics::MetricsObservation)
+/// snapshot carries (e.g. `rejected_recovered_symbols`).  Those counters live
+/// only in the typed observation; this row stays the congestion/reliability
+/// trace.  The retransmission-armor event is still visible here as the generic
+/// `op` name (`retransmission_armor_duplicate`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsRow<'a> {
     pub schema_version: u16,
