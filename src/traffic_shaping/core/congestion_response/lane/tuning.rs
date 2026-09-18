@@ -44,20 +44,27 @@ pub(crate) const SHARED_ADDITIVE_PROBE_ACCEL: f64 = 3000.0;
 /// Largest fraction of the current rate the shared lane's additive probe step
 /// may add.
 ///
-/// Capping the step at `0.6 * current_rate` bounds the probe target at `1.6x`,
-/// just above the historical `1.5x` multiplicative probe, so a late joiner can
-/// close the fairness gap at an RTT-independent rate without overshooting into
-/// starving the incumbent.  A step of `0.65x` or more occasionally does starve
-/// the incumbent, so the cap stays below that edge.
-pub(crate) const SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION: f64 = 0.6;
+/// The ordinary probe's multiplicative part (`delivery * 1.5`) grows a flow in
+/// proportion to its own share, and it fires once per control RTT, so a low-RTT
+/// flow earns both more increases per second and larger ones; two flows then
+/// keep whatever ratio they first acquire.  The additive step is the
+/// convergence force, but capping it at `0.6 * current_rate` bounds the probe
+/// target at `1.6x`, barely above the multiplicative `1.5x`, so it is inert for
+/// exactly the starved flow it exists for (a starved flow's `current_rate`, and
+/// therefore its cap, is depressed).  The cap is raised to `1.5x` so the
+/// RTT-scaled additive step survives as a real absolute increase (target up to
+/// `2.5x`), while the multiplicative probe still governs an unstarved flow.
+/// Above this value the step starts to overshoot a high-RTT flow's share and
+/// the convergence becomes unstable in the late-join arms.
+pub(crate) const SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION: f64 = 1.5;
 
 impl CongestionLane {
     /// The additive rate step this lane adds to one accepted ordinary probe.
     ///
     /// Expressed as an acceleration times the path's control RTT so the
     /// per-second increase is RTT-independent, then capped at a fraction of the
-    /// current rate so the probe target stays just above the multiplicative
-    /// probe.  A dedicated lane adds nothing.
+    /// current rate so the probe target stays bounded.  A dedicated lane adds
+    /// nothing.
     pub(crate) fn ordinary_additive_probe_step(
         self,
         control_rtt: Duration,
