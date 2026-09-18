@@ -149,6 +149,12 @@ pub(crate) struct QueueGrowth {
     /// reorder-induced low RTT outliers instead of treating them as the path
     /// baseline.
     reorder_tolerant: bool,
+    /// The lane shares its queue with competing flows (see
+    /// [`CongestionLane::shares_queue`]).  On a shared lane the delay gate's
+    /// absolute drain-trigger margin must be common-mode, so the
+    /// propagation-floor-scaled term is dropped; a dedicated lane's queue is
+    /// its own and keeps it.
+    common_mode_queue: bool,
     persistent_since: Option<Instant>,
     /// The single observation clock that voids every timer's continuity across
     /// an idle gap (see [`IdleGap`]).
@@ -165,6 +171,7 @@ impl QueueGrowth {
             prev_floor: None,
             floor_step_hold: 0,
             reorder_tolerant,
+            common_mode_queue: CongestionLane::default().shares_queue(),
             persistent_since: None,
             idle_gap: IdleGap::new(),
             building: false,
@@ -192,6 +199,7 @@ impl QueueGrowth {
 
     /// Declare this controller's congestion lane.
     pub(crate) fn set_lane(&mut self, lane: CongestionLane) {
+        self.common_mode_queue = lane.shares_queue();
         self.gentle.set_lane(lane);
     }
 
@@ -264,11 +272,21 @@ impl QueueGrowth {
             jitter.steady
         };
         let persistent_rttvar = jitter.trending;
-        let tolerance = queue_tolerance(ordinary_rttvar, floor, QUEUE_RTT_FACTOR);
+        // A shared lane's queue is common to every flow over the bottleneck, so
+        // its drain-trigger margin may not scale with this flow's own
+        // propagation floor: two contending flows with different RTTs would
+        // otherwise see different queue-building thresholds, letting the
+        // higher-RTT flow keep probing while the lower-RTT flow drains.  The
+        // reorder-tolerant lane keeps its floor-scaled margin: its floor window
+        // is already the short, baseline-scaled, reorder-aware one, and the
+        // common-mode margin measurably regresses that lane's asymmetric arm.
+        let floor_scaled = !self.common_mode_queue || self.reorder_tolerant;
+        let tolerance = queue_tolerance(ordinary_rttvar, floor, QUEUE_RTT_FACTOR, floor_scaled);
         let persistent_tolerance = queue_tolerance(
             persistent_rttvar,
             floor,
             QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            floor_scaled,
         );
         if smooth > floor + persistent_tolerance {
             self.persistent_since.get_or_insert(now);
@@ -400,11 +418,18 @@ impl QueueGrowth {
     }
 }
 
-fn queue_tolerance(rttvar: Duration, floor: Duration, coefficient: f64) -> Duration {
-    rttvar
-        .mul_f64(coefficient)
-        .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
-        .max(QUEUE_RTT_FLOOR)
+fn queue_tolerance(
+    rttvar: Duration,
+    floor: Duration,
+    coefficient: f64,
+    floor_scaled: bool,
+) -> Duration {
+    let jitter_margin = rttvar.mul_f64(coefficient).max(QUEUE_RTT_FLOOR);
+    if floor_scaled {
+        jitter_margin.max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
+    } else {
+        jitter_margin
+    }
 }
 
 #[cfg(test)]
@@ -417,11 +442,12 @@ mod tests {
         let floor = Duration::from_millis(100);
         let rttvar = Duration::from_millis(50);
         let smooth = Duration::from_millis(250);
-        let normal = queue_tolerance(rttvar, floor, QUEUE_RTT_FACTOR);
+        let normal = queue_tolerance(rttvar, floor, QUEUE_RTT_FACTOR, true);
         let persistent = queue_tolerance(
             rttvar,
             floor,
             QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            true,
         );
         assert!(smooth > floor + normal);
         assert!(smooth <= floor + persistent);
@@ -443,6 +469,94 @@ mod tests {
         );
         assert!(observation.building);
         assert_eq!(observation.persistent_for, None);
+    }
+
+    /// A shared lane's drain-trigger margin is common-mode: it may not scale
+    /// with this flow's own propagation floor, because the queue is shared.
+    /// Two contending flows with different RTTs would otherwise see different
+    /// queue-building thresholds, letting the higher-RTT flow keep probing
+    /// while the lower-RTT flow drains.  A dedicated lane's queue is its own,
+    /// so it keeps the propagation-floor-scaled margin.
+    #[test]
+    fn shared_lane_drops_the_floor_scaled_margin_dedicated_keeps_it() {
+        let jitter = Duration::from_millis(2);
+        let rttvar_margin = jitter.mul_f64(QUEUE_RTT_FACTOR).max(QUEUE_RTT_FLOOR);
+        // A high-RTT path where the floor-scaled term dominates the jitter
+        // term (as a 100 ms-RTT flow's does over a shared 10 Mbit/s queue).
+        let floor = Duration::from_millis(200);
+        assert!(floor.mul_f64(QUEUE_TOL_RTT_FRACTION) > rttvar_margin);
+
+        assert_eq!(
+            queue_tolerance(jitter, floor, QUEUE_RTT_FACTOR, false),
+            rttvar_margin,
+            "a common-mode lane keeps only the jitter margin"
+        );
+        assert_eq!(
+            queue_tolerance(jitter, floor, QUEUE_RTT_FACTOR, true),
+            floor.mul_f64(QUEUE_TOL_RTT_FRACTION),
+            "a self-owned queue keeps the propagation-floor-scaled margin"
+        );
+    }
+
+    /// The declared lane selects the margin: the same observation on a
+    /// `Shared` lane yields the smaller common-mode tolerance and on a
+    /// `Dedicated` lane the floor-scaled one.
+    #[test]
+    fn the_declared_lane_selects_the_floor_scaling() {
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(200);
+        let smooth = Duration::from_millis(260);
+        let control_rtt = Duration::from_millis(400);
+        let jitter = GateJitter::uniform(Duration::from_millis(2));
+
+        let mut shared = QueueGrowth::new(t0, false);
+        shared.set_lane(CongestionLane::Shared);
+        let mut dedicated = QueueGrowth::new(t0, false);
+        dedicated.set_lane(CongestionLane::Dedicated);
+        shared.observe(floor, jitter, Some(0.0), t0, control_rtt);
+        dedicated.observe(floor, jitter, Some(0.0), t0, control_rtt);
+        let shared_obs = shared.observe(
+            smooth,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+        let dedicated_obs = dedicated.observe(
+            smooth,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+        assert_eq!(
+            shared_obs.tolerance, QUEUE_RTT_FLOOR,
+            "the shared lane's tolerance is the common-mode jitter margin"
+        );
+        assert_eq!(
+            dedicated_obs.tolerance,
+            floor.mul_f64(QUEUE_TOL_RTT_FRACTION),
+            "the dedicated lane keeps the floor-scaled tolerance"
+        );
+
+        // The reorder-tolerant shared lane keeps the floor-scaled margin: its
+        // floor window is already the short, baseline-scaled, reorder-aware
+        // one, and the common-mode margin regresses its asymmetric arm.
+        let mut reorder = QueueGrowth::new(t0, true);
+        reorder.set_lane(CongestionLane::Shared);
+        reorder.observe(floor, jitter, Some(0.0), t0, control_rtt);
+        let reorder_obs = reorder.observe(
+            smooth,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+        assert_eq!(
+            reorder_obs.tolerance,
+            floor.mul_f64(QUEUE_TOL_RTT_FRACTION),
+            "the reorder-tolerant shared lane keeps the floor-scaled tolerance"
+        );
     }
 
     /// The interactive fast-forward lane opts into out-of-order delivery, so a
@@ -641,7 +755,7 @@ mod tests {
             t0 + Duration::from_secs(1),
             control_rtt,
         );
-        let steady_tolerance = queue_tolerance(steady, observation.floor, QUEUE_RTT_FACTOR);
+        let steady_tolerance = queue_tolerance(steady, observation.floor, QUEUE_RTT_FACTOR, true);
         assert!(
             observation.tolerance > steady_tolerance,
             "a floor step must use the trending margin: tol={:?} steady={:?}",
@@ -666,7 +780,8 @@ mod tests {
             t0 + Duration::from_millis(1),
             control_rtt,
         );
-        let trending_tolerance = queue_tolerance(trending, observation.floor, QUEUE_RTT_FACTOR);
+        let trending_tolerance =
+            queue_tolerance(trending, observation.floor, QUEUE_RTT_FACTOR, true);
         assert!(
             observation.tolerance < trending_tolerance,
             "gradual queue growth must keep the steady margin: tol={:?} trending={:?}",
@@ -695,11 +810,12 @@ mod tests {
         // does not.  `building` sees the steady margin, the persistent timer the
         // trending one.
         let smooth = floor + Duration::from_millis(30);
-        let steady_tolerance = queue_tolerance(steady, floor, QUEUE_RTT_FACTOR);
+        let steady_tolerance = queue_tolerance(steady, floor, QUEUE_RTT_FACTOR, true);
         let trending_persistent = queue_tolerance(
             trending,
             floor,
             QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            true,
         );
         assert!(smooth > floor + steady_tolerance);
         assert!(smooth <= floor + trending_persistent);

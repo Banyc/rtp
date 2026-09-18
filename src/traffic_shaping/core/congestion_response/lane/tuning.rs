@@ -68,6 +68,18 @@ impl CongestionLane {
         }
     }
 
+    /// Whether this lane shares its queue with competing flows.
+    ///
+    /// A shared lane's queue is common to every flow over the bottleneck, so a
+    /// drain-trigger margin derived from this flow's own propagation RTT is not
+    /// common-mode: it lets a high-RTT flow keep probing while a low-RTT flow
+    /// drains.  The delay gate consults this to keep the shared lane's margin
+    /// common-mode.  A dedicated lane's queue is its own, so its margin may
+    /// scale with its own path.
+    pub(crate) fn shares_queue(self) -> bool {
+        matches!(self, Self::Shared)
+    }
+
     /// The multiplicative gain the gentle probe creeps at on this lane.
     pub(crate) fn gentle_probe_gain(self) -> f64 {
         match self {
