@@ -97,8 +97,10 @@ pub(crate) struct RttStats {
 /// directions: the trending variance reacts immediately to a path step but is
 /// inflated by a self-inflicted queue, while the windowed steady-state floor
 /// is immune to the queue but lags a step.  [`QueueGrowth`](crate::traffic_shaping::core::QueueGrowth)
-/// picks the trending value while its own RTT floor is stepping and the
-/// steady-state value otherwise.
+/// uses the steady-state value for its ordinary gate (picking the trending one
+/// while its own RTT floor is stepping), and the trending value for the
+/// persistent-queue timer -- the drain trigger -- because the windowed minimum
+/// is not a common-mode estimate across flows sharing a bottleneck.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GateJitter {
     /// Jitter for a settled path: the windowed steady-state minimum, or the

@@ -244,14 +244,29 @@ impl QueueGrowth {
         } else {
             self.floor_step_hold = self.floor_step_hold.saturating_sub(1);
         }
-        let rttvar = if self.floor_step_hold > 0 {
+        // The ordinary gate keeps the queue-immune steady-state margin (falling
+        // back to the trending margin only while the RTT floor is stepping).
+        // The *persistent*-queue timer -- the drain trigger -- instead always
+        // uses the trending margin.  The windowed steady-state minimum is the
+        // quietest recent stretch of *this* flow; across flows sharing one
+        // bottleneck that is not a common-mode estimate (a low-RTT flow
+        // reaches a quiet stretch sooner than a high-RTT flow), so feeding it
+        // the persistent timer drains the low-RTT contending flow more often
+        // and starves it.  The trending margin tracks the queue itself, so a
+        // standing queue raises the persistent threshold for every contending
+        // flow alike.  A persistent threshold that is dominated by the
+        // floor-scaled term (a bursty interactive lane on a long path) is
+        // unchanged either way, and the stock/bulk lane passes both estimates
+        // equal.
+        let ordinary_rttvar = if self.floor_step_hold > 0 {
             jitter.trending
         } else {
             jitter.steady
         };
-        let tolerance = queue_tolerance(rttvar, floor, QUEUE_RTT_FACTOR);
+        let persistent_rttvar = jitter.trending;
+        let tolerance = queue_tolerance(ordinary_rttvar, floor, QUEUE_RTT_FACTOR);
         let persistent_tolerance = queue_tolerance(
-            rttvar,
+            persistent_rttvar,
             floor,
             QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
         );
@@ -657,6 +672,59 @@ mod tests {
             "gradual queue growth must keep the steady margin: tol={:?} trending={:?}",
             observation.tolerance,
             trending_tolerance
+        );
+    }
+
+    /// The persistent-queue timer -- the drain trigger -- must use the trending
+    /// jitter margin, not the queue-immune windowed minimum.  On a shared
+    /// bottleneck the windowed minimum is the quietest recent stretch of *this*
+    /// flow and is not common-mode across flows, so a low-RTT contending flow
+    /// would arm the persistent timer while a high-RTT one would not and be
+    /// starved.  The ordinary gate keeps the steady margin, so this pins the
+    /// split between the two tolerances.
+    #[test]
+    fn persistent_queue_threshold_uses_the_trending_margin() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let floor = Duration::from_millis(50);
+        let steady = Duration::from_millis(5);
+        let trending = Duration::from_millis(80);
+        let jitter = GateJitter { steady, trending };
+
+        // A gap that the steady margin calls persistent but the trending margin
+        // does not.  `building` sees the steady margin, the persistent timer the
+        // trending one.
+        let smooth = floor + Duration::from_millis(30);
+        let steady_tolerance = queue_tolerance(steady, floor, QUEUE_RTT_FACTOR);
+        let trending_persistent = queue_tolerance(
+            trending,
+            floor,
+            QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+        );
+        assert!(smooth > floor + steady_tolerance);
+        assert!(smooth <= floor + trending_persistent);
+
+        let mut growth = QueueGrowth::new(t0, true);
+        growth.observe(floor, jitter, Some(0.0), t0, control_rtt);
+        let observation = growth.observe(
+            smooth,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+
+        assert_eq!(
+            observation.tolerance, steady_tolerance,
+            "the ordinary gate must keep the steady-state margin"
+        );
+        assert!(
+            observation.building,
+            "the ordinary gate must still flag the queue"
+        );
+        assert!(
+            observation.persistent_for.is_none(),
+            "the persistent timer must use the trending margin, not the steady one"
         );
     }
 }
