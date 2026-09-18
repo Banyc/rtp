@@ -72,7 +72,6 @@ const MAX_DATA_LOSS_RATE: f64 = 0.9;
 /// because an ACK can repair the window between asynchronous sends.
 const HUGE_DATA_LOSS_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 const PRINT_DEBUG_MSGS: bool = false;
-const LINEAR_BACKOFF: bool = true;
 fn metrics_gentle_exit_cause(cause: GentleExitCause) -> MetricsGentleExitCause {
     match cause {
         GentleExitCause::Loss => MetricsGentleExitCause::Loss,
@@ -628,11 +627,7 @@ impl ReliableLayer {
             );
         }
 
-        if LINEAR_BACKOFF {
-            self.backoff_on_huge_data_loss_linear(now);
-        } else {
-            self.backoff_on_huge_data_loss_exponential(now);
-        }
+        self.backoff_on_huge_data_loss_linear(now);
 
         // Reconcile any deferred CC loss-events whose stock reorder-window
         // deadline has now elapsed (jitter-tolerant fast-retransmit path).
@@ -1107,22 +1102,17 @@ impl ReliableLayer {
                 }
             }
             CongestionDecision::LossBackoff { raw, floor, target } => {
-                if LINEAR_BACKOFF {
-                    self.last_congestion_action =
-                        Some(crate::metrics::MetricsCongestionAction::LossBackoff);
-                    self.record_loss_backoff(raw, floor, target);
-                    if let Some(new_rate) = linear_backoff_step(
-                        current,
-                        target,
-                        sr.interval(),
-                        control_rtt,
-                        CWND_SEND_RATE_SCALE,
-                    ) {
-                        self.set_send_rate(new_rate, now);
-                    }
-                } else {
-                    self.slow_start = false;
-                    self.set_smooth_send_rate(sr.delivery_rate(), now);
+                self.last_congestion_action =
+                    Some(crate::metrics::MetricsCongestionAction::LossBackoff);
+                self.record_loss_backoff(raw, floor, target);
+                if let Some(new_rate) = linear_backoff_step(
+                    current,
+                    target,
+                    sr.interval(),
+                    control_rtt,
+                    CWND_SEND_RATE_SCALE,
+                ) {
+                    self.set_send_rate(new_rate, now);
                 }
             }
         }
@@ -1155,16 +1145,6 @@ impl ReliableLayer {
         self.last_congestion_action =
             Some(crate::metrics::MetricsCongestionAction::HugeLossBackoff);
         self.set_send_rate(new_rate, now);
-    }
-
-    /// Original exponential backoff on unrecovered huge data loss.
-    fn backoff_on_huge_data_loss_exponential(&mut self, now: Instant) {
-        let Some(_) = self.huge_data_loss_gate(now) else {
-            return;
-        };
-        self.last_congestion_action =
-            Some(crate::metrics::MetricsCongestionAction::HugeLossBackoff);
-        self.set_send_rate(self.send_rate.get() / 2., now);
     }
 
     /// Shared gate for huge-data-loss backoff. Returns the elapsed time the
