@@ -3585,6 +3585,78 @@ mod tests {
         );
     }
 
+    /// The additive step must reach the applied *send rate* on the
+    /// reorder-tolerant `Shared` lane (the production mux interactive lane's
+    /// congestion mode, `allow_reorder`).  The reorder probe cap bounds only
+    /// the delivery-scaled part of a probe, so it must not clip the lane's
+    /// absolute additive headroom on the wire.
+    ///
+    /// The lane is ramped out of slow start, its control RTT is lifted to
+    /// ~100 ms (additive step ~= `SHARED_ADDITIVE_PROBE_STEP`), then a probe
+    /// from a deliberately depressed current rate (100 pkt/s) with a delivery
+    /// sample below that rate is applied.  A multiplicative-only probe, or the
+    /// old delivery-scaled cap that dropped the additive step, cannot raise the
+    /// rate at all here; the additive step raises the smoothed rate to
+    /// `0.6 * current + 0.4 * (current + additive)`, which exceeds the 1.5x
+    /// delivery-scaled cap that used to clip it.
+    #[test]
+    fn reorder_tolerant_shared_lane_applies_the_additive_step_to_the_send_rate() {
+        let t0 = Instant::now();
+        let mut rl = test_layer_reorder(t0);
+        assert!(rl.congestion_response.reorder_tolerant());
+        let mut t = t0;
+        // Ramp out of slow start so the ordinary bandwidth-probe branch is
+        // active.
+        for _ in 0..40 {
+            send_max(&mut rl, t);
+            t += Duration::from_millis(10);
+            ack_all(&mut rl, Some(Duration::from_millis(10)), t);
+        }
+        assert!(!rl.slow_start, "slow start must exit during the ramp");
+        // Lift the control RTT (and, on the reorder lane, the floor) to 100 ms
+        // so the absolute additive step is a large fraction of the depressed
+        // current rate and therefore exceeds the 1.5x delivery-scaled cap.
+        for _ in 0..60 {
+            rl.sample_rtt(Duration::from_millis(100), t);
+            t += Duration::from_millis(10);
+        }
+        for _ in 0..10 {
+            send_max(&mut rl, t);
+            t += Duration::from_millis(100);
+            ack_all(&mut rl, Some(Duration::from_millis(100)), t);
+            t += Duration::from_nanos(1);
+        }
+        assert_eq!(
+            rl.last_congestion_action,
+            Some(crate::metrics::MetricsCongestionAction::BandwidthProbe),
+            "the clean reorder lane must take an ordinary bandwidth probe"
+        );
+
+        let current = 100.0;
+        rl.set_send_rate(current, t);
+        send_max(&mut rl, t);
+        let rtt = Duration::from_millis(100);
+        t += rtt;
+        ack_all(&mut rl, Some(rtt), t);
+
+        let additive = crate::CongestionLane::Shared.ordinary_additive_probe_step(rl.control_rtt());
+        assert!(additive > 0.0, "the shared lane carries an additive step");
+        let rate = rl.send_rate.get();
+        assert!(
+            rate > current + 0.2 * additive,
+            "the additive step must reach the send rate: {rate} vs current {current} + 0.2 * {additive}"
+        );
+        assert!(
+            rate < current + additive,
+            "the applied rate is the smoothed probe target, below the full target: {rate}"
+        );
+        assert!(
+            rate > current * ORDINARY_PROBE_MAX_GAIN,
+            "the applied rate {rate} must exceed the 1.5x delivery-scaled cap {}: the reorder cap must not clip the additive step",
+            current * ORDINARY_PROBE_MAX_GAIN,
+        );
+    }
+
     #[test]
     fn unchanged_smooth_rate_refreshes_send_space_without_touching_the_pacer() {
         let t0 = Instant::now();
