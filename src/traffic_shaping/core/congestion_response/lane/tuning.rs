@@ -8,6 +8,9 @@
 use super::CongestionLane;
 use std::time::Duration;
 
+/// Reference path RTT the shared lane's additive step is calibrated at.
+pub(crate) const SHARED_ADDITIVE_PROBE_REFERENCE_RTT: Duration = Duration::from_millis(100);
+
 /// Gentle-mode multiplicative probe gain for the shared lane.  A shared lane
 /// keeps the conservative cross-traffic-protecting gain.
 pub(crate) const GENTLE_BW_PROBE_GAIN: f64 = 0.20;
@@ -27,53 +30,41 @@ pub(crate) const GENTLE_DRAIN_FRAC: f64 = 0.75;
 /// mode, and that a dedicated lane keeps even while gentle mode is active.
 pub(crate) const DRAIN_RATE_FRACTION: f64 = 0.9;
 
-/// Additive-increase acceleration for the shared lane's ordinary probe, in
-/// rate units per second of path RTT (`pkt/s` per second).
+/// The additive-increase step the shared lane adds to one accepted ordinary
+/// probe, in `pkt/s`, at [`SHARED_ADDITIVE_PROBE_REFERENCE_RTT`].
 ///
-/// The ordinary probe is purely multiplicative (`delivery * 1.5`), which has no
-/// convergence force: two flows sharing a bottleneck keep whatever rate ratio
-/// they first acquire, so a flow that captured the link early (or a low-RTT
-/// flow whose per-RTT probe fires more often) keeps its share indefinitely.
-/// The shared lane adds this RTT-scaled rate step on every accepted probe so
-/// the increase is a fixed amount per unit time regardless of path RTT, giving
-/// a starved flow an absolute headroom to climb back toward its fair share.  A
+/// The step is an absolute rate, so two flows contending for one bottleneck
+/// converge to equal rates under the multiplicative drain instead of keeping
+/// whatever ratio the delivery-scaled multiplicative probe first gave them.
+/// It is deliberately independent of the flow's current rate (a
+/// `current`-proportional step grows with the share it exists to redistribute).
+///
+/// It is scaled by the *square root* of the path's control RTT.  A step
+/// proportional to `control_rtt` would be right only if every flow's probe
+/// fired exactly once per RTT; under a shared queue the accepted-probe cadence
+/// is instead set by the common queue drain/hold cycle, so a full linear
+/// compensation over-rewards a high-RTT flow (measured: it wins ~2.4x).  A
+/// constant step over-rewards a low-RTT flow (measured: it wins ~2.6x).  The
+/// geometric scaling matches the measured cadence and converges the pair.  A
 /// dedicated lane has no competing flow to converge against, so it keeps the
 /// historical purely multiplicative probe.
-pub(crate) const SHARED_ADDITIVE_PROBE_ACCEL: f64 = 3000.0;
-
-/// Largest fraction of the current rate the shared lane's additive probe step
-/// may add.
-///
-/// The ordinary probe's multiplicative part (`delivery * 1.5`) grows a flow in
-/// proportion to its own share, and it fires once per control RTT, so a low-RTT
-/// flow earns both more increases per second and larger ones; two flows then
-/// keep whatever ratio they first acquire.  The additive step is the
-/// convergence force, but capping it at `0.6 * current_rate` bounds the probe
-/// target at `1.6x`, barely above the multiplicative `1.5x`, so it is inert for
-/// exactly the starved flow it exists for (a starved flow's `current_rate`, and
-/// therefore its cap, is depressed).  The cap is raised to `1.5x` so the
-/// RTT-scaled additive step survives as a real absolute increase (target up to
-/// `2.5x`), while the multiplicative probe still governs an unstarved flow.
-/// Above this value the step starts to overshoot a high-RTT flow's share and
-/// the convergence becomes unstable in the late-join arms.
-pub(crate) const SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION: f64 = 1.5;
+pub(crate) const SHARED_ADDITIVE_PROBE_STEP: f64 = 150.0;
 
 impl CongestionLane {
     /// The additive rate step this lane adds to one accepted ordinary probe.
     ///
-    /// Expressed as an acceleration times the path's control RTT so the
-    /// per-second increase is RTT-independent, then capped at a fraction of the
-    /// current rate so the probe target stays bounded.  A dedicated lane adds
-    /// nothing.
-    pub(crate) fn ordinary_additive_probe_step(
-        self,
-        control_rtt: Duration,
-        current_rate: f64,
-    ) -> f64 {
+    /// An absolute rate scaled by the *square root* of the path's control RTT:
+    /// the shared queue gates the accepted-probe cadence more than each flow's
+    /// own RTT does, so a full linear RTT compensation over-rewards the
+    /// high-RTT flow.  A dedicated lane adds nothing.
+    pub(crate) fn ordinary_additive_probe_step(self, control_rtt: Duration) -> f64 {
         match self {
             Self::Dedicated => 0.0,
-            Self::Shared => (SHARED_ADDITIVE_PROBE_ACCEL * control_rtt.as_secs_f64())
-                .min(SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION * current_rate),
+            Self::Shared => {
+                let ratio =
+                    control_rtt.as_secs_f64() / SHARED_ADDITIVE_PROBE_REFERENCE_RTT.as_secs_f64();
+                SHARED_ADDITIVE_PROBE_STEP * ratio.max(0.0).sqrt()
+            }
         }
     }
 

@@ -43,7 +43,7 @@ use crate::{
         CWND_BDP_CAP_ENGAGE_RTT_FACTOR, CWND_BDP_CAP_SCALE, CWND_SEND_RATE_SCALE, INIT_CWND,
         PktSendSpace,
     },
-    traffic_shaping::recovery::reorder_tolerance::{cap_probe_target, select_gate_jitter},
+    traffic_shaping::recovery::reorder_tolerance::select_gate_jitter,
     transmission::watchdog_tuning::WatchdogTuning,
 };
 
@@ -1036,6 +1036,15 @@ impl ReliableLayer {
                     self.congestion_response.clear_delivery_peak(now);
                 }
             } else {
+                // The exit threshold is the ordinary *multiplicative* probe
+                // ceiling (`1.5 * delivery`), not the shared lane's additive
+                // step.  The additive target is always `current + step`, so it
+                // is higher than the ceiling for a backlogged flow; using it
+                // would exit slow start more aggressively than the historical
+                // stock exit.  The shared lane deliberately keeps the lower
+                // ceiling, and the ordinary additive probe takes over once slow
+                // start ends.  This coupling is deliberate; see
+                // `shared_lane_slow_start_exits_on_the_multiplicative_ceiling_not_the_additive_target`.
                 let probed =
                     CongestionResponse::proposed_probe_rate(sr.delivery_rate(), loss_event_rate);
                 if should_exit_slow_start(
@@ -1073,21 +1082,11 @@ impl ReliableLayer {
                 ProbeKind::Gentle => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::GentleProbe);
-                    let target = cap_probe_target(
-                        self.congestion_response.reorder_tolerant(),
-                        current,
-                        target,
-                    );
                     self.set_smooth_send_rate(target, now);
                 }
                 ProbeKind::Bandwidth => {
                     self.last_congestion_action =
                         Some(crate::metrics::MetricsCongestionAction::BandwidthProbe);
-                    let target = cap_probe_target(
-                        self.congestion_response.reorder_tolerant(),
-                        current,
-                        target,
-                    );
                     self.record_bandwidth_probe(now, current, target);
                     self.set_smooth_send_rate(target, now);
                 }
@@ -1744,7 +1743,9 @@ mod tests {
         WindowedRttMin, should_exit_slow_start,
     };
     use crate::delivery::byte_stream::send::send_data_buf_len;
-    use crate::traffic_shaping::core::{has_spare_capacity, has_spare_capacity_interactive};
+    use crate::traffic_shaping::core::{
+        CongestionResponse, has_spare_capacity, has_spare_capacity_interactive,
+    };
     use crate::traffic_shaping::recovery::reorder_tolerance::{
         RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, cap_probe_target,
     };
@@ -1779,7 +1780,8 @@ mod tests {
             cap_probe_target(
                 reorder.congestion_response.reorder_tolerant(),
                 current,
-                spurious
+                spurious,
+                0.0,
             ),
             current * ORDINARY_PROBE_MAX_GAIN,
             "the reorder lane must cap a spurious per-probe rate jump",
@@ -1788,7 +1790,8 @@ mod tests {
             cap_probe_target(
                 stock.congestion_response.reorder_tolerant(),
                 current,
-                spurious
+                spurious,
+                0.0,
             ),
             spurious,
             "the stock/bulk lane must keep the unbounded probe",
@@ -1797,7 +1800,8 @@ mod tests {
             cap_probe_target(
                 reorder.congestion_response.reorder_tolerant(),
                 current,
-                500.0
+                500.0,
+                0.0,
             ),
             500.0,
             "a legitimate target below the cap is unchanged",
@@ -1806,10 +1810,25 @@ mod tests {
             cap_probe_target(
                 reorder.congestion_response.reorder_tolerant(),
                 current,
-                current * ORDINARY_PROBE_MAX_GAIN
+                current * ORDINARY_PROBE_MAX_GAIN,
+                0.0,
             ),
             current * ORDINARY_PROBE_MAX_GAIN,
             "the cap must not clip the ordinary probe's own legitimate maximum",
+        );
+        // The additive step is not delivery-scaled, so it is added after the
+        // bound rather than clipped by it: a starved backlogged flow must keep
+        // its absolute headroom even on the reorder lane.
+        let additive = 300.0;
+        assert_eq!(
+            cap_probe_target(
+                reorder.congestion_response.reorder_tolerant(),
+                current,
+                current * 5.0 + additive,
+                additive,
+            ),
+            current * ORDINARY_PROBE_MAX_GAIN + additive,
+            "the reorder cap must bound the delivery-scaled part but let the additive step through",
         );
     }
 
@@ -2441,6 +2460,40 @@ mod tests {
             should_exit_slow_start(send, probed, false, false, true),
             "queue growth must exit slow start"
         );
+    }
+
+    /// The shared lane's slow-start exit threshold is the ordinary
+    /// *multiplicative* probe ceiling, not the additive step.  The additive
+    /// target is always `current + step`, so it is higher than the ceiling for
+    /// a backlogged flow; using it would exit slow start more aggressively than
+    /// the historical stock exit.  The lane deliberately keeps the lower
+    /// ceiling.
+    #[test]
+    fn shared_lane_slow_start_exits_on_the_multiplicative_ceiling_not_the_additive_target() {
+        let delivery = 100.0;
+        let proposed = CongestionResponse::proposed_probe_rate(delivery, Some(0.0));
+        assert_eq!(
+            proposed, 150.0,
+            "the multiplicative ceiling is 1.5x delivery"
+        );
+        // A 100 ms control RTT gives a 300 pkt/s absolute additive step, so the
+        // shared lane's additive target (400) is far above the multiplicative
+        // ceiling (150).
+        let additive_target = delivery + 300.0;
+        assert!(additive_target > proposed);
+        // A send rate between the two thresholds: the ceiling keeps slow start
+        // while send is above it, whereas the additive target would exit.  The
+        // lane uses the ceiling, i.e. the historical stock exit.
+        assert!(
+            !should_exit_slow_start(200.0, proposed, false, false, false),
+            "the multiplicative ceiling must keep slow start while send is above it"
+        );
+        assert!(
+            should_exit_slow_start(200.0, additive_target, false, false, false),
+            "the additive target would exit slow start for the same sample"
+        );
+        // Below the ceiling both thresholds exit.
+        assert!(should_exit_slow_start(140.0, proposed, false, false, false));
     }
 
     #[test]

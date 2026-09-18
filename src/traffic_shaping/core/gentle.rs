@@ -218,10 +218,20 @@ impl GentleMode {
             // shallower one).
             let gain = self.lane.gentle_probe_gain();
             let probed = delivery_rate * (1.0 + loss_scaled_gain(gain, loss_event_rate));
-            let additive = GENTLE_ADD_PKTS / control_rtt.as_secs_f64();
+            let additive = Self::probe_additive(control_rtt);
             let target = (probed + additive).max(send_rate);
             GentleProbeOutcome::Apply(target)
         }
+    }
+
+    /// The absolute rate step the gentle probe adds on top of its
+    /// delivery-scaled creep.
+    ///
+    /// Exposed so the reorder-lane probe cap can add it back: the cap bounds
+    /// the delivery-scaled part of a probe, and this step is not derived from
+    /// the (possibly reorder-inflated) delivery sample.
+    pub(crate) fn probe_additive(control_rtt: Duration) -> f64 {
+        GENTLE_ADD_PKTS / control_rtt.as_secs_f64()
     }
 
     /// Get the drain fraction - gentle mode drains more conservatively.

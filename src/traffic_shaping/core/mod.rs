@@ -9,7 +9,7 @@ mod rate_bridge;
 mod rate_window;
 mod spare_capacity;
 
-pub(crate) use bandwidth_probe::{ORDINARY_PROBE_MAX_GAIN, OrdinaryBandwidthProbe};
+pub(crate) use bandwidth_probe::{ORDINARY_PROBE_MAX_GAIN, OrdinaryBandwidthProbe, ProbeIncrease};
 pub(crate) use congestion_response::{
     CongestionDecision, CongestionInput, CongestionResponse, ProbeKind, linear_backoff_step,
 };

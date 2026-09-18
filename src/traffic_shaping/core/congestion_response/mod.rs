@@ -7,8 +7,9 @@
 //! a loss sample blocks every delay-control branch.
 use std::time::{Duration, Instant};
 
-use super::gentle::{GentleExitCause, GentleProbeOutcome};
-use super::{OrdinaryBandwidthProbe, QueueGrowth, WindowedDeliveryMax};
+use super::gentle::{GentleExitCause, GentleMode, GentleProbeOutcome};
+use super::{OrdinaryBandwidthProbe, ProbeIncrease, QueueGrowth, WindowedDeliveryMax};
+use crate::traffic_shaping::recovery::reorder_tolerance::cap_probe_target;
 use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 use decision::{ResponsePath, select_path};
 use lane::{CongestionLane, peak_scaled_probe_base};
@@ -175,11 +176,18 @@ impl CongestionResponse {
                     input.now,
                     input.loss_event_rate,
                 ) {
-                    GentleProbeOutcome::Apply(target) => CongestionOutcome::new(
-                        CongestionDecision::Probe { target },
-                        Some(ProbeKind::Gentle),
-                        gentle_exit,
-                    ),
+                    GentleProbeOutcome::Apply(target) => {
+                        let target = self.cap_reorder_probe(
+                            input.current_rate,
+                            target,
+                            GentleMode::probe_additive(input.control_rtt),
+                        );
+                        CongestionOutcome::new(
+                            CongestionDecision::Probe { target },
+                            Some(ProbeKind::Gentle),
+                            gentle_exit,
+                        )
+                    }
                     GentleProbeOutcome::Exit(cause) => {
                         gentle_exit = gentle_exit.or(Some(cause));
                         self.ordinary_probe(input, gentle_exit)
@@ -225,6 +233,18 @@ impl CongestionResponse {
                 gentle_exit,
             ),
         }
+    }
+
+    /// Bound a probe target on the reorder-tolerant lane.
+    ///
+    /// The cap exists because a reorder-inflated delivery sample could
+    /// otherwise spike the probe several-fold in one control RTT.  It bounds
+    /// only the *delivery-scaled* part of the target; a lane's additive step is
+    /// a fixed RTT-scaled rate, not derived from the delivery sample, so it is
+    /// added after the bound instead of being clipped by it.  On a
+    /// non-reorder-tolerant lane the target is returned unchanged.
+    fn cap_reorder_probe(&self, current: f64, target: f64, additive: f64) -> f64 {
+        cap_probe_target(self.reorder_tolerant(), current, target, additive)
     }
 
     /// Whether the delay controller is using its conservative high-queue mode.
@@ -277,17 +297,30 @@ impl CongestionResponse {
         let additive = if input.app_limited {
             0.0
         } else {
-            self.lane
-                .ordinary_additive_probe_step(input.control_rtt, input.current_rate)
+            self.lane.ordinary_additive_probe_step(input.control_rtt)
+        };
+        // A lane with an active additive step probes additively: the step is
+        // an absolute rate, so two flows contending for one bottleneck converge
+        // to equal rates instead of keeping whatever ratio the multiplicative
+        // probe first gave them.  Every other case (a dedicated lane, whose step
+        // is zero, or an application-limited sample, whose delivery reflects the
+        // application) keeps the historical delivery-scaled multiplicative
+        // probe.
+        let increase = if additive > 0.0 {
+            ProbeIncrease::Additive
+        } else {
+            ProbeIncrease::Multiplicative
         };
         let target = self.bandwidth_probe.target(
             input.current_rate,
             input.delivery_rate,
             input.loss_event_rate,
             input.control_rtt,
+            increase,
             additive,
             input.now,
         );
+        let target = self.cap_reorder_probe(input.current_rate, target, additive);
         CongestionOutcome::new(
             CongestionDecision::Probe { target },
             Some(ProbeKind::Bandwidth),
@@ -318,8 +351,8 @@ mod tests {
     use std::time::Instant;
 
     use super::lane::{
-        DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC, SHARED_ADDITIVE_PROBE_ACCEL,
-        SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION,
+        DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC, SHARED_ADDITIVE_PROBE_REFERENCE_RTT,
+        SHARED_ADDITIVE_PROBE_STEP,
     };
     use super::*;
     use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
@@ -630,26 +663,97 @@ mod tests {
         );
     }
 
-    /// The shared lane adds an RTT-scaled additive step to an accepted ordinary
-    /// probe so a starved flow can climb back toward its fair share; the step is
-    /// capped at a fraction of the current rate and the dedicated lane keeps the
-    /// historical purely multiplicative probe.
+    /// The shared lane adds an absolute additive step to an accepted ordinary
+    /// probe.  The step is scaled by the square root of the path's control RTT:
+    /// the shared queue, not each flow's own RTT, gates the accepted-probe
+    /// cadence, so a full linear compensation over-rewards the high-RTT flow.
+    /// A dedicated lane keeps the purely multiplicative probe.
     #[test]
-    fn shared_lane_ordinary_probe_adds_an_rtt_scaled_capped_additive_step() {
-        let rtt = Duration::from_millis(40);
+    fn shared_lane_ordinary_probe_adds_a_sqrt_rtt_scaled_absolute_step() {
+        let reference = SHARED_ADDITIVE_PROBE_REFERENCE_RTT;
         assert_eq!(
-            CongestionLane::Shared.ordinary_additive_probe_step(rtt, 1000.0),
-            SHARED_ADDITIVE_PROBE_ACCEL * rtt.as_secs_f64(),
+            CongestionLane::Shared.ordinary_additive_probe_step(reference),
+            SHARED_ADDITIVE_PROBE_STEP,
+            "the step is calibrated at the reference RTT"
+        );
+        let double = reference * 2;
+        assert_eq!(
+            CongestionLane::Shared.ordinary_additive_probe_step(double),
+            SHARED_ADDITIVE_PROBE_STEP * 2f64.sqrt(),
+            "the RTT compensation is sub-linear"
         );
         assert_eq!(
-            CongestionLane::Shared.ordinary_additive_probe_step(rtt, 50.0),
-            SHARED_ADDITIVE_PROBE_MAX_STEP_FRACTION * 50.0,
-            "the additive step must be capped at a fraction of the current rate"
-        );
-        assert_eq!(
-            CongestionLane::Dedicated.ordinary_additive_probe_step(rtt, 1000.0),
+            CongestionLane::Dedicated.ordinary_additive_probe_step(reference),
             0.0,
             "the dedicated lane must keep a purely multiplicative probe"
         );
+    }
+
+    /// A reorder-tolerant shared lane still gets the additive step: the
+    /// reorder probe cap bounds only the delivery-scaled part of the target, so
+    /// it must not clip the lane's absolute additive headroom.
+    #[test]
+    fn reorder_probe_cap_does_not_clip_the_lane_additive_step() {
+        use crate::traffic_shaping::recovery::reorder_tolerance::cap_probe_target;
+        let current = 100.0;
+        let additive = 400.0;
+        let target = current + additive;
+        assert_eq!(
+            cap_probe_target(true, current, target, additive),
+            target,
+            "the additive step must survive the reorder cap"
+        );
+        assert_eq!(
+            cap_probe_target(false, current, target, additive),
+            target,
+            "the stock/bulk lane is uncapped"
+        );
+    }
+
+    /// A shared non-reorder lane and a shared reorder lane differ only in the
+    /// cap: both keep the additive step.  This pins the fix for the conflict
+    /// where the reorder cap used to cancel the additive contribution entirely.
+    #[test]
+    fn shared_additive_step_survives_on_a_reorder_tolerant_lane() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(50);
+        let jitter = GateJitter::uniform(Duration::from_millis(1));
+        let current = 100.0;
+        let delivery = 90.0;
+        let input = CongestionInput {
+            delivery_rate: delivery,
+            current_rate: current,
+            smooth_rtt: control_rtt,
+            control_rtt,
+            loss_event_rate: Some(0.0),
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            now: t0,
+        };
+        let mut stock = CongestionResponse::new(t0, false, CongestionLane::Shared);
+        let mut reorder = CongestionResponse::new(t0, true, CongestionLane::Shared);
+        let stock_obs = stock.observe(control_rtt, jitter, Some(0.0), delivery, t0, control_rtt);
+        let reorder_obs =
+            reorder.observe(control_rtt, jitter, Some(0.0), delivery, t0, control_rtt);
+        let CongestionDecision::Probe {
+            target: stock_target,
+        } = stock.decide(stock_obs, input).decision()
+        else {
+            panic!("the clean shared lane must probe");
+        };
+        let CongestionDecision::Probe {
+            target: reorder_target,
+        } = reorder.decide(reorder_obs, input).decision()
+        else {
+            panic!("the clean reorder shared lane must probe");
+        };
+        // Both lanes add the same square-root-RTT-scaled absolute step, so both
+        // target the same value; the reorder cap (1.5 * current, plus the
+        // additive step) does not bind here because the additive target already
+        // dominates.
+        let expected = current + CongestionLane::Shared.ordinary_additive_probe_step(control_rtt);
+        assert!((stock_target - expected).abs() < 1e-9);
+        assert!((reorder_target - expected).abs() < 1e-9);
     }
 }
