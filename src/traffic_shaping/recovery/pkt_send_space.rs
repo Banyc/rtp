@@ -1491,19 +1491,30 @@ impl PktSendSpace {
         if self.num_in_flight <= LOSS_RATE_MIN_SAMPLES {
             return false;
         }
-        let Some((samples, data_loss_rate)) = self.data_loss_stats(now) else {
+        let threshold = tolerant_loss_rate.get();
+        let (samples, data_loss_rate) = self.data_loss_stats(threshold, now);
+        let Some(data_loss_rate) = data_loss_rate else {
             return false;
         };
         let enough_samples_for_stats = LOSS_RATE_MIN_SAMPLES < samples;
-        enough_samples_for_stats && tolerant_loss_rate.get() < data_loss_rate
+        enough_samples_for_stats && threshold < data_loss_rate
     }
 
     /// One send-window traversal computing both the sample count and the loss
-    /// ratio, so `huge_data_loss` no longer walks `pkts_in_pipe` a second
-    /// time for its sample count.
-    fn data_loss_stats(&self, now: Instant) -> Option<(usize, f64)> {
-        let mut lost = 0;
-        let mut len = 0;
+    /// ratio, stopping as soon as the final ratio provably cannot exceed
+    /// `threshold`.  The pipe is a subset of the in-flight window, so after
+    /// `len` pipe packets scanned (of which `lost` are lost) at most
+    /// `num_in_flight - len` more can remain; a completion with all of them
+    /// lost bounds the achievable ratio at `(lost + remaining) / num_in_flight`.
+    /// Once that bound is at or below the threshold the verdict cannot change,
+    /// so the pass is proportional to the decisions it can still affect rather
+    /// than the historical in-flight total.  Returns the scanned length and
+    /// the exact ratio, or `None` when the threshold is already unreachable
+    /// (or the pipe is empty).
+    fn data_loss_stats(&self, threshold: f64, now: Instant) -> (usize, Option<f64>) {
+        let in_flight = self.num_in_flight;
+        let mut lost = 0usize;
+        let mut len = 0usize;
         let live_rto = self.rtt_stats.rto_duration();
         for (_, p) in self.pkts_in_pipe() {
             len += 1;
@@ -1511,11 +1522,15 @@ impl PktSendSpace {
             if rtxed || p.hits_rto(now, live_rto) {
                 lost += 1;
             }
+            let remaining = in_flight.saturating_sub(len);
+            if (lost + remaining) as f64 <= threshold * in_flight as f64 {
+                return (len, None);
+            }
         }
         if len == 0 {
-            return None;
+            return (0, None);
         }
-        Some((len, lost as f64 / len as f64))
+        (len, Some(lost as f64 / len as f64))
     }
 
     pub fn loss_event_rate(&mut self, now: Instant) -> Option<f64> {
@@ -2463,6 +2478,53 @@ mod tests {
 
         send_packet(&mut space, t0 + ms(LOSS_RATE_MIN_SAMPLES as u64));
         assert!(space.huge_data_loss(threshold, after_rto));
+    }
+
+    /// The huge-loss scan must stop as soon as the verdict can no longer
+    /// change: it is a pass over the whole in-flight window on the send path,
+    /// holding the reliable-layer lock the peer's reader needs, run on every
+    /// huge-loss check.  A clean window (no packet lost and none RTO-due) can
+    /// never reach the threshold, so the scan must return before walking the
+    /// whole pipe; a genuinely lost window must still walk it and report.
+    #[test]
+    fn huge_loss_scan_stops_once_the_verdict_cannot_change() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let n = 512u64;
+        for _ in 0..n {
+            send_packet(&mut space, t0 + ms(1));
+        }
+        let clean_now = t0 + ms(2);
+        assert!(
+            clean_now < t0 + space.rto_duration(),
+            "the clean sample must be before any RTO"
+        );
+        let threshold = 0.9;
+        let in_flight = space.num_in_flight_pkts();
+        assert_eq!(in_flight as u64, n);
+        let (scanned, ratio) = space.data_loss_stats(threshold, clean_now);
+        assert!(
+            ratio.is_none(),
+            "a clean window can never reach the threshold"
+        );
+        assert!(
+            scanned < in_flight,
+            "the scan must stop before the historical total: scanned={scanned} in_flight={in_flight}"
+        );
+        assert!(!space.huge_data_loss(UnitR::new(threshold).unwrap(), clean_now));
+
+        // Every packet RTO-due with no ACK: the verdict is genuine huge loss,
+        // so the scan has no sound stopping point before the whole pipe.
+        let after_rto = t0 + space.rto_duration() + ms(1);
+        let (scanned, ratio) = space.data_loss_stats(threshold, after_rto);
+        let ratio = ratio.expect("an all-due window must yield a ratio");
+        assert_eq!(
+            scanned, in_flight,
+            "an all-lost window must walk the whole pipe"
+        );
+        assert!(ratio > threshold, "ratio={ratio}");
+        assert!(space.huge_data_loss(UnitR::new(threshold).unwrap(), after_rto));
     }
 
     #[test]
