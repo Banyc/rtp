@@ -122,3 +122,123 @@ impl CapParityStash {
         std::mem::take(&mut self.pending).into_iter().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depth(decision: InStreamParity) -> usize {
+        match decision {
+            InStreamParity::Hold => 0,
+            InStreamParity::Emit(count) => usize::from(count),
+        }
+    }
+
+    /// The open-group parity decision is budget-adaptive and bounded: a zero
+    /// budget HOLDS the group open (never destroys its accumulated data
+    /// symbols), the depth never exceeds the one-parity-per-data-symbol-group
+    /// cap, and more budget never emits fewer parity symbols.  The last is the
+    /// direction the redundancy constraint needs: as the spare-budget share is
+    /// cut, the parity depth is cut, never raised.
+    #[test]
+    fn parity_depth_is_budget_adaptive_bounded_and_monotone() {
+        assert_eq!(
+            decide_in_stream_parity(0),
+            InStreamParity::Hold,
+            "a zero budget must hold the group open, not emit parity"
+        );
+        // Below the cap the depth tracks the budget exactly (one parity per
+        // unit of budget).
+        for budget in 1..=INSTREAM_PARITY_PER_GROUP {
+            assert_eq!(
+                decide_in_stream_parity(budget),
+                InStreamParity::Emit(u8::try_from(budget).unwrap()),
+                "budget {budget} must emit exactly {budget} parity symbols"
+            );
+        }
+        // Above the cap the depth saturates at the group parity count.
+        for budget in INSTREAM_PARITY_PER_GROUP..=1024 {
+            assert_eq!(
+                decide_in_stream_parity(budget),
+                InStreamParity::Emit(u8::try_from(INSTREAM_PARITY_PER_GROUP).unwrap()),
+                "budget {budget} must saturate at the {INSTREAM_PARITY_PER_GROUP}-parity cap"
+            );
+        }
+        // Monotone non-decreasing in budget across the whole range, including
+        // the Hold->Emit floor at zero.
+        let mut previous = 0usize;
+        for budget in 0..=64 {
+            let depth = depth(decide_in_stream_parity(budget));
+            assert!(
+                depth >= previous,
+                "budget {budget} emitted {depth} parity, fewer than a lower budget ({previous})"
+            );
+            previous = depth;
+        }
+    }
+
+    /// The full-group predicate fires only for the interactive toggle once the
+    /// group reaches the group size; the stock path always gets `false`.
+    #[test]
+    fn group_is_full_only_when_instream_and_at_the_group_size() {
+        assert!(!group_is_full(false, INSTREAM_DATA_PER_GROUP));
+        assert!(!group_is_full(false, INSTREAM_DATA_PER_GROUP * 10));
+        assert!(!group_is_full(true, 0));
+        assert!(!group_is_full(true, INSTREAM_DATA_PER_GROUP - 1));
+        assert!(group_is_full(true, INSTREAM_DATA_PER_GROUP));
+        assert!(group_is_full(true, INSTREAM_DATA_PER_GROUP + 1));
+    }
+
+    /// The hard group cap is reached exactly at `MAX_DATA_PER_GROUP`, so a
+    /// group can never carry more data symbols than the peer's decoder accepts.
+    #[test]
+    fn cap_is_reached_at_max_data_per_group() {
+        assert!(!cap_reached(0));
+        assert!(!cap_reached(MAX_DATA_PER_GROUP - 1));
+        assert!(cap_reached(MAX_DATA_PER_GROUP));
+        assert!(cap_reached(MAX_DATA_PER_GROUP + 1));
+    }
+
+    /// A cap-forced parity stash is non-destructive and FIFO: on a budget too
+    /// tight for the whole stash `affordable` is false (the caller HOLDS rather
+    /// than drops it, then retries), and once taken the packets come back in
+    /// emission order so a retry can neither reorder nor drop a symbol.  The
+    /// stash is drained to empty, so a later hold starts a fresh burst.
+    #[test]
+    fn cap_parity_stash_holds_on_a_tight_budget_and_takes_fifo() {
+        let mut stash = CapParityStash::new();
+        assert!(stash.is_empty());
+        assert_eq!(stash.len(), 0);
+        assert!(
+            stash.affordable(0),
+            "an empty stash is affordable at any budget"
+        );
+
+        stash.hold(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(stash.len(), 3);
+        assert!(
+            !stash.affordable(2),
+            "a budget below the stash size must hold, not drop"
+        );
+        assert!(stash.affordable(3));
+        assert!(stash.affordable(4));
+
+        let taken = stash.take();
+        assert_eq!(
+            taken,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the stash must replay in emission order"
+        );
+        assert!(stash.is_empty());
+        assert_eq!(stash.len(), 0);
+        assert!(
+            stash.take().is_empty(),
+            "taking an empty stash must yield nothing"
+        );
+
+        // A second hold starts a fresh burst rather than appending forever.
+        stash.hold(vec![b"x".to_vec()]);
+        assert_eq!(stash.len(), 1);
+        assert_eq!(stash.take(), vec![b"x".to_vec()]);
+    }
+}

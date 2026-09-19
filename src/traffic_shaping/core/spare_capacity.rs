@@ -45,3 +45,69 @@ pub(crate) fn has_spare_capacity_interactive(
     // parity never competes with a congestion-limited data stream.
     accepts_new_pkt && application_write_waiters == 0 && !queue_building
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{has_spare_capacity, has_spare_capacity_interactive};
+
+    /// The stock predicate requires the settled tail AND zero application
+    /// waiters AND no queue growth: any one failing closes the gate, so parity
+    /// never competes with a queued/building data stream.
+    #[test]
+    fn stock_spare_capacity_requires_every_condition() {
+        assert!(has_spare_capacity(true, 0, false));
+        assert!(
+            !has_spare_capacity(false, 0, false),
+            "an unsettled tail must close the stock gate"
+        );
+        assert!(
+            !has_spare_capacity(true, 1, false),
+            "a waiting application writer must close the stock gate"
+        );
+        assert!(
+            !has_spare_capacity(true, 0, true),
+            "queue growth must close the stock gate"
+        );
+        assert!(!has_spare_capacity(true, 3, true));
+    }
+
+    /// The interactive predicate drops only the settled-tail requirement: it
+    /// still requires a sendable window, zero waiters, and no queue growth, so
+    /// a non-empty stage alone no longer closes it but application
+    /// backpressure and queue growth still do.
+    #[test]
+    fn interactive_spare_capacity_keeps_backpressure_and_growth_closed() {
+        assert!(has_spare_capacity_interactive(true, 0, false));
+        assert!(
+            !has_spare_capacity_interactive(false, 0, false),
+            "no room in the send window must close the interactive gate"
+        );
+        assert!(
+            !has_spare_capacity_interactive(true, 1, false),
+            "a waiting application writer must close the interactive gate"
+        );
+        assert!(
+            !has_spare_capacity_interactive(true, 0, true),
+            "queue growth must close the interactive gate"
+        );
+    }
+
+    /// The interactive predicate is strictly weaker than the stock one: it is
+    /// open wherever the stock gate is open, so a lane that switched predicate
+    /// can never lose a parity opportunity the stock gate would have granted.
+    #[test]
+    fn interactive_spare_capacity_is_implied_by_the_stock_gate() {
+        for can_send in [false, true] {
+            for waiters in [0usize, 1, 5] {
+                for building in [false, true] {
+                    if has_spare_capacity(can_send, waiters, building) {
+                        assert!(
+                            has_spare_capacity_interactive(can_send, waiters, building),
+                            "stock-spare ({can_send}, {waiters}, {building}) must imply interactive-spare"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

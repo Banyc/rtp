@@ -23,3 +23,28 @@ impl InStreamGroupFlush {
         self.enabled && loss_active
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::InStreamGroupFlush;
+
+    /// In-stream group FEC is live only when the toggle is on AND the
+    /// condition gate has measured loss evidence.  Either missing condition
+    /// keeps it dark, so a stock connection (toggle off) can never accumulate
+    /// a full group and startup without loss never emits parity.
+    #[test]
+    fn live_requires_both_the_toggle_and_loss_evidence() {
+        let on = InStreamGroupFlush::new(true);
+        let off = InStreamGroupFlush::new(false);
+        assert!(on.live(true), "toggle on + loss active must be live");
+        assert!(
+            !on.live(false),
+            "toggle on without loss evidence must not be live"
+        );
+        assert!(
+            !off.live(true),
+            "the stock toggle must never be live even under loss"
+        );
+        assert!(!off.live(false));
+    }
+}

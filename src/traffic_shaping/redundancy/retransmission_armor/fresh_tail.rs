@@ -196,6 +196,94 @@ mod tests {
         }
     }
 
+    /// Only a whole single-symbol frame qualifies for the interactive tail's
+    /// armor: the packet must carry the frame's declared length.  A
+    /// multi-symbol bulk frame's first packet declares a larger `frame_len`
+    /// and must NEVER qualify, and an unframed send must not either — this is
+    /// what keeps bulk traffic from gaining any redundancy (no wire
+    /// inflation).
+    #[test]
+    fn only_a_whole_single_symbol_frame_qualifies_for_armor() {
+        use super::is_single_symbol_frame;
+        assert!(
+            is_single_symbol_frame(Some(2048), 2048),
+            "a whole single-symbol frame must qualify"
+        );
+        assert!(
+            !is_single_symbol_frame(Some(8192), 2048),
+            "a multi-symbol bulk frame must not qualify"
+        );
+        assert!(
+            !is_single_symbol_frame(None, 2048),
+            "an unframed send must not qualify"
+        );
+        assert!(
+            !is_single_symbol_frame(Some(1024), 2048),
+            "a frame shorter than the written data must not qualify"
+        );
+        assert!(
+            !is_single_symbol_frame(Some(2048), 0),
+            "a zero-length send must not qualify"
+        );
+    }
+
+    /// The interactive tail is only a fresh (non-recovery) send on the
+    /// force-flush lane that is either a whole single-symbol frame or the
+    /// first data symbol of an open group.  A recovery send, the stock lane,
+    /// and a non-first multi-symbol group all must not qualify, so armor never
+    /// reaches bulk or the recovery path.
+    #[test]
+    fn only_a_fresh_interactive_tail_qualifies_for_armor() {
+        use super::is_fresh_interactive_tail;
+        // The two qualifying shapes.
+        assert!(is_fresh_interactive_tail(false, true, true, None));
+        assert!(is_fresh_interactive_tail(false, true, true, Some(5)));
+        assert!(is_fresh_interactive_tail(false, true, false, Some(1)));
+        // A recovery send never qualifies, even as a single-symbol frame.
+        assert!(!is_fresh_interactive_tail(true, true, true, Some(1)));
+        // The stock lane (no force-flush) never qualifies.
+        assert!(!is_fresh_interactive_tail(false, false, true, Some(1)));
+        // A non-first symbol of a multi-symbol group never qualifies.
+        assert!(!is_fresh_interactive_tail(false, true, false, Some(2)));
+        assert!(!is_fresh_interactive_tail(false, true, false, None));
+    }
+
+    /// A non-tail (recovery) send carries exactly one armor copy regardless of
+    /// the measured loss or a test override, and a fresh interactive tail uses
+    /// the override when set, else the loss-adaptive ladder.  Keeping the
+    /// override beside the ladder means a forced count can never leak into the
+    /// recovery path and a hostile loss tier can never inflate a recovery
+    /// send's copies.
+    #[test]
+    fn armor_copy_count_never_leaks_the_override_into_recovery() {
+        use super::{fresh_tail_armor_copies, fresh_tail_armor_copy_count};
+        for loss in [None, Some(0.0), Some(0.15), Some(0.30), Some(1.0)] {
+            for override_copies in [None, Some(0usize), Some(7)] {
+                assert_eq!(
+                    fresh_tail_armor_copy_count(false, override_copies, loss, false),
+                    1,
+                    "a recovery send must carry exactly one copy (loss={loss:?}, override={override_copies:?})"
+                );
+            }
+        }
+        // A fresh interactive tail: the override wins, else the ladder.
+        assert_eq!(
+            fresh_tail_armor_copy_count(true, Some(7), Some(0.5), false),
+            7,
+            "the test override must force the fresh tail's copy count"
+        );
+        assert_eq!(
+            fresh_tail_armor_copy_count(true, None, Some(0.30), true),
+            fresh_tail_armor_copies(Some(0.30), true),
+            "without an override the fresh tail must use the loss-adaptive ladder"
+        );
+        assert_eq!(
+            fresh_tail_armor_copy_count(true, None, Some(0.0), false),
+            fresh_tail_armor_copies(Some(0.0), false),
+            "without an override the clean-link fresh tail must use the burst-cover tier"
+        );
+    }
+
     /// The interactive fresh tail's per-message wire is bounded by six
     /// back-to-back datagrams at every loss tier and never grows with loss.
     /// The primary datagram plus the armor copies plus the (at most one)

@@ -39,3 +39,56 @@ impl CapacityGate {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CapacityGate;
+    use std::cell::Cell;
+
+    /// The tuning selects the predicate: a force-flush tuning gets the
+    /// interactive predicate, the stock default keeps the strict one.
+    #[test]
+    fn instream_flush_selects_the_interactive_predicate() {
+        assert_eq!(
+            CapacityGate::for_instream_flush(true),
+            CapacityGate::Interactive
+        );
+        assert_eq!(
+            CapacityGate::for_instream_flush(false),
+            CapacityGate::Strict
+        );
+    }
+
+    /// Evaluating the selected predicate invokes only that side: the
+    /// unselected closure never reads session state, so a lane cannot pay for
+    /// (or be perturbed by) the predicate it did not select.
+    #[test]
+    fn spare_invokes_only_the_selected_predicate() {
+        let strict_calls = Cell::new(0);
+        let interactive_calls = Cell::new(0);
+        let strict = || {
+            strict_calls.set(strict_calls.get() + 1);
+            true
+        };
+        let interactive = || {
+            interactive_calls.set(interactive_calls.get() + 1);
+            false
+        };
+
+        assert!(CapacityGate::Strict.spare(strict, interactive));
+        assert_eq!(strict_calls.get(), 1, "the strict side must be consulted");
+        assert_eq!(
+            interactive_calls.get(),
+            0,
+            "the interactive side must not be consulted"
+        );
+
+        assert!(!CapacityGate::Interactive.spare(strict, interactive));
+        assert_eq!(strict_calls.get(), 1, "the strict side must not be re-read");
+        assert_eq!(
+            interactive_calls.get(),
+            1,
+            "the interactive side must be consulted once"
+        );
+    }
+}

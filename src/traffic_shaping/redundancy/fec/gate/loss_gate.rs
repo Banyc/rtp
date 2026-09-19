@@ -347,6 +347,137 @@ mod tests {
         );
     }
 
+    /// As the observed wire loss rises, the gate never closes: once it is
+    /// open, a higher loss keeps it open (the hysteresis threshold only ever
+    /// relaxes upward).  This is the direction the redundancy constraint needs
+    /// — the gate is a threshold that admits parity, and it must not flicker
+    /// shut under a *rising* loss series, which would both strand recovery and
+    /// make the emitted-parity count non-monotone.  It also never opens below
+    /// the enable threshold, so a clean link emits no parity.
+    #[test]
+    fn loss_gate_is_monotone_non_decreasing_in_a_rising_loss_series() {
+        // Sweep from clean to hostile in small steps; once the gate opens it
+        // must stay open for every higher loss in the same series.
+        let mut gate = FecConditionGate::with_thresholds(FecLossGateThresholds::INTERACTIVE);
+        let mut opened_at = None;
+        for step in 0..=200 {
+            let loss = step as f64 / 200.0;
+            gate.refresh_loss(true, Some(loss));
+            if gate.loss_active() && opened_at.is_none() {
+                opened_at = Some(loss);
+            }
+            if let Some(opened) = opened_at {
+                assert!(
+                    gate.loss_active(),
+                    "the gate opened at {opened} but closed again at the higher loss {loss}"
+                );
+            } else {
+                assert!(
+                    loss < FecLossGateThresholds::INTERACTIVE.enable_loss,
+                    "the gate stayed closed at {loss}, at or above the enable threshold"
+                );
+            }
+        }
+        assert_eq!(
+            opened_at,
+            Some(FecLossGateThresholds::INTERACTIVE.enable_loss),
+            "the interactive gate must first open exactly at its enable threshold"
+        );
+    }
+
+    /// The gate reads the effective loss as the maximum of the congestion
+    /// feedback and the sender-side recovery ratio: either source alone can
+    /// warrant recovery, and neither can be masked by a low reading from the
+    /// other.  This is the loss evidence the interactive fresh-tail armor
+    /// ladder backs off from.
+    #[test]
+    fn effective_loss_is_the_maximum_of_congestion_and_recovery() {
+        let mut gate = FecConditionGate::default();
+        let stock_min = FecLossGateThresholds::STOCK.min_recovery_samples;
+        // Congestion alone is reported verbatim.
+        gate.refresh_loss(true, Some(0.42));
+        assert_eq!(gate.effective_loss_ratio(), Some(0.42));
+        // Recovery alone (a full-recovery window reads 1.0) is reported when
+        // congestion feedback is absent.
+        let mut recovery_only = FecConditionGate::default();
+        for _ in 0..stock_min {
+            recovery_only.record_data_send(true);
+        }
+        recovery_only.refresh_loss(true, None);
+        assert_eq!(recovery_only.effective_loss_ratio(), Some(1.0));
+        // With both present the higher wins: a low congestion reading must not
+        // mask a high recovery ratio, nor the reverse.
+        let mut both = FecConditionGate::default();
+        for _ in 0..stock_min {
+            both.record_data_send(true);
+        }
+        both.refresh_loss(true, Some(0.02));
+        assert_eq!(
+            both.effective_loss_ratio(),
+            Some(1.0),
+            "a high recovery ratio must not be masked by low congestion loss"
+        );
+        // No evidence at all reads as `None` and keeps the gate closed.
+        let mut none = FecConditionGate::default();
+        none.refresh_loss(true, None);
+        assert_eq!(none.effective_loss_ratio(), None);
+        assert!(!none.loss_active());
+    }
+
+    /// The recovery ratio is measured over only the most recent
+    /// [`RECOVERY_WINDOW`] primary sends: once the ring is full, recording a
+    /// new sample evicts the oldest from both the count and the window, so the
+    /// ratio tracks the recent loss and cannot drift upward on stale recovery
+    /// sends.  This is the loss evidence the interactive fresh-tail armor
+    /// ladder backs off from; a ring that forgot to evict would pin the ratio
+    /// high after a burst of recovery and leave the redundancy un-backed-off
+    /// on a now-clean link.
+    #[test]
+    fn recovery_window_tracks_only_the_most_recent_sends() {
+        let mut gate = FecConditionGate::default();
+        // A full window of fresh sends reads as zero recovery.
+        for _ in 0..RECOVERY_WINDOW {
+            gate.record_data_send(false);
+        }
+        assert_eq!(
+            gate.recovery_loss_ratio(),
+            Some(0.0),
+            "an all-fresh window must read as zero recovery"
+        );
+
+        // Feeding recovery sends displaces fresh sends one at a time; the
+        // ratio is non-decreasing at every step as recovery takes over.
+        let mut previous = 0.0;
+        for filled in 1..=RECOVERY_WINDOW {
+            gate.record_data_send(true);
+            let ratio = gate
+                .recovery_loss_ratio()
+                .expect("a full window is always measured");
+            assert!(
+                ratio >= previous,
+                "after {filled} recovery sends the ratio {ratio} dropped below {previous}"
+            );
+            previous = ratio;
+        }
+        assert_eq!(
+            gate.recovery_loss_ratio(),
+            Some(1.0),
+            "an all-recovery window must read as full recovery"
+        );
+
+        // Feeding fresh sends now evicts the recovery samples; the ratio falls
+        // back to zero, proving the eviction happens (a non-evicting ring would
+        // stay at 1.0).
+        for _ in 0..RECOVERY_WINDOW {
+            gate.record_data_send(false);
+        }
+        assert_eq!(
+            gate.recovery_loss_ratio(),
+            Some(0.0),
+            "recovery evidence older than the window must be evicted"
+        );
+    }
+
     /// The interactive preset treats the sender-side recovery ratio as
     /// measured after 8 primary sends; the stock preset still requires 16.
     #[test]
