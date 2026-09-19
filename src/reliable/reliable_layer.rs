@@ -3803,6 +3803,100 @@ mod tests {
         );
     }
 
+    /// The minimum-RTT bandwidth-delay-product ceiling bounds the in-flight
+    /// window once the smoothed RTT has left its propagation floor, and it is
+    /// deliberately excluded on the interactive reorder-tolerant lane so the
+    /// bulk-path safety cannot change that lane's latency floor.  Drive the
+    /// real rate-write path (`set_send_rate`) and read the window back.
+    ///
+    /// `min_rtt` is a lifetime minimum, so seeding one low sample and then a
+    /// high-RTT steady state leaves the engage check (smooth_rtt >= 3 *
+    /// min_rtt) satisfied while the propagation floor stays low.  The expected
+    /// ceiling is written literally so a changed scale cannot move both sides.
+    #[test]
+    fn bdp_cap_bounds_the_window_off_the_floor_and_excludes_the_reorder_lane() {
+        use crate::traffic_shaping::recovery::pkt_send_space::{
+            CWND_BDP_CAP_SCALE, CWND_SEND_RATE_SCALE, INIT_CWND,
+        };
+
+        let t0 = Instant::now();
+        let min_rtt = Duration::from_millis(10);
+        let high_rtt = Duration::from_millis(100);
+        let peak = 1000.0;
+        let rate = 10_000.0;
+
+        // bdp = 10 ms * 1000 pkt/s = 10 pkts; the ceiling is 6 * bdp = 60,
+        // above the 32-packet initial-window floor.  The raw rate-based window
+        // is sRTT * rate * 8 = 8000, so the ceiling must bind.
+        let expected_cap = 60usize;
+        assert_eq!(
+            ((min_rtt.as_secs_f64() * peak * CWND_BDP_CAP_SCALE as f64).round() as usize)
+                .max(INIT_CWND),
+            expected_cap,
+            "the test's expected ceiling must match the scenario's arithmetic"
+        );
+        let uncapped = (high_rtt.as_secs_f64() * rate).round() as usize * CWND_SEND_RATE_SCALE;
+        assert!(
+            expected_cap < uncapped,
+            "the scenario must make the ceiling bind"
+        );
+
+        // One low sample seeds the propagation floor; a high-RTT steady state
+        // then leaves the floor behind.
+        fn drive(
+            rl: &mut super::ReliableLayer,
+            t0: Instant,
+            min_rtt: Duration,
+            high_rtt: Duration,
+        ) -> Instant {
+            let mut t = t0;
+            rl.sample_rtt(min_rtt, t);
+            for _ in 0..60 {
+                t += Duration::from_millis(1);
+                rl.sample_rtt(high_rtt, t);
+            }
+            t
+        }
+
+        // Stock lane: the ceiling binds the window.
+        let mut stock = test_layer(t0);
+        let t = drive(&mut stock, t0, min_rtt, high_rtt);
+        stock.congestion_response.delivery_peak().update(t, peak);
+        stock.set_send_rate(rate, t);
+        assert_eq!(
+            stock.pkt_send_space().cwnd().get(),
+            expected_cap,
+            "the stock lane's window must be bounded by the minimum-RTT BDP ceiling"
+        );
+
+        // Below the engage factor (sRTT still at the floor) the ceiling must
+        // not bind: the window is the raw rate-based estimate.
+        let mut quiet = test_layer(t0);
+        let mut tq = t0;
+        for _ in 0..60 {
+            tq += Duration::from_millis(1);
+            quiet.sample_rtt(min_rtt, tq);
+        }
+        quiet.congestion_response.delivery_peak().update(tq, peak);
+        quiet.set_send_rate(rate, tq);
+        assert!(
+            quiet.pkt_send_space().cwnd().get() > expected_cap,
+            "a window still at its propagation floor must not be capped"
+        );
+
+        // The interactive reorder-tolerant lane is excluded: the ceiling must
+        // not bind even with the same high-RTT, low-floor observation.
+        let mut reorder = test_layer_reorder(t0);
+        assert!(reorder.congestion_response.reorder_tolerant());
+        let tr = drive(&mut reorder, t0, min_rtt, high_rtt);
+        reorder.congestion_response.delivery_peak().update(tr, peak);
+        reorder.set_send_rate(rate, tr);
+        assert!(
+            reorder.pkt_send_space().cwnd().get() > expected_cap,
+            "the reorder-tolerant lane must be excluded from the bulk BDP ceiling"
+        );
+    }
+
     #[test]
     fn congestion_metrics_track_persistent_queue_resets_on_signal_loss() {
         let t0 = Instant::now();
