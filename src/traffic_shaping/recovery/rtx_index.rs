@@ -431,24 +431,33 @@ impl RetransmissionIndex {
         );
         for key in floor_due.iter().copied() {
             let seq = key.seq;
-            if self
-                .ready
-                .get(&seq)
-                .is_some_and(|reasons| reasons.rto.is_some())
-            {
-                continue;
-            }
             let entry = self
                 .active
                 .get(&seq)
                 .expect("floor deadline must belong to an active packet");
             let effective = entry.effective_rto_deadline(live_rto);
             if effective <= now {
-                self.rto_deadlines.remove(&DeadlineKey {
-                    at: entry.rto_at,
-                    seq,
-                });
-                self.update_ready(seq, |reasons| reasons.rto = Some(effective));
+                if !self
+                    .ready
+                    .get(&seq)
+                    .is_some_and(|reasons| reasons.rto.is_some())
+                {
+                    self.rto_deadlines.remove(&DeadlineKey {
+                        at: entry.rto_at,
+                        seq,
+                    });
+                    self.update_ready(seq, |reasons| reasons.rto = Some(effective));
+                }
+                // The live deadline has passed and the packet is ready at
+                // its effective deadline, so the floor entry has served its
+                // purpose.  Drop it here instead of leaving it in the prefix
+                // for every later pass to re-scan: the entry is re-inserted
+                // only if the packet is later deactivated and re-activated
+                // on retransmission.  An entry whose effective deadline is
+                // still in the future (a latched packet RTO above the live
+                // estimator) is retained so it is promoted when it truly
+                // becomes due.
+                self.floor_sent.remove(&key);
             }
         }
         self.floor_sent_scratch = floor_due;
@@ -891,6 +900,78 @@ mod tests {
             index.floor_sent_scratch.capacity(),
             capacity_after_first,
             "a second promote_due pass with the same due prefix must reuse the scratch buffer, not allocate"
+        );
+    }
+
+    /// A floor entry whose live deadline has passed and whose effective
+    /// deadline is now (so `promote_due` makes the packet ready) has served
+    /// its purpose and must be dropped from `floor_sent`.  Leaving it in the
+    /// prefix would make every later send pass re-scan the whole historical
+    /// prefix - the unbounded synchronous pass that starves the runtime on a
+    /// large in-flight window.  This is the vacuity check for the drain.
+    #[test]
+    fn promote_due_drops_floor_entries_once_promoted() {
+        let t0 = Instant::now();
+        let live = ms(50);
+        let mut index = RetransmissionIndex::new(sq(0));
+        for i in 0..8u64 {
+            index.activate(RetransmissionActivation {
+                seq: sq(i),
+                rto_at: t0 + ms(30),
+                sent_at: t0,
+                apply_live_rto_floor: true,
+                reorder_eligible: false,
+                fast_loss_eligible: false,
+                pre_outage_eligible: false,
+            });
+        }
+        assert_eq!(
+            index.floor_sent.len(),
+            8,
+            "premise: every packet is floor-tracked"
+        );
+        let now = t0 + live + ms(1);
+        index.promote_due(now, ms(100), live);
+        assert!(
+            index.floor_sent.is_empty(),
+            "a promoted floor entry must be dropped, got {} retained",
+            index.floor_sent.len()
+        );
+        assert_eq!(
+            index.ready.len(),
+            8,
+            "the packets are ready at their effective deadline"
+        );
+    }
+
+    /// The mirror of the drain: a floor entry whose *effective* deadline is
+    /// still in the future (its latched packet RTO exceeds the live
+    /// estimator) must be retained, not dropped - it is promoted only when it
+    /// truly becomes due.
+    #[test]
+    fn promote_due_retains_floor_entries_whose_effective_deadline_is_future() {
+        let t0 = Instant::now();
+        let live = ms(50);
+        let mut index = RetransmissionIndex::new(sq(0));
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(200),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        let now = t0 + live + ms(1);
+        index.promote_due(now, ms(100), live);
+        assert_eq!(
+            index.floor_sent.len(),
+            1,
+            "a future effective deadline keeps the floor entry"
+        );
+        assert!(
+            index.ready.is_empty(),
+            "the packet is not due at its latched packet RTO yet"
         );
     }
 
