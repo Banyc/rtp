@@ -413,7 +413,32 @@ mod tests {
         assert_eq!(DEDICATED_GENTLE_BW_PROBE_GAIN, 0.02);
         // 1.02x = 102, plus the additive 4/0.1 s = 40 -> 142.
         assert_eq!(target, 142.0);
-        assert!(target < 160.0, "the dedicated probe must be shallower");
+        // The dedicated probe must be strictly shallower than the shared lane's
+        // on identical inputs.  Compare against a real shared-lane probe rather
+        // than a magic constant, so a regression that collapses the two gains
+        // together fails here instead of passing against a stale literal.
+        let mut shared = GentleMode::new();
+        shared.set_lane(super::super::congestion_response::lane::CongestionLane::Shared);
+        let _ = shared.update_mode(
+            Some(GENTLE_ENTER_MIN),
+            Some(0.0),
+            t0 + GENTLE_ENTER_MIN,
+            control_rtt,
+        );
+        let GentleProbeOutcome::Apply(shared_target) = shared.probe(
+            100.0,
+            100.0,
+            control_rtt,
+            Duration::from_secs(1),
+            t0 + GENTLE_ENTER_MIN,
+            Some(0.0),
+        ) else {
+            panic!("gentle mode should probe before the open threshold");
+        };
+        assert!(
+            target < shared_target,
+            "the dedicated probe ({target}) must be shallower than the shared probe ({shared_target})"
+        );
     }
 
     #[test]

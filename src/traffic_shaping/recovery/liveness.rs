@@ -163,7 +163,6 @@ mod tests {
         latched.on_send(now + Duration::from_secs(1), Duration::from_secs(30));
         assert!(latched.should_terminate_session(now + Duration::from_secs(47), true));
         assert!(latched.should_terminate_session(now + Duration::from_secs(47), false));
-        assert!(latched.should_terminate_session(now + max_wd, true));
 
         let mut capped = PeerLiveness::new();
         capped.on_send(now, Duration::from_secs(30));

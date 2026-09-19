@@ -216,23 +216,34 @@ mod tests {
     #[test]
     fn spread_is_clamped_into_u16_range() {
         let mut sampler = DataSizeSampler::new();
-        // mode pinned at 60000 with two low outliers: the raw spread is
-        // |60000 - 100| = 59900, which must be clamped so mode + spread
-        // does not overflow u16 (and mode - spread does not underflow).
+        // mode pinned at 60000 with two low outliers: the raw one-sided
+        // spread is |60000 - 100| = 59900, which the clamp must cut to
+        // `u16::MAX - mode` so the triangular band stays inside u16.
+        let low = 100u16;
+        let high = 60000u16;
         for _ in 0..2 {
-            sampler.observe(100);
+            sampler.observe(low as usize);
         }
         for _ in 0..15 {
-            sampler.observe(60000);
+            sampler.observe(high as usize);
         }
-        let (mode, spread, _) = sampler.fit_mode_and_spread(Instant::now()).unwrap();
-        assert_eq!(mode, 60000);
-        assert_eq!(spread, 5535, "the spread must clamp at u16::MAX - mode");
+        // The scenario must genuinely exercise the clamp: the unclamped
+        // one-sided spread would put `mode + spread` past u16::MAX.  If the
+        // sample set stops making the clamp bind, this fires instead of the
+        // test silently passing on a band that never needed clamping.
+        let raw_spread = high - low;
         assert!(
-            (mode as u32 + spread as u32) <= u32::from(u16::MAX),
-            "mode + spread must stay inside u16"
+            raw_spread > u16::MAX - high,
+            "the sample set must make the raw spread overflow the u16 band: raw {raw_spread}, headroom {}",
+            u16::MAX - high
         );
-        assert!(mode >= spread, "mode - spread must not underflow");
+        let (mode, spread, _) = sampler.fit_mode_and_spread(Instant::now()).unwrap();
+        assert_eq!(mode, high);
+        assert_eq!(
+            spread,
+            u16::MAX - high,
+            "the spread must clamp at u16::MAX - mode"
+        );
     }
 
     #[test]

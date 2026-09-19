@@ -187,10 +187,6 @@ mod tests {
         assert_eq!(floor, 100.0, "the floor must be capped by the current rate");
         assert_eq!(raw, 100.0, "raw = delivery.min(current).max(minimum_rate)");
         assert_eq!(target, 100.0, "target = raw.max(floor)");
-        assert!(
-            target <= 100.0,
-            "the loss response must never raise the rate"
-        );
 
         // Delivery below current pulls the raw target down while the floor
         // holds at the initial-rate cap.  This sample opens a binding latch
@@ -203,7 +199,6 @@ mod tests {
         assert_eq!(floor, 128.0, "clamp(500, 1, 128) = 128, min(current) = 128");
         assert_eq!(raw, 50.0);
         assert_eq!(target, 128.0);
-        assert!(target <= 200.0);
 
         // A current rate below the capacity floor caps the floor at current:
         // the target can never exceed the current rate.
@@ -215,7 +210,6 @@ mod tests {
         assert_eq!(floor, 40.0, "min(128, current 40)");
         assert_eq!(raw, 10.0);
         assert_eq!(target, 40.0);
-        assert!(target <= 40.0);
 
         // The minimum-rate floor holds both the raw target and the floor.
         let CongestionDecision::LossBackoff { raw, floor, target } =
@@ -226,7 +220,29 @@ mod tests {
         assert_eq!(floor, 1.0, "clamp(0.5, 1, 128) = 1, min(current) = 1");
         assert_eq!(raw, 1.0, "0.1.min(50).max(1) = 1");
         assert_eq!(target, 1.0);
-        assert!(target <= 50.0);
+
+        // The exact pins above only cover the sampled inputs; the invariant
+        // they share -- the loss response must never raise the rate while the
+        // minimum rate is at or below the current rate -- is pinned
+        // independently across a grid the pins do not touch.  Each input gets
+        // a fresh controller so the binding latch cannot decay the floor and
+        // mask a regression.
+        for &(current, delivery, peak) in &[
+            (90.0, 200.0, 10_000.0),
+            (200.0, 5.0, 500.0),
+            (7.0, 7.0, 50_000.0),
+            (1000.0, 0.0, 1000.0),
+        ] {
+            let CongestionDecision::LossBackoff { raw, floor, target } =
+                LossBackoff::default().decide(input(current, delivery, peak, control_rtt, t0))
+            else {
+                panic!("loss backoff expected");
+            };
+            assert!(
+                target <= current && raw <= current && floor <= current,
+                "the loss response must never raise the rate: current={current} raw={raw} floor={floor} target={target} (delivery={delivery} peak={peak})"
+            );
+        }
     }
 
     #[test]
