@@ -125,6 +125,34 @@ pub(crate) fn linear_backoff_step(
 mod tests {
     use super::*;
 
+    /// The linear step never falls below the probe floor
+    /// `interval / (scale * rtt^2)`, which guarantees at least one packet's
+    /// worth of headway over the RTT window even when the natural step
+    /// (`current * interval / rtt`) is below float-meaningful progress.  At a
+    /// low rate the floor dominates; without it the step is the smaller
+    /// natural value and the backoff stalls short of the target.
+    #[test]
+    fn linear_backoff_step_is_floored_by_the_one_packet_probe_floor() {
+        let interval = Duration::from_millis(1);
+        let rtt = Duration::from_secs(1);
+        let scale = 8usize;
+        let current = 0.1;
+        let target = 0.0;
+        let rtt_secs = rtt.as_secs_f64();
+        let natural = current * interval.as_secs_f64() / rtt_secs;
+        let probe_floor = interval.as_secs_f64() / (scale as f64 * rtt_secs * rtt_secs);
+        assert!(
+            probe_floor > natural,
+            "the scenario must make the probe floor dominate: floor {probe_floor} vs natural {natural}"
+        );
+        let step = linear_backoff_step(current, target, interval, rtt, scale).unwrap();
+        let expected = current - probe_floor;
+        assert!(
+            (step - expected).abs() < 1e-12,
+            "the step must be the probe floor, not the smaller natural step: got {step}, expected {expected}"
+        );
+    }
+
     fn input(
         current_rate: f64,
         delivery_rate: f64,
