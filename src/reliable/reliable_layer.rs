@@ -2004,6 +2004,28 @@ mod tests {
         assert_eq!(rl.send_rate.get(), 4096.0);
     }
 
+    /// The smoothed-probe bridge weights the *current* rate by `1 - alpha` and
+    /// the probe target by `alpha` (`alpha = 0.4`), so one applied probe moves
+    /// the live rate 40% of the way to the target.  A reciprocal swap of the
+    /// two weights is a plausible off-by-one that no existing test catches;
+    /// pin the exact blend.
+    #[test]
+    fn smooth_send_rate_blends_the_current_rate_with_the_configured_alpha() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let current = 1000.0;
+        let target = 2000.0;
+        rl.set_send_rate(current, t0);
+        rl.set_smooth_send_rate(target, t0);
+        // alpha = 0.4: 1000 * 0.6 + 2000 * 0.4 = 1400.
+        let expected = 1400.0;
+        let blended = rl.send_rate.get();
+        assert!(
+            (blended - expected).abs() < 1e-6,
+            "the smoothed rate must be current * 0.6 + target * 0.4 = {expected}, got {blended}"
+        );
+    }
+
     /// A genuine *standing queue* on the reorder-tolerant lane must still be
     /// flagged and drained.  This guards the floor-window change against
     /// trading away queue detection for path-shift recovery.
