@@ -1539,6 +1539,31 @@ mod tests {
         }
     }
 
+    /// The in-stream group path is only live while the condition gate has
+    /// measured loss evidence, at the real `instream_group_fec_enabled` method
+    /// the encoder consults.  A force-flush tuning enables the path, but
+    /// startup without loss must keep it dark so no full group accumulates
+    /// (parity-less) wire state before there is anything to repair.
+    #[test]
+    fn instream_group_fec_is_live_only_with_loss_evidence() {
+        let (shared, mut write_half) = flush_probe_connection(FecTuning::interactive_prompt());
+        let _ = &shared;
+        assert!(
+            !write_half.fec_gate.loss_active(),
+            "the condition gate must start closed before any loss evidence"
+        );
+        assert!(
+            !write_half.instream_group_fec_enabled(),
+            "startup without loss evidence must keep the in-stream group path dark"
+        );
+        write_half.fec_gate.refresh_loss(true, Some(0.5));
+        assert!(write_half.fec_gate.loss_active());
+        assert!(
+            write_half.instream_group_fec_enabled(),
+            "measured loss must light the in-stream group path"
+        );
+    }
+
     #[test]
     fn inert_catcher() {
         let now = Instant::now();
