@@ -532,4 +532,40 @@ mod tests {
             "open loss gate + spare capacity + tail request must flush"
         );
     }
+
+    /// The hysteresis band's lower bound is *inclusive*: once the gate is
+    /// open, a loss ratio exactly at the preset's disable threshold keeps it
+    /// open; only a ratio strictly below it closes the gate.  The band exists
+    /// so a link hovering at the disable threshold does not flicker parity
+    /// on and off, so the boundary comparison must be `>=`, not `>`.  Pinned
+    /// per preset because the stock and interactive thresholds differ.
+    #[test]
+    fn the_disable_threshold_is_inclusive_on_every_preset() {
+        for thresholds in [
+            FecLossGateThresholds::STOCK,
+            FecLossGateThresholds::INTERACTIVE,
+        ] {
+            let mut gate = FecConditionGate::with_thresholds(thresholds);
+            // Open the gate at its enable threshold.
+            gate.refresh_loss(true, Some(thresholds.enable_loss));
+            assert!(
+                gate.loss_active(),
+                "the gate must open at the enable threshold {}",
+                thresholds.enable_loss
+            );
+            // Exactly the disable threshold while open: still open.
+            gate.refresh_loss(true, Some(thresholds.disable_loss));
+            assert!(
+                gate.loss_active(),
+                "a loss ratio exactly at the disable threshold {} must keep an open gate open",
+                thresholds.disable_loss
+            );
+            // Strictly below the disable threshold: closes.
+            gate.refresh_loss(true, Some(thresholds.disable_loss * 0.5));
+            assert!(
+                !gate.loss_active(),
+                "a loss ratio below the disable threshold must close the gate"
+            );
+        }
+    }
 }

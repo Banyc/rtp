@@ -68,3 +68,27 @@ impl FastStartEpisode {
         loss_blocks_delay_control || queue_building
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FastStartEpisode;
+
+    /// The dedicated fast start exits on *either* a congestion loss block or a
+    /// built queue; each is independently sufficient.  A lone loss block with
+    /// no queue and a lone built queue with no loss must both end the ramp, or
+    /// it would keep growing into the self-inflicted queue (or through the
+    /// loss episode) it is meant to stop at.
+    #[test]
+    fn the_dedicated_fast_start_exits_on_either_a_loss_block_or_a_built_queue() {
+        assert!(
+            FastStartEpisode::exits_on_rate_sample(true, false),
+            "a congestion loss block alone must end the dedicated fast start"
+        );
+        assert!(
+            FastStartEpisode::exits_on_rate_sample(false, true),
+            "a built queue alone must end the dedicated fast start"
+        );
+        assert!(FastStartEpisode::exits_on_rate_sample(true, true));
+        assert!(!FastStartEpisode::exits_on_rate_sample(false, false));
+    }
+}

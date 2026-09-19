@@ -756,4 +756,55 @@ mod tests {
         assert!((stock_target - expected).abs() < 1e-9);
         assert!((reorder_target - expected).abs() < 1e-9);
     }
+
+    /// An application-limited sample can only be attributed to a *competing*
+    /// flow's standing queue on a shared lane; a dedicated lane's queue is its
+    /// own, so the ordinary drain still applies.  The path selector is tested
+    /// with the flag pre-computed (`response_path_encodes_the_controller_
+    /// precedence`), which leaves the lane->flag mapping itself unpinned;
+    /// this drives the real `decide` call site with a standing queue and an
+    /// application-limited sample on each lane.
+    #[test]
+    fn app_limited_attribution_is_shared_lane_only_at_the_decide_call_site() {
+        let now = Instant::now();
+        // A standing, persistent queue with no loss block.
+        let observation = CongestionObservation {
+            floor: Duration::from_millis(100),
+            tolerance: Duration::from_millis(20),
+            queue_building: true,
+            persistent_for: Some(Duration::from_secs(1)),
+            peak_delivery: 1000.0,
+            loss_blocks_delay_control: false,
+            gentle_exit: None,
+        };
+        let input = CongestionInput {
+            delivery_rate: 1000.0,
+            current_rate: 1000.0,
+            smooth_rtt: Duration::from_millis(300),
+            control_rtt: Duration::from_millis(100),
+            loss_event_rate: Some(0.0),
+            app_limited: true,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            now,
+        };
+
+        let mut shared = CongestionResponse::new(now, false, CongestionLane::Shared);
+        assert!(
+            matches!(
+                shared.decide(observation, input).decision(),
+                CongestionDecision::Probe { .. }
+            ),
+            "an application-limited sample on a shared lane must probe: the standing delay belongs to a competing flow, not this (empty) queue"
+        );
+
+        let mut dedicated = CongestionResponse::new(now, false, CongestionLane::Dedicated);
+        assert!(
+            matches!(
+                dedicated.decide(observation, input).decision(),
+                CongestionDecision::Drain { .. }
+            ),
+            "the same application-limited sample on a dedicated lane must drain: the standing queue is its own"
+        );
+    }
 }
