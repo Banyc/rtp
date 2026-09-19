@@ -1457,6 +1457,88 @@ mod tests {
         );
     }
 
+    /// A connection whose write half can be asked for a FEC flush decision.
+    /// The FEC encoder is absent (the capacity gate does not consult it), but
+    /// the tuning still selects the lane's spare-capacity predicate.
+    fn flush_probe_connection(
+        fec_tuning: FecTuning,
+    ) -> (
+        Arc<crate::transmission::connection::Connection>,
+        super::WriteHalf,
+    ) {
+        let layer = UnreliableLayer {
+            utp_read: Box::new(PendingRead),
+            utp_write: Box::new(BlockingWrite::new()),
+            post_open_handshake: None,
+            session_tag: None,
+            initial_sequences: crate::sequence::InitialSequences::ZERO,
+            initial_rtt: None,
+            metrics_observer: None,
+            mss: crate::mss::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            fec: None,
+            fec_tuning,
+            frame_delivery: FrameMode::default(),
+            congestion_lane: crate::CongestionLane::default(),
+            retransmission_armor: RetransmissionArmorConfig::disabled(),
+            instream_group_fec: false,
+            ack_padding: AckPaddingMode::None,
+            fresh_tail_armor_copies_override: None,
+        };
+        let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (shared, write_half, _read_half, _reaper) =
+            new_connection_with_watchdog_tuning(layer, None, watchdog);
+        (shared, write_half)
+    }
+
+    /// The force-flush tuning selects the interactive spare-capacity predicate
+    /// and the stock tuning the strict one, at the real `fec_gate_decision`
+    /// call site.  A staged (non-empty) send buffer closes the strict
+    /// predicate's `can_send_tail_fec` while the interactive predicate only
+    /// needs send-window room, so the two predicates disagree exactly here:
+    /// the interactive lane flushes, the stock lane defers.  Swapping the two
+    /// closure bodies (or the tuning-to-predicate mapping) must not pass.
+    #[test]
+    fn fec_flush_selects_the_interactive_predicate_only_for_the_force_flush_lane() {
+        use crate::traffic_shaping::redundancy::fec::gate::FecGateDecision;
+
+        let now = Instant::now();
+        for (tuning, expected) in [
+            (FecTuning::interactive_prompt(), FecGateDecision::Flush),
+            (FecTuning::default(), FecGateDecision::NoSpareCapacity),
+        ] {
+            let (shared, mut write_half) = flush_probe_connection(tuning);
+            // Stage more than one packet without sending it: the send stage is
+            // non-empty (closing the stock `can_send_tail_fec`) while the send
+            // window still accepts a packet (opening the interactive
+            // predicate).  The two predicates therefore disagree on this
+            // state, which is what pins the selection.
+            {
+                let mut reliable = shared.reliable_layer_for_test().lock().unwrap();
+                let payload = vec![0u8; reliable.max_data_size_per_pkt() * 2];
+                assert_eq!(
+                    reliable.send_data_buf(&payload, now).unwrap(),
+                    payload.len()
+                );
+                assert!(
+                    !reliable.can_send_tail_fec(now),
+                    "the staged send buffer must close the stock tail gate"
+                );
+                assert!(
+                    reliable.pkt_send_space().accepts_new_pkt(),
+                    "the send window must still accept a packet"
+                );
+            }
+            // Loss warrants recovery, so the only thing left between the two
+            // lanes is the capacity predicate.
+            write_half.fec_gate.refresh_loss(true, Some(0.5));
+            assert_eq!(
+                write_half.fec_gate_decision(now, true),
+                expected,
+                "the force-flush lane selects the interactive predicate; stock selects the strict one"
+            );
+        }
+    }
+
     #[test]
     fn inert_catcher() {
         let now = Instant::now();
