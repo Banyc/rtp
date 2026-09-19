@@ -3547,6 +3547,50 @@ mod tests {
         }
         assert!(fired, "huge-data-loss backoff must fire after 2 * RTO");
     }
+
+    /// The send path must apply the *linear* huge-loss backoff, not the
+    /// exponential halving that the removed `LINEAR_BACKOFF` const used to
+    /// select.  A plain `< before` check cannot tell the two apart when the
+    /// linear step lands far below `before / 2`; this drives the real
+    /// `send_data_pkt` call site and asserts the rate collapses all the way to
+    /// `MIN_SEND_RATE` (the linear step pins to the target once the loss has
+    /// persisted for an RTT), which the halving branch does not.
+    #[test]
+    fn huge_loss_backoff_on_the_send_path_is_linear_not_exponential() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        send_burst(&mut rl, 20, t0);
+        assert!(rl.huge_data_loss_gate(t0).is_none());
+        let mut pkt = vec![0u8; TEST_MSS];
+        let mut t = t0 + Duration::from_secs(2) + Duration::from_millis(1);
+        let mut fired = false;
+        for _ in 0..600 {
+            let before = rl.send_rate.get();
+            // The send path's first action is the huge-loss backoff.
+            let _ = rl.send_data_pkt(&mut pkt, t);
+            if rl.last_congestion_action
+                == Some(crate::metrics::MetricsCongestionAction::HugeLossBackoff)
+            {
+                fired = true;
+                let after = rl.send_rate.get();
+                assert!(
+                    after < before,
+                    "the huge-loss backoff must lower the send rate"
+                );
+                assert_eq!(
+                    after,
+                    super::MIN_SEND_RATE,
+                    "the send path must apply the linear step (which reaches MIN_SEND_RATE \
+                     once the loss has persisted for an RTT), not the exponential halving: \
+                     before={before} after={after}"
+                );
+                break;
+            }
+            t += Duration::from_millis(10);
+        }
+        assert!(fired, "huge-data-loss backoff must fire after 2 * RTO");
+    }
+
     #[test]
     fn ordinary_bandwidth_probe_waits_for_previous_feedback() {
         let t0 = Instant::now();
