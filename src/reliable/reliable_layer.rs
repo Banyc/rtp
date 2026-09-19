@@ -2213,6 +2213,65 @@ mod tests {
         );
     }
 
+    /// The huge-loss persistence timer is condition-clocked, not a one-shot
+    /// deadline: a flight that is repaired before the timer matures clears it,
+    /// so a *fresh* huge-loss episode must re-earn the full `2 * RTO`
+    /// persistence instead of inheriting the earlier episode's elapsed time.
+    /// If the clear were dropped, the second episode's first positive sample
+    /// would fire the backoff instantly, stalling a send path whose earlier
+    /// loss had already been repaired.
+    #[test]
+    fn huge_loss_persistence_timer_restarts_after_the_flight_is_repaired() {
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+
+        // Episode A: a stalled flight becomes a huge-loss sample once its RTO
+        // elapses, arming the `2 * RTO` persistence timer. The first positive
+        // check must arm, not fire.
+        send_burst(&mut rl, 20, t0);
+        let rto = rl.pkt_send_space().rto_duration();
+        let lost_a = t0 + rto + Duration::from_millis(1);
+        assert!(
+            rl.huge_data_loss_gate(lost_a).is_none(),
+            "the first positive huge-loss check must arm the persistence timer, not fire"
+        );
+
+        // The flight is repaired before the timer matures. That is forward
+        // progress, so the next check must CLEAR the persistence timer rather
+        // than let a later positive sample inherit the elapsed time.
+        ack_all(&mut rl, None, lost_a + Duration::from_millis(1));
+        let cleared_at = lost_a + HUGE_DATA_LOSS_CHECK_INTERVAL + Duration::from_millis(1);
+        assert!(
+            rl.huge_data_loss_gate(cleared_at).is_none(),
+            "a repaired flight must not fire the huge-loss gate"
+        );
+
+        // Episode B: a fresh stalled flight observed after the original timer
+        // would have matured (`lost_a + 2 * rto`). If the clear above were
+        // missing, this very first positive sample would find the stale start
+        // and fire immediately; with the clear it must re-earn the full
+        // `2 * RTO` persistence.
+        let send_b = lost_a + 3 * rto;
+        send_burst(&mut rl, 20, send_b);
+        let lost_b = send_b + rto + Duration::from_millis(1);
+        assert!(
+            rl.huge_data_loss_gate(lost_b).is_none(),
+            "a fresh huge-loss episode must re-earn the full 2 * RTO persistence"
+        );
+        assert!(
+            rl.huge_data_loss_gate(lost_b + rto + rto - Duration::from_millis(1))
+                .is_none(),
+            "the fresh episode must not fire before 2 * RTO"
+        );
+        assert!(
+            rl.huge_data_loss_gate(
+                lost_b + rto + rto + HUGE_DATA_LOSS_CHECK_INTERVAL + Duration::from_millis(1),
+            )
+            .is_some(),
+            "the fresh episode must fire once 2 * RTO persist"
+        );
+    }
+
     fn send_burst(rl: &mut super::ReliableLayer, n: usize, now: Instant) {
         let payload = vec![0u8; 100];
         let mut pkt = vec![0u8; TEST_MSS];
