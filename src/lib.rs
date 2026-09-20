@@ -16,6 +16,8 @@ pub mod socket;
 mod tag;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+#[cfg(feature = "testing")]
+pub mod testkit;
 pub mod traffic_shaping;
 mod transmission;
 pub mod udp;

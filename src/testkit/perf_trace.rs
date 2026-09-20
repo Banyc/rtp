@@ -1,0 +1,1969 @@
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::metrics::{
+    MetricsAckFlushReason, MetricsEvent, MetricsFecCounters, MetricsFecGroupSizeBuckets,
+    MetricsGentleExitCause, MetricsInterest, MetricsObservation, MetricsObserver,
+    MetricsRetransmissionCounters, MetricsSendDriverResumeSource, MetricsSendDriverWake,
+    MetricsSnapshot,
+};
+use netem_test::CountersSnapshot;
+
+/// Trace schema 32: RTP rows carry the complete congestion-controller and
+/// retransmission-scheduler snapshot (73 columns) plus the 30 typed FEC
+/// work/recovery columns and `trace_elapsed_us` so endpoint, netem, and
+/// progress samples share one clock (`PerfTrace::trace_start`). Event-only
+/// rows leave every snapshot column empty; the retransmission-active/ready,
+/// RTO timing, controller-decision, and FEC evidence is present only on
+/// snapshot rows.
+const TRACE_SCHEMA_VERSION: u16 = 32;
+const DEFAULT_CAPACITY: usize = 100_000;
+const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+/// Raw RTT samples are time-decimated to one retained row per interval on
+/// their own clock, finer than [`STATE_SAMPLE_INTERVAL`] so the retained RTT
+/// series stays dense enough for p90/p99 tail evidence. Retention is then a
+/// fixed rows-per-second constant per endpoint regardless of lane speed, so a
+/// fast lane cannot exhaust the bounded storage and long runs degrade
+/// evidence resolution uniformly rather than losing their tail.
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
+const RTP_TRACE_COLUMNS: usize = 103;
+const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_1,fec_flushed_groups_2_to_4,fec_flushed_groups_5_to_7,fec_flushed_groups_8,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_1,fec_no_surplus_groups_2_to_4,fec_no_surplus_groups_5_to_7,fec_no_surplus_groups_8,fec_groups_skipped_burst_end,fec_burst_end_groups_1,fec_burst_end_groups_2_to_4,fec_burst_end_groups_5_to_7,fec_burst_end_groups_8,fec_groups_skipped_loss_gate,fec_loss_gate_groups_1,fec_loss_gate_groups_2_to_4,fec_loss_gate_groups_5_to_7,fec_loss_gate_groups_8,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_1,fec_no_spare_capacity_groups_2_to_4,fec_no_spare_capacity_groups_5_to_7,fec_no_spare_capacity_groups_8,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,fec_rejected_recovered_symbols,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+
+/// Exact per-cause gentle-mode exit counters. Rare transitions are aggregated
+/// atomically and never consume bounded state-row capacity.
+#[derive(Debug, Default)]
+struct GentleExitCounters {
+    loss: AtomicU64,
+    gate_open: AtomicU64,
+    drain_guard: AtomicU64,
+    outage_reset: AtomicU64,
+}
+
+impl GentleExitCounters {
+    fn counter(&self, cause: MetricsGentleExitCause) -> &AtomicU64 {
+        match cause {
+            MetricsGentleExitCause::Loss => &self.loss,
+            MetricsGentleExitCause::GateOpen => &self.gate_open,
+            MetricsGentleExitCause::DrainGuard => &self.drain_guard,
+            MetricsGentleExitCause::OutageReset => &self.outage_reset,
+        }
+    }
+
+    fn increment(&self, cause: MetricsGentleExitCause) {
+        self.counter(cause).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        for cause in MetricsGentleExitCause::ALL {
+            self.counter(cause).store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self, cause: MetricsGentleExitCause) -> u64 {
+        self.counter(cause).load(Ordering::Relaxed)
+    }
+}
+
+/// Exact per-reason ACK-flush claim counters. Only successful transactional
+/// claims are counted (never resume wake requests), and the aggregate atomics
+/// never consume bounded state-row capacity.
+#[derive(Debug, Default)]
+struct AckFlushCounters {
+    initial: AtomicU64,
+    age: AtomicU64,
+    count: AtomicU64,
+    fin: AtomicU64,
+    explicit: AtomicU64,
+}
+
+impl AckFlushCounters {
+    fn counter(&self, reason: MetricsAckFlushReason) -> &AtomicU64 {
+        match reason {
+            MetricsAckFlushReason::Initial => &self.initial,
+            MetricsAckFlushReason::Age => &self.age,
+            MetricsAckFlushReason::Count => &self.count,
+            MetricsAckFlushReason::Fin => &self.fin,
+            MetricsAckFlushReason::Explicit => &self.explicit,
+        }
+    }
+
+    fn increment(&self, reason: MetricsAckFlushReason) {
+        self.counter(reason).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        for reason in MetricsAckFlushReason::ALL {
+            self.counter(reason).store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn load(&self, reason: MetricsAckFlushReason) -> u64 {
+        self.counter(reason).load(Ordering::Relaxed)
+    }
+}
+
+/// Connection-lifetime cumulative counters rebased at the measurement
+/// boundary so warmup delivery is excluded from the retained evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CumulativeCounters {
+    retransmission: MetricsRetransmissionCounters,
+    fec: Option<MetricsFecCounters>,
+    rto_deadline_postponements: u64,
+    application_limited_detections: u64,
+    application_limited_suppressions: u64,
+    congestion_rate_samples: u64,
+    congestion_probe_decisions: u64,
+    congestion_probe_increases: u64,
+    congestion_probe_before_feedback: u64,
+    congestion_persistent_queue_resets: u64,
+    congestion_delay_drains: u64,
+    congestion_loss_backoffs: u64,
+    congestion_loss_backoff_floor_bindings: u64,
+}
+
+impl CumulativeCounters {
+    fn from_snapshot(snapshot: MetricsSnapshot) -> Self {
+        Self {
+            retransmission: snapshot.retransmission_counters,
+            fec: snapshot.fec_counters,
+            rto_deadline_postponements: snapshot.rto_deadline_postponements,
+            application_limited_detections: snapshot.application_limited_detections,
+            application_limited_suppressions: snapshot
+                .application_limited_detections_suppressed_by_waiting_writer,
+            congestion_rate_samples: snapshot.congestion_rate_samples,
+            congestion_probe_decisions: snapshot.congestion_bandwidth_probe_decisions,
+            congestion_probe_increases: snapshot.congestion_bandwidth_probe_increases,
+            congestion_probe_before_feedback: snapshot.congestion_bandwidth_probe_before_feedback,
+            congestion_persistent_queue_resets: snapshot.congestion_persistent_queue_resets,
+            congestion_delay_drains: snapshot.congestion_delay_drains,
+            congestion_loss_backoffs: snapshot.congestion_loss_backoffs,
+            congestion_loss_backoff_floor_bindings: snapshot.congestion_loss_backoff_floor_bindings,
+        }
+    }
+
+    fn apply_to(self, snapshot: &mut MetricsSnapshot) {
+        snapshot.retransmission_counters = self.retransmission;
+        snapshot.fec_counters = self.fec;
+        snapshot.rto_deadline_postponements = self.rto_deadline_postponements;
+        snapshot.application_limited_detections = self.application_limited_detections;
+        snapshot.application_limited_detections_suppressed_by_waiting_writer =
+            self.application_limited_suppressions;
+        snapshot.congestion_rate_samples = self.congestion_rate_samples;
+        snapshot.congestion_bandwidth_probe_decisions = self.congestion_probe_decisions;
+        snapshot.congestion_bandwidth_probe_increases = self.congestion_probe_increases;
+        snapshot.congestion_bandwidth_probe_before_feedback = self.congestion_probe_before_feedback;
+        snapshot.congestion_persistent_queue_resets = self.congestion_persistent_queue_resets;
+        snapshot.congestion_delay_drains = self.congestion_delay_drains;
+        snapshot.congestion_loss_backoffs = self.congestion_loss_backoffs;
+        snapshot.congestion_loss_backoff_floor_bindings =
+            self.congestion_loss_backoff_floor_bindings;
+    }
+
+    fn since(self, baseline: Self) -> Self {
+        let since = |current: u64, previous: u64| current.saturating_sub(previous);
+        let group_sizes_since =
+            |current: MetricsFecGroupSizeBuckets, previous: MetricsFecGroupSizeBuckets| {
+                MetricsFecGroupSizeBuckets {
+                    one: since(current.one, previous.one),
+                    two_to_four: since(current.two_to_four, previous.two_to_four),
+                    five_to_seven: since(current.five_to_seven, previous.five_to_seven),
+                    full_eight: since(current.full_eight, previous.full_eight),
+                }
+            };
+        let fec = self.fec.map(|current| {
+            let previous = baseline.fec.unwrap_or_default();
+            MetricsFecCounters {
+                parity_sent: since(current.parity_sent, previous.parity_sent),
+                groups_flushed: since(current.groups_flushed, previous.groups_flushed),
+                flushed_group_sizes: group_sizes_since(
+                    current.flushed_group_sizes,
+                    previous.flushed_group_sizes,
+                ),
+                groups_skipped_no_surplus_tokens: since(
+                    current.groups_skipped_no_surplus_tokens,
+                    previous.groups_skipped_no_surplus_tokens,
+                ),
+                no_surplus_group_sizes: group_sizes_since(
+                    current.no_surplus_group_sizes,
+                    previous.no_surplus_group_sizes,
+                ),
+                groups_skipped_burst_end: since(
+                    current.groups_skipped_burst_end,
+                    previous.groups_skipped_burst_end,
+                ),
+                burst_end_group_sizes: group_sizes_since(
+                    current.burst_end_group_sizes,
+                    previous.burst_end_group_sizes,
+                ),
+                groups_skipped_loss_gate: since(
+                    current.groups_skipped_loss_gate,
+                    previous.groups_skipped_loss_gate,
+                ),
+                loss_gate_group_sizes: group_sizes_since(
+                    current.loss_gate_group_sizes,
+                    previous.loss_gate_group_sizes,
+                ),
+                groups_skipped_no_spare_capacity: since(
+                    current.groups_skipped_no_spare_capacity,
+                    previous.groups_skipped_no_spare_capacity,
+                ),
+                no_spare_capacity_group_sizes: group_sizes_since(
+                    current.no_spare_capacity_group_sizes,
+                    previous.no_spare_capacity_group_sizes,
+                ),
+                recovered_symbols: since(current.recovered_symbols, previous.recovered_symbols),
+                dropped_malformed_packets: since(
+                    current.dropped_malformed_packets,
+                    previous.dropped_malformed_packets,
+                ),
+                dropped_decoder_panics: since(
+                    current.dropped_decoder_panics,
+                    previous.dropped_decoder_panics,
+                ),
+                rejected_recovered_symbols: since(
+                    current.rejected_recovered_symbols,
+                    previous.rejected_recovered_symbols,
+                ),
+            }
+        });
+        Self {
+            retransmission: MetricsRetransmissionCounters {
+                attempts: since(
+                    self.retransmission.attempts,
+                    baseline.retransmission.attempts,
+                ),
+                first_attempts: since(
+                    self.retransmission.first_attempts,
+                    baseline.retransmission.first_attempts,
+                ),
+                repeat_attempts: since(
+                    self.retransmission.repeat_attempts,
+                    baseline.retransmission.repeat_attempts,
+                ),
+                rto_reason: since(
+                    self.retransmission.rto_reason,
+                    baseline.retransmission.rto_reason,
+                ),
+                reorder_reason: since(
+                    self.retransmission.reorder_reason,
+                    baseline.retransmission.reorder_reason,
+                ),
+                fast_loss_reason: since(
+                    self.retransmission.fast_loss_reason,
+                    baseline.retransmission.fast_loss_reason,
+                ),
+                pre_outage_reason: since(
+                    self.retransmission.pre_outage_reason,
+                    baseline.retransmission.pre_outage_reason,
+                ),
+                tail_probes: since(
+                    self.retransmission.tail_probes,
+                    baseline.retransmission.tail_probes,
+                ),
+            },
+            fec,
+            rto_deadline_postponements: since(
+                self.rto_deadline_postponements,
+                baseline.rto_deadline_postponements,
+            ),
+            application_limited_detections: since(
+                self.application_limited_detections,
+                baseline.application_limited_detections,
+            ),
+            application_limited_suppressions: since(
+                self.application_limited_suppressions,
+                baseline.application_limited_suppressions,
+            ),
+            congestion_rate_samples: since(
+                self.congestion_rate_samples,
+                baseline.congestion_rate_samples,
+            ),
+            congestion_probe_decisions: since(
+                self.congestion_probe_decisions,
+                baseline.congestion_probe_decisions,
+            ),
+            congestion_probe_increases: since(
+                self.congestion_probe_increases,
+                baseline.congestion_probe_increases,
+            ),
+            congestion_probe_before_feedback: since(
+                self.congestion_probe_before_feedback,
+                baseline.congestion_probe_before_feedback,
+            ),
+            congestion_persistent_queue_resets: since(
+                self.congestion_persistent_queue_resets,
+                baseline.congestion_persistent_queue_resets,
+            ),
+            congestion_delay_drains: since(
+                self.congestion_delay_drains,
+                baseline.congestion_delay_drains,
+            ),
+            congestion_loss_backoffs: since(
+                self.congestion_loss_backoffs,
+                baseline.congestion_loss_backoffs,
+            ),
+            congestion_loss_backoff_floor_bindings: since(
+                self.congestion_loss_backoff_floor_bindings,
+                baseline.congestion_loss_backoff_floor_bindings,
+            ),
+        }
+    }
+}
+
+/// One captured RTP observation plus its position on the shared trace clock.
+#[derive(Debug, Clone, Copy)]
+struct CapturedRtpObservation {
+    observation: MetricsObservation,
+    trace_elapsed: Duration,
+}
+
+/// One netem/progress sample: the scenario-relative `elapsed` and its shared
+/// trace-clock position.
+#[derive(Debug, Clone, Copy)]
+struct NetemObservation {
+    elapsed: Duration,
+    trace_elapsed: Duration,
+    c2s: CountersSnapshot,
+    s2c: CountersSnapshot,
+    delivered_bytes: u64,
+}
+
+/// A bounded, sealable capture of RTP observations for one endpoint. State
+/// samples are throttled to [`STATE_SAMPLE_INTERVAL`] and raw RTT samples are
+/// time-decimated to [`RTT_SAMPLE_INTERVAL`] on an independent clock;
+/// termination rows bypass both throttles. Callbacks are synchronous and the
+/// storage is bounded at `capacity`; the retained row rate is a fixed const
+/// per endpoint (state + claimed RTT + terminations), so arbitrarily fast
+/// lanes cannot exhaust capacity and long runs degrade evidence resolution
+/// (fewer samples per second) rather than losing the run tail. First-N
+/// truncation would bias per-unit-time evidence on fast lanes; uniform
+/// time-decimation keeps the retained RTT series an unbiased sample of the
+/// RTT process on the same grid for every lane. Rare scheduler/recovery
+/// events are aggregate atomics and never consume bounded row capacity.
+#[derive(Debug)]
+struct RtpCapture {
+    trace_start: Instant,
+    observations: Mutex<Vec<CapturedRtpObservation>>,
+    counter_baseline: Mutex<Option<CumulativeCounters>>,
+    measurement_start_micros: AtomicU64,
+    last_state_sample_micros: AtomicU64,
+    last_rtt_sample_micros: AtomicU64,
+    dropped_capacity: AtomicU64,
+    send_driver_resume_signal_wakes: AtomicU64,
+    send_driver_ack_schedule_signal_wakes: AtomicU64,
+    send_driver_pacing_timer_wakes: AtomicU64,
+    send_driver_protocol_timer_wakes: AtomicU64,
+    send_driver_kill_requested_wakes: AtomicU64,
+    send_driver_resume_application_data_requests: AtomicU64,
+    send_driver_resume_application_frame_requests: AtomicU64,
+    send_driver_resume_application_finish_requests: AtomicU64,
+    send_driver_resume_peer_ack_requests: AtomicU64,
+    send_driver_resume_ack_flush_requests: AtomicU64,
+    send_driver_resume_post_open_handshake_requests: AtomicU64,
+    send_driver_resume_receive_opportunity_requests: AtomicU64,
+    retransmission_armor_duplicates: AtomicU64,
+    data_send_would_blocks: AtomicU64,
+    gentle_exits: GentleExitCounters,
+    ack_flushes: AckFlushCounters,
+    sealed: AtomicBool,
+    capacity: usize,
+}
+
+impl RtpCapture {
+    fn new(trace_start: Instant, capacity: usize) -> Self {
+        Self {
+            trace_start,
+            observations: Mutex::new(Vec::with_capacity(capacity)),
+            counter_baseline: Mutex::new(None),
+            measurement_start_micros: AtomicU64::new(0),
+            last_state_sample_micros: AtomicU64::new(u64::MAX),
+            last_rtt_sample_micros: AtomicU64::new(u64::MAX),
+            dropped_capacity: AtomicU64::new(0),
+            send_driver_resume_signal_wakes: AtomicU64::new(0),
+            send_driver_ack_schedule_signal_wakes: AtomicU64::new(0),
+            send_driver_pacing_timer_wakes: AtomicU64::new(0),
+            send_driver_protocol_timer_wakes: AtomicU64::new(0),
+            send_driver_kill_requested_wakes: AtomicU64::new(0),
+            send_driver_resume_application_data_requests: AtomicU64::new(0),
+            send_driver_resume_application_frame_requests: AtomicU64::new(0),
+            send_driver_resume_application_finish_requests: AtomicU64::new(0),
+            send_driver_resume_peer_ack_requests: AtomicU64::new(0),
+            send_driver_resume_ack_flush_requests: AtomicU64::new(0),
+            send_driver_resume_post_open_handshake_requests: AtomicU64::new(0),
+            send_driver_resume_receive_opportunity_requests: AtomicU64::new(0),
+            retransmission_armor_duplicates: AtomicU64::new(0),
+            data_send_would_blocks: AtomicU64::new(0),
+            gentle_exits: GentleExitCounters::default(),
+            ack_flushes: AckFlushCounters::default(),
+            sealed: AtomicBool::new(false),
+            capacity,
+        }
+    }
+
+    fn record(&self, observation: MetricsObservation) {
+        if self.sealed.load(Ordering::Acquire) {
+            return;
+        }
+        let captured = CapturedRtpObservation {
+            observation,
+            trace_elapsed: self.trace_start.elapsed(),
+        };
+        let mut observations = self.observations.lock().unwrap();
+        if self.sealed.load(Ordering::Acquire) {
+            return;
+        }
+        let measurement_start = self.measurement_start_micros.load(Ordering::Acquire);
+        if measurement_start != 0 && captured.trace_elapsed.as_micros() < measurement_start.into() {
+            return;
+        }
+        if observations.len() >= self.capacity {
+            self.dropped_capacity.fetch_add(1, Ordering::Relaxed);
+        } else {
+            observations.push(captured);
+        }
+    }
+
+    /// Stop accepting callbacks. Runs before any output file is written so a
+    /// callback that raced past the finish boundary cannot corrupt the rows.
+    fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
+        drop(self.observations.lock().unwrap());
+    }
+
+    /// Anchor the measurement boundary and rebase connection-lifetime
+    /// counters. Warmup rows are discarded, capacity state is reset, and one
+    /// pre-boundary baseline snapshot is captured for later `since`
+    /// subtraction while serializing sealed observations.
+    fn begin_measurement(&self, trace_elapsed: Duration) {
+        let boundary = u64::try_from(trace_elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.measurement_start_micros
+            .store(boundary, Ordering::Release);
+        let mut observations = self.observations.lock().unwrap();
+        let counter_baseline = observations
+            .iter()
+            .filter(|captured| captured.trace_elapsed < trace_elapsed)
+            .filter_map(|captured| {
+                captured
+                    .observation
+                    .snapshot
+                    .map(|snapshot| (captured.observation.event_index, snapshot))
+            })
+            .max_by_key(|(event_index, _)| *event_index)
+            .map(|(_, snapshot)| CumulativeCounters::from_snapshot(snapshot));
+        *self.counter_baseline.lock().unwrap() = counter_baseline;
+        observations.retain(|captured| captured.trace_elapsed >= trace_elapsed);
+        drop(observations);
+        self.last_state_sample_micros
+            .store(u64::MAX, Ordering::Relaxed);
+        self.last_rtt_sample_micros
+            .store(u64::MAX, Ordering::Relaxed);
+        self.dropped_capacity.store(0, Ordering::Relaxed);
+        self.send_driver_resume_signal_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_ack_schedule_signal_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_pacing_timer_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_protocol_timer_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_kill_requested_wakes
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_data_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_frame_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_application_finish_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_peer_ack_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_ack_flush_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_post_open_handshake_requests
+            .store(0, Ordering::Relaxed);
+        self.send_driver_resume_receive_opportunity_requests
+            .store(0, Ordering::Relaxed);
+        self.retransmission_armor_duplicates
+            .store(0, Ordering::Relaxed);
+        self.data_send_would_blocks.store(0, Ordering::Relaxed);
+        self.gentle_exits.reset();
+        self.ack_flushes.reset();
+    }
+
+    /// Claim the next raw RTT sample on the RTT decimation clock: at most one
+    /// sample per [`RTT_SAMPLE_INTERVAL`], with the first sample after the
+    /// measurement boundary always claiming. Independent of the state clock
+    /// so RTT retention never competes with state-row cadence.
+    fn claim_rtt_sample_at(&self, elapsed: Duration) -> bool {
+        let now = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let interval = RTT_SAMPLE_INTERVAL.as_micros() as u64;
+        let mut previous = self.last_rtt_sample_micros.load(Ordering::Relaxed);
+        loop {
+            if previous != u64::MAX && now.saturating_sub(previous) < interval {
+                return false;
+            }
+            match self.last_rtt_sample_micros.compare_exchange_weak(
+                previous,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => previous = actual,
+            }
+        }
+    }
+
+    fn claim_state_sample_at(&self, elapsed: Duration) -> bool {
+        let now = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let interval = STATE_SAMPLE_INTERVAL.as_micros() as u64;
+        let mut previous = self.last_state_sample_micros.load(Ordering::Relaxed);
+        loop {
+            if previous != u64::MAX && now.saturating_sub(previous) < interval {
+                return false;
+            }
+            match self.last_state_sample_micros.compare_exchange_weak(
+                previous,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => previous = actual,
+            }
+        }
+    }
+
+    fn interest(&self, event: MetricsEvent, elapsed: Duration) -> MetricsInterest {
+        if self.sealed.load(Ordering::Acquire) {
+            return MetricsInterest::Skip;
+        }
+        match event {
+            MetricsEvent::SendDriverWake(wake) => {
+                let counter = match wake {
+                    MetricsSendDriverWake::ResumeSignal => &self.send_driver_resume_signal_wakes,
+                    MetricsSendDriverWake::AckScheduleSignal => {
+                        &self.send_driver_ack_schedule_signal_wakes
+                    }
+                    MetricsSendDriverWake::PacingTimer => &self.send_driver_pacing_timer_wakes,
+                    MetricsSendDriverWake::ProtocolTimer => &self.send_driver_protocol_timer_wakes,
+                    MetricsSendDriverWake::KillRequested => &self.send_driver_kill_requested_wakes,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::SendDriverResumeRequest(source) => {
+                let counter = match source {
+                    MetricsSendDriverResumeSource::ApplicationData => {
+                        &self.send_driver_resume_application_data_requests
+                    }
+                    MetricsSendDriverResumeSource::ApplicationFrame => {
+                        &self.send_driver_resume_application_frame_requests
+                    }
+                    MetricsSendDriverResumeSource::ApplicationFinish => {
+                        &self.send_driver_resume_application_finish_requests
+                    }
+                    MetricsSendDriverResumeSource::PeerAck => {
+                        &self.send_driver_resume_peer_ack_requests
+                    }
+                    MetricsSendDriverResumeSource::AckFlush => {
+                        &self.send_driver_resume_ack_flush_requests
+                    }
+                    MetricsSendDriverResumeSource::PostOpenHandshake => {
+                        &self.send_driver_resume_post_open_handshake_requests
+                    }
+                    MetricsSendDriverResumeSource::ReceiveOpportunity => {
+                        &self.send_driver_resume_receive_opportunity_requests
+                    }
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::GentleModeExit(cause) => {
+                self.gentle_exits.increment(cause);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::RetransmissionArmorDuplicate => {
+                self.retransmission_armor_duplicates
+                    .fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::DataSendWouldBlock => {
+                self.data_send_would_blocks.fetch_add(1, Ordering::Relaxed);
+                return MetricsInterest::Skip;
+            }
+            MetricsEvent::AckFlush(reason) => {
+                // A successful transactional claim, not a resume wake request.
+                self.ack_flushes.increment(reason);
+                return MetricsInterest::Skip;
+            }
+            _ => {}
+        }
+        if matches!(event, MetricsEvent::SessionTermination(_))
+            || self.claim_state_sample_at(elapsed)
+        {
+            MetricsInterest::Snapshot
+        } else if event == MetricsEvent::RttSample && self.claim_rtt_sample_at(elapsed) {
+            MetricsInterest::EventOnly
+        } else {
+            MetricsInterest::Skip
+        }
+    }
+}
+
+/// Opt-in capture for performance probes. Set 'NETEM_PERF_TRACE_DIR' to an
+/// empty output directory to enable it. Client and accepted-peer RTP state
+/// are captured independently at 50 ms while raw RTT samples are
+/// time-decimated at a finer 10 ms cadence on an independent clock, so
+/// retention is a fixed rows-per-second constant per endpoint regardless of
+/// lane speed. Storage is bounded and callback execution is synchronous; no
+/// async channel or detached task is involved.
+///
+/// Set 'NETEM_PERF_TRACE_RTP=0' to retain only netem and application-progress
+/// samples for an observer-free control run with the same output artifacts.
+#[derive(Debug)]
+pub struct PerfTrace {
+    output_dir: PathBuf,
+    capture_rtp: bool,
+    trace_start: Instant,
+    measurement_start_trace_elapsed: Option<Duration>,
+    rtp: Arc<RtpCapture>,
+    rtp_peer: Arc<RtpCapture>,
+    netem: Vec<NetemObservation>,
+}
+
+impl PerfTrace {
+    fn new(output_dir: PathBuf, capture_rtp: bool) -> Self {
+        let trace_start = Instant::now();
+        Self {
+            output_dir,
+            capture_rtp,
+            trace_start,
+            measurement_start_trace_elapsed: None,
+            rtp: Self::new_rtp_capture(trace_start),
+            rtp_peer: Self::new_rtp_capture(trace_start),
+            netem: Vec::new(),
+        }
+    }
+
+    fn new_rtp_capture(trace_start: Instant) -> Arc<RtpCapture> {
+        Arc::new(RtpCapture::new(trace_start, DEFAULT_CAPACITY))
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let output_dir = std::env::var_os("NETEM_PERF_TRACE_DIR").map(PathBuf::from)?;
+        let capture_rtp = std::env::var_os("NETEM_PERF_TRACE_RTP").is_none_or(|value| value != "0");
+        Some(Self::new(output_dir, capture_rtp))
+    }
+
+    /// Anchor the measurement boundary on the shared trace clock. Netem and
+    /// progress samples recorded after this call carry
+    /// `measurement_start_trace_elapsed + scenario_elapsed`; RTP captures
+    /// discard warmup rows and rebase their cumulative counters from the
+    /// last pre-boundary snapshot.
+    pub fn mark_measurement_start(&mut self, start: Instant) {
+        let trace_elapsed = start.saturating_duration_since(self.trace_start);
+        self.measurement_start_trace_elapsed = Some(trace_elapsed);
+        self.rtp.begin_measurement(trace_elapsed);
+        self.rtp_peer.begin_measurement(trace_elapsed);
+    }
+
+    pub fn rtp_observer(&self) -> Option<MetricsObserver> {
+        self.observer_for(&self.rtp)
+    }
+
+    pub fn rtp_peer_observer(&self) -> Option<MetricsObserver> {
+        self.observer_for(&self.rtp_peer)
+    }
+
+    fn observer_for(&self, rtp: &Arc<RtpCapture>) -> Option<MetricsObserver> {
+        if !self.capture_rtp {
+            return None;
+        }
+        let filter_capture = Arc::clone(rtp);
+        let capture = Arc::clone(rtp);
+        Some(MetricsObserver::selective(
+            move |event, elapsed| filter_capture.interest(event, elapsed),
+            move |observation| capture.record(observation),
+        ))
+    }
+
+    pub fn record_netem(
+        &mut self,
+        elapsed: Duration,
+        c2s: CountersSnapshot,
+        s2c: CountersSnapshot,
+        delivered_bytes: u64,
+    ) {
+        let trace_elapsed = self
+            .measurement_start_trace_elapsed
+            .map(|start| start + elapsed)
+            .unwrap_or_else(|| self.trace_start.elapsed());
+        self.netem.push(NetemObservation {
+            elapsed,
+            trace_elapsed,
+            c2s,
+            s2c,
+            delivered_bytes,
+        });
+    }
+
+    pub fn finish(self, metadata: &[(&str, String)]) -> io::Result<PathBuf> {
+        self.rtp.seal();
+        self.rtp_peer.seal();
+        std::fs::create_dir_all(&self.output_dir)?;
+        self.write_manifest(metadata)?;
+        self.write_rtp(&self.rtp, "rtp.csv")?;
+        self.write_rtp(&self.rtp_peer, "rtp_peer.csv")?;
+        self.write_netem()?;
+        self.write_progress()?;
+        Ok(self.output_dir)
+    }
+
+    fn write_manifest(&self, metadata: &[(&str, String)]) -> io::Result<()> {
+        let mut out = csv_writer(self.output_dir.join("manifest.csv"))?;
+        writeln!(out, "key,value")?;
+        write_csv_row(
+            &mut out,
+            &["trace_schema_version", &TRACE_SCHEMA_VERSION.to_string()],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "rtp_metrics_schema_version",
+                &crate::metrics::SCHEMA_VERSION.to_string(),
+            ],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "trace_finish_elapsed_us",
+                &self.trace_start.elapsed().as_micros().to_string(),
+            ],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "measurement_start_trace_elapsed_us",
+                &self
+                    .measurement_start_trace_elapsed
+                    .map(|elapsed| elapsed.as_micros().to_string())
+                    .unwrap_or_default(),
+            ],
+        )?;
+        write_csv_row(&mut out, &["rtp_observer", &self.capture_rtp.to_string()])?;
+        write_csv_row(
+            &mut out,
+            &[
+                "rtp_state_sample_interval_micros",
+                &STATE_SAMPLE_INTERVAL.as_micros().to_string(),
+            ],
+        )?;
+        write_csv_row(
+            &mut out,
+            &[
+                "rtp_rtt_sample_interval_micros",
+                &RTT_SAMPLE_INTERVAL.as_micros().to_string(),
+            ],
+        )?;
+        write_csv_row(&mut out, &["rtp_capacity", &self.rtp.capacity.to_string()])?;
+        write_capture_health(&mut out, "rtp", &self.rtp)?;
+        write_capture_health(&mut out, "rtp_peer", &self.rtp_peer)?;
+        write_csv_row(&mut out, &["netem_samples", &self.netem.len().to_string()])?;
+        write_csv_row(
+            &mut out,
+            &["progress_samples", &self.netem.len().to_string()],
+        )?;
+        for (key, value) in metadata {
+            write_csv_row(&mut out, &[key, value])?;
+        }
+        Ok(())
+    }
+
+    fn write_rtp(&self, capture: &RtpCapture, filename: &str) -> io::Result<()> {
+        let mut observations = capture.observations.lock().unwrap().clone();
+        observations.sort_unstable_by_key(|captured| captured.observation.event_index);
+        let counter_baseline = *capture.counter_baseline.lock().unwrap();
+        let mut out = csv_writer(self.output_dir.join(filename))?;
+        writeln!(out, "{RTP_TRACE_HEADER}")?;
+        for captured in observations {
+            let mut observation = captured.observation;
+            if let (Some(baseline), Some(mut snapshot)) = (counter_baseline, observation.snapshot) {
+                CumulativeCounters::from_snapshot(snapshot)
+                    .since(baseline)
+                    .apply_to(&mut snapshot);
+                observation.snapshot = Some(snapshot);
+            }
+            writeln!(
+                out,
+                "{}",
+                rtp_fields(observation, captured.trace_elapsed).join(",")
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_netem(&self) -> io::Result<()> {
+        let mut out = csv_writer(self.output_dir.join("netem.csv"))?;
+        writeln!(
+            out,
+            "elapsed_us,trace_elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,forwarded_bytes,received_bytes,overflow_dropped,scheduled_drain_batches,scheduled_drain_packets,scheduled_drain_max_packets,queue_len"
+        )?;
+        for observation in &self.netem {
+            write_netem_row(
+                &mut out,
+                observation.elapsed,
+                observation.trace_elapsed,
+                "c2s",
+                observation.c2s,
+            )?;
+            write_netem_row(
+                &mut out,
+                observation.elapsed,
+                observation.trace_elapsed,
+                "s2c",
+                observation.s2c,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_progress(&self) -> io::Result<()> {
+        let mut out = csv_writer(self.output_dir.join("progress.csv"))?;
+        writeln!(out, "elapsed_us,trace_elapsed_us,delivered_bytes")?;
+        for observation in &self.netem {
+            writeln!(
+                out,
+                "{},{},{}",
+                observation.elapsed.as_micros(),
+                observation.trace_elapsed.as_micros(),
+                observation.delivered_bytes,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn write_capture_health(
+    out: &mut impl Write,
+    prefix: &str,
+    capture: &RtpCapture,
+) -> io::Result<()> {
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_captured"),
+            &capture.observations.lock().unwrap().len().to_string(),
+        ],
+    )?;
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_dropped_capacity"),
+            &capture.dropped_capacity.load(Ordering::Relaxed).to_string(),
+        ],
+    )?;
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_counter_baseline_present"),
+            &capture
+                .counter_baseline
+                .lock()
+                .unwrap()
+                .is_some()
+                .to_string(),
+        ],
+    )?;
+    for cause in MetricsGentleExitCause::ALL {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_gentle_mode_exit_{}", cause.as_str()),
+                &capture.gentle_exits.load(cause).to_string(),
+            ],
+        )?;
+    }
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_retransmission_armor_duplicates"),
+            &capture
+                .retransmission_armor_duplicates
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ],
+    )?;
+    write_csv_row(
+        out,
+        &[
+            &format!("{prefix}_data_send_would_blocks"),
+            &capture
+                .data_send_would_blocks
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ],
+    )?;
+    for reason in MetricsAckFlushReason::ALL {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_ack_flush_{}_claims", reason.as_str()),
+                &capture.ack_flushes.load(reason).to_string(),
+            ],
+        )?;
+    }
+    for (wake, count) in [
+        (
+            "resume_signal",
+            capture
+                .send_driver_resume_signal_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "ack_schedule_signal",
+            capture
+                .send_driver_ack_schedule_signal_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "pacing_timer",
+            capture
+                .send_driver_pacing_timer_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "protocol_timer",
+            capture
+                .send_driver_protocol_timer_wakes
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "kill_requested",
+            capture
+                .send_driver_kill_requested_wakes
+                .load(Ordering::Relaxed),
+        ),
+    ] {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_send_driver_{wake}_wakes"),
+                &count.to_string(),
+            ],
+        )?;
+    }
+    for (source, count) in [
+        (
+            "application_data",
+            capture
+                .send_driver_resume_application_data_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "application_frame",
+            capture
+                .send_driver_resume_application_frame_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "application_finish",
+            capture
+                .send_driver_resume_application_finish_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "peer_ack",
+            capture
+                .send_driver_resume_peer_ack_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "ack_flush",
+            capture
+                .send_driver_resume_ack_flush_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "post_open_handshake",
+            capture
+                .send_driver_resume_post_open_handshake_requests
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "receive_opportunity",
+            capture
+                .send_driver_resume_receive_opportunity_requests
+                .load(Ordering::Relaxed),
+        ),
+    ] {
+        write_csv_row(
+            out,
+            &[
+                &format!("{prefix}_send_driver_resume_{source}_requests"),
+                &count.to_string(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn csv_writer(path: impl AsRef<Path>) -> io::Result<BufWriter<File>> {
+    Ok(BufWriter::new(File::create(path)?))
+}
+
+fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<String> {
+    let termination = match observation.event {
+        MetricsEvent::SessionTermination(termination) => Some(termination),
+        _ => None,
+    };
+    let mut fields = vec![
+        observation.schema_version.to_string(),
+        observation.event_index.to_string(),
+        observation.elapsed.as_micros().to_string(),
+        observation.event.as_str().to_owned(),
+        termination
+            .map(|termination| termination.cause.as_str().to_owned())
+            .unwrap_or_default(),
+        termination
+            .map(|termination| termination.error_kind_str().to_owned())
+            .unwrap_or_default(),
+        termination
+            .and_then(|termination| termination.raw_os_error)
+            .map(|error| error.to_string())
+            .unwrap_or_default(),
+        optional_u128(observation.raw_rtt_sample.map(|value| value.as_micros())),
+    ];
+    if let Some(snapshot) = observation.snapshot {
+        fields.extend([
+            snapshot.pacer_tokens_packets.to_string(),
+            snapshot.send_rate_packets_per_second.to_string(),
+            optional_f64(snapshot.loss_ratio),
+            snapshot.in_flight_packets.to_string(),
+            snapshot.packets_in_pipe.to_string(),
+            snapshot.retransmission_active_packets.to_string(),
+            snapshot.retransmission_ready_packets.to_string(),
+            snapshot.retransmitted_packets.to_string(),
+            snapshot.retransmission_counters.attempts.to_string(),
+            snapshot.retransmission_counters.first_attempts.to_string(),
+            snapshot.retransmission_counters.repeat_attempts.to_string(),
+            snapshot.retransmission_counters.rto_reason.to_string(),
+            snapshot.retransmission_counters.reorder_reason.to_string(),
+            snapshot
+                .retransmission_counters
+                .fast_loss_reason
+                .to_string(),
+            snapshot
+                .retransmission_counters
+                .pre_outage_reason
+                .to_string(),
+            snapshot.retransmission_counters.tail_probes.to_string(),
+        ]);
+        if let Some(fec) = snapshot.fec_counters {
+            fields.extend([
+                fec.parity_sent.to_string(),
+                fec.groups_flushed.to_string(),
+                fec.flushed_group_sizes.one.to_string(),
+                fec.flushed_group_sizes.two_to_four.to_string(),
+                fec.flushed_group_sizes.five_to_seven.to_string(),
+                fec.flushed_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_no_surplus_tokens.to_string(),
+                fec.no_surplus_group_sizes.one.to_string(),
+                fec.no_surplus_group_sizes.two_to_four.to_string(),
+                fec.no_surplus_group_sizes.five_to_seven.to_string(),
+                fec.no_surplus_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_burst_end.to_string(),
+                fec.burst_end_group_sizes.one.to_string(),
+                fec.burst_end_group_sizes.two_to_four.to_string(),
+                fec.burst_end_group_sizes.five_to_seven.to_string(),
+                fec.burst_end_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_loss_gate.to_string(),
+                fec.loss_gate_group_sizes.one.to_string(),
+                fec.loss_gate_group_sizes.two_to_four.to_string(),
+                fec.loss_gate_group_sizes.five_to_seven.to_string(),
+                fec.loss_gate_group_sizes.full_eight.to_string(),
+                fec.groups_skipped_no_spare_capacity.to_string(),
+                fec.no_spare_capacity_group_sizes.one.to_string(),
+                fec.no_spare_capacity_group_sizes.two_to_four.to_string(),
+                fec.no_spare_capacity_group_sizes.five_to_seven.to_string(),
+                fec.no_spare_capacity_group_sizes.full_eight.to_string(),
+                fec.recovered_symbols.to_string(),
+                fec.dropped_malformed_packets.to_string(),
+                fec.dropped_decoder_panics.to_string(),
+                fec.rejected_recovered_symbols.to_string(),
+            ]);
+        } else {
+            fields.extend(std::iter::repeat_with(String::new).take(30));
+        }
+        fields.extend([
+            snapshot.next_send_sequence.to_string(),
+            optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
+            snapshot.smoothed_rtt.as_micros().to_string(),
+            snapshot.retransmission_timeout.as_micros().to_string(),
+            optional_u128(
+                snapshot
+                    .oldest_pipe_packet_age
+                    .map(|value| value.as_micros()),
+            ),
+            optional_u128(
+                snapshot
+                    .maximum_packet_rto_overdue
+                    .map(|value| value.as_micros()),
+            ),
+            snapshot.rto_deadline_postponements.to_string(),
+            snapshot.congestion_window_packets.to_string(),
+            snapshot.received_packets.to_string(),
+            optional_u64(snapshot.next_receive_sequence),
+            optional_f64(snapshot.delivery_rate_packets_per_second),
+            optional_bool(snapshot.delivery_sample_app_limited),
+            snapshot.application_write_waiters.to_string(),
+            snapshot.application_limited_detections.to_string(),
+            snapshot
+                .application_limited_detections_suppressed_by_waiting_writer
+                .to_string(),
+            optional_u128(
+                snapshot
+                    .congestion_control_rtt
+                    .map(|value| value.as_micros()),
+            ),
+            optional_u128(snapshot.congestion_rtt_floor.map(|value| value.as_micros())),
+            optional_u128(
+                snapshot
+                    .congestion_queue_tolerance
+                    .map(|value| value.as_micros()),
+            ),
+            optional_u128(
+                snapshot
+                    .congestion_persistent_queue_for
+                    .map(|value| value.as_micros()),
+            ),
+            snapshot.congestion_persistent_queue_resets.to_string(),
+            optional_f64(snapshot.congestion_delivery_peak_packets_per_second),
+            optional_f64(snapshot.congestion_drain_floor_packets_per_second),
+            optional_f64(snapshot.congestion_drain_target_packets_per_second),
+            optional_f64(snapshot.congestion_loss_backoff_floor_packets_per_second),
+            optional_f64(snapshot.congestion_loss_backoff_raw_target_packets_per_second),
+            optional_f64(snapshot.congestion_loss_backoff_target_packets_per_second),
+            snapshot.congestion_loss_backoffs.to_string(),
+            snapshot.congestion_loss_backoff_floor_bindings.to_string(),
+            snapshot.congestion_rate_samples.to_string(),
+            snapshot.congestion_bandwidth_probe_decisions.to_string(),
+            snapshot.congestion_bandwidth_probe_increases.to_string(),
+            snapshot
+                .congestion_bandwidth_probe_before_feedback
+                .to_string(),
+            optional_u128(
+                snapshot
+                    .congestion_last_bandwidth_probe_interval
+                    .map(|value| value.as_micros()),
+            ),
+            snapshot.congestion_delay_drains.to_string(),
+            snapshot.pending_send_bytes.to_string(),
+            snapshot.send_stage_capacity_bytes.to_string(),
+            snapshot.accepts_new_packet.to_string(),
+            snapshot.slow_start.to_string(),
+            snapshot.gentle_mode.to_string(),
+            snapshot.gentle_draining.to_string(),
+            snapshot.queue_building.to_string(),
+            snapshot.drain_floor_binding.to_string(),
+            snapshot.outage_recovery.to_string(),
+            optional_u128(snapshot.no_response_for.map(|value| value.as_micros())),
+            optional_u128(snapshot.no_progress_for.map(|value| value.as_micros())),
+            snapshot
+                .stall_reason
+                .map(|reason| reason.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            optional_f64(snapshot.congestion_loss_ratio),
+            snapshot
+                .congestion_action
+                .map(|action| action.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        ]);
+    } else {
+        fields.resize(RTP_TRACE_COLUMNS - 1, String::new());
+    }
+    fields.push(trace_elapsed.as_micros().to_string());
+    debug_assert_eq!(fields.len(), RTP_TRACE_COLUMNS);
+    fields
+}
+
+fn write_netem_row(
+    out: &mut impl Write,
+    elapsed: Duration,
+    trace_elapsed: Duration,
+    direction: &str,
+    snapshot: CountersSnapshot,
+) -> io::Result<()> {
+    let stats = snapshot.stats;
+    writeln!(
+        out,
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        elapsed.as_micros(),
+        trace_elapsed.as_micros(),
+        direction,
+        stats.delayed,
+        stats.dropped,
+        stats.duplicated,
+        stats.reordered,
+        stats.rate_limited,
+        stats.forwarded,
+        stats.received,
+        stats.forwarded_bytes,
+        stats.received_bytes,
+        stats.overflow_dropped,
+        stats.scheduled_drain_batches,
+        stats.scheduled_drain_packets,
+        stats.scheduled_drain_max_packets,
+        snapshot.queue_len,
+    )
+}
+
+fn write_csv_row(out: &mut impl Write, values: &[&str]) -> io::Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            write!(out, ",")?;
+        }
+        write!(out, "\"{}\"", value.replace('"', "\"\""))?;
+    }
+    writeln!(out)
+}
+
+fn optional_u128(value: Option<u128>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_f64(value: Option<f64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn optional_bool(value: Option<bool>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{
+        MetricsSendDriverResumeSource, MetricsSendDriverWake, MetricsSnapshot, MetricsTermination,
+        MetricsTerminationCause, SCHEMA_VERSION,
+    };
+
+    fn observation(event_index: u64, elapsed_ms: u64, event: MetricsEvent) -> MetricsObservation {
+        MetricsObservation {
+            schema_version: SCHEMA_VERSION,
+            event_index,
+            elapsed: Duration::from_millis(elapsed_ms),
+            event,
+            raw_rtt_sample: (event == MetricsEvent::RttSample).then(|| Duration::from_millis(20)),
+            snapshot: Some(MetricsSnapshot {
+                pacer_tokens_packets: 0.0,
+                send_rate_packets_per_second: 1.0,
+                loss_ratio: None,
+                congestion_loss_ratio: None,
+                congestion_action: None,
+                in_flight_packets: 0,
+                packets_in_pipe: 0,
+                retransmission_active_packets: 0,
+                retransmission_ready_packets: 0,
+                retransmitted_packets: 0,
+                next_send_sequence: 0,
+                minimum_rtt: None,
+                smoothed_rtt: Duration::from_millis(20),
+                retransmission_timeout: Duration::from_millis(1000),
+                oldest_pipe_packet_age: None,
+                maximum_packet_rto_overdue: None,
+                rto_deadline_postponements: 0,
+                congestion_window_packets: 1,
+                received_packets: 0,
+                next_receive_sequence: None,
+                delivery_rate_packets_per_second: None,
+                delivery_sample_app_limited: None,
+                retransmission_counters: MetricsRetransmissionCounters::default(),
+                fec_counters: None,
+                application_write_waiters: 0,
+                application_limited_detections: 0,
+                application_limited_detections_suppressed_by_waiting_writer: 0,
+                congestion_control_rtt: None,
+                congestion_rtt_floor: None,
+                congestion_queue_tolerance: None,
+                congestion_persistent_queue_for: None,
+                congestion_persistent_queue_resets: 0,
+                congestion_delivery_peak_packets_per_second: None,
+                congestion_drain_floor_packets_per_second: None,
+                congestion_drain_target_packets_per_second: None,
+                congestion_loss_backoff_floor_packets_per_second: None,
+                congestion_loss_backoff_raw_target_packets_per_second: None,
+                congestion_loss_backoff_target_packets_per_second: None,
+                congestion_loss_backoffs: 0,
+                congestion_loss_backoff_floor_bindings: 0,
+                congestion_rate_samples: 0,
+                congestion_bandwidth_probe_decisions: 0,
+                congestion_bandwidth_probe_increases: 0,
+                congestion_bandwidth_probe_before_feedback: 0,
+                congestion_last_bandwidth_probe_interval: None,
+                congestion_delay_drains: 0,
+                pending_send_bytes: 0,
+                send_stage_capacity_bytes: 8192,
+                accepts_new_packet: true,
+                slow_start: true,
+                gentle_mode: false,
+                gentle_draining: false,
+                queue_building: false,
+                drain_floor_binding: false,
+                outage_recovery: false,
+                no_response_for: None,
+                no_progress_for: None,
+                stall_reason: None,
+            }),
+        }
+    }
+
+    fn capture(trace_start: Instant, capacity: usize) -> RtpCapture {
+        RtpCapture::new(trace_start, capacity)
+    }
+
+    #[test]
+    fn state_and_rtt_samples_are_each_time_decimated_on_independent_clocks() {
+        let capture = capture(Instant::now(), 8);
+        // The first event claims the state clock.
+        assert_eq!(
+            capture.interest(MetricsEvent::SendDataPacketAttempt, Duration::ZERO),
+            MetricsInterest::Snapshot
+        );
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        // A second state event inside the state interval is throttled even
+        // though the RTT clock is still unclaimed: the clocks are independent.
+        assert_eq!(
+            capture.interest(
+                MetricsEvent::SendDataPacketAttempt,
+                Duration::from_millis(1)
+            ),
+            MetricsInterest::Skip
+        );
+        // The first raw RTT sample claims the RTT clock and is retained.
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(2)),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(2, 2, MetricsEvent::RttSample));
+        // Raw RTT samples are time-decimated on their own clock, mirroring
+        // the state throttle: a sample inside the RTT interval is not
+        // retained, so arbitrarily fast lanes cannot exhaust storage.
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(3)),
+            MetricsInterest::Skip,
+            "raw RTT samples inside {RTT_SAMPLE_INTERVAL:?} of the previous \
+             claim must be decimated"
+        );
+        // The state clock is due again at 50 ms and claims independently of
+        // the RTT clock.
+        assert_eq!(
+            capture.interest(MetricsEvent::ReceiveAckPacket, Duration::from_millis(50)),
+            MetricsInterest::Snapshot
+        );
+        capture.record(observation(4, 50, MetricsEvent::ReceiveAckPacket));
+        // One RTT interval after its own prior claim the RTT clock is due
+        // again: the sample is retained even though it is inside the state
+        // interval.
+        let rtt_due = Duration::from_millis(2) + RTT_SAMPLE_INTERVAL;
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, rtt_due),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(5, 52, MetricsEvent::RttSample));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, rtt_due + Duration::from_millis(1)),
+            MetricsInterest::Skip
+        );
+        // Termination bypasses both throttles.
+        assert_eq!(
+            capture.interest(
+                MetricsEvent::SessionTermination(MetricsTermination {
+                    cause: MetricsTerminationCause::ProactiveStall,
+                    error_kind: std::io::ErrorKind::BrokenPipe,
+                    raw_os_error: None,
+                }),
+                Duration::from_millis(60)
+            ),
+            MetricsInterest::Snapshot,
+            "termination must bypass the periodic state and RTT throttles"
+        );
+
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 4);
+        assert_eq!(observations[0].observation.event_index, 0);
+        assert_eq!(observations[1].observation.event_index, 2);
+        assert_eq!(observations[2].observation.event_index, 4);
+        assert_eq!(observations[3].observation.event_index, 5);
+        // Every captured row carries its shared trace-clock position.
+        for captured in observations.iter() {
+            assert!(!captured.trace_elapsed.is_zero());
+        }
+    }
+
+    #[test]
+    fn rtt_decimation_clock_resets_at_the_measurement_boundary() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 8);
+        // Warmup: the first event claims the state clock; the next RTT sample
+        // claims the RTT clock; the one after is decimated.
+        assert_eq!(
+            capture.interest(MetricsEvent::SendDataPacketAttempt, Duration::ZERO),
+            MetricsInterest::Snapshot
+        );
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(1)),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(1, 1, MetricsEvent::RttSample));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(2)),
+            MetricsInterest::Skip
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let boundary = trace_start.elapsed();
+        capture.begin_measurement(boundary);
+        // Both decimation clocks reset with the capacity state: warmup rows
+        // are discarded and the first post-boundary event claims the state
+        // clock again ...
+        assert_eq!(
+            capture.interest(
+                MetricsEvent::SendDataPacketAttempt,
+                Duration::from_millis(100)
+            ),
+            MetricsInterest::Snapshot
+        );
+        capture.record(observation(100, 100, MetricsEvent::SendDataPacketAttempt));
+        // ... while the first post-boundary RTT sample claims the RTT clock
+        // again, even though it arrives inside the state interval.
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(101)),
+            MetricsInterest::EventOnly
+        );
+        capture.record(observation(101, 101, MetricsEvent::RttSample));
+        assert_eq!(
+            capture.interest(MetricsEvent::RttSample, Duration::from_millis(102)),
+            MetricsInterest::Skip
+        );
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].observation.event_index, 100);
+        assert_eq!(observations[1].observation.event_index, 101);
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn event_only_and_snapshot_rows_match_the_schema_width() {
+        assert_eq!(RTP_TRACE_HEADER.split(',').count(), RTP_TRACE_COLUMNS);
+        let mut snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
+        snapshot.snapshot.as_mut().unwrap().fec_counters = Some(MetricsFecCounters {
+            parity_sent: 1,
+            groups_flushed: 2,
+            flushed_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 3,
+                two_to_four: 4,
+                five_to_seven: 5,
+                full_eight: 6,
+            },
+            groups_skipped_no_surplus_tokens: 7,
+            no_surplus_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 8,
+                two_to_four: 9,
+                five_to_seven: 10,
+                full_eight: 11,
+            },
+            groups_skipped_burst_end: 12,
+            burst_end_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 13,
+                two_to_four: 14,
+                five_to_seven: 15,
+                full_eight: 16,
+            },
+            groups_skipped_loss_gate: 17,
+            loss_gate_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 18,
+                two_to_four: 19,
+                five_to_seven: 20,
+                full_eight: 21,
+            },
+            groups_skipped_no_spare_capacity: 22,
+            no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets {
+                one: 23,
+                two_to_four: 24,
+                five_to_seven: 25,
+                full_eight: 26,
+            },
+            recovered_symbols: 27,
+            dropped_malformed_packets: 28,
+            dropped_decoder_panics: 29,
+            rejected_recovered_symbols: 30,
+        });
+        let mut event_only = observation(1, 1, MetricsEvent::RttSample);
+        event_only.snapshot = None;
+        let trace_elapsed = Duration::from_micros(123);
+        let snapshot_fields = rtp_fields(snapshot, trace_elapsed);
+        assert_eq!(snapshot_fields.len(), RTP_TRACE_COLUMNS);
+        let event_only_fields = rtp_fields(event_only, trace_elapsed);
+        assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS);
+        assert_eq!(event_only_fields[7], "20000");
+        assert!(
+            event_only_fields[8..RTP_TRACE_COLUMNS - 1]
+                .iter()
+                .all(String::is_empty)
+        );
+        assert_eq!(event_only_fields[RTP_TRACE_COLUMNS - 1], "123");
+
+        // The 30 typed FEC columns sit immediately after `tail_probe_attempts`.
+        let columns: Vec<&str> = RTP_TRACE_HEADER.split(',').collect();
+        let fec_start = columns
+            .iter()
+            .position(|column| *column == "tail_probe_attempts")
+            .unwrap()
+            + 1;
+        let fec_end = columns
+            .iter()
+            .position(|column| *column == "next_send_sequence")
+            .unwrap();
+        assert_eq!(fec_end - fec_start, 30);
+        for (index, column) in columns[fec_start..fec_end].iter().enumerate() {
+            assert!(
+                column.starts_with("fec_"),
+                "column {} must be an FEC column: {column}",
+                index
+            );
+        }
+        // Snapshot rows serialize every FEC member in header order ...
+        let expected_fec: Vec<&str> = vec![
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+            "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30",
+        ];
+        assert_eq!(&snapshot_fields[fec_start..fec_end], &expected_fec);
+        // ... while event-only rows leave them empty, preserving the width.
+        assert!(
+            event_only_fields[fec_start..fec_end]
+                .iter()
+                .all(String::is_empty)
+        );
+    }
+
+    #[test]
+    fn sealed_capture_rejects_callbacks_after_finish_starts() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 2);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        capture.seal();
+        // A callback that raced past the finish boundary must be rejected:
+        // the captured set is frozen and the count does not grow.
+        capture.record(observation(1, 1, MetricsEvent::SendDataPacketAttempt));
+        capture.record(observation(2, 2, MetricsEvent::RttSample));
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observation.event_index, 0);
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn observer_free_capture_has_no_rtp_callback() {
+        let trace = PerfTrace::new(PathBuf::from("unused"), false);
+        assert!(trace.rtp_observer().is_none());
+        assert!(trace.rtp_peer_observer().is_none());
+    }
+
+    #[test]
+    fn measurement_boundary_discards_warmup_rows_and_resets_capacity_state() {
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 2);
+        for index in 0..3 {
+            capture.record(observation(
+                index,
+                index,
+                MetricsEvent::SendDataPacketAttempt,
+            ));
+        }
+        // The third row overflows the bounded capacity while still warmup.
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        let boundary = trace_start.elapsed();
+        capture.begin_measurement(boundary);
+        // Warmup rows are discarded and the capacity state is reset, but the
+        // last pre-boundary snapshot is retained as the counter baseline.
+        assert_eq!(capture.observations.lock().unwrap().len(), 0);
+        assert_eq!(capture.dropped_capacity.load(Ordering::Relaxed), 0);
+        assert!(
+            capture.counter_baseline.lock().unwrap().is_some(),
+            "begin_measurement must retain the last pre-boundary snapshot as the counter baseline"
+        );
+        capture.record(observation(3, 3, MetricsEvent::SendDataPacketAttempt));
+        let observations = capture.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observation.event_index, 3);
+    }
+
+    #[test]
+    fn ack_flush_reasons_are_counted_without_consuming_trace_rows() {
+        use crate::metrics::MetricsAckFlushReason;
+        let capture = capture(Instant::now(), 8);
+        for (index, reason) in [
+            MetricsAckFlushReason::Initial,
+            MetricsAckFlushReason::Age,
+            MetricsAckFlushReason::Count,
+            MetricsAckFlushReason::Fin,
+            MetricsAckFlushReason::Explicit,
+            MetricsAckFlushReason::Initial,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::AckFlush(reason),
+                    Duration::from_millis(index as u64)
+                ),
+                MetricsInterest::Skip,
+                "a claim event is a counted aggregate, never a state row"
+            );
+        }
+        assert_eq!(
+            capture.observations.lock().unwrap().len(),
+            0,
+            "claim counters must not consume bounded state-row capacity"
+        );
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Initial), 2);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Age), 1);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Count), 1);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Fin), 1);
+        assert_eq!(capture.ack_flushes.load(MetricsAckFlushReason::Explicit), 1);
+        // The measurement boundary rebases the claim counters alongside the
+        // other aggregates.
+        capture.begin_measurement(capture.trace_start.elapsed());
+        assert_eq!(
+            capture.ack_flushes.load(MetricsAckFlushReason::Initial),
+            0,
+            "begin_measurement must reset the claim counters"
+        );
+    }
+
+    #[test]
+    fn cumulative_counters_start_at_the_measurement_boundary() {
+        fn fec(base: u64, malformed: u64) -> MetricsFecCounters {
+            MetricsFecCounters {
+                parity_sent: base,
+                groups_flushed: base,
+                flushed_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_no_surplus_tokens: base,
+                no_surplus_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_burst_end: base,
+                burst_end_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_loss_gate: base,
+                loss_gate_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                groups_skipped_no_spare_capacity: base,
+                no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets {
+                    one: base,
+                    two_to_four: base,
+                    five_to_seven: base,
+                    full_eight: base,
+                },
+                recovered_symbols: base,
+                dropped_malformed_packets: malformed,
+                dropped_decoder_panics: base,
+                rejected_recovered_symbols: base,
+            }
+        }
+        // Stamp every cumulative retransmission and FEC member onto a
+        // snapshot; `malformed` lets the malformed-packet input decrease so
+        // the saturating subtraction is exercised.
+        fn stamp(snapshot: &mut MetricsSnapshot, base: u64, malformed: u64) {
+            snapshot.retransmission_counters = MetricsRetransmissionCounters {
+                attempts: base,
+                first_attempts: base,
+                repeat_attempts: base,
+                rto_reason: base,
+                reorder_reason: base,
+                fast_loss_reason: base,
+                pre_outage_reason: base,
+                tail_probes: base,
+            };
+            snapshot.fec_counters = Some(fec(base, malformed));
+            snapshot.rto_deadline_postponements = base;
+            snapshot.application_limited_detections = base;
+            snapshot.application_limited_detections_suppressed_by_waiting_writer = base;
+            snapshot.congestion_rate_samples = base;
+            snapshot.congestion_bandwidth_probe_decisions = base;
+            snapshot.congestion_bandwidth_probe_increases = base;
+            snapshot.congestion_bandwidth_probe_before_feedback = base;
+            snapshot.congestion_persistent_queue_resets = base;
+            snapshot.congestion_delay_drains = base;
+            snapshot.congestion_loss_backoffs = base;
+            snapshot.congestion_loss_backoff_floor_bindings = base;
+        }
+
+        let trace_start = Instant::now();
+        let capture = capture(trace_start, 8);
+        let mut warmup = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
+        stamp(warmup.snapshot.as_mut().unwrap(), 10, 10);
+        capture.record(warmup);
+        std::thread::sleep(Duration::from_millis(2));
+        let mut boundary_snapshot = observation(1, 1, MetricsEvent::ReceiveAckPacket);
+        stamp(boundary_snapshot.snapshot.as_mut().unwrap(), 17, 17);
+        capture.record(boundary_snapshot);
+        std::thread::sleep(Duration::from_millis(2));
+        let boundary = trace_start.elapsed();
+        capture.begin_measurement(boundary);
+        // The baseline is the last pre-boundary snapshot.
+        let baseline = capture.counter_baseline.lock().unwrap().unwrap();
+        assert_eq!(baseline.rto_deadline_postponements, 17);
+        let mut after = observation(2, 2, MetricsEvent::SendDataPacketAttempt);
+        // The malformed-packet input decreases from 17 to 12: saturating
+        // subtraction must rebase it to zero, never wrapping.
+        stamp(after.snapshot.as_mut().unwrap(), 23, 12);
+        capture.record(after);
+        let retained = capture.observations.lock().unwrap();
+        assert_eq!(retained.len(), 1);
+        let snapshot = retained[0].observation.snapshot.unwrap();
+        drop(retained);
+        let rebased = CumulativeCounters::from_snapshot(snapshot).since(baseline);
+        // Every retransmission member rebases 23 - 17.
+        assert_eq!(
+            rebased.retransmission,
+            MetricsRetransmissionCounters {
+                attempts: 6,
+                first_attempts: 6,
+                repeat_attempts: 6,
+                rto_reason: 6,
+                reorder_reason: 6,
+                fast_loss_reason: 6,
+                pre_outage_reason: 6,
+                tail_probes: 6,
+            }
+        );
+        // Every FEC member rebases 23 - 17 except the decreasing malformed
+        // input, which saturates to zero; the lane stays `Some` throughout.
+        assert_eq!(rebased.fec, Some(fec(6, 0)));
+        assert_eq!(rebased.rto_deadline_postponements, 6);
+        assert_eq!(rebased.application_limited_detections, 6);
+        assert_eq!(rebased.application_limited_suppressions, 6);
+        assert_eq!(rebased.congestion_rate_samples, 6);
+        assert_eq!(rebased.congestion_probe_decisions, 6);
+        assert_eq!(rebased.congestion_probe_increases, 6);
+        assert_eq!(rebased.congestion_probe_before_feedback, 6);
+        assert_eq!(rebased.congestion_persistent_queue_resets, 6);
+        assert_eq!(rebased.congestion_delay_drains, 6);
+        assert_eq!(rebased.congestion_loss_backoffs, 6);
+        assert_eq!(rebased.congestion_loss_backoff_floor_bindings, 6);
+        // apply_to restores the typed FEC counters onto the snapshot.
+        let mut applied = snapshot;
+        rebased.apply_to(&mut applied);
+        assert_eq!(applied.fec_counters, Some(fec(6, 0)));
+        assert_eq!(applied.retransmission_counters.attempts, 6);
+        // A non-FEC lane stays `None`, never fabricated zero.
+        let mut no_fec = observation(3, 3, MetricsEvent::SendDataPacketAttempt);
+        stamp(no_fec.snapshot.as_mut().unwrap(), 23, 12);
+        no_fec.snapshot.as_mut().unwrap().fec_counters = None;
+        let mut no_fec_baseline = observation(4, 4, MetricsEvent::SendDataPacketAttempt);
+        stamp(no_fec_baseline.snapshot.as_mut().unwrap(), 17, 17);
+        no_fec_baseline.snapshot.as_mut().unwrap().fec_counters = None;
+        let rebased_none = CumulativeCounters::from_snapshot(no_fec.snapshot.unwrap()).since(
+            CumulativeCounters::from_snapshot(no_fec_baseline.snapshot.unwrap()),
+        );
+        assert_eq!(rebased_none.fec, None);
+    }
+
+    #[test]
+    fn send_driver_wakes_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        for wake in [
+            MetricsSendDriverWake::ResumeSignal,
+            MetricsSendDriverWake::AckScheduleSignal,
+            MetricsSendDriverWake::PacingTimer,
+            MetricsSendDriverWake::ProtocolTimer,
+            MetricsSendDriverWake::KillRequested,
+        ] {
+            assert_eq!(
+                capture.interest(MetricsEvent::SendDriverWake(wake), Duration::from_millis(1)),
+                MetricsInterest::Skip,
+            );
+        }
+        assert_eq!(
+            capture
+                .send_driver_resume_signal_wakes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_ack_schedule_signal_wakes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_pacing_timer_wakes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_protocol_timer_wakes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_kill_requested_wakes
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn gentle_mode_exit_causes_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        for cause in MetricsGentleExitCause::ALL {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::GentleModeExit(cause),
+                    Duration::from_millis(1)
+                ),
+                MetricsInterest::Skip,
+            );
+            assert_eq!(capture.gentle_exits.load(cause), 1);
+        }
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn retransmission_armor_duplicates_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        assert_eq!(
+            capture.interest(
+                MetricsEvent::RetransmissionArmorDuplicate,
+                Duration::from_millis(1)
+            ),
+            MetricsInterest::Skip,
+        );
+        assert_eq!(
+            capture
+                .retransmission_armor_duplicates
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn data_send_would_blocks_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        assert_eq!(
+            capture.interest(MetricsEvent::DataSendWouldBlock, Duration::from_millis(1)),
+            MetricsInterest::Skip,
+        );
+        assert_eq!(capture.data_send_would_blocks.load(Ordering::Relaxed), 1);
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+
+    #[test]
+    fn send_driver_resume_requests_are_counted_without_consuming_trace_rows() {
+        let capture = capture(Instant::now(), 8);
+        capture.record(observation(0, 0, MetricsEvent::SendDataPacketAttempt));
+        let rows_before = capture.observations.lock().unwrap().len();
+        for source in [
+            MetricsSendDriverResumeSource::ApplicationData,
+            MetricsSendDriverResumeSource::ApplicationFrame,
+            MetricsSendDriverResumeSource::ApplicationFinish,
+            MetricsSendDriverResumeSource::PeerAck,
+            MetricsSendDriverResumeSource::AckFlush,
+            MetricsSendDriverResumeSource::PostOpenHandshake,
+            MetricsSendDriverResumeSource::ReceiveOpportunity,
+        ] {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::SendDriverResumeRequest(source),
+                    Duration::from_millis(1)
+                ),
+                MetricsInterest::Skip,
+            );
+        }
+        assert_eq!(
+            capture
+                .send_driver_resume_application_data_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_application_frame_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_application_finish_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_peer_ack_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_ack_flush_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_post_open_handshake_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            capture
+                .send_driver_resume_receive_opportunity_requests
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(capture.observations.lock().unwrap().len(), rows_before);
+    }
+}
