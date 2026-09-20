@@ -274,6 +274,34 @@ mod tests {
         assert_eq!(SendWake::after_send_pass(now, None, None), SendWake::Event);
     }
 
+    /// The tie at `pacing == protocol` must resolve to `Pacing`, not
+    /// `Protocol`: the guard is INCLUSIVE (`pacing <= protocol`), so an
+    /// already-fabricated deadline that collides with the pacing deadline
+    /// still reports the pacing wake.
+    #[test]
+    fn a_tie_between_pacing_and_protocol_prefers_pacing() {
+        let now = Instant::now();
+        let tie = now + Duration::from_millis(7);
+        assert_eq!(
+            SendWake::after_send_pass(now, Some(tie), Some(tie)),
+            SendWake::Pacing(tie),
+            "the exact pacing/protocol tie must report Pacing, not Protocol"
+        );
+        // One instant earlier on each side stays on its own arm.
+        let pacing = now + Duration::from_millis(7);
+        let protocol = now + Duration::from_millis(8);
+        assert_eq!(
+            SendWake::after_send_pass(now, Some(pacing), Some(protocol)),
+            SendWake::Pacing(pacing)
+        );
+        let pacing = now + Duration::from_millis(8);
+        let protocol = now + Duration::from_millis(7);
+        assert_eq!(
+            SendWake::after_send_pass(now, Some(pacing), Some(protocol)),
+            SendWake::Protocol(protocol)
+        );
+    }
+
     #[test]
     fn pacing_block_ignores_an_already_processed_protocol_deadline() {
         let now = Instant::now();

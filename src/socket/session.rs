@@ -11,6 +11,7 @@ use tokio::task::{JoinError, JoinSet};
 use super::stream::{ConnReader, ConnWriter};
 
 use crate::metrics::{MetricsEvent, MetricsSendDriverWake, MetricsTerminationCause};
+use crate::traffic_shaping::core::SendWake;
 use crate::transmission::ack_feedback::AckSchedule;
 
 use crate::transmission::{
@@ -177,6 +178,34 @@ impl TransmissionLayer {
 
 /// The send-driver task: runs send passes and waits for the next wake
 /// (resume signal, ACK schedule, pacing/protocol timer, kill, or shutdown).
+/// Label the next timed driver wake from the send-pass outcome and the
+/// current ACK schedule. `None` means the driver parks only on signals;
+/// `Some((deadline, label))` parks on a timer (and wakes early on a resume
+/// signal or kill). When the pacing deadline and the ACK deadline collide
+/// exactly the pacing label wins (`pacing <= ack`), mirroring
+/// [`SendWake::after_send_pass`] — the tie is deliberately inclusive so the
+/// wake label matches the convention that owns the pacing deadline.
+fn timed_wake_for(
+    next_wake: SendWake,
+    ack_deadline: Option<Instant>,
+) -> Option<(Instant, MetricsSendDriverWake)> {
+    match (next_wake, ack_deadline) {
+        (SendWake::Event, None) => None,
+        (SendWake::Event, Some(ack)) => Some((ack, MetricsSendDriverWake::ProtocolTimer)),
+        (SendWake::Pacing(pacing), None) => Some((pacing, MetricsSendDriverWake::PacingTimer)),
+        (SendWake::Pacing(pacing), Some(ack)) if pacing <= ack => {
+            Some((pacing, MetricsSendDriverWake::PacingTimer))
+        }
+        (SendWake::Pacing(_), Some(ack)) => Some((ack, MetricsSendDriverWake::ProtocolTimer)),
+        (SendWake::Protocol(protocol), None) => {
+            Some((protocol, MetricsSendDriverWake::ProtocolTimer))
+        }
+        (SendWake::Protocol(protocol), Some(ack)) => {
+            Some((protocol.min(ack), MetricsSendDriverWake::ProtocolTimer))
+        }
+    }
+}
+
 struct WriteDriver {
     write_half: WriteHalf,
     stop: tokio_util::sync::CancellationToken,
@@ -210,29 +239,7 @@ impl WriteDriver {
                     AckSchedule::At(deadline) => Some(deadline),
                     AckSchedule::Due(_) => break,
                 };
-                let timed_wake = match (next_wake, ack_deadline) {
-                    (crate::traffic_shaping::core::SendWake::Event, None) => None,
-                    (crate::traffic_shaping::core::SendWake::Event, Some(ack)) => {
-                        Some((ack, MetricsSendDriverWake::ProtocolTimer))
-                    }
-                    (crate::traffic_shaping::core::SendWake::Pacing(pacing), None) => {
-                        Some((pacing, MetricsSendDriverWake::PacingTimer))
-                    }
-                    (crate::traffic_shaping::core::SendWake::Pacing(pacing), Some(ack))
-                        if pacing <= ack =>
-                    {
-                        Some((pacing, MetricsSendDriverWake::PacingTimer))
-                    }
-                    (crate::traffic_shaping::core::SendWake::Pacing(_), Some(ack)) => {
-                        Some((ack, MetricsSendDriverWake::ProtocolTimer))
-                    }
-                    (crate::traffic_shaping::core::SendWake::Protocol(protocol), None) => {
-                        Some((protocol, MetricsSendDriverWake::ProtocolTimer))
-                    }
-                    (crate::traffic_shaping::core::SendWake::Protocol(protocol), Some(ack)) => {
-                        Some((protocol.min(ack), MetricsSendDriverWake::ProtocolTimer))
-                    }
-                };
+                let timed_wake = timed_wake_for(next_wake, ack_deadline);
                 let wake = match timed_wake {
                     Some((deadline, timer_wake)) => {
                         tokio::select! {
@@ -511,6 +518,60 @@ mod tests {
     use core::time::Duration;
     use std::sync::Mutex;
 
+    /// Every arm of the driver's timed-wake decision, including the exact
+    /// `pacing == ack` tie, which must keep the `PacingTimer` label (the
+    /// guard is inclusive, mirroring [`SendWake::after_send_pass`]).
+    #[test]
+    fn timed_wake_for_labels_every_arm_including_the_pacing_ack_tie() {
+        let now = Instant::now();
+        let tie = now + Duration::from_millis(5);
+        // Signal-only park when neither a pacing nor an ack deadline exists.
+        assert_eq!(timed_wake_for(SendWake::Event, None), None);
+        // Event + ack deadline: the ack deadline, protocol timer.
+        assert_eq!(
+            timed_wake_for(SendWake::Event, Some(tie)),
+            Some((tie, MetricsSendDriverWake::ProtocolTimer))
+        );
+        // Pacing deadline alone: the pacing deadline, pacing timer.
+        assert_eq!(
+            timed_wake_for(SendWake::Pacing(tie), None),
+            Some((tie, MetricsSendDriverWake::PacingTimer))
+        );
+        // Pacing strictly before the ack deadline: the pacing deadline wins.
+        let pacing = now + Duration::from_millis(4);
+        let ack = now + Duration::from_millis(5);
+        assert_eq!(
+            timed_wake_for(SendWake::Pacing(pacing), Some(ack)),
+            Some((pacing, MetricsSendDriverWake::PacingTimer))
+        );
+        // EXACT tie: the pacing deadline wins, label stays PacingTimer.
+        assert_eq!(
+            timed_wake_for(SendWake::Pacing(tie), Some(tie)),
+            Some((tie, MetricsSendDriverWake::PacingTimer)),
+            "the exact pacing/ack tie must keep the PacingTimer label"
+        );
+        // Pacing strictly after the ack deadline: the ack deadline wins.
+        let pacing_late = now + Duration::from_millis(6);
+        assert_eq!(
+            timed_wake_for(SendWake::Pacing(pacing_late), Some(ack)),
+            Some((ack, MetricsSendDriverWake::ProtocolTimer))
+        );
+        // Protocol deadline alone: the protocol deadline, protocol timer.
+        assert_eq!(
+            timed_wake_for(SendWake::Protocol(tie), None),
+            Some((tie, MetricsSendDriverWake::ProtocolTimer))
+        );
+        // Protocol + ack deadline: the earlier of the two, protocol timer.
+        let earlier = now + Duration::from_millis(3);
+        assert_eq!(
+            timed_wake_for(SendWake::Protocol(tie), Some(earlier)),
+            Some((earlier, MetricsSendDriverWake::ProtocolTimer))
+        );
+        assert_eq!(
+            timed_wake_for(SendWake::Protocol(earlier), Some(tie)),
+            Some((earlier, MetricsSendDriverWake::ProtocolTimer))
+        );
+    }
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
         use std::sync::atomic::{AtomicUsize, Ordering};
