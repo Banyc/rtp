@@ -63,3 +63,44 @@ pub(crate) fn control_plane_tag(
         None => splitmix64(obfuscation),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tags are a pure function of the two secrets: deterministic, and the
+    /// dispatch key both changes the tag (the `Some` arm must actually mix
+    /// it in) and separates sessions sharing one obfuscation key.
+    #[test]
+    fn tags_are_deterministic_and_dispatch_keys_separate_sessions() {
+        let obf = [7u8; KEY_LEN];
+        let other_obf = [8u8; KEY_LEN];
+        let none = control_plane_tag(obf, None);
+        let keyed_a = control_plane_tag(obf, Some(&[1, 2, 3]));
+        let keyed_b = control_plane_tag(obf, Some(&[9, 9, 9]));
+        assert_ne!(
+            none, keyed_a,
+            "mixing in a dispatch key must change the tag"
+        );
+        assert_ne!(
+            keyed_a, keyed_b,
+            "different dispatch keys must separate sessions sharing one obfuscation key"
+        );
+        assert_ne!(none, control_plane_tag(other_obf, None));
+        assert_eq!(control_plane_tag(obf, Some(&[1, 2, 3])), keyed_a, "deterministic");
+        assert_eq!(control_plane_tag(obf, None), none, "deterministic");
+    }
+
+    /// The exact derivation is pinned so a refactor cannot silently change
+    /// every session's control-plane tag: peers derive the same tag only by
+    /// running the same function over the same secrets.
+    #[test]
+    fn the_tag_derivation_matches_the_recorded_vector() {
+        let obf = [7u8; KEY_LEN];
+        assert_eq!(control_plane_tag(obf, None), 0xe4e2_66e0_1171_34bb);
+        assert_eq!(
+            control_plane_tag(obf, Some(&[42])),
+            0x3fae_37ba_2cbe_e6d2
+        );
+    }
+}
