@@ -39,8 +39,13 @@ testing = ["dep:netem-test"]
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.0.6" }
+# The relocated rtp scenario suites (step 5 of the relocation) consume the
+# impairment instrument and the generic helpers from the local harness
+# checkout behind its `test-kit` feature; the layer kit (`rtp::testkit`) is
+# enabled for the same test builds through the self dev-dependency below.
+netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
 rtp = { path = ".", features = ["testing"] }
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.profiling]
 inherits = "release"
