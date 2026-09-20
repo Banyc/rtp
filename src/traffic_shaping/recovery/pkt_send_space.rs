@@ -2957,6 +2957,52 @@ mod tests {
     }
 
     #[test]
+    fn a_fast_loss_rtx_at_exactly_the_stock_deadline_records_instead_of_defers() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        assert!(space.fast_loss_armed());
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+
+        let stock_window = space.rtt_stats.reorder_window();
+        // The fast-loss rtx lands EXACTLY on the original send time + stock
+        // reorder window: `loss_accounting` treats `now == deadline` as
+        // RecordNow (`now < deadline` is the only deferral trigger), so the
+        // loss event is recorded immediately and no deferred entry is left
+        // behind.
+        let rtx_t = t0 + stock_window;
+        let rtx = space.rtx(rtx_t).expect("fast loss should fire for seq 0");
+        assert_eq!(rtx.seq, sq(0));
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "an rtx at exactly the stock deadline must record the loss event now"
+        );
+        assert_eq!(
+            space.deferred_losses.len(),
+            0,
+            "an rtx at exactly the stock deadline must not defer the loss event"
+        );
+        let p = space
+            .send_wnd
+            .get(&sq(0))
+            .and_then(|o| o.as_ref())
+            .expect("seq 0 still in flight after rtx");
+        assert_eq!(
+            p.deferred_loss_baseline_deadline,
+            None,
+            "an rtx at exactly the stock deadline must carry no deferral baseline"
+        );
+    }
+
+    #[test]
     fn jitter_cap_defaults_on_and_accepts_an_explicit_diagnostic_disable() {
         assert!(super::jitter_cap_enabled(None));
         assert!(super::jitter_cap_enabled(Some("1")));
