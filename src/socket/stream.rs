@@ -1497,6 +1497,50 @@ mod tests {
         drop(write_stream);
     }
 
+    /// A write of EXACTLY `max_write_bytes` must be accepted whole (polled
+    /// to completion in one poll), never truncated to `max_write_bytes - 1`:
+    /// the oversize guard is strict (`buf.len() > max_write_bytes`), so the
+    /// exact-size write is a partial-write boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_at_exactly_max_write_bytes_is_not_truncated() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::AsyncWrite;
+        let fec = false;
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        // Frame-delivery mode: a write is exactly one wire frame, so the
+        // exact-size frame is the acceptance boundary (the oversize arm
+        // rejects with InvalidInput instead of truncating).
+        let a = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(a.clone()),
+            Box::new(a),
+            fec,
+            crate::udp::Mss::try_new(9_000).unwrap(),
+            crate::traffic_shaping::redundancy::fec::gate::FecTuning::default(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
+        )
+        .unwrap();
+        let b = wrap_fec(Box::new(b.clone()), Box::new(b), fec);
+        let (_a_r, a_w, _a_supervisor) = socket(a, None);
+        let (_b_r, _b_w, _b_supervisor) = socket(b, None);
+        let mut write_stream = a_w.into_async_write();
+        let max_write_bytes = write_stream.max_write_bytes();
+        let exact = vec![0u8; max_write_bytes];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let pinned = Pin::new(&mut write_stream);
+        match pinned.poll_write(&mut cx, &exact) {
+            Poll::Ready(Ok(n)) => assert_eq!(
+                n, max_write_bytes,
+                "a write of exactly max_write_bytes must not be truncated"
+            ),
+            Poll::Ready(Err(e)) => panic!("an exact-size write must not error: {e}"),
+            Poll::Pending => panic!("an exact-size write must not park"),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn write_stream_stages_at_most_the_send_buf_capacity() {
         use std::pin::Pin;
