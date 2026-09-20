@@ -1959,4 +1959,36 @@ mod tests {
             "a multi-symbol parity must stop at the longest member's prefix"
         );
     }
+
+    /// A stock group of exactly `PARITY_DATA_THRESHOLD` data symbols is the
+    /// largest `encode_data` leaves open (it skips at `>= threshold` before
+    /// the *next* encode), and the flush gate skips only `> threshold`.  Such
+    /// a group must still emit its stock parity: an inclusive skip gate would
+    /// silently strip parity from every exactly-threshold stock group.
+    #[test]
+    fn stock_path_flushes_parity_at_the_data_threshold_boundary() {
+        let now = Instant::now();
+        let mut fec = fec_state(8192 - 11, 1);
+        let mut sym_buf = vec![0u8; 8192];
+        let data = b"threshold group";
+        for _ in 0..PARITY_DATA_THRESHOLD {
+            let _ = fec.encoder.encode_data(data, &mut sym_buf, false);
+        }
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            PARITY_DATA_THRESHOLD
+        );
+        let (mut tb, now) = unlimited_bucket(now);
+        let pkts = fec.encoder.maybe_flush_parities(&mut tb, now, false);
+        assert_eq!(
+            pkts.len(),
+            usize::from(parity_for(PARITY_DATA_THRESHOLD)),
+            "a group exactly at the threshold must flush its stock parity, not be skipped"
+        );
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            0,
+            "the flush must close the group"
+        );
+    }
 }
