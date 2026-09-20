@@ -726,6 +726,42 @@ mod tests {
         );
     }
 
+    /// A selective block whose start AND end lie wholly in the ancient
+    /// region (more than half the sequence space behind the sender's
+    /// window) must be dropped: clipping it yields an EMPTY range
+    /// (`rel_start == rel_end`), which the `rel_end <= rel_start` guard
+    /// rejects. Recognising it instead would claim the sender's own window
+    /// head as the highest SACKed off a block that acknowledges nothing.
+    #[test]
+    fn a_block_wholly_before_the_window_head_is_dropped_whole() {
+        let send_start = seq(1000);
+        let sent_span = 3u64;
+        let in_flight = [seq(1000), seq(1001), seq(1002)];
+        let ancient = [iv(995, 1)];
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut evidence = Vec::new();
+        let recved = AckBlocks::new(seq(995), &ancient);
+        let analysis = recved.analyze(
+            send_start,
+            sent_span,
+            &in_flight,
+            &mut block_offsets,
+            &mut acked,
+            &mut evidence,
+        );
+        assert_eq!(
+            block_offsets,
+            Vec::<(u64, u64)>::new(),
+            "a block wholly before the window head must be rejected, not kept as an empty range"
+        );
+        assert_eq!(
+            analysis.highest_sacked, None,
+            "an empty range must not advance the reorder bound to the window head"
+        );
+        assert!(acked.is_empty());
+    }
+
     #[test]
     fn stale_cumulative_and_future_cumulative_never_report_progress() {
         let send_start = seq(100);
