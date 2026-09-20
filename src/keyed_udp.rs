@@ -1116,6 +1116,154 @@ mod tests {
         );
     }
 
+    /// The `max_connections` cap is INCLUSIVE: at exactly `count == cap` the
+    /// dispatch refuses an unknown-key datagram (`ExistingOnly` — dropped, no
+    /// session allocated), while existing keys keep routing. Below the cap an
+    /// unknown key creates a session. Drives the real accept loop through the
+    /// public connector/listener API; the boundary is observed both as a
+    /// listener counter and as the absence of a new accept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_the_cap_unknown_keys_are_refused_and_existing_keys_keep_routing() {
+        use crate::udp::AcceptConfig;
+        use std::time::Duration;
+
+        const CAP: usize = 2;
+        let server = Arc::new(
+            Listener::<u8>::bind_with_max_connections("127.0.0.1:0", CAP)
+                .await
+                .unwrap(),
+        );
+        let addr = server.local_addr();
+        let client = Arc::new(
+            Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+                .await
+                .unwrap(),
+        );
+        let mut dispatch = tokio::task::JoinSet::new();
+        {
+            let client = Arc::clone(&client);
+            dispatch.spawn(async move {
+                loop {
+                    if client.dispatch().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Below the cap every unknown key creates a session: open and accept
+        // exactly `CAP` distinct keys, each confirmed by the accept loop.
+        let mut client_sessions = Vec::new();
+        let mut server_sessions = Vec::new();
+        for key in 1..=CAP as u8 {
+            let mut opened = client
+                .open_without_handshake_with(key, AcceptConfig::default())
+                .expect("open below the cap must succeed");
+            // The server accept resolves only once a datagram for the key
+            // arrives on the wire.
+            opened.write.send(&[key]).await.unwrap();
+            let mut accepted = tokio::time::timeout(
+                Duration::from_secs(5),
+                server.accept_with(AcceptConfig::default()),
+            )
+            .await
+            .expect("an unknown key below the cap must be accepted")
+            .unwrap();
+            assert_eq!(accepted.dispatch_key, key);
+            // Drain the probe payload so later reads observe only the
+            // routing probe sent at the cap.
+            let mut probe_buf = [0u8; 8];
+            let n =
+                tokio::time::timeout(Duration::from_secs(5), accepted.read.recv(&mut probe_buf))
+                    .await
+                    .expect("the first payload must be delivered")
+                    .unwrap();
+            assert_eq!(&probe_buf[..n], &[key]);
+            client_sessions.push(opened);
+            server_sessions.push(accepted);
+        }
+        assert_eq!(
+            server
+                .listener
+                .stats()
+                .connections_opened
+                .load(Ordering::SeqCst),
+            CAP as u64,
+            "each pre-cap unknown key must have created a session"
+        );
+
+        // Keep the accept loop alive so the cap probe below is actually
+        // read and classified. Accepted sessions are held so the live count
+        // stays pinned at `CAP`.
+        let mut keepalive = tokio::task::JoinSet::new();
+        {
+            let server = Arc::clone(&server);
+            keepalive.spawn(async move {
+                let mut held = Vec::new();
+                loop {
+                    match server.accept_with(AcceptConfig::default()).await {
+                        Ok(accepted) => held.push(accepted),
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
+
+        // At exactly `count == cap`, an UNKNOWN key must be refused: the
+        // datagram is classified ExistingOnly and dropped before any session
+        // or conn-table entry is allocated.
+        let unknown = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        unknown.send_to(&[3, 1, 2, 3], addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server
+                    .listener
+                    .stats()
+                    .packets_dropped_existing_only
+                    .load(Ordering::SeqCst)
+                    > 0
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the datagram for an unknown key at the cap must be refused (ExistingOnly)");
+        assert_eq!(
+            server
+                .listener
+                .stats()
+                .connections_opened
+                .load(Ordering::SeqCst),
+            CAP as u64,
+            "an unknown key at exactly the cap must NOT create a session"
+        );
+        assert_eq!(
+            server
+                .listener
+                .stats()
+                .packets_dropped_existing_only
+                .load(Ordering::SeqCst),
+            1,
+            "the refused datagram must be counted exactly once"
+        );
+
+        // An EXISTING key still routes at the cap: its session receives the
+        // datagram even though unknown keys are refused.
+        let keyed_route = b"still routed at the cap";
+        client_sessions[0].write.send(keyed_route).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_sessions[0].read.recv(&mut buf),
+        )
+        .await
+        .expect("an existing key must keep routing at the cap")
+        .expect("the existing session read failed");
+        assert_eq!(&buf[..n], keyed_route);
+    }
+
     #[test]
     fn frame_mode_rejects_undersized_mss() {
         let mss = 33;
