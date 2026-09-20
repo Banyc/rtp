@@ -1583,4 +1583,48 @@ mod tests {
             "indexed {many:.1} ns/op is not materially below the linear reference at {linear_many:.1} ns/op"
         );
     }
+
+    #[test]
+    fn floor_due_prefix_includes_the_packet_at_exactly_the_live_deadline() {
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        // A floor-eligible packet with a small packet RTO whose stored key is
+        // latched up by an estimator spike to t0 + 900 ms.
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(100),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        assert_eq!(index.promote_due(t0 + ms(100), ms(100), ms(900)), 1);
+
+        // The estimator clears to 200 ms.  At *exactly* the live deadline
+        // (now == sent_at + live_rto == t0 + 200 ms) the packet is due: the
+        // floor-due prefix must include the equality, or `has_due` reports
+        // due while `promote_due` withholds the reason and the poll spins.
+        let due_now = t0 + ms(200);
+        assert_eq!(
+            index.next_deadline(due_now, || ms(100), ms(200)),
+            Some(due_now),
+            "the floor wake must fire at exactly the live deadline"
+        );
+        assert!(
+            index.has_rto_due(due_now, ms(200)),
+            "has_rto_due must see the packet at exactly the live deadline"
+        );
+        assert!(
+            index.has_due(due_now, || ms(100), ms(200)),
+            "has_due must see the packet at exactly the live deadline"
+        );
+        assert_eq!(
+            index.promote_due(due_now, ms(100), ms(200)),
+            0,
+            "promote_due must promote (not postpone) at exactly the live deadline"
+        );
+        assert_eq!(index.rto_ready_count, 1);
+        assert_eq!(index.first_ready().map(|(seq, _)| seq), Some(sq(0)));
+    }
 }
