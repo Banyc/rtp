@@ -546,9 +546,9 @@ pub async fn spawn_rtp_byte_sink_server_via(
 /// `base`]`. The frame protocol has exactly one authority here — the sink
 /// decoders below (`spawn_rtp_msg_latency_sink*`) read this layout, and the
 /// latency assertions in the scenario suites gate both sides against it. The
-/// mux layer kit carries the same encoder for its stream-framed sparse pings;
-/// that copy is a view of this protocol, not a second authority (the same
-/// sink decoder reads both).
+/// mux layer kit re-exports this encoder for its stream-framed sparse pings,
+/// so the protocol has exactly one authority here and no second copy can
+/// drift.
 ///
 /// Tick cadence uses [`tokio::time::interval`] with
 /// [`MissedTickBehavior::Delay`] so a missed deadline does not burst the
