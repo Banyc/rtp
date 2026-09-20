@@ -506,6 +506,25 @@ mod tests {
     }
 
     #[test]
+    fn an_ack_at_exactly_the_protocol_block_bound_is_accepted() {
+        // MAX_ACK_BLOCKS is inclusive: an ACK carrying exactly that many
+        // selective intervals is a legitimately-encoded datagram (the
+        // encoder clamps to the same bound), and only a count past it is
+        // Corrupted.
+        let mut buf = vec![0u8]; // ACK_CMD
+        buf.extend_from_slice(&7u64.to_be_bytes()); // cumulative next
+        buf.push(crate::ack::MAX_ACK_BLOCKS as u8); // exactly the bound
+        for i in 0..crate::ack::MAX_ACK_BLOCKS as u64 {
+            buf.extend_from_slice(&((2 * i) as u64).to_be_bytes()); // start
+            buf.extend_from_slice(&1u64.to_be_bytes()); // size 1
+        }
+        let mut acks = Vec::new();
+        let decoded = decode(&buf, &mut acks, None).expect("exactly-bound ACK must decode");
+        assert!(decoded.data.is_none());
+        assert_eq!(acks.len(), crate::ack::MAX_ACK_BLOCKS);
+    }
+
+    #[test]
     fn decodes_legacy_data_without_ts() {
         // DATA_CMD: cmd u8 + seq u64 BE + len u16 BE + payload
         let mut buf = Vec::new();
