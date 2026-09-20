@@ -567,4 +567,86 @@ mod tests {
             "the age cap must fire at last + ACK_FLUSH_AGE"
         );
     }
+
+    #[test]
+    fn deep_page_capacity_is_capped_at_the_protocol_block_bound() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.record(ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        // A history of 400 selective blocks: the deep page starts at
+        // MAX_NUM_ACK and fronts a 336-block tail.  Its carried capacity must
+        // still be capped at MAX_NUM_ACK.  The encoder emits at most that
+        // many blocks, so an uncapped `max_blocks` would make
+        // `conveyed_blocks` (which completes claimed work on a WouldBlock)
+        // bill the wire for blocks that were never sent.
+        let claim = state.claim(now, 400).expect("pending work must claim");
+        let deep = claim.pages()[1].expect("deep history must claim a deep page");
+        assert_eq!(deep.first_block_index, MAX_NUM_ACK);
+        assert_eq!(
+            deep.max_blocks, MAX_NUM_ACK,
+            "the deep page capacity must never exceed the ACK block bound"
+        );
+
+        // A short tail is billed at its exact length, not as a full page.
+        let mut short = State::new();
+        short.record(ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        let claim = short
+            .claim(now, MAX_NUM_ACK + 10)
+            .expect("pending work must claim");
+        assert_eq!(
+            claim.pages()[1]
+                .expect("tail history must claim a deep page")
+                .max_blocks,
+            10,
+            "a short tail must be billed at its exact length"
+        );
+    }
+
+    #[test]
+    fn deep_cursor_wraps_to_the_first_deep_page_when_the_walk_reaches_the_end() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.record(ReceivedAckWork {
+            pending_acks: 2 * MAX_NUM_ACK,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        // History of exactly two pages: head [0, 64) + deep [64, 128).
+        let claim = state
+            .claim(now, 2 * MAX_NUM_ACK)
+            .expect("pending work must claim");
+        assert_eq!(
+            claim.pages()[1]
+                .expect("deep history must claim a deep page")
+                .first_block_index,
+            MAX_NUM_ACK
+        );
+        state.complete(claim, AckFlushOutcome::Sent { pages_sent: 2 });
+        // The deep walk reached the end of the history, so the next claim's
+        // deep page must resume just past the always-sent head page
+        // (MAX_NUM_ACK), not past the now-drained end of the history.
+        state.record(ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        let next = state
+            .claim(now, 2 * MAX_NUM_ACK)
+            .expect("pending work must claim");
+        assert_eq!(
+            next.pages()[1]
+                .expect("the deep walk must wrap, not vanish at the history end")
+                .first_block_index,
+            MAX_NUM_ACK,
+            "the deep cursor must wrap to the first deep page at the history end"
+        );
+    }
 }
