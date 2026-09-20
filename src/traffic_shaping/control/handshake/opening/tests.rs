@@ -1,4 +1,5 @@
 use super::super::wire::PACKET_LEN;
+use super::super::wire::SEND_RETRY_INTERVAL;
 use super::*;
 use crate::{
     codec,
@@ -59,6 +60,45 @@ impl UnreliableRead for RecordingRead {
         self.sizes.lock().unwrap().push(n);
         Ok(n)
     }
+}
+
+/// The handshake retransmission schedule must fit the opening deadline:
+/// a jittered retry (`RETRY_INTERVAL + RETRY_JITTER_MS`, clamped to the
+/// deadline) must be able to fire while the opening is still live, and the
+/// pre-handshake burst delay must not exceed the deadline either. These are
+/// relations between the constants — asserted without racing wall-clock —
+/// so shrinking `OPENING_TIMEOUT` below the max retry offset (or growing
+/// the jitter past the timeout) is caught deterministically, exactly the
+/// class the end-to-end lost-leg recovery test enforces through real time.
+#[test]
+fn the_retry_schedule_fits_inside_the_opening_timeout() {
+    let max_retry_offset = RETRY_INTERVAL + Duration::from_millis(RETRY_JITTER_MS);
+    assert!(
+        max_retry_offset < OPENING_TIMEOUT,
+        "a jittered retransmission ({max_retry_offset:?}) must be able to fire before the \
+         opening deadline ({OPENING_TIMEOUT:?})"
+    );
+    assert!(
+        Duration::from_millis(OPENING_JITTER_MS) < OPENING_TIMEOUT,
+        "the pre-handshake burst delay ({OPENING_JITTER_MS} ms) must not exhaust the \
+         opening deadline ({OPENING_TIMEOUT:?})"
+    );
+}
+
+/// A WouldBlocked handshake send must get at least one retry inside its
+/// send budget: the jittered retry offset must be strictly below
+/// `SEND_RETRY_BUDGET`, otherwise the first WouldBlock parks until the
+/// budget elapses and the write dies without ever retrying. Pinned as a
+/// constant relation (no timing), mirroring what
+/// `send_completes_on_late_writability` enforces through real sleeps.
+#[test]
+fn a_blocked_send_gets_a_retry_within_its_budget() {
+    let max_retry_offset = SEND_RETRY_INTERVAL + Duration::from_millis(SEND_RETRY_JITTER_MS);
+    assert!(
+        max_retry_offset < SEND_RETRY_BUDGET,
+        "a jittered retry ({max_retry_offset:?}) must fit inside the send budget \
+         ({SEND_RETRY_BUDGET:?})"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
