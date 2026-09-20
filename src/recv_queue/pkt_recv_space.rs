@@ -317,6 +317,28 @@ mod tests {
     }
 
     #[test]
+    fn window_is_full_at_exactly_the_capacity() {
+        let mut space = PktRecvSpace::new();
+        // Fill the receive window to every in-window sequence: the window is
+        // full at exactly MAX_NUM_RECVING_PKTS occupied slots (the anchor
+        // never advances because nothing is popped), not one slot later.
+        for i in 0..MAX_NUM_RECVING_PKTS as u64 {
+            assert!(
+                space.recv(i, b"x".to_vec(), None),
+                "in-window seq {i} must be accepted"
+            );
+        }
+        assert!(
+            space.is_full(),
+            "the window is full once every in-window slot is occupied"
+        );
+        // The next sequence is beyond the window: rejected, so under a
+        // strict `>` comparison is_full could never become true.
+        assert!(!space.recv(MAX_NUM_RECVING_PKTS as u64, b"x".to_vec(), None));
+        assert!(space.is_full());
+    }
+
+    #[test]
     fn duplicate_acked_but_not_reinserted() {
         let mut space = PktRecvSpace::new();
         assert!(space.recv(0, b"a".to_vec(), None));
