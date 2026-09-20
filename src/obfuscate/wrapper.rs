@@ -275,8 +275,7 @@ mod tests {
             "a bounded junk flood must yield WouldBlock, got {result:?}"
         );
         assert_eq!(
-            read.inner.reads,
-            MAX_CONSECUTIVE_INVALID_DATAGRAMS,
+            read.inner.reads, MAX_CONSECUTIVE_INVALID_DATAGRAMS,
             "the bound must fire at exactly the cap without attempting the next read"
         );
     }

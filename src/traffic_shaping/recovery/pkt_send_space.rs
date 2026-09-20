@@ -3029,8 +3029,7 @@ mod tests {
             .and_then(|o| o.as_ref())
             .expect("seq 0 still in flight after rtx");
         assert_eq!(
-            p.deferred_loss_baseline_deadline,
-            None,
+            p.deferred_loss_baseline_deadline, None,
             "an rtx at exactly the stock deadline must carry no deferral baseline"
         );
     }

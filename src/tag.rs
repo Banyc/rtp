@@ -87,7 +87,11 @@ mod tests {
             "different dispatch keys must separate sessions sharing one obfuscation key"
         );
         assert_ne!(none, control_plane_tag(other_obf, None));
-        assert_eq!(control_plane_tag(obf, Some(&[1, 2, 3])), keyed_a, "deterministic");
+        assert_eq!(
+            control_plane_tag(obf, Some(&[1, 2, 3])),
+            keyed_a,
+            "deterministic"
+        );
         assert_eq!(control_plane_tag(obf, None), none, "deterministic");
     }
 
@@ -98,9 +102,6 @@ mod tests {
     fn the_tag_derivation_matches_the_recorded_vector() {
         let obf = [7u8; KEY_LEN];
         assert_eq!(control_plane_tag(obf, None), 0xe4e2_66e0_1171_34bb);
-        assert_eq!(
-            control_plane_tag(obf, Some(&[42])),
-            0x3fae_37ba_2cbe_e6d2
-        );
+        assert_eq!(control_plane_tag(obf, Some(&[42])), 0x3fae_37ba_2cbe_e6d2);
     }
 }

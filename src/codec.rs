@@ -515,7 +515,7 @@ mod tests {
         buf.extend_from_slice(&7u64.to_be_bytes()); // cumulative next
         buf.push(crate::ack::MAX_ACK_BLOCKS as u8); // exactly the bound
         for i in 0..crate::ack::MAX_ACK_BLOCKS as u64 {
-            buf.extend_from_slice(&((2 * i) as u64).to_be_bytes()); // start
+            buf.extend_from_slice(&(2 * i).to_be_bytes()); // start
             buf.extend_from_slice(&1u64.to_be_bytes()); // size 1
         }
         let mut acks = Vec::new();
