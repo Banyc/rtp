@@ -1248,6 +1248,47 @@ mod tests {
         assert_eq!(seq, sq(0));
     }
 
+    /// The stuck-floor prefix is inclusive at `sent_at + live_rto == now`: a
+    /// floor-eligible packet whose live-estimator deadline has *exactly*
+    /// elapsed (a latched stored key still in the future) is due at that
+    /// instant, so `has_due` reports it, the wake is immediate, and
+    /// `promote_due` arms the RTO reason there — not one instant later.
+    #[test]
+    fn a_stuck_floor_packet_is_due_at_exactly_sent_at_plus_live_rto() {
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        // A floor-eligible packet whose packet RTO is 30 ms; the estimator
+        // spikes to 60 ms, lazily postponing the stored key to t0 + 60 ms.
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(30),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        assert_eq!(index.promote_due(t0 + ms(30), ms(100), ms(60)), 1);
+        // The estimator clears to 50 ms: the true deadline is
+        // sent_at + max(30, 50) = t0 + 50 ms.  At exactly that instant the
+        // latched stored key (t0 + 60 ms) is still in the future, so only
+        // the stuck-floor prefix can see the packet as due.
+        let at_boundary = t0 + ms(50);
+        assert!(index.has_due(at_boundary, || ms(100), ms(50)));
+        assert!(index.has_rto_due(at_boundary, ms(50)));
+        assert_eq!(index.rto_ready_count, 0, "no RTO reason is armed yet");
+        assert_eq!(
+            index.next_deadline(at_boundary, || ms(100), ms(50)),
+            Some(at_boundary),
+            "a packet due at its live-estimator deadline wakes the poll immediately"
+        );
+        assert_eq!(index.promote_due(at_boundary, ms(100), ms(50)), 0);
+        assert_eq!(index.rto_ready_count, 1);
+        let (seq, _) = index.first_ready().unwrap();
+        assert_eq!(seq, sq(0));
+        assert!(index.has_rto_due(at_boundary, ms(50)));
+    }
+
     #[test]
     fn next_deadline_floor_wake_uses_the_minimum_effective_deadline_over_the_floor_prefix() {
         let t0 = Instant::now();
