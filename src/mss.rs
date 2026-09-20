@@ -128,6 +128,32 @@ mod tests {
     }
 
     #[test]
+    fn an_mss_with_no_room_for_the_codec_payload_is_rejected_at_the_exact_boundary() {
+        // try_new rejects an MSS that carries no codec payload at all: the
+        // equality `data_overhead == mss` is an error (a strict `>` would
+        // accept it, and max_data_size_per_pkt would then wrap the usize
+        // subtraction below zero).
+        let overhead = codec::data_overhead();
+        assert!(
+            matches!(
+                Mss::try_new(overhead),
+                Err(MssError::NoRoomForCodecPayload { .. })
+            ),
+            "an MSS exactly equal to the codec overhead must be rejected"
+        );
+        assert!(
+            Mss::try_new(overhead + 1).is_ok(),
+            "an MSS with room for exactly one payload byte must be valid"
+        );
+        let mss = Mss::try_new(overhead + 1).unwrap();
+        assert_eq!(
+            mss.max_data_size_per_pkt(),
+            1 - TRUNCATION_DETECTION_BYTES,
+            "the payload math must not wrap below zero"
+        );
+    }
+
+    #[test]
     fn max_data_size_per_pkt_deducts_the_detection_headroom() {
         // The wire datagram is `data_overhead + payload`; the headroom keeps
         // it at least one byte below the MSS (and therefore never exactly
