@@ -71,6 +71,22 @@ pub(crate) struct RetransmissionCounters {
 /// the classic dup-ACK threshold of 3.
 pub(crate) const FAST_LOSS_SACK_THRESHOLD: u32 = 3;
 
+/// How long a fast-loss declaration must survive before it may fire: the
+/// confirmation window during which the original's own ACK can falsify the
+/// declaration (measured: a reordered original's resolution ACK arrives
+/// within ~15 ms of the SACK evidence on the production interactive lane,
+/// because the echo stream piggybacks the ACK within one frame).
+///
+/// A SACK gap of [`FAST_LOSS_SACK_THRESHOLD`] newer packets is ambiguous: it
+/// is either a genuine drop or a late arrival (a packet delayed past its
+/// three successors by link jitter).  The declaration is armed immediately
+/// but must not FIRE until the confirmation window elapses; an ACK of the
+/// original within the window cancels it (the gap was reordering).  A genuine
+/// drop has no original ACK, so the declaration fires as soon as the window
+/// expires — still bounded well below the time-based reorder window, so real
+/// loss is repaired fast without an RTO.
+pub(crate) const FAST_LOSS_CONFIRM_MS: u64 = 18;
+
 /// How many current smoothed round trips an observed-reordering fast-loss
 /// disable stays armed before a genuinely clean link re-enables
 /// evidence-gated fast loss ("a few round trips").
@@ -299,12 +315,19 @@ impl PktSendSpace {
     /// two low-jitter gates:
     ///
     /// * the structural srtt-relative gate (`K*rttvar < srtt/4`), and/or
-    /// * the queue-independent lifetime-min-RTT gate (`rttvar < min_rtt`).
+    /// * the queue-premised lifetime-min-RTT gate (`rttvar < min_rtt` **and**
+    ///   `srtt` elevated above `min_rtt` by more than the path's jitter
+    ///   tolerance — a standing queue).
     ///
     /// The srtt-relative gate alone is disarmed when a bulk sender fills the
-    /// bottleneck queue (queueing inflates srtt and rttvar together); the
-    /// lifetime minimum RTT is captured while the path is uncongested, so the
-    /// min-RTT gate keeps the fast path armed under bulk + loss.  Always-on
+    /// bottleneck queue (queueing inflates srtt and rttvar together), and it
+    /// is equally disarmed when the path is genuinely jittery with no queue.
+    /// In the first world a SACK gap is loss evidence and the lifetime
+    /// minimum RTT (captured while the path was uncongested, so it does not
+    /// inflate with the queue) keeps the fast path armed; in the second world
+    /// the gap is reordering evidence and the rescue abstains — `srtt` sits
+    /// within the jitter tolerance of the floor, so the srtt-relative gate's
+    /// disarm stands and the reorder-window repair owns the gap.  Always-on
     /// when armed, and gated by no environment variable: the two gates above
     /// are the whole safety.  (The neighbouring `RTP_JITTER_CAP` toggle is a
     /// different switch — it is never read here and neither arms nor disarms
@@ -319,6 +342,7 @@ impl PktSendSpace {
             && (self.rtt_stats.fast_loss_armed()
                 || crate::traffic_shaping::recovery::fast_loss::armed_against_min_rtt(
                     self.rtt_stats.min_rtt(),
+                    self.rtt_stats.smooth_rtt(),
                     self.rtt_stats.smooth_rtt_var(),
                 ))
     }
@@ -472,9 +496,10 @@ impl PktSendSpace {
             }
         }
         for &seq in &self.fast_loss_buf {
-            let sent_time = self.send_wnd.get(&seq).unwrap().as_ref().unwrap().sent_time;
+            let p = self.send_wnd.get(&seq).unwrap().as_ref().unwrap();
+            let deadline = p.fast_loss_confirm_until.unwrap_or(p.sent_time);
             self.rtx_index
-                .set_reason(seq, ReadyReason::FastLoss, Some(sent_time));
+                .set_reason(seq, ReadyReason::FastLoss, Some(deadline));
         }
         // Advance the anchor to the send-window front (or the next sequence
         // when the window is empty) so wrap safety holds as the window
@@ -673,9 +698,10 @@ impl PktSendSpace {
             }
         }
         for &seq in &self.fast_loss_buf {
-            let sent_time = self.send_wnd.get(&seq).unwrap().as_ref().unwrap().sent_time;
+            let p = self.send_wnd.get(&seq).unwrap().as_ref().unwrap();
+            let deadline = p.fast_loss_confirm_until.unwrap_or(p.sent_time);
             self.rtx_index
-                .set_reason(seq, ReadyReason::FastLoss, Some(sent_time));
+                .set_reason(seq, ReadyReason::FastLoss, Some(deadline));
         }
         // Advance the anchor to the send-window front (or the next sequence
         // when the window is empty) so wrap safety holds as the window
@@ -869,7 +895,14 @@ impl PktSendSpace {
                     // scoped ACK-path sync can re-arm exactly the packets
                     // whose fast-loss readiness could have changed (or drop
                     // the armed reason when the transition was the other
-                    // way).
+                    // way).  A transition INTO eligibility also arms the
+                    // confirmation deadline: the declaration may not fire
+                    // until the window elapses, so the original's own ACK
+                    // (a reordered late arrival) can falsify it first.
+                    if packet.is_fast_loss() {
+                        packet.fast_loss_confirm_until =
+                            Some(now + Duration::from_millis(FAST_LOSS_CONFIRM_MS));
+                    }
                     self.fast_loss_buf.push(sequence);
                     fast_loss_eligibility_changed = true;
                 }
@@ -997,6 +1030,7 @@ impl PktSendSpace {
                 rto_from_tail_probe: true,
                 sacked_above: _,
                 fast_loss_rtx_time: _,
+                fast_loss_confirm_until: _,
                 deferred_loss_baseline_deadline: _,
             };
         }
@@ -1058,6 +1092,7 @@ impl PktSendSpace {
             rto_from_tail_probe: false,
             sacked_above: 0,
             fast_loss_rtx_time: None,
+            fast_loss_confirm_until: None,
             deferred_loss_baseline_deadline: None,
         };
 
@@ -1127,6 +1162,23 @@ impl PktSendSpace {
         );
         let (s, reasons) = self.rtx_index.first_ready()?;
         let reasons = *reasons;
+        // The evidence-gated fast-loss reason may be armed with a FUTURE
+        // confirmation deadline.  It must not fire before the window elapses:
+        // an ACK of the original inside the window falsifies the declaration
+        // (the gap was a late arrival, not a drop).  The time-based reasons
+        // (RTO / reorder) are only ever promoted when due, so this check is
+        // precise: if the only ready reason is an unelapsed fast-loss
+        // declaration, defer the selection (the poll loop wakes at the
+        // deadline via `next_poll_time`).
+        if reasons
+            .fast_loss_at()
+            .is_some_and(|deadline| deadline > now)
+            && !reasons.has_rto()
+            && !reasons.has_reorder()
+            && !reasons.has_pre_outage()
+        {
+            return None;
+        }
         let p = self.send_wnd.get_mut(&s)?.as_mut()?;
 
         // Count one loss event per packet the first time it is retransmitted,
@@ -1198,6 +1250,7 @@ impl PktSendSpace {
                     rto_from_tail_probe: false,
                     sacked_above: _,
                     fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
+                    fast_loss_confirm_until: None,
                     deferred_loss_baseline_deadline: baseline_deadline_opt,
                 };
             }
@@ -1657,6 +1710,14 @@ struct InFlightPkt {
     /// [`FAST_LOSS_SACK_THRESHOLD`], the packet is declared lost without
     /// waiting for the time-based reorder window to expire.
     pub sacked_above: u32,
+    /// The earliest instant the evidence-gated fast-loss declaration for this
+    /// packet may fire: the SACK-evidence moment plus
+    /// [`FAST_LOSS_CONFIRM_MS`].  Set when the packet first becomes
+    /// fast-loss-eligible and consumed by the retransmission; an ACK of the
+    /// original inside the window cancels the declaration (the gap was a
+    /// late arrival, not a drop), which is what keeps the evidence-gated
+    /// path from mistaking jitter reordering for loss.
+    pub fast_loss_confirm_until: Option<Instant>,
     /// `Some(t)` if this packet was retransmitted by the evidence-gated
     /// fast-loss path at time `t`.  Used to detect observed reordering: if an
     /// ACK for this packet arrives before `t + <current estimator floor>` could
@@ -1728,8 +1789,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        CWND_SEND_RATE_SCALE, FAST_LOSS_DISABLE_ROUND_TRIPS, INIT_CWND, LOSS_RATE_MIN_SAMPLES,
-        MAX_ACK_BLOCKS, OUTAGE_RECOVERY_CWND, PktSendSpace,
+        CWND_SEND_RATE_SCALE, FAST_LOSS_CONFIRM_MS, FAST_LOSS_DISABLE_ROUND_TRIPS, INIT_CWND,
+        LOSS_RATE_MIN_SAMPLES, MAX_ACK_BLOCKS, OUTAGE_RECOVERY_CWND, PktSendSpace,
     };
     use crate::sequence::SequenceNumber;
     use primitive::ops::float::{PosR, UnitR};
@@ -2684,6 +2745,95 @@ mod tests {
         assert_eq!(space.retransmission_counters.fast_loss_reason, 1);
         assert_eq!(space.retransmission_counters.rto_reason, 0);
         assert_eq!(space.retransmission_counters.reorder_reason, 0);
+    }
+
+    /// The production spurious-fast-loss shape: the SACK gap is a late
+    /// arrival, not a drop.  The declaration is armed on the third SACK but
+    /// must NOT fire while the original's own ACK can still falsify it — an
+    /// ACK of the original inside the confirmation window cancels the
+    /// declaration entirely (no retransmission, no fast-loss accounting).
+    #[test]
+    fn original_ack_inside_the_confirmation_window_cancels_the_fast_loss_declaration() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        assert!(space.fast_loss_armed(), "gate should be armed");
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        // 1, 2, 3 are SACKed past seq 0: the gap reaches the threshold.
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+        assert_eq!(sacked_above(&space, 0), 3);
+
+        // The original arrives (it was reordered, not lost) BEFORE the
+        // confirmation window ends, and its ACK delivers it.
+        assert_eq!(ack_one(&mut space, 0, t0 + ms(20)), 1);
+
+        // Well past the confirmation deadline and still before the reorder
+        // window: nothing may be retransmitted and no fast loss is counted.
+        let late = t0 + ms(60);
+        assert!(
+            late.duration_since(t0) < space.rtt_stats.reorder_window(),
+            "test must run before the reorder window would repair it"
+        );
+        assert!(
+            !space.has_rtx(late),
+            "a falsified declaration must not be repaired"
+        );
+        let rtx = space.rtx(late);
+        assert!(
+            rtx.map(|p| p.seq) != Some(sq(0)),
+            "the original was acked; seq 0 must not be retransmitted"
+        );
+        assert_eq!(space.retransmission_counters.attempts, 0);
+        assert_eq!(space.retransmission_counters.fast_loss_reason, 0);
+    }
+
+    /// The genuine-loss companion: the confirmation window must not delay a
+    /// real drop past usefulness.  A starved seq 0 whose original never
+    /// arrives is repaired as soon as the window elapses — still well before
+    /// the time-based reorder window — so real loss keeps the fast path.
+    #[test]
+    fn genuine_loss_survives_the_confirmation_window_and_fires_before_reorder() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        assert!(space.fast_loss_armed(), "gate should be armed");
+
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+        send_packet(&mut space, t0 + ms(3));
+
+        sack_one(&mut space, 1, t0 + ms(10));
+        sack_one(&mut space, 2, t0 + ms(11));
+        sack_one(&mut space, 3, t0 + ms(12));
+        assert_eq!(sacked_above(&space, 0), 3);
+
+        // The original never arrives: the declaration fires once the
+        // confirmation window elapses and is not withheld by it.
+        let confirm = FAST_LOSS_CONFIRM_MS;
+        let due = t0 + ms(12 + confirm);
+        assert!(
+            space.rtx(due - ms(1)).is_none(),
+            "not due inside the window"
+        );
+        let rtx = space
+            .rtx(due)
+            .expect("genuine loss must fire as soon as the window elapses");
+        assert_eq!(rtx.seq, sq(0));
+        assert_eq!(space.retransmission_counters.fast_loss_reason, 1);
+        assert_eq!(space.retransmission_counters.rto_reason, 0);
+        assert_eq!(space.retransmission_counters.reorder_reason, 0);
+        assert!(
+            due.duration_since(t0) < space.rtt_stats.reorder_window(),
+            "the fast repair must land before the time-based reorder window"
+        );
     }
 
     #[test]
@@ -3709,8 +3859,11 @@ mod tests {
             t += ms(1);
         }
 
-        // seq 0 is fast-loss ready while the reorder window has not expired:
-        // retransmit it, arming fast_loss_rtx_time.
+        // The fast-loss declaration is armed but must survive its
+        // confirmation window (seq 0's own ACK could yet falsify it): the
+        // rtx fires once the window elapses, still before the reorder window
+        // expires.
+        t += ms(FAST_LOSS_CONFIRM_MS);
         run(&mut scoped, &mut reference, "fast-loss rtx", &|s| {
             let rtx = s.rtx(t).expect("seq 0 must be fast-loss ready");
             assert_eq!(rtx.seq, sq(0));

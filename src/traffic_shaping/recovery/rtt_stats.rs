@@ -338,8 +338,9 @@ mod tests {
             "srtt-relative gate must be disarmed by queue inflation"
         );
         assert!(
-            armed_against_min_rtt(stats.min_rtt(), stats.smooth_rtt_var()),
-            "queue-independent min-RTT gate must be armed"
+            armed_against_min_rtt(stats.min_rtt(), stats.smooth_rtt(), stats.smooth_rtt_var()),
+            "queue-premised min-RTT gate must be armed under queue inflation - \
+             srtt clears the floor by the jitter tolerance and beyond"
         );
     }
 
@@ -352,7 +353,7 @@ mod tests {
         }
         assert!(!stats.fast_loss_armed(), "srtt-relative gate disarmed");
         assert!(
-            !armed_against_min_rtt(stats.min_rtt(), stats.smooth_rtt_var()),
+            !armed_against_min_rtt(stats.min_rtt(), stats.smooth_rtt(), stats.smooth_rtt_var()),
             "min-RTT gate must stay off when jitter dwarfs the propagation floor"
         );
     }
@@ -363,6 +364,7 @@ mod tests {
         assert!(stats.min_rtt().is_none());
         assert!(!armed_against_min_rtt(
             stats.min_rtt(),
+            stats.smooth_rtt(),
             stats.smooth_rtt_var()
         ));
     }

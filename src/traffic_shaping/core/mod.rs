@@ -4,7 +4,7 @@ pub(crate) mod fast_start;
 mod gentle;
 mod idle_gap;
 mod pacing;
-mod queue_growth;
+pub(crate) mod queue_growth;
 mod rate_bridge;
 mod rate_window;
 mod spare_capacity;
