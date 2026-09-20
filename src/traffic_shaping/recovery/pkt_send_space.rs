@@ -2465,6 +2465,39 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_rto_rtx_counts_as_lost_until_its_fresh_rto_elapses() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(1));
+        send_packet(&mut space, t0 + ms(2));
+
+        // RTO fires for the tail packet (seq 1), which is ALSO the newest
+        // sequence ever sent: max_pipe_seq == seq(1).  `considered_new_in_cwnd`
+        // is false for strictly-not-past (`lt(m, s)`), so the retransmit
+        // counts as a lost packet in the pipe observation even though its
+        // freshened RTO has not elapsed yet.
+        let rtx_t = t0 + ms(2) + space.rto_duration() + ms(1);
+        let rtx = space.rtx(rtx_t).expect("RTO should fire");
+        assert_eq!(rtx.seq, sq(1));
+        assert_eq!(space.max_pipe_seq, Some(sq(1)));
+
+        // Immediately after the retransmit: the retransmission's own fresh
+        // RTO has not elapsed, so only the rtxed classification can mark
+        // the packet lost.
+        let obs = space.send_window_observation(rtx_t + ms(1));
+        assert_eq!(
+            obs.loss_ratio,
+            Some(1.0),
+            "a tail retransmission at the pipe frontier must count as lost"
+        );
+        assert_eq!(obs.packets_in_pipe, 1);
+        assert_eq!(obs.retransmitted_packets, 1);
+    }
+
+    #[test]
     fn huge_loss_requires_more_than_the_minimum_sample_count() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
