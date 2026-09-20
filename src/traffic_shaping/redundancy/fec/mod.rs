@@ -1960,6 +1960,40 @@ mod tests {
         );
     }
 
+    /// The stock (non-instream) `encode_data` force-flushes its open group
+    /// at exactly `PARITY_DATA_THRESHOLD` data symbols (skip at `>=
+    /// threshold` before the next encode) so a fresh group starts on the
+    /// NEXT symbol: a group of 4 stays open while it is below the threshold,
+    /// but the 5th symbol must NOT be appended to it. This is the encode-gate
+    /// arm of the threshold (the flush gate's `> threshold` arm is pinned by
+    /// `stock_path_flushes_parity_at_the_data_threshold_boundary`); mutating
+    /// it to `>` lets a stock group grow to five data symbols.
+    #[test]
+    fn the_stock_group_is_force_flushed_at_exactly_parity_data_threshold() {
+        let mut fec = fec_state(8192 - 11, 1);
+        let data = b"threshold members";
+        let mut sym_buf = vec![0u8; 8192];
+        for _ in 0..PARITY_DATA_THRESHOLD {
+            fec.encoder.encode_data(data, &mut sym_buf, false);
+        }
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            PARITY_DATA_THRESHOLD,
+            "a stock group below the threshold must stay open"
+        );
+        // The next stock symbol force-flushes the 4-symbol group and starts
+        // a fresh one: the open group must never grow to 5 data symbols on
+        // the stock path.
+        fec.encoder.encode_data(data, &mut sym_buf, false);
+        assert_eq!(
+            fec.encoder.encoder.group_data_count(),
+            1,
+            "a stock group at exactly PARITY_DATA_THRESHOLD symbols must be force-flushed \
+             before the next symbol, not grow to {} data symbols",
+            PARITY_DATA_THRESHOLD + 1
+        );
+    }
+
     /// A stock group of exactly `PARITY_DATA_THRESHOLD` data symbols is the
     /// largest `encode_data` leaves open (it skips at `>= threshold` before
     /// the *next* encode), and the flush gate skips only `> threshold`.  Such
