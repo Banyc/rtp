@@ -233,6 +233,54 @@ mod tests {
         (std::sync::Arc::new(a), std::sync::Arc::new(b))
     }
 
+    /// A read double that serves `junk_left` nonce-short datagrams, then
+    /// blocks (WouldBlock), counting every inner read.
+    #[derive(Debug)]
+    struct JunkThenBlock {
+        junk_left: usize,
+        reads: usize,
+    }
+
+    #[async_trait]
+    impl UnreliableRead for JunkThenBlock {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            self.reads += 1;
+            if self.junk_left > 0 {
+                self.junk_left -= 1;
+                buf[..3].copy_from_slice(&[1, 2, 3]);
+                Ok(3)
+            } else {
+                Err(IoErr::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            self.try_recv(buf)
+        }
+    }
+
+    #[test]
+    fn try_recv_bounds_consecutive_invalid_datagrams_at_exactly_the_cap() {
+        let mut read = ObfuscatedRead::new(
+            JunkThenBlock {
+                junk_left: MAX_CONSECUTIVE_INVALID_DATAGRAMS,
+                reads: 0,
+            },
+            settings(),
+        );
+        let mut buf = [0u8; 1024];
+        let result = read.try_recv(&mut buf);
+        assert!(
+            matches!(result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a bounded junk flood must yield WouldBlock, got {result:?}"
+        );
+        assert_eq!(
+            read.inner.reads,
+            MAX_CONSECUTIVE_INVALID_DATAGRAMS,
+            "the bound must fire at exactly the cap without attempting the next read"
+        );
+    }
+
     #[tokio::test]
     async fn a_payload_round_trips_through_the_wrapper() {
         let (a, b) = socket_pair().await;
