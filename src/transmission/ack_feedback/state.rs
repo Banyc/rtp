@@ -649,4 +649,36 @@ mod tests {
             "the deep cursor must wrap to the first deep page at the history end"
         );
     }
+
+    #[test]
+    fn a_pre_deadline_claim_reports_the_explicit_flush_reason() {
+        let mut state = State::new();
+        let now = Instant::now();
+        state.record(ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        let claim = state.claim(now, 0).expect("pending work must claim");
+        state.complete(claim, AckFlushOutcome::Sent { pages_sent: 1 });
+        // Sparse work after a successful flush is rearmed for ACK_FLUSH_AGE,
+        // so a claim taken before that deadline is not schedule-driven: its
+        // reason must be the explicit fallback, not a timer trigger.
+        state.record(ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        });
+        assert_eq!(
+            state.schedule(now),
+            AckSchedule::At(now + ACK_FLUSH_AGE),
+            "premise: the flush is parked until the age deadline"
+        );
+        let claim = state.claim(now, 0).expect("pending work must claim");
+        assert_eq!(
+            claim.reason(),
+            MetricsAckFlushReason::Explicit,
+            "a claim taken before the deadline is an explicit flush, not an age flush"
+        );
+    }
 }
