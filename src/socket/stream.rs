@@ -858,6 +858,8 @@ mod tests {
     /// `interactive_prompt` preset (deployment) and depth-3 `max_diversity`.
     /// Prints the sender parity/gate counters and the receiver recovered
     /// count so the repair path is observable without the netem oracle.
+    ///
+    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process FEC-repair measurement probe; ~45 s; run with --ignored --nocapture"]
     async fn probe_single_symbol_interactive_fec_repair() {
@@ -960,6 +962,8 @@ mod tests {
     /// redundancy shows as a sub-millisecond echo instead of the ~10 ms
     /// tail-loss-probe wait, so the p99 echo latency is the interactive
     /// repair tail.  Run with `--ignored --nocapture` to print the summary.
+    ///
+    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process interactive repair-latency probe; ~25 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_armor_latency() {
@@ -1077,6 +1081,8 @@ mod tests {
     /// a same-round-trip recovery stays near the loopback floor, while a
     /// fall-through to the reorder-window ARQ repair costs at least one extra
     /// RTT. Run with `--ignored --nocapture`.
+    ///
+    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process burst-loss interactive repair probe; ~145 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_burst_loss_latency() {
@@ -1251,6 +1257,8 @@ mod tests {
     /// (iid basis points, 0 = off), `ARMOR_BURST`/`ARMOR_GAP` (burst length and
     /// fixed quiet gap, burst 0 = off), `ARMOR_N`, `ARMOR_SEED`.  Run with
     /// `--ignored --nocapture`.
+    ///
+    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process armor-frontier cell; ~10 s per cell; run with --ignored --nocapture"]
     async fn probe_armor_copy_cell() {
