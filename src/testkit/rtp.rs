@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -537,6 +537,57 @@ pub async fn spawn_rtp_byte_sink_server_via(
     fec: bool,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     spawn_rtp_byte_sink_server_with_mss_via(tx, fec, crate::udp::NO_FEC_MSS).await
+}
+
+/// Send timestamped messages to a [`spawn_rtp_msg_latency_sink`] peer.
+///
+/// Writes the sink's per-message framing over any byte stream: `[4-byte LE
+/// total frame length][payload][8-byte LE send timestamp in micros since
+/// `base`]`. The frame protocol has exactly one authority here — the sink
+/// decoders below (`spawn_rtp_msg_latency_sink*`) read this layout, and the
+/// latency assertions in the scenario suites gate both sides against it. The
+/// mux layer kit carries the same encoder for its stream-framed sparse pings;
+/// that copy is a view of this protocol, not a second authority (the same
+/// sink decoder reads both).
+///
+/// Tick cadence uses [`tokio::time::interval`] with
+/// [`MissedTickBehavior::Delay`] so a missed deadline does not burst the
+/// offered load. The payload is a repeated pattern (rest-padded), verifiable
+/// against the framing by the sink.
+///
+/// Returns the number of messages sent. The caller is responsible for keeping
+/// `write` alive for the duration of the test (e.g. by not shutting down the
+/// underlying connection early).
+pub async fn send_timestamped_messages(
+    write: &mut (impl AsyncWrite + Unpin),
+    base: Instant,
+    msg_bytes: usize,
+    interval: Duration,
+    run_for: Duration,
+) -> u64 {
+    assert!(msg_bytes >= 12, "message framing needs at least 12 bytes");
+    let mut interval = tokio::time::interval(interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sent = 0u64;
+    let payload_bytes = msg_bytes - 12;
+    let payload: Vec<u8> = (0..payload_bytes).map(|i| (i % 251) as u8).collect();
+    let start = Instant::now();
+    loop {
+        interval.tick().await;
+        if start.elapsed() >= run_for {
+            break;
+        }
+        let sent_us = base.elapsed().as_micros() as u64;
+        let mut frame = Vec::with_capacity(msg_bytes);
+        frame.extend_from_slice(&((msg_bytes as u32).to_le_bytes()));
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&sent_us.to_le_bytes());
+        if write.write_all(&frame).await.is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    sent
 }
 
 /// Spawn an `rtp` server that accepts one connection and parses the same
