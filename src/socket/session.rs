@@ -926,8 +926,23 @@ mod tests {
         let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         a.connect(b.local_addr().unwrap()).await.unwrap();
         b.connect(a.local_addr().unwrap()).await.unwrap();
-        let (a_read, mut a_write, _a_supervisor) =
-            socket(wrap_fec(Box::new(a.clone()), Box::new(a), false), None);
+        // The read-closed half's KILL must be labelled with the documented
+        // cause: the metrics observer records every SessionTermination cause
+        // the session presses, and the final assertion requires the
+        // `UnreadPayloadAfterReadClose` label to be among them.
+        let a_terminations = Arc::new(Mutex::new(Vec::new()));
+        let observed_a_terminations = Arc::clone(&a_terminations);
+        let mut a_layer = wrap_fec(Box::new(a.clone()), Box::new(a), false);
+        a_layer.metrics_observer = Some(crate::metrics::MetricsObserver::new(move |observation| {
+            if let MetricsEvent::SessionTermination(termination) = observation.event {
+                observed_a_terminations
+                    .lock()
+                    .unwrap()
+                    .push(termination.cause);
+            }
+        }));
+        let (a_read, mut a_write, _a_supervisor) = socket(a_layer, None);
+
         let (mut b_read, mut b_write, _b_supervisor) =
             socket(wrap_fec(Box::new(b.clone()), Box::new(b), false), None);
         drop(a_read);
@@ -966,6 +981,24 @@ mod tests {
             .await
             .expect_err("the read-closed half must abort locally once the recv window saturates");
         assert_eq!(local_error, std::io::ErrorKind::BrokenPipe);
+        // The local KILL must carry the documented termination cause. The
+        // press publishes the metrics event before the peer observes the
+        // KILL datagram (asserted above), so by now it is in the vec; poll
+        // briefly anyway to stay robust against scheduler reordering.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if a_terminations
+                    .lock()
+                    .unwrap()
+                    .contains(&MetricsTerminationCause::UnreadPayloadAfterReadClose)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read-closed half must label its KILL as UnreadPayloadAfterReadClose");
     }
 
     #[tokio::test]
