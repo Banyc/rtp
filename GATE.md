@@ -61,12 +61,19 @@ The whole in-crate opt-in battery is `cargo test --release -p rtp --lib --
 ## Scenario gate tiers
 
 The rtp performance scenarios relocated here from the harness
-(`netem_test/tests`, step 5 of the relocation) so that every rtp transport
-floor is asserted by rtp's own test invocation; the harness keeps only the
-impairment instrument and points at the owning crates. They consume the
-harness's `netem-test` kit (local-path dev-dependency, `test-kit` feature)
-for impairment and the generic helpers, and rtp's own layer kit
-(`rtp::testkit`, behind the `testing` feature).
+(`netem_test/tests`) so that every rtp transport floor is asserted by rtp's own
+test invocation; the harness keeps only the impairment instrument and points at
+the owning crates. They consume the harness's `netem-test` kit (local `git`
+release tag, `test-kit` feature) for impairment and the generic helpers, and
+rtp's own layer kit (`rtp::testkit`, behind the `testing` feature).
+
+The relocated `tests/` set is: the earlier `rtp_bufferbloat`, `rtp_burst_loss`,
+`rtp_fec`, `rtp_gentle`, `rtp_liveness`, `rtp_loss`, `rtp_mss` and
+`rtp_padding_bench` suites, plus the raw-`rtp` arms of the DualMux-v4 A/B
+comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
+`mux/tests/hol_verify4.rs`) and the shared-bottleneck fairness/latency battery
+(`shared_bottleneck.rs`, which drives `rtp` flows through a shared
+`BottleneckShaper`).
 
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp` runs it.
   Every scenario here is seeded (deterministic impairment) and finishes in a
@@ -84,6 +91,11 @@ for impairment and the generic helpers, and rtp's own layer kit
   scenario must not contain an assertion in its own body, nor reach an
   assertion through a helper: `check-gate.py --crate . rtp` fails with the
   scenario name, its file, and the token if it does.
+- **standard** / **full** asserting scenarios may keep their assertion in a
+  helper defined in the same target file (the shared-bottleneck `full` arms
+  assert inside `rr_under_bulk_ab`); `tools/check-ignored.py` follows those
+  crate-local calls and fails when the reachable closure loses its last
+  assertion token, so such a scenario cannot silently stop being a gate.
 
 `gate-default-required` names the asserting scenarios that must stay in the
 default tier; the checker fails if one is re-`#[ignore]`d or removed.
@@ -176,6 +188,15 @@ tests/rtp_padding_bench.rs::ab_small_echo_latency = perf
 tests/rtp_padding_bench.rs::ab_small_echo_latency_ack_padding = perf
 tests/rtp_padding_bench.rs::ab_small_echo_latency_across_presets = perf
 tests/rtp_padding_bench.rs::padding_throughput_overhead = perf
+tests/hol_verify4.rs::v4_clean_rawbulk = perf
+tests/hol_verify4.rs::v4_ge5_rawbulk = perf
+tests/shared_bottleneck.rs::shared_bneck_fairness_longrun = full
+tests/shared_bottleneck.rs::shared_bneck_fairness_sweep = full
+tests/shared_bottleneck.rs::shared_bneck_late_joiner_fairness = full
+tests/shared_bottleneck.rs::shared_bneck_reorder_tolerant_fairness = full
+tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_10mbps = full
+tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_2mbps = full
+tests/shared_bottleneck.rs::shared_bneck_rr_under_dedicated_bulk_10mbps = full
 ```
 
 ## Scenario manifest
@@ -185,6 +206,8 @@ non-`support` tests reported by `cargo test -p rtp --test <target> -- --list
 --ignored`.
 
 ```gate-manifest
+hol_verify4::v4_clean_rawbulk = perf
+hol_verify4::v4_ge5_rawbulk = perf
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss = full
@@ -198,6 +221,13 @@ rtp_padding_bench::ab_small_echo_latency = perf
 rtp_padding_bench::ab_small_echo_latency_ack_padding = perf
 rtp_padding_bench::ab_small_echo_latency_across_presets = perf
 rtp_padding_bench::padding_throughput_overhead = perf
+shared_bottleneck::shared_bneck_fairness_longrun = full
+shared_bottleneck::shared_bneck_fairness_sweep = full
+shared_bottleneck::shared_bneck_late_joiner_fairness = full
+shared_bottleneck::shared_bneck_reorder_tolerant_fairness = full
+shared_bottleneck::shared_bneck_rr_under_bulk_10mbps = full
+shared_bottleneck::shared_bneck_rr_under_bulk_2mbps = full
+shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps = full
 ```
 
 The `gate-default-required` block below pins the asserting scenarios that must
@@ -207,6 +237,8 @@ report-only/asserting split (all default-required plus every `standard` and
 `full` scenario); the per-tier `perf` scenarios are report-only by definition.
 
 ```gate-default-required
+shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
+shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
 rtp_clean::rtp_over_netem_clean_link_delivers_400kib
 rtp_clean::rtp_over_netem_clean_link_delivers_data
 rtp_clean::rtp_over_netem_latency_is_observable
@@ -222,6 +254,15 @@ rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
 ```
 
 ```gate-asserting
+shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
+shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
+shared_bottleneck::shared_bneck_fairness_longrun
+shared_bottleneck::shared_bneck_fairness_sweep
+shared_bottleneck::shared_bneck_late_joiner_fairness
+shared_bottleneck::shared_bneck_reorder_tolerant_fairness
+shared_bottleneck::shared_bneck_rr_under_bulk_10mbps
+shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
+shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss
@@ -251,9 +292,11 @@ requires it declared here with its assertion-token count:
 
 ```gate-perf-guard-helpers
 netem_test/netem-test/src/kit/payload.rs::with_timeout = 1
+netem_test/netem-test/src/kit/presets.rs::gilbert_elliott_loss = 2
 netem_test/netem-test/src/kit/task_scope.rs::run = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
+rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
 tests/rtp_padding_bench.rs::run_transfer = 1
 tests/rtp_padding_bench.rs::run_transfer_preset = 1
 ```

@@ -25,9 +25,12 @@ The in-crate (`src/`) inventory has one of two honest classifications:
 The relocated scenario targets (`tests/`) keep the harness tier vocabulary:
 
 - `standard` / `full` — *asserting* opt-in scenarios (correctness or
-  performance floors measured in an opt-in tier). The checker requires the
-  test body to still contain an assertion token, so an opt-in scenario that
-  loses its assertion has silently stopped being a gate.
+  performance floors measured in an opt-in tier). The checker requires an
+  assertion token to be reachable from the test body — in the body itself or
+  through a helper defined in the same target file — so an opt-in scenario
+  that loses its assertion has silently stopped being a gate. The closure is
+  crate-local: a call whose callee lives outside the scanned file is never
+  followed, so it cannot silently supply the assertion.
 - `perf` — a *report-only* scenario (A/B bench, measurement). The checker
   requires its body to contain no assertion token, so a check cannot hide
   under the report-only tier.
@@ -66,6 +69,7 @@ IGNORE_RE = re.compile(r"#\[ignore\s*(?:=\s*\"([^\"]*)\")?\s*\]")
 FN_RE = re.compile(
     r"\b(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\("
 )
+CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
 
 
 def manifest_block(name: str) -> str | None:
@@ -148,17 +152,61 @@ def strip_comments(text: str) -> str:
     return "".join(out)
 
 
-def ignored_tests() -> dict[str, tuple[str, str]]:
-    """Map `relpath::fn` -> (ignore reason, body) for every `#[ignore]`d test.
+def local_functions(text: str) -> dict[str, str]:
+    """Map every function defined in ``text`` to its brace-balanced body.
+
+    ``text`` is already comment-stripped, so a signature inside a doc example
+    is not mistaken for a definition. The first definition of a name wins, the
+    same way the scenario gate extracts bodies.
+    """
+    found: dict[str, str] = {}
+    for match in FN_RE.finditer(text):
+        start = text.find("{", match.end())
+        if start == -1:
+            continue
+        found.setdefault(match.group(1), fn_body(text, start))
+    return found
+
+
+def reaches_assertion(body: str, functions: dict[str, str]) -> bool:
+    """True when ``body`` or a transitively called local function asserts.
+
+    A `standard`/`full` scenario may keep its assertion one call away, in a
+    helper defined in the same target file; the own-body scan would misread
+    such a gate as report-only and demand it be reclassified. Only functions
+    defined in the same scanned file are followed, so a call whose callee
+    lives outside it cannot silently supply the token.
+    """
+    seen: set[str] = set()
+    stack = [body]
+    while stack:
+        current = stack.pop()
+        if ASSERTION_TOKENS.search(current):
+            return True
+        for call in CALL_RE.finditer(current):
+            name = call.group(1).rsplit("::", 1)[-1]
+            if name in functions and name not in seen:
+                seen.add(name)
+                stack.append(functions[name])
+    return False
+
+
+def ignored_tests() -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
+    """`(relpath::fn -> (ignore reason, body), relpath -> local functions)`.
 
     The crate's own `src/` tree and the relocated `tests/` scenario targets
     are scanned; the attribute is matched before the function it decorates,
-    exactly as the compiler would see it.
+    exactly as the compiler would see it. The per-file function map lets the
+    `standard`/`full` check follow an assertion into a helper defined in the
+    same file.
     """
     found: dict[str, tuple[str, str]] = {}
+    functions: dict[str, dict[str, str]] = {}
     for root in (SRC, TESTS):
         for path in sorted(root.rglob("*.rs")):
             text = strip_comments(path.read_text(encoding="utf-8"))
+            rel = path.relative_to(REPO).as_posix()
+            functions[rel] = local_functions(text)
             for match in IGNORE_RE.finditer(text):
                 fn_match = FN_RE.search(text, match.end())
                 if fn_match is None:
@@ -166,17 +214,16 @@ def ignored_tests() -> dict[str, tuple[str, str]]:
                 start = text.find("{", fn_match.end())
                 if start == -1:
                     sys.exit(f"{path}: fn {fn_match.group(1)} has no body")
-                rel = path.relative_to(REPO).as_posix()
                 found[f"{rel}::{fn_match.group(1)}"] = (
                     match.group(1) or "",
                     fn_body(text, start),
                 )
-    return found
+    return found, functions
 
 
 def main() -> int:
     manifest = manifest_entries()
-    actual = ignored_tests()
+    actual, functions = ignored_tests()
 
     bad = False
     missing = sorted(actual.keys() - manifest.keys())
@@ -215,9 +262,10 @@ def main() -> int:
                 )
                 bad = True
         elif classification in ("standard", "full"):
-            if not tokens:
+            rel = name.rsplit("::", 1)[0]
+            if not reaches_assertion(body, functions.get(rel, {})):
                 print(
-                    f"{classification} scenario {name} contains no assertion token: "
+                    f"{classification} scenario {name} reaches no assertion token: "
                     f"it has silently stopped being a gate (reclassify as perf "
                     f"or restore the assertion)"
                 )
