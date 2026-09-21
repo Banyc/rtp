@@ -220,6 +220,26 @@ fn resume_preempts_wait(timed_wake: Option<(Instant, MetricsSendDriverWake)>) ->
     !matches!(timed_wake, Some((_, MetricsSendDriverWake::PacingTimer)))
 }
 
+/// Whether an ACK-schedule notification must be reported as a driver wake.
+///
+/// The driver's whole reaction to a schedule notification is derived from the
+/// `ack_schedule(now)` read it takes before parking: it flushes when that read
+/// reports `Due`, and otherwise arms the deadline that read names.  The
+/// notifier publishes only after it has committed the state it announces
+/// (`AckFeedback::record` mutates under the state lock and notifies after
+/// releasing it), so a notification that was already in hand when the driver
+/// made that read is reflected in the schedule the read returned — the work it
+/// announced is already covered by the wait this iteration arms.  Reporting
+/// such a notification as a wake would count a wake that never happened: the
+/// select had it ready on entry, so it never yielded the task.
+///
+/// Only a notification published after the read can preempt the armed wait
+/// with a deadline the read did not already account for, so that one is a
+/// wake.
+fn ack_schedule_signal_is_wake(published_before_the_schedule_read: bool) -> bool {
+    !published_before_the_schedule_read
+}
+
 struct WriteDriver {
     write_half: WriteHalf,
     stop: tokio_util::sync::CancellationToken,
@@ -247,12 +267,23 @@ impl WriteDriver {
                 let resume_send = self.write_half.resume_send().notified();
                 let ack_schedule_changed = self.write_half.ack_schedule_changed().notified();
                 tokio::pin!(ack_schedule_changed);
-                ack_schedule_changed.as_mut().enable();
+                let ack_schedule_published = ack_schedule_changed.as_mut().enable();
                 let ack_deadline = match self.write_half.ack_schedule(Instant::now()) {
                     AckSchedule::Idle => None,
                     AckSchedule::At(deadline) => Some(deadline),
                     AckSchedule::Due(_) => break,
                 };
+                if !ack_schedule_signal_is_wake(ack_schedule_published) {
+                    // The notification is already reflected in the schedule
+                    // read above: re-arm from a fresh registration instead of
+                    // letting the select fire on a change this iteration has
+                    // already accounted for.  Each consumed notification
+                    // needs one extra iteration, so the loop is bounded by
+                    // the number of notifications published concurrently
+                    // with the read; a notification published after it is
+                    // registered normally and preempts the wait.
+                    continue;
+                }
                 let timed_wake = timed_wake_for(next_wake, ack_deadline);
                 let resume_preempts = resume_preempts_wait(timed_wake);
                 let wake = match timed_wake {
@@ -585,6 +616,32 @@ mod tests {
         assert_eq!(
             timed_wake_for(SendWake::Protocol(earlier), Some(tie)),
             Some((earlier, MetricsSendDriverWake::ProtocolTimer))
+        );
+    }
+
+    /// Only a notification published after the driver read the ACK schedule
+    /// can preempt the wait that read arms: the schedule read happens after
+    /// `enable`, so a notification already in hand when it was taken is
+    /// already reflected in the schedule the read returned.  The rule is not
+    /// vacuous — it must answer differently for the two publication orders —
+    /// and it must answer `false` (not a wake) exactly for the ordering whose
+    /// change the read already accounts for; a constant `true` is the
+    /// instrument defect it removes, and a constant `false` would drop a
+    /// notification that shortens the armed wait.
+    #[test]
+    fn an_already_published_ack_schedule_signal_is_not_a_driver_wake() {
+        assert!(
+            ack_schedule_signal_is_wake(false),
+            "a notification published after the schedule read can shorten the armed wait"
+        );
+        assert!(
+            !ack_schedule_signal_is_wake(true),
+            "a notification published before the schedule read is already reflected in it"
+        );
+        assert_ne!(
+            ack_schedule_signal_is_wake(true),
+            ack_schedule_signal_is_wake(false),
+            "the rule must not be constant: it has to distinguish the two publication orders"
         );
     }
 

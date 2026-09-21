@@ -83,4 +83,40 @@ mod tests {
             .await
             .expect("a waiter armed before the state change must be reached");
     }
+
+    /// The write driver consumes a notification with `enable` before it reads
+    /// `ack_schedule`, so a schedule read taken after that consumption must
+    /// already reflect the work the notification announced: `record` commits
+    /// the state change before it publishes.  This is what lets the driver
+    /// treat such a notification as already accounted for instead of a wake.
+    /// A published-then-committed ordering (the reverse) would leave the read
+    /// behind the notification that announced it.
+    #[test]
+    fn a_consumed_notification_is_visible_to_the_schedule_read_that_follows_it() {
+        let owner = AckFeedback::new();
+        let now = Instant::now();
+        assert_eq!(
+            owner.schedule(now),
+            AckSchedule::Idle,
+            "nothing pending yet"
+        );
+        let work = ReceivedAckWork {
+            pending_acks: 1,
+            fin_ack: false,
+            echo_ts: None,
+        };
+        // Published with no waiter registered: `notify_one` stores a permit.
+        assert!(owner.record(work), "empty-to-pending must report a change");
+        let notified = owner.schedule_changed().notified();
+        tokio::pin!(notified);
+        assert!(
+            notified.as_mut().enable(),
+            "the notification must be in hand before the schedule read"
+        );
+        assert_ne!(
+            owner.schedule(now),
+            AckSchedule::Idle,
+            "a consumed notification must already be in the schedule that follows it"
+        );
+    }
 }
