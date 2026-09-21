@@ -206,6 +206,20 @@ fn timed_wake_for(
     }
 }
 
+/// Whether a resume notification may preempt the armed wait.
+///
+/// A pacing deadline is the pacer's own batch deadline: `next_batch_time`
+/// returns an instant at most one `TARGET_WAKE_INTERVAL` (plus one token
+/// period) after the caller's `now`, and the pass it schedules drains
+/// everything a resume could have sent.  A resume that arrives while one is
+/// armed therefore cannot produce a datagram earlier than that pass, so it
+/// is deferred to it and one task wake per batch interval is removed.  Every
+/// other armed tick — a retransmission (RTO) deadline or an ACK deadline —
+/// can be arbitrarily far away, so a resume must still preempt it.
+fn resume_preempts_wait(timed_wake: Option<(Instant, MetricsSendDriverWake)>) -> bool {
+    !matches!(timed_wake, Some((_, MetricsSendDriverWake::PacingTimer)))
+}
+
 struct WriteDriver {
     write_half: WriteHalf,
     stop: tokio_util::sync::CancellationToken,
@@ -240,11 +254,12 @@ impl WriteDriver {
                     AckSchedule::Due(_) => break,
                 };
                 let timed_wake = timed_wake_for(next_wake, ack_deadline);
+                let resume_preempts = resume_preempts_wait(timed_wake);
                 let wake = match timed_wake {
                     Some((deadline, timer_wake)) => {
                         tokio::select! {
                             () = tokio::time::sleep_until(deadline.into()) => Some(timer_wake),
-                            () = resume_send => Some(MetricsSendDriverWake::ResumeSignal),
+                            () = resume_send, if resume_preempts => Some(MetricsSendDriverWake::ResumeSignal),
                             () = &mut ack_schedule_changed => None,
                             () = kill_requested.cancelled() => Some(MetricsSendDriverWake::KillRequested),
                             () = self.stop.cancelled() => return,
@@ -571,6 +586,34 @@ mod tests {
             timed_wake_for(SendWake::Protocol(earlier), Some(tie)),
             Some((earlier, MetricsSendDriverWake::ProtocolTimer))
         );
+    }
+
+    /// A resume notification is deferred only to a pacing deadline: every
+    /// other armed tick can be arbitrarily far away, so deferring to it would
+    /// delay the resume past the pacer's batch interval.
+    #[test]
+    fn a_resume_preempts_every_armed_wake_except_a_pacing_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(1);
+        assert!(
+            resume_preempts_wait(None),
+            "a signal-only park must honour a resume immediately"
+        );
+        assert!(
+            !resume_preempts_wait(Some((deadline, MetricsSendDriverWake::PacingTimer))),
+            "a pacing deadline already schedules the pass a resume would request"
+        );
+        for armed in [
+            MetricsSendDriverWake::ProtocolTimer,
+            MetricsSendDriverWake::ResumeSignal,
+            MetricsSendDriverWake::AckScheduleSignal,
+            MetricsSendDriverWake::KillRequested,
+        ] {
+            assert!(
+                resume_preempts_wait(Some((deadline, armed))),
+                "{armed:?} must not defer a resume"
+            );
+        }
     }
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {

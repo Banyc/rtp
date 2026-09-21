@@ -258,6 +258,40 @@ mod tests {
         assert_eq!(pacer.next_batch_time(now, 64), now);
     }
 
+    /// The send driver defers a resume notification to an armed pacing
+    /// deadline, so that deadline must stay within the pacer's target wake
+    /// interval: the batch is `ceil(rate * TARGET_WAKE_INTERVAL)` tokens, and
+    /// the fractional coining token can leave at most one token period of
+    /// slack.  A deadline that drifted further (a larger batch, a coarser
+    /// interval) would silently turn the deferral into added send latency.
+    #[test]
+    fn a_pacing_deadline_stays_within_the_target_wake_interval() {
+        assert_eq!(
+            TARGET_WAKE_INTERVAL,
+            Duration::from_millis(1),
+            "the send driver defers a resume to an armed pacing deadline, so \
+             this interval is the deferral bound; raising it adds send latency"
+        );
+        let now = Instant::now();
+        for packets_per_second in [1.0, 10.0, 128.0, 1_000.0, 10_000.0, 1_000_000.0] {
+            let rate = rate(packets_per_second);
+            let token_period = Duration::from_secs_f64(1.0 / packets_per_second);
+            let bound = TARGET_WAKE_INTERVAL + token_period;
+            for max_sendable in [1usize, 2, 8, 64, 4096] {
+                // Drain the prefill so the deadline is a real future wait.
+                let pacer = SendPacer::new_prefilled(rate, now);
+                pacer.take_at_most_tokens(usize::MAX, now);
+                let deadline = pacer.next_batch_time(now, max_sendable);
+                assert!(
+                    deadline <= now + bound,
+                    "rate {packets_per_second}, max_sendable {max_sendable}: deadline {:?} \
+                     exceeds the {bound:?} deferral bound",
+                    deadline.duration_since(now)
+                );
+            }
+        }
+    }
+
     #[test]
     fn wake_reason_preserves_the_earliest_deadline() {
         let now = Instant::now();
