@@ -1323,8 +1323,11 @@ async fn a_slow_reply_resynchronizes_instead_of_ending_the_phase() {
 
     // Echo server: delay the first reply past the round-trip bound, echo every
     // later read promptly. Mirrors the RTP echo server, which echoes each
-    // partial read rather than waiting for a whole message.
-    let echo = tokio::spawn(async move {
+    // partial read rather than waiting for a whole message. The body owns the
+    // echo in its JoinSet: it runs concurrently with the measured phase, which
+    // aborts and reaps it afterwards.
+    let mut echo_tasks = tokio::task::JoinSet::new();
+    echo_tasks.spawn(async move {
         let mut buf = vec![0u8; 8 * 1024];
         let mut first = true;
         loop {
@@ -1356,7 +1359,15 @@ async fn a_slow_reply_resynchronizes_instead_of_ending_the_phase() {
         },
     )
     .await;
-    echo.abort();
+
+    // Abort the echo (it may be parked mid-write on the duplex) and reap its
+    // result so a panic inside it is re-raised rather than left detached.
+    echo_tasks.abort_all();
+    while let Some(result) = echo_tasks.join_next().await {
+        if result.as_ref().is_err_and(tokio::task::JoinError::is_panic) {
+            result.unwrap();
+        }
+    }
 
     assert!(
         sent > 1,
