@@ -2558,6 +2558,38 @@ mod tests {
         assert_eq!(obs.retransmitted_packets, 1);
     }
 
+    /// The RTO-overdue metric is inclusive at the deadline: a packet exactly
+    /// at `sent_time + rto` is already lost by `hits_rto`, so the reported
+    /// overdue must be zero rather than absent.
+    #[test]
+    fn pipe_rto_overdue_is_zero_at_exactly_the_deadline() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let sent_at = t0 + ms(1000);
+        send_packet(&mut space, sent_at);
+        let at_deadline = sent_at + space.rtt_stats.rto_duration();
+
+        let obs = space.send_window_observation(at_deadline);
+        assert_eq!(obs.packets_in_pipe, 1);
+        assert_eq!(
+            obs.loss_ratio,
+            Some(1.0),
+            "the packet is RTO-due at exactly its deadline"
+        );
+        assert_eq!(
+            obs.maximum_packet_rto_overdue,
+            Some(Duration::ZERO),
+            "a packet exactly at its RTO deadline is overdue by zero, not absent"
+        );
+        // One nanosecond later the overdue is strictly positive.
+        let obs = space.send_window_observation(at_deadline + Duration::from_nanos(1));
+        assert_eq!(
+            obs.maximum_packet_rto_overdue,
+            Some(Duration::from_nanos(1))
+        );
+    }
+
     #[test]
     fn huge_loss_requires_more_than_the_minimum_sample_count() {
         let t0 = Instant::now();
@@ -2572,6 +2604,55 @@ mod tests {
 
         send_packet(&mut space, t0 + ms(LOSS_RATE_MIN_SAMPLES as u64));
         assert!(space.huge_data_loss(threshold, after_rto));
+    }
+
+    /// The huge-loss verdict is a strict comparison: a pipe loss rate exactly
+    /// equal to the tolerated rate is *not* huge loss, and one packet more is.
+    /// The pipe is a strict subset of the in-flight window here — the rate
+    /// write retracts the pipe frontier to the `cwnd+1`-th packet — which is
+    /// the only shape in which the scan can report a ratio at or below the
+    /// threshold (a full-window pipe early-exits to `None` at equality).
+    #[test]
+    fn huge_loss_is_strict_at_exactly_the_tolerated_pipe_rate() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        let rate = PosR::new(100.0).unwrap();
+        space.set_send_rate(rate);
+        let cwnd = space.cwnd().get();
+        for _ in 0..cwnd + 3 {
+            send_packet(&mut space, t0 + ms(1000));
+        }
+        space.set_send_rate(rate);
+        let pipe_len = space.num_pkts_in_pipe();
+        let in_flight = space.num_in_flight_pkts();
+        assert_eq!(pipe_len, cwnd + 1, "the pipe is the cwnd+1 frontier");
+        assert_eq!(
+            in_flight,
+            cwnd + 3,
+            "two packets sit past the retracted pipe frontier"
+        );
+        assert!(
+            in_flight > LOSS_RATE_MIN_SAMPLES,
+            "the verdict gate needs more than LOSS_RATE_MIN_SAMPLES in flight"
+        );
+        // Exactly `k` of the pipe's packets are lost: the pipe ratio is
+        // exactly `k / pipe_len`.
+        let k = 5u64;
+        for seq in 0..k {
+            lose_packet(&mut space, seq, t0 + ms(1100));
+        }
+        let threshold = UnitR::new(k as f64 / pipe_len as f64).unwrap();
+        assert!(
+            !space.huge_data_loss(threshold, t0 + ms(1100)),
+            "a loss rate exactly equal to the tolerated rate is not huge loss"
+        );
+        // One more lost pipe packet puts the rate strictly above tolerance.
+        lose_packet(&mut space, k, t0 + ms(1100));
+        assert!(
+            space.huge_data_loss(threshold, t0 + ms(1100)),
+            "a loss rate strictly above the tolerated rate is huge loss"
+        );
     }
 
     /// The huge-loss scan must stop as soon as the verdict can no longer

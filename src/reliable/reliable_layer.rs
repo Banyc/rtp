@@ -3919,6 +3919,43 @@ mod tests {
         );
     }
 
+    /// The BDP ceiling engages *at* the engage factor: the abstain branch is
+    /// the strict `smooth_rtt < factor * min_rtt`, so a smoothed RTT exactly
+    /// at `factor * min_rtt` is capped rather than treated as still at its
+    /// propagation floor.  62.5 ms and 1.0625 s are dyadic, so the SRTT EWMA
+    /// lands exactly on `3 * min_rtt = 187.5 ms` (`0.875 * 0.0625 + 0.125 *
+    /// 1.0625`).
+    #[test]
+    fn bdp_cap_engages_at_exactly_the_engage_factor() {
+        use crate::traffic_shaping::recovery::pkt_send_space::{
+            CWND_BDP_CAP_ENGAGE_RTT_FACTOR, CWND_BDP_CAP_SCALE, INIT_CWND,
+        };
+
+        let t0 = Instant::now();
+        let mut rl = test_layer(t0);
+        let min_rtt = Duration::from_secs_f64(0.0625);
+        let high_rtt = Duration::from_secs_f64(1.0625);
+        rl.sample_rtt(min_rtt, t0);
+        rl.sample_rtt(high_rtt, t0 + Duration::from_millis(1));
+        assert_eq!(rl.pkt_send_space().min_rtt(), Some(min_rtt));
+        assert_eq!(
+            rl.pkt_send_space().smooth_rtt(),
+            min_rtt.mul_f64(CWND_BDP_CAP_ENGAGE_RTT_FACTOR),
+            "the sample must land exactly on the engage boundary"
+        );
+        let peak = 1000.0;
+        rl.congestion_response
+            .delivery_peak()
+            .update(t0 + Duration::from_millis(2), peak);
+        let bdp = min_rtt.as_secs_f64() * peak;
+        let expected_cap = ((bdp * CWND_BDP_CAP_SCALE as f64).round() as usize).max(INIT_CWND);
+        assert_eq!(
+            rl.cwnd_bdp_cap(),
+            Some(expected_cap),
+            "a smoothed RTT exactly at the engage factor must engage the ceiling"
+        );
+    }
+
     #[test]
     fn congestion_metrics_track_persistent_queue_resets_on_signal_loss() {
         let t0 = Instant::now();

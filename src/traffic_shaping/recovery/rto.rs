@@ -218,4 +218,28 @@ mod tests {
             rto.rto()
         );
     }
+
+    /// The structural fast-loss gate is a strict comparison: `K * rttvar`
+    /// exactly equal to `srtt / 4` leaves the gate disarmed (the jitter is not
+    /// *below* the quarter-SRTT margin), so the evidence-gated path stays off
+    /// at the boundary.  0.4 and 0.025 are both exactly representable and
+    /// `0.025 * 4` is the same `f64` as `0.4 / 4`.
+    #[test]
+    fn fast_loss_gate_is_disarmed_at_exactly_the_quarter_srtt_boundary() {
+        use primitive::ops::float::NonNegR;
+
+        let mut timer = RtxTimer::new();
+        timer.smooth_rtt = NonNegR::new(0.4).unwrap();
+        timer.smooth_rtt_var = NonNegR::new(0.025).unwrap();
+        timer.recompute_derived();
+        assert_eq!(
+            timer.smooth_rtt_var().mul_f64(RtxTimer::K),
+            timer.smooth_rtt() / 4,
+            "the sample must land exactly on the engage boundary"
+        );
+        assert!(
+            !timer.fast_loss_armed(),
+            "K*rttvar exactly at srtt/4 must leave the structural gate disarmed"
+        );
+    }
 }
