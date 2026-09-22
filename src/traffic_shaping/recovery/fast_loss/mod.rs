@@ -14,10 +14,11 @@ use crate::traffic_shaping::core::queue_growth::{
 
 /// The jitter tolerance the queue-gate machinery uses to tell a standing
 /// queue from the path's own jitter: `2 * rttvar`, never below 5 ms, and
-/// never below a quarter of the propagation floor (the floor-scaled term the
+/// never below an eighth of the propagation floor (the floor-scaled term the
 /// delay gate applies too).  Reused here so the fast-loss rescue and the
 /// congestion controller's queue verdict share one definition of "srtt is
-/// elevated by queueing, not by jitter".
+/// elevated by queueing, not by jitter": the rescue must stay reachable at
+/// the queue the delay gate's drain actually permits.
 fn queue_jitter_margin(floor: Duration, smooth_rtt_var: Duration) -> Duration {
     smooth_rtt_var
         .mul_f64(QUEUE_RTT_FACTOR)
@@ -88,11 +89,15 @@ mod tests {
     #[test]
     fn no_queue_no_rescue_even_when_the_srtt_gate_would_have_disarmed_for_jitter() {
         // The production spurious-fast-loss shape: 5 ms one-way jitter under
-        // the 50 ms propagation floor, srtt elevated only by the jitter's own
-        // mean-vs-min spread.  The srtt-relative gate disarms (K*rttvar >=
-        // srtt/4 at rttvar 4 ms), but the min-RTT rescue must abstain because
-        // there is no queue above the floor.
-        assert!(!armed_against_min_rtt(Some(ms(41)), ms(51), ms(4)));
+        // the 50 ms propagation floor, srtt at the jitter's own mean (the
+        // floor is set by the minimum sample).  The srtt-relative gate disarms
+        // (K*rttvar >= srtt/4 at rttvar 4 ms), but the min-RTT rescue must
+        // abstain because there is no queue above the jitter margin.
+        assert!(!armed_against_min_rtt(Some(ms(41)), ms(46), ms(4)));
+        // The margin is the jitter term here (2 * 4 ms), not the floor-scaled
+        // one, so the boundary sits one millisecond above it.
+        assert!(!armed_against_min_rtt(Some(ms(41)), ms(49), ms(4)));
+        assert!(armed_against_min_rtt(Some(ms(41)), ms(50), ms(4)));
         // The same link with a 15 ms standing queue: rescue fires.
         assert!(armed_against_min_rtt(Some(ms(41)), ms(66), ms(4)));
     }

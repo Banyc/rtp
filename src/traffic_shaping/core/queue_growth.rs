@@ -22,7 +22,19 @@ pub(crate) const QUEUE_RTT_FACTOR: f64 = 2.0;
 /// ordinary delay gate, preventing high jitter from masquerading as a standing
 /// queue while still letting the ordinary gate drain transient growth.
 pub(crate) const PERSISTENT_QUEUE_RTTVAR_FACTOR: f64 = 2.0;
-pub(crate) const QUEUE_TOL_RTT_FRACTION: f64 = 0.25;
+/// Fraction of the propagation floor that a dedicated lane's queue gate
+/// tolerates as a standing queue before it declares the delay self-inflicted.
+///
+/// This is a latency budget, not a throughput one.  A rate-paced sender keeps
+/// the bottleneck saturated at any sawtooth amplitude: the tolerated queue is
+/// exactly the storage a below-delivery-rate drain consumes, so a cycle's mean
+/// send rate is the link rate whatever the ceiling is, and a larger ceiling
+/// buys standing delay and nothing else.  The ceiling must still exceed the
+/// queue the gate accumulates while it reacts -- one probe interval at the
+/// probe's overshoot rate, measured at about 4 % of the propagation floor on
+/// the 100 Mbit/s, 300 ms lanes.  An eighth holds a margin of more than three
+/// over that reaction lag while halving the standing queue the gate permits.
+pub(crate) const QUEUE_TOL_RTT_FRACTION: f64 = 0.125;
 pub(crate) const QUEUE_RTT_FLOOR: Duration = Duration::from_millis(5);
 
 /// Fractional single-observe rise of the RTT floor that marks a path *step*
@@ -435,6 +447,68 @@ fn queue_tolerance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The floor-scaled drain allowance is the *whole* tolerated standing
+    /// queue whenever the path's own jitter is small against the propagation
+    /// floor -- which is exactly the state of a rate-paced sender on a long
+    /// dedicated lane (a self-inflicted queue raises the trending variance
+    /// only as fast as it raises the RTT, so the jitter margin stays at a few
+    /// milliseconds while the floor term decides).  Ramp such a lane's queue
+    /// the way its own probe overshoot does and the drain trigger must fire
+    /// within an eighth of the floor: a quarter would let the standing queue
+    /// -- and so the delay every packet pays -- sit twice as deep for the same
+    /// saturation.
+    #[test]
+    fn the_drain_trigger_fires_within_an_eighth_of_the_propagation_floor() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(300);
+        let floor = Duration::from_millis(300);
+        let jitter = GateJitter::uniform(Duration::from_millis(1));
+        let mut growth = QueueGrowth::new(t0, false);
+        growth.set_lane(CongestionLane::Dedicated);
+        let _ = growth.observe(floor, jitter, Some(0.0), t0, control_rtt);
+
+        // +32 ms of standing queue per second, sampled every 4 ms: the ramp a
+        // 2 %-over-link probe gives a 100 Mbit/s, 300 ms pipe.
+        let step = Duration::from_micros(128);
+        let mut armed_at = None;
+        for i in 1..=400u64 {
+            let excess = step * i as u32;
+            let now = t0 + Duration::from_micros(i * 4_000);
+            let observation = growth.observe(floor + excess, jitter, Some(0.0), now, control_rtt);
+            if observation.persistent_for.is_some() {
+                armed_at = Some(excess);
+                break;
+            }
+        }
+
+        let excess = armed_at.expect("the drain trigger must arm on a standing queue");
+        // The bound is a specification, deliberately not written in terms of
+        // `QUEUE_TOL_RTT_FRACTION`: a tolerated standing queue deeper than an
+        // eighth of the propagation floor is the regression this test catches.
+        let bound = floor / 8;
+        assert!(
+            excess <= bound + step,
+            "a {floor:?} floor must not tolerate more than {bound:?} of standing queue, armed at {excess:?}"
+        );
+    }
+
+    /// The tolerated standing queue is bounded without touching the jitter
+    /// margin: an eighth of the floor never displaces the `2 * rttvar` term a
+    /// jittery path relies on, so a tighter floor allowance cannot make the
+    /// gate fire on the path's own jitter.
+    #[test]
+    fn the_floor_allowance_leaves_the_jitter_margin_intact() {
+        let floor = Duration::from_millis(100);
+        let rttvar = Duration::from_millis(60);
+        let jitter_margin = rttvar.mul_f64(QUEUE_RTT_FACTOR).max(QUEUE_RTT_FLOOR);
+        assert!(jitter_margin > floor.mul_f64(QUEUE_TOL_RTT_FRACTION));
+        assert_eq!(
+            queue_tolerance(rttvar, floor, QUEUE_RTT_FACTOR, true),
+            jitter_margin,
+            "the jitter margin must remain the gate's allowance when it is the larger"
+        );
+    }
 
     #[test]
     fn persistent_queue_uses_a_wider_jitter_margin_than_the_normal_gate() {
