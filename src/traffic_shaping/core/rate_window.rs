@@ -91,4 +91,41 @@ mod tests {
         assert_eq!(window.update(t0 + DELIVERY_PEAK_BUCKET * 3, 25.0), 70.0);
         assert_eq!(window.peek(), Some(70.0));
     }
+
+    /// The double-bucket reset is `elapsed > DELIVERY_PEAK_BUCKET * 2`, STRICT:
+    /// at exactly two buckets the previous bucket is still inside the window
+    /// (it is moved into `prev`, not discarded), so a peak that is exactly two
+    /// buckets old must still be reported.  `DELIVERY_PEAK_BUCKET * 2` is an
+    /// exact `Duration` product and the sample instants are exact, so the
+    /// boundary carries no float-derived margin.
+    #[test]
+    fn a_peak_exactly_two_buckets_old_is_still_in_the_window() {
+        let t0 = Instant::now();
+        let mut window = WindowedDeliveryMax::new(t0);
+        assert_eq!(window.update(t0, 100.0), 100.0);
+        assert_eq!(
+            window.update(t0 + DELIVERY_PEAK_BUCKET * 2, 10.0),
+            100.0,
+            "a peak exactly two buckets old is still inside the window"
+        );
+    }
+
+    /// The single-bucket roll is `elapsed > DELIVERY_PEAK_BUCKET`, STRICT: at
+    /// exactly one bucket the sample has not rolled, so the peak it joins stays
+    /// in the *current* bucket and keeps that bucket's ageing.  A `>=` mutant
+    /// rolls one sample early, which moves the stored bucket start forward;
+    /// the peak is then displaced into `prev` a whole bucket sooner and has
+    /// aged out by the time this test looks two buckets after the first sample.
+    #[test]
+    fn a_sample_exactly_one_bucket_old_has_not_rolled_yet() {
+        let t0 = Instant::now();
+        let mut window = WindowedDeliveryMax::new(t0);
+        assert_eq!(window.update(t0, 100.0), 100.0);
+        assert_eq!(window.update(t0 + DELIVERY_PEAK_BUCKET, 10.0), 100.0);
+        assert_eq!(
+            window.update(t0 + DELIVERY_PEAK_BUCKET * 2, 10.0),
+            100.0,
+            "an early roll ages the peak out a whole bucket sooner"
+        );
+    }
 }

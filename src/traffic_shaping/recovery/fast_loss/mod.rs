@@ -101,4 +101,36 @@ mod tests {
         // The same link with a 15 ms standing queue: rescue fires.
         assert!(armed_against_min_rtt(Some(ms(41)), ms(66), ms(4)));
     }
+
+    /// The variation premise is `smooth_rtt_var < min_rtt`, STRICT: a variation
+    /// exactly equal to the propagation floor is not *below* the floor, so it
+    /// cannot open the rescue by itself.  The existing boundary cases cannot
+    /// see this -- where they do land on `var == min_rtt` the second premise
+    /// already fails (the srtt does not clear the jitter margin), so a `<=`
+    /// mutant passes them.  Here the srtt clears the margin by one millisecond,
+    /// which leaves the variation comparison as the only thing holding the
+    /// rescue off.  The margin at `var == min_rtt` is exactly `2 * min_rtt`
+    /// (the 5 ms floor and the floor-scaled eighth are both smaller), and every
+    /// duration here is a whole number of milliseconds, so the boundary is
+    /// exact rather than a float-derived margin probed with a literal.
+    #[test]
+    fn variation_equal_to_the_propagation_floor_does_not_arm_alone() {
+        let min_rtt = ms(100);
+        let margin = min_rtt.mul_f64(2.0);
+        assert_eq!(margin, ms(200), "the margin at var == min_rtt is exact");
+        let elevated = min_rtt + margin + ms(1);
+
+        assert!(
+            !armed_against_min_rtt(Some(min_rtt), elevated, min_rtt),
+            "a variation exactly equal to the floor is not below it, so the \
+             rescue must stay disarmed"
+        );
+        // One nanosecond below the floor with the same srtt arms, so the
+        // premise holding the rescue off here is the variation comparison.
+        assert!(armed_against_min_rtt(
+            Some(min_rtt),
+            elevated,
+            min_rtt - Duration::from_nanos(1)
+        ));
+    }
 }

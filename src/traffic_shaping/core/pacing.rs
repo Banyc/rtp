@@ -347,6 +347,27 @@ mod tests {
         );
     }
 
+    /// The "already processed" test is `deadline <= now`, INCLUSIVE.  A
+    /// protocol deadline that lands exactly on `now` was consumed by this very
+    /// pass too, and it must not be reported back: the driver would wake
+    /// immediately to re-run the pass with no pacing change, and since that
+    /// pass still has no token the same `Protocol(now)` deadline would be
+    /// re-fabricated, spinning until the pacing deadline.  The strictly-past
+    /// case above cannot see this, because `now - 1 ms` satisfies both `<` and
+    /// `<=`.  `Instant` equality is exact, so the boundary needs no tolerance.
+    #[test]
+    fn a_protocol_deadline_exactly_now_is_already_processed() {
+        let now = Instant::now();
+        let pacing = now + Duration::from_millis(2);
+        assert_eq!(
+            SendWake::after_send_pass(now, Some(pacing), Some(now)),
+            SendWake::Pacing(pacing),
+            "a protocol deadline equal to now was processed by this pass; the \
+             next useful wake is the pacing deadline, not an immediate \
+             Protocol(now) wake"
+        );
+    }
+
     #[test]
     fn burst_capacity_scales_with_rate() {
         assert_eq!(

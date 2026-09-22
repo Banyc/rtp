@@ -917,4 +917,180 @@ mod tests {
             "the persistent timer must use the trending margin, not the steady one"
         );
     }
+
+    /// The path-step test is `floor > previous * (1 +
+    /// QUEUE_FLOOR_STEP_RISE_FRACTION)`, STRICT: a floor that rises by exactly
+    /// the step fraction is still queue growth -- a queue raises the windowed
+    /// floor gradually -- and must keep the queue-immune steady margin instead
+    /// of switching the ordinary gate to the wider trending margin for the next
+    /// eight observations.  The boundary is built from the implementation's own
+    /// expression, so the equality is bit-exact (the test asserts it actually
+    /// landed on the floor), not a float-derived margin probed with a literal
+    /// that a `>=` mutant could clear.
+    #[test]
+    fn a_floor_rise_of_exactly_the_step_fraction_is_not_a_step() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(200);
+        let steady = Duration::from_millis(5);
+        let trending = Duration::from_millis(80);
+        let jitter = GateJitter { steady, trending };
+
+        let base = Duration::from_millis(100);
+        let mut growth = QueueGrowth::new(t0, true);
+        growth.observe(base, jitter, Some(0.0), t0, control_rtt);
+
+        // The reorder-tolerant bucket is `max(200 ms, 10 * floor)`, so three
+        // seconds of elapsed time voids both buckets and the next sample *is*
+        // the windowed floor.
+        let step = base.mul_f64(1.0 + QUEUE_FLOOR_STEP_RISE_FRACTION);
+        let observation = growth.observe(
+            step,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_secs(3),
+            control_rtt,
+        );
+        assert_eq!(
+            observation.floor, step,
+            "the setup must land the windowed floor exactly on the boundary"
+        );
+        assert_eq!(
+            observation.tolerance,
+            queue_tolerance(steady, observation.floor, QUEUE_RTT_FACTOR, true),
+            "a rise of exactly 1 + QUEUE_FLOOR_STEP_RISE_FRACTION is queue \
+             growth, not a path step, so the ordinary gate keeps the \
+             steady-state margin"
+        );
+        assert!(
+            observation.tolerance
+                < queue_tolerance(trending, observation.floor, QUEUE_RTT_FACTOR, true),
+            "the stepped margin must be distinguishable from the steady one"
+        );
+    }
+
+    /// The persistent-queue timer's arm is `smooth > floor +
+    /// persistent_tolerance`, STRICT: a queue exactly at the threshold is not
+    /// yet persistent, so the drain must not arm one sample early.  The
+    /// boundary is assembled from the module's own `queue_tolerance` and the
+    /// returned floor, which the test pins to exact whole milliseconds, so no
+    /// float-derived margin is probed with a literal.
+    #[test]
+    fn the_drain_timer_arms_only_above_its_exact_boundary() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(300);
+        let floor = Duration::from_millis(100);
+        let jitter = GateJitter {
+            steady: Duration::from_millis(5),
+            trending: Duration::from_millis(10),
+        };
+        let mut growth = QueueGrowth::new(t0, false);
+        growth.set_lane(CongestionLane::Dedicated);
+        growth.observe(floor, jitter, Some(0.0), t0, control_rtt);
+
+        let persistent_tolerance = queue_tolerance(
+            jitter.trending,
+            floor,
+            QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            true,
+        );
+        assert_eq!(
+            persistent_tolerance,
+            Duration::from_millis(40),
+            "the test setup's margin must be an exact whole number of ms"
+        );
+        let smooth = floor + persistent_tolerance;
+        let observation = growth.observe(
+            smooth,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+        assert_eq!(observation.floor, floor, "the floor must not move");
+        assert!(
+            observation.building,
+            "the ordinary gate is already open here, so only the persistent \
+             timer sits on its boundary"
+        );
+        assert_eq!(
+            observation.persistent_for, None,
+            "a queue exactly at the persistent threshold is not yet persistent"
+        );
+    }
+
+    /// The ordinary gate is `smooth > floor + tolerance`, STRICT: a queue
+    /// exactly at the tolerated depth is not yet building.  Same exactness
+    /// argument as the persistent timer -- the boundary is the tolerance the
+    /// call itself reports plus the floor it reports, and both are pinned to
+    /// exact values here.
+    #[test]
+    fn the_ordinary_gate_opens_only_above_its_exact_boundary() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(300);
+        let floor = Duration::from_millis(100);
+        let jitter = GateJitter::uniform(Duration::from_millis(5));
+        let mut growth = QueueGrowth::new(t0, false);
+        growth.set_lane(CongestionLane::Dedicated);
+        growth.observe(floor, jitter, Some(0.0), t0, control_rtt);
+
+        // Dedicated lane: the margin is the floor-scaled term, 100 ms / 8 =
+        // 12.5 ms, which is above the 2 * 5 ms jitter term and the 5 ms floor.
+        let tolerance = queue_tolerance(jitter.steady, floor, QUEUE_RTT_FACTOR, true);
+        assert_eq!(
+            tolerance,
+            Duration::from_micros(12_500),
+            "the test setup's tolerance must be an exact duration"
+        );
+        let observation = growth.observe(
+            floor + tolerance,
+            jitter,
+            Some(0.0),
+            t0 + Duration::from_millis(1),
+            control_rtt,
+        );
+        assert_eq!(observation.floor, floor, "the floor must not move");
+        assert_eq!(
+            observation.tolerance, tolerance,
+            "the reported tolerance is the boundary this test probes"
+        );
+        assert!(
+            !observation.building,
+            "a queue exactly at the tolerated depth is not yet building"
+        );
+        assert_eq!(observation.persistent_for, None);
+    }
+
+    /// The floor window rotates on `elapsed > bucket` and on
+    /// `elapsed > bucket * 2`, both STRICT: at exactly one bucket the window
+    /// has not rolled, so the low floor stays in the current bucket, and at
+    /// exactly two buckets the rotation moves it into `prev`, where it is
+    /// still a candidate.  Both bucket widths are exact `Duration` values and
+    /// the sample instants are exact, so neither boundary carries a
+    /// float-derived margin.  A `>=` on either comparison ages the low floor
+    /// out a whole bucket early, and the standing-queue gate then reads the
+    /// higher RTT as queue growth.
+    #[test]
+    fn the_floor_window_keeps_a_low_floor_at_exactly_one_and_two_buckets() {
+        let t0 = Instant::now();
+        let low = Duration::from_millis(50);
+        let high = Duration::from_millis(80);
+        let bucket = RTT_MIN_BUCKET.max(low.saturating_mul(RTT_MIN_BUCKET_RTT_SCALE));
+        assert_eq!(
+            bucket, RTT_MIN_BUCKET,
+            "the test setup's bucket must be an exact duration"
+        );
+
+        let mut floor = WindowedRttMin::new(t0);
+        assert_eq!(floor.update(t0, low), low);
+        assert_eq!(
+            floor.update(t0 + bucket, high),
+            low,
+            "one bucket of elapsed time is not yet a roll"
+        );
+        assert_eq!(
+            floor.update(t0 + bucket * 2, high),
+            low,
+            "the low floor moved into the previous bucket is still a candidate"
+        );
+    }
 }
