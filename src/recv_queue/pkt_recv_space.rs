@@ -977,6 +977,27 @@ mod tests {
         );
     }
 
+    /// EOF is signalled by an *empty-payload packet with no declared frame
+    /// length*. A frame *start* whose first packet happens to carry zero
+    /// payload bytes declares a frame length, so it is not a FIN and must not
+    /// surface EOF: treating it as one would truncate the stream at a frame
+    /// boundary whose remaining packets have not arrived yet.
+    #[test]
+    fn an_empty_payload_frame_start_is_not_a_fin() {
+        let mut space = PktRecvSpace::new();
+        assert!(space.recv(0, vec![], Some(6)));
+        assert!(
+            !space.fin_at_head(),
+            "a zero-payload frame start (frame_len = 6) must not surface EOF"
+        );
+        // The frame completes once its continuation arrives.
+        assert!(space.recv(1, b"ABCDEF".to_vec(), None));
+        assert_eq!(space.pop_complete_frame().unwrap(), b"ABCDEF");
+        // A real FIN — empty payload, no frame_len — still surfaces EOF.
+        assert!(space.recv(2, vec![], None));
+        assert!(space.fin_at_head());
+    }
+
     #[test]
     fn a_late_packet_below_the_scan_cursor_still_completes_its_frame() {
         let mut space = PktRecvSpace::new();

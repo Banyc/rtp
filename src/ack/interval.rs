@@ -516,6 +516,40 @@ mod tests {
         assert_eq!(blocks[0].start, seq(5));
     }
 
+    /// The history's map window must slide with the cumulative front. If the
+    /// anchor were left at the connection's initial sequence, the map would
+    /// keep the window `[initial, initial + MAX_NUM_RECVING_PKTS)` forever:
+    /// once the front has folded more than one window past the initial
+    /// sequence, a selective receipt one sequence past the front — well
+    /// inside the live receive window — falls outside the map's window and
+    /// its range is silently dropped. The ACK then omits a packet the
+    /// receiver actually holds, and the sender retransmits it for the rest
+    /// of the connection.
+    #[test]
+    fn a_selective_range_past_the_initial_map_window_is_still_recorded() {
+        let mut a = AckHistory::new_at(seq(0));
+        // Fold the front exactly one full receive window forward, in order.
+        for s in 0..MAX_NUM_RECVING_PKTS as u64 {
+            a.insert(seq(s));
+        }
+        assert_eq!(a.next(), seq(MAX_NUM_RECVING_PKTS as u64));
+        assert_eq!(a.len(), 0);
+        // One selective receipt one past the front: forward distance 1 from
+        // the front, but raw sequence one whole window past the initial one.
+        let far = MAX_NUM_RECVING_PKTS as u64 + 1;
+        a.insert(seq(far));
+        assert_eq!(a.next(), seq(MAX_NUM_RECVING_PKTS as u64));
+        let blocks: Vec<_> = a.blocks().collect();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "a selective range one past the front must be recorded even when \
+             its sequence is a whole window past the initial one"
+        );
+        assert_eq!(blocks[0].start, seq(far));
+        assert_eq!(blocks[0].size.get(), 1);
+    }
+
     #[test]
     fn selective_blocks_merge_across_zero() {
         // Two selective ranges straddling the physical zero boundary merge
