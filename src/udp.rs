@@ -2363,6 +2363,17 @@ mod nohandshake_obf {
                     let mut buf = [0; 1];
                     a.read.recv(&mut buf).await.expect("server recv failed");
                     eprintln!("server: got byte");
+                    // `send` stages bytes; it returns before they reach the
+                    // wire. The handler is done as soon as it has the peer's
+                    // byte, so dropping the connection here cancels the send
+                    // driver with the reply still staged and the client waits
+                    // forever. Hold the connection until the reply is
+                    // acknowledged, i.e. until the round trip's outbound leg
+                    // is confirmed delivered.
+                    a.write
+                        .all_sent_data_acked()
+                        .await
+                        .expect("server reply was never acknowledged");
                 });
             }
         });
@@ -2417,6 +2428,17 @@ mod nohandshake_plain {
                     let mut buf = [0; 1];
                     a.read.recv(&mut buf).await.expect("server recv failed");
                     eprintln!("server: got byte");
+                    // `send` stages bytes; it returns before they reach the
+                    // wire. The handler is done as soon as it has the peer's
+                    // byte, so dropping the connection here cancels the send
+                    // driver with the reply still staged and the client waits
+                    // forever. Hold the connection until the reply is
+                    // acknowledged, i.e. until the round trip's outbound leg
+                    // is confirmed delivered.
+                    a.write
+                        .all_sent_data_acked()
+                        .await
+                        .expect("server reply was never acknowledged");
                 });
             }
         });
