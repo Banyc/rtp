@@ -397,6 +397,77 @@ mod tests {
         );
     }
 
+    /// The caller-supplied cap bounds the number of paths a session may
+    /// declare: a session asking for more conns than the cap is refused (no
+    /// `MpUdpConn` is ever produced), while one asking for exactly the cap is
+    /// accepted. `Listener::bind` forwards the cap to the path-set backlog,
+    /// so discarding it there would let any peer open a session with an
+    /// unbounded path set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_wider_than_the_cap_is_refused() {
+        /// An mpudp session's first datagram is its 17-byte Init header: the
+        /// session id and the declared path count, both big-endian u64,
+        /// followed by the with-payload flag.
+        fn session_header(session: u64, conns: u64) -> [u8; 17] {
+            let mut header = [0; 17];
+            header[..8].copy_from_slice(&session.to_be_bytes());
+            header[8..16].copy_from_slice(&conns.to_be_bytes());
+            header
+        }
+        /// Two peers (two paths) declare one session and keep their sockets
+        /// alive until the datagrams are on the wire.
+        async fn declare_two_paths(addr: SocketAddr, session: u64, conns: u64) {
+            let mut peers = Vec::new();
+            for _ in 0..2 {
+                let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                peer.send_to(&session_header(session, conns), addr)
+                    .await
+                    .unwrap();
+                peers.push(peer);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(peers);
+        }
+
+        // Cap 1: the two path declarations exceed the cap, so the session is
+        // refused and `accept_with` never produces a connection.
+        let mut narrow = Listener::bind(
+            ["127.0.0.1:0".parse().unwrap()].into_iter(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+        let narrow_addr = narrow.local_addrs().next().unwrap();
+        declare_two_paths(narrow_addr, 11, 2).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                narrow.accept_with(AcceptConfig::default()),
+            )
+            .await
+            .is_err(),
+            "a session declaring more paths than the caller's cap must be refused"
+        );
+
+        // Cap 2: the same two-path declaration is at the cap and is accepted.
+        let mut wide = Listener::bind(
+            ["127.0.0.1:0"].map(|x| x.parse().unwrap()).into_iter(),
+            NonZeroUsize::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+        let wide_addr = wide.local_addrs().next().unwrap();
+        declare_two_paths(wide_addr, 12, 2).await;
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wide.accept_with(AcceptConfig::default()),
+        )
+        .await
+        .expect("a session declaring exactly the cap must be accepted")
+        .expect("the accepted session must convert");
+        drop(conn);
+    }
+
     #[test]
     fn require_fn_to_be_send() {
         fn require_send<T: Send>(_t: T) {}

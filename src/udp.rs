@@ -2336,6 +2336,187 @@ mod tests {
         );
         drop(new_accepted);
     }
+
+    /// The cap must re-bind from the state its own softness permits: the
+    /// ledger is a soft bound, so it may read more than `max_connections`
+    /// after the documented overshoot. Once it does, an unknown source must
+    /// still be refused — an equality test would let that overshoot unbind
+    /// the cap permanently and admit every later unknown source, growing the
+    /// conn table without bound.
+    ///
+    /// The overshoot is reached through the real path. The listener socket is
+    /// only drained by an accept call, so a dispatcher task keeps accept
+    /// futures flowing and hands each classified one to this test instead of
+    /// driving it: the two classified while the ledger is still empty are
+    /// driven only afterwards, and each takes its slot when its opening
+    /// handshake completes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_session_cap_re_binds_after_a_soft_overshoot() {
+        const MAX: usize = 1;
+        let listener = Arc::new(
+            Listener::bind(
+                "127.0.0.1:0",
+                ListenerConfig {
+                    max_connections: MAX,
+                    ..ListenerConfig::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let addr = listener.local_addr();
+
+        let (tx, mut dispatched) = tokio::sync::mpsc::channel::<AcceptTask>(8);
+        let mut dispatcher = tokio::task::JoinSet::new();
+        dispatcher.spawn({
+            let listener = Arc::clone(&listener);
+            async move {
+                loop {
+                    let Ok(task) = listener.accept_with(AcceptConfig::default()).await else {
+                        break;
+                    };
+                    if tx.send(task).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Two real clients drive the opening handshakes; their Hello
+        // datagrams are what the dispatcher classifies.
+        let mut clients = tokio::task::JoinSet::new();
+        for _ in 0..=MAX {
+            clients.spawn(async move {
+                connect_with("0.0.0.0:0", addr, ConnectConfig::default()).await
+            });
+        }
+
+        // Classify both datagrams before either accept future is polled: two
+        // connections exist while the ledger is still empty.
+        let mut pending = Vec::new();
+        for _ in 0..=MAX {
+            pending.push(
+                tokio::time::timeout(std::time::Duration::from_secs(10), dispatched.recv())
+                    .await
+                    .expect("both clients' Hellos must be classified")
+                    .expect("the dispatcher must hand out every classified accept"),
+            );
+        }
+        let accept_a = pending.remove(0);
+        let accept_b = pending.remove(0);
+        assert_eq!(
+            listener.session_count.load(Ordering::Relaxed),
+            0,
+            "neither accept future has been polled, so no cap slot is held yet"
+        );
+        assert_eq!(
+            listener
+                .listener
+                .stats()
+                .connections_opened
+                .load(Ordering::Relaxed),
+            u64::try_from(MAX + 1).unwrap(),
+            "both classified sources must have opened a connection"
+        );
+
+        // Drive both server handshakes (the dispatcher keeps draining the
+        // socket, so their Confirm datagrams reach the connections); each
+        // takes its slot on completion, so the ledger overshoots the cap.
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(accept_a, accept_b)
+        })
+        .await
+        .expect("both opening handshakes must complete");
+        let accepted = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            listener.session_count.load(Ordering::Relaxed),
+            MAX + 1,
+            "both accepted sessions must have taken a cap slot"
+        );
+
+        // The cap must re-bind from the overshoot: the ledger reads
+        // `MAX + 1`, not `MAX`, and an unknown source is still refused.
+        let over = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        over.connect(addr).await.unwrap();
+        over.send(b"over").await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), dispatched.recv())
+                .await
+                .is_err(),
+            "an unknown source past the cap must be refused, not admitted once the ledger overshoots"
+        );
+        assert_eq!(
+            listener
+                .listener
+                .stats()
+                .packets_dropped_existing_only
+                .load(Ordering::Relaxed),
+            1,
+            "the over-cap datagram must be dropped at the dispatch"
+        );
+        assert_eq!(
+            listener
+                .listener
+                .stats()
+                .connections_opened
+                .load(Ordering::Relaxed),
+            u64::try_from(MAX + 1).unwrap(),
+            "the refused source must not have opened a connection"
+        );
+        drop(accepted);
+        clients.abort_all();
+        dispatcher.abort_all();
+    }
+
+    /// A cap slot belongs to a live session: the ledger is acquired only
+    /// after the accept has produced one (past the opening handshake). An
+    /// accept future abandoned mid-handshake — the normal outcome when a
+    /// caller bounds its accept concurrency — must leave the ledger
+    /// untouched, or every abandoned accept leaks a slot and the listener
+    /// eventually refuses every new source.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_accept_holds_no_cap_slot() {
+        let listener = Listener::bind(
+            "127.0.0.1:0",
+            ListenerConfig {
+                max_connections: 1,
+                ..ListenerConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr();
+
+        // One unknown source: the accept below classifies its datagram and
+        // returns the unstarted handshake future.
+        let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        source.connect(addr).await.unwrap();
+        source.send(b"open").await.unwrap();
+
+        // Poll the accept far enough to start the server opening handshake,
+        // then abandon it: the peer never answers the Hello, so the future is
+        // still waiting on the opening deadline when it is dropped.
+        let mut pending = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            listener.accept_with(AcceptConfig::default()),
+        )
+        .await
+        .expect("the opening datagram must have been classified")
+        .unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut pending).await;
+        assert!(
+            outcome.is_err(),
+            "the opening handshake must still be in flight when the accept is abandoned; \
+             the accept future resolved instead: {outcome:?}"
+        );
+        drop(pending);
+        assert_eq!(
+            listener.session_count.load(Ordering::Relaxed),
+            0,
+            "an accept abandoned before it produced a session must not hold a cap slot"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1285,6 +1285,137 @@ mod tests {
         assert_eq!(&buf[..n], keyed_route);
     }
 
+    /// A keyed session's cap slot is released when the session ends: after
+    /// dropping an accepted session the ledger returns to 0 and a new key is
+    /// admitted again. Without the on-exit release the listener permanently
+    /// refuses every key beyond the first `cap` sessions that ever lived.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exited_keyed_session_frees_its_cap_slot() {
+        use crate::udp::AcceptConfig;
+        use std::time::Duration;
+
+        const CAP: usize = 1;
+        let server = Arc::new(
+            Listener::<u8>::bind_with_max_connections("127.0.0.1:0", CAP)
+                .await
+                .unwrap(),
+        );
+        let addr = server.local_addr();
+        let client = Arc::new(
+            Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
+                .await
+                .unwrap(),
+        );
+        let mut dispatch = tokio::task::JoinSet::new();
+        {
+            let client = Arc::clone(&client);
+            dispatch.spawn(async move {
+                loop {
+                    if client.dispatch().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let mut opened = client
+            .open_without_handshake_with(1, AcceptConfig::default())
+            .expect("the first key must open below the cap");
+        opened.write.send(&[1]).await.unwrap();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.accept_with(AcceptConfig::default()),
+        )
+        .await
+        .expect("the first key must be accepted")
+        .unwrap();
+        assert_eq!(accepted.dispatch_key, 1);
+        assert_eq!(
+            server.session_count.load(Ordering::SeqCst),
+            1,
+            "the accepted session must occupy the cap slot"
+        );
+
+        // End the session and wait for its on-exit release.
+        drop(accepted);
+        drop(opened);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server.session_count.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exited session's cap slot was never released");
+
+        // With the slot free a new key is admitted.
+        let mut opened = client
+            .open_without_handshake_with(2, AcceptConfig::default())
+            .expect("a new key must open once the slot freed");
+        opened.write.send(&[2]).await.unwrap();
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.accept_with(AcceptConfig::default()),
+        )
+        .await
+        .expect("a new key could not be accepted after the slot freed")
+        .unwrap();
+        assert_eq!(accepted.dispatch_key, 2);
+    }
+
+    /// The keyed ledger is a soft bound: the dispatch admits datagrams that
+    /// race the accept loop, so the live count may overshoot the cap. The
+    /// dispatch must therefore refuse an unknown key for every value at or
+    /// above the cap — an equality test would let one overshoot unbind the
+    /// cap permanently and spawn a full session per key spray. Unlike the
+    /// plain listener (whose opening handshake leaves a window between the
+    /// admission decision and the slot take), the keyed accept path has no
+    /// await in that window, so the overshoot value is set directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_overshot_keyed_ledger_still_refuses_unknown_keys() {
+        use crate::udp::AcceptConfig;
+        use std::time::Duration;
+
+        const CAP: usize = 2;
+        let server = Listener::<u8>::bind_with_max_connections("127.0.0.1:0", CAP)
+            .await
+            .unwrap();
+        let addr = server.local_addr();
+        server.session_count.store(CAP + 1, Ordering::SeqCst);
+
+        let unknown = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        unknown.send_to(&[1, 0, 0, 0], addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                server.accept_with(AcceptConfig::default()),
+            )
+            .await
+            .is_err(),
+            "an unknown key must be refused whenever the ledger reads at least the cap"
+        );
+        assert_eq!(
+            server
+                .listener
+                .stats()
+                .packets_dropped_existing_only
+                .load(Ordering::SeqCst),
+            1,
+            "the over-cap datagram must be dropped before any session is allocated"
+        );
+        assert_eq!(
+            server
+                .listener
+                .stats()
+                .connections_opened
+                .load(Ordering::SeqCst),
+            0,
+            "the refused key must not have opened a session"
+        );
+    }
+
     #[test]
     fn frame_mode_rejects_undersized_mss() {
         let mss = 33;
