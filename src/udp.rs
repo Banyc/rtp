@@ -1424,7 +1424,13 @@ mod tests {
             }
             async fn recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
                 if let Some(fired) = self.artifact.take() {
-                    fired.notify_waiters();
+                    // `notify_one`, not `notify_waiters`: `socket` spawns the
+                    // read driver before the test first polls `notified()`, so
+                    // the artifact can fire before a waiter is registered. A
+                    // stored permit survives that ordering, whereas a
+                    // `notify_waiters` wakeup with no waiter is dropped and
+                    // strands the test on its 5s timeout.
+                    fired.notify_one();
                     return Err(std::io::ErrorKind::ConnectionRefused.into());
                 }
                 // The ICMP error was consumed by the failed syscall: the
