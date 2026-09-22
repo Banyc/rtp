@@ -681,6 +681,63 @@ mod tests {
             );
         }
     }
+    /// A terminal error that carries a KILL request parks the reaper on the
+    /// best-effort KILL datagram.  That tail must be bounded: an underlay that
+    /// never completes the KILL (the writer is alive but stuck, so the reaper
+    /// genuinely waits for it) must not park the session supervisor forever.
+    #[tokio::test]
+    async fn the_post_terminal_kill_tail_is_bounded() {
+        use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
+        // The write half lives inside the layer, so its termination writer is
+        // alive and the KILL request is really pending, not finished.
+        let layer = wrap_fec(Box::new(PendingRead), Box::new(BlockingWrite::new()), false);
+        let transmission = TransmissionLayer::new(layer, None);
+        let shared = Arc::clone(transmission.shared_for_test());
+        let reaper = transmission.termination_reaper_for_test().clone();
+        shared.request_kill_and_abort(MetricsTerminationCause::LocalAbort);
+        let mut ready = Box::pin(reaper_ready(&reaper, &shared));
+        tokio::time::timeout(Duration::from_secs(10), &mut ready)
+            .await
+            .expect("the post-terminal KILL tail is unbounded and stalled the session reap");
+    }
+
+    /// A driver parked inside the underlay's send cannot observe the stop
+    /// token, and a terminal error carrying a KILL request parks the reaper on
+    /// that same underlay's best-effort KILL datagram, which a stuck underlay
+    /// never emits.  Both waits must be bounded so the session handle still
+    /// resolves: hanging the caller is not a permissible outcome of a stuck
+    /// underlay.
+    #[tokio::test]
+    async fn a_stuck_underlay_still_resolves_the_session_handle() {
+        use crate::transmission::test_doubles::BlockingWrite;
+        let started = Arc::new(tokio::sync::Notify::new());
+        // Never released: the KILL datagram stays inside the underlay send.
+        let never_released = Arc::new(tokio::sync::Notify::new());
+        let layer = wrap_fec(
+            Box::new(PendingRead),
+            Box::new(BlockingWrite {
+                started: Arc::clone(&started),
+                release: never_released,
+            }),
+            false,
+        );
+        let (_read, mut write, supervisor) = socket(layer, None);
+        let mut owner_tasks = tokio::task::JoinSet::new();
+        owner_tasks.spawn(supervisor);
+        // A terminal error that requests a KILL: the write driver claims the
+        // request (the first thing a send pass does) and blocks in the underlay
+        // send, where it can no longer observe the stop token.
+        write.send_kill_and_abort().await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the writer never reached the stuck underlay send");
+        let joined = tokio::time::timeout(Duration::from_secs(20), owner_tasks.join_next())
+            .await
+            .expect("a stuck underlay hung the session handle instead of resolving it")
+            .expect("the supervisor JoinSet was empty");
+        joined.expect("the supervisor task failed");
+    }
+
     #[tokio::test]
     async fn supervisor_reaps_immediately_when_terminal_error_has_no_kill() {
         use std::sync::atomic::{AtomicUsize, Ordering};

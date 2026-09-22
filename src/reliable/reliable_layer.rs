@@ -2411,6 +2411,79 @@ mod tests {
         );
     }
 
+    /// A staged frame is unsent application data, and the frame staging buffer
+    /// is its only source of truth: the empty-stage predicate must report
+    /// `false` between the frame write and the packetization that drains the
+    /// stage.  Reporting empty there lets a `send_buf_empty` /
+    /// `all_sent_data_acked` barrier return with the frame still staged.
+    #[test]
+    fn a_staged_frame_is_not_an_empty_send_stage() {
+        let now = Instant::now();
+        let (mut frame, pacer) = super::ReliableLayer::new(
+            crate::mss::Mss::try_new(TEST_MSS).unwrap(),
+            crate::delivery::frame::mode::FrameMode::enabled(),
+            now,
+        );
+        pacer.set_min_burst_for_test(64, now);
+        assert!(
+            frame.is_send_buf_empty(),
+            "a fresh frame lane starts with an empty send stage"
+        );
+        frame.send_frame_buf(b"frame", now).unwrap();
+        assert!(
+            !frame.is_send_buf_empty(),
+            "a frame staged and not yet packetized is not an empty send stage"
+        );
+        assert!(!frame.is_no_data_to_send());
+        let mut pkt = vec![0u8; TEST_MSS];
+        let packetized = frame
+            .send_data_pkt(&mut pkt, now)
+            .expect("the staged frame must packetize");
+        assert!(
+            packetized.frame_len.is_some(),
+            "the frame's first packet carries the frame length"
+        );
+        assert_eq!(frame.pending_frame_bytes(), 0, "the frame stage drained");
+        assert!(
+            frame.is_send_buf_empty(),
+            "once packetized, the frame stage is empty again"
+        );
+        assert!(
+            !frame.is_no_data_to_send(),
+            "the packetized frame is still in flight"
+        );
+    }
+
+    /// A write close is idempotent once its FIN packet is in flight: both the
+    /// application's `shutdown` and the session's write-close arm call
+    /// `send_fin_buf`, and a repeated close while the FIN is in flight must not
+    /// mint a second FIN packet (a fresh sequence number carrying no data).
+    #[test]
+    fn a_repeated_write_close_does_not_mint_a_second_fin_packet() {
+        let now = Instant::now();
+        let mut rl = test_layer(now);
+        rl.send_fin_buf();
+        let mut pkt = vec![0u8; TEST_MSS];
+        let fin = rl
+            .send_data_pkt(&mut pkt, now)
+            .expect("the requested FIN must be packetized");
+        assert!(matches!(fin.data_written, super::DataPktPayload::Fin));
+        assert_eq!(rl.pkt_send_space().num_in_flight_pkts(), 1);
+        // The write half may close again while that FIN is still in flight:
+        // the in-flight FIN already is the close, so nothing new is minted.
+        rl.send_fin_buf();
+        let mut pkt = vec![0u8; TEST_MSS];
+        assert!(
+            rl.send_data_pkt(&mut pkt, now).is_none(),
+            "a repeated write close minted a second FIN packet"
+        );
+        assert_eq!(
+            rl.pkt_send_space().num_in_flight_pkts(),
+            1,
+            "a repeated write close grew the in-flight send window"
+        );
+    }
+
     fn ack_seq(rl: &mut super::ReliableLayer, seq: u64, rtt: Duration, now: Instant) {
         let _ = ack_seq_observed(rl, seq, rtt, now);
     }
