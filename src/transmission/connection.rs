@@ -1037,6 +1037,24 @@ mod tests {
         );
     }
 
+    /// `send` stages only what the send stage accepts and returns that count,
+    /// so a caller that stages once and ignores the return value silently
+    /// drops the remainder.  The contract is a partial write (see
+    /// `ConnWriter::send`); this pins that boundary, which is easy to mistake
+    /// for a block-until-everything-is-staged shape.
+    #[tokio::test]
+    async fn an_application_send_stages_a_partial_write_and_returns_its_length() {
+        let (shared, _write_half, _read_half, _reaper) =
+            new_connection(pending_layer(FrameMode::default()), None);
+        let data = vec![0_u8; shared.write_unit_capacity() * 2 + 1];
+        let staged = shared.send(&data).await.unwrap();
+        assert!(
+            staged > 0 && staged < data.len(),
+            "a {}-byte send must stage a partial write, staged {staged}",
+            data.len()
+        );
+    }
+
     /// A staged write always produces a pacing timer, so the send driver can
     /// never park on `Event` while data is staged: the `Event` + pending-work
     /// state guarded by [`super::apply_send_park_safety`] is unreachable.

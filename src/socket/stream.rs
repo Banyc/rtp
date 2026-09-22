@@ -317,6 +317,17 @@ impl ConnReader {
     }
 }
 
+/// The write half of an RTP connection.
+///
+/// [`send`](ConnWriter::send) stages bytes into the connection and returns; a
+/// driver task owned by the session packetizes and transmits them
+/// asynchronously. Dropping this half closes the write side, and dropping the
+/// [`SessionHandle`](crate::SessionHandle) that owns the driver tasks aborts
+/// them, so bytes that are still staged — or staged and not yet acknowledged —
+/// are discarded instead of sent. Await
+/// [`all_sent_data_acked`](ConnWriter::all_sent_data_acked) for a full drain,
+/// or [`send_buf_empty`](ConnWriter::send_buf_empty) for a packetization-only
+/// barrier, before the connection is dropped.
 #[derive(Debug)]
 pub struct ConnWriter {
     transmission_layer: Arc<Connection>,
@@ -334,10 +345,31 @@ impl ConnWriter {
         }
     }
 
+    /// Stages bytes for the send driver and returns how many were staged.
+    ///
+    /// This is a **partial** write, matching the `AsyncWrite` contract: only
+    /// what the send stage can accept is staged, so the return value can be
+    /// less than `data.len()`. A non-empty `data` always stages at least one
+    /// byte — the call waits for stage space rather than returning `0` — and
+    /// only an empty `data` returns `0`. Stage repeatedly until every byte has
+    /// been accepted; `write_all` on the adapter from
+    /// [`into_async_write`](Self::into_async_write) does that.
+    ///
+    /// The call returns once the bytes are staged, **not** when they reach the
+    /// wire: the send driver packetizes and transmits them asynchronously.
+    /// Await [`send_buf_empty`](Self::send_buf_empty) to wait for
+    /// packetization and [`all_sent_data_acked`](Self::all_sent_data_acked)
+    /// for acknowledgement — and do so before dropping, since dropping
+    /// discards whatever is still staged (see [`ConnWriter`]).
     pub async fn send(&mut self, data: &[u8]) -> Result<usize, IoErr> {
         self.transmission_layer.send(data).await
     }
 
+    /// Stages one frame for the send driver and returns its length.
+    ///
+    /// Unlike [`send`](Self::send) this stages the whole frame or fails. The
+    /// staging-not-delivery contract and the drop contract are the same as
+    /// [`send`](Self::send)'s.
     pub async fn send_frame(&mut self, frame: &[u8]) -> Result<usize, IoErr> {
         self.transmission_layer.send_frame(frame).await
     }
@@ -361,8 +393,9 @@ impl ConnWriter {
     /// Waits until there is no data left to send: the staging buffer is
     /// empty, the send window holds no in-flight packets, and every sent
     /// packet has been acknowledged. This is the full-drain counterpart of
-    /// [`ConnWriter::send_buf_empty`].
-    pub(crate) async fn all_sent_data_acked(&self) -> Result<(), IoErr> {
+    /// [`ConnWriter::send_buf_empty`], and the barrier to await before
+    /// dropping the connection — see [`ConnWriter`].
+    pub async fn all_sent_data_acked(&self) -> Result<(), IoErr> {
         self.transmission_layer.no_data_to_send().await
     }
 

@@ -34,6 +34,15 @@ use crate::transmission::{
 /// datagram (the kill is best-effort on a stuck underlay).
 const DRIVER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The session's driver tasks, owned as one scope.
+///
+/// Retaining this handle keeps those tasks alive. Dropping the write half alone
+/// therefore does not discard outbound data: the session keeps transmitting
+/// the staged bytes and the FIN, and the handle resolves when the peer closes
+/// the connection (or, if the peer never does, when the graceful-close wait
+/// for it expires). Dropping the handle instead aborts the drivers at once,
+/// discarding everything still staged and everything not yet acknowledged, so
+/// a staged reply has no guaranteed way to reach the peer.
 #[derive(Debug)]
 #[must_use = "the RTP session handle must be retained and awaited"]
 pub struct SessionHandle {
