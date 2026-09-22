@@ -11,7 +11,7 @@ use crate::metrics::{
     MetricsRetransmissionCounters, MetricsSendDriverResumeSource, MetricsSendDriverWake,
     MetricsSnapshot,
 };
-use netem_test::CountersSnapshot;
+use netem_test::{Counters, CountersSnapshot};
 
 /// Trace schema 32: RTP rows carry the complete congestion-controller and
 /// retransmission-scheduler snapshot (73 columns) plus the 30 typed FEC
@@ -633,6 +633,7 @@ pub struct PerfTrace {
     rtp: Arc<RtpCapture>,
     rtp_peer: Arc<RtpCapture>,
     netem: Vec<NetemObservation>,
+    netem_baseline: Option<(CountersSnapshot, CountersSnapshot)>,
 }
 
 impl PerfTrace {
@@ -646,6 +647,7 @@ impl PerfTrace {
             rtp: Self::new_rtp_capture(trace_start),
             rtp_peer: Self::new_rtp_capture(trace_start),
             netem: Vec::new(),
+            netem_baseline: None,
         }
     }
 
@@ -663,7 +665,9 @@ impl PerfTrace {
     /// progress samples recorded after this call carry
     /// `measurement_start_trace_elapsed + scenario_elapsed`; RTP captures
     /// discard warmup rows and rebase their cumulative counters from the
-    /// last pre-boundary snapshot.
+    /// last pre-boundary snapshot. The netem counters are cumulative over the
+    /// instrument's whole lifetime too, so [`PerfTrace::record_netem`] rebases
+    /// them the same way, from the first sample inside the window.
     pub fn mark_measurement_start(&mut self, start: Instant) {
         let trace_elapsed = start.saturating_duration_since(self.trace_start);
         self.measurement_start_trace_elapsed = Some(trace_elapsed);
@@ -691,6 +695,16 @@ impl PerfTrace {
         ))
     }
 
+    /// Record one in-window netem/progress sample.
+    ///
+    /// `c2s`/`s2c` are the instrument's connection-lifetime counters, while
+    /// `delivered_bytes` is already relative to the measurement boundary. The
+    /// first sample recorded here is therefore retained as the window baseline
+    /// and every row is written relative to it, so a trace's final netem row
+    /// totals exactly the measurement window that `delivered_bytes` covers.
+    /// Without the rebase the numerator of a bytes-per-delivered-byte ratio
+    /// would span the whole process — the unmeasured warmup included — while
+    /// the denominator spans only the window.
     pub fn record_netem(
         &mut self,
         elapsed: Duration,
@@ -702,6 +716,7 @@ impl PerfTrace {
             .measurement_start_trace_elapsed
             .map(|start| start + elapsed)
             .unwrap_or_else(|| self.trace_start.elapsed());
+        self.netem_baseline.get_or_insert((c2s, s2c));
         self.netem.push(NetemObservation {
             elapsed,
             trace_elapsed,
@@ -812,20 +827,21 @@ impl PerfTrace {
             out,
             "elapsed_us,trace_elapsed_us,direction,delayed,dropped,duplicated,reordered,rate_limited,forwarded,received,forwarded_bytes,received_bytes,overflow_dropped,scheduled_drain_batches,scheduled_drain_packets,scheduled_drain_max_packets,queue_len"
         )?;
+        let (c2s_baseline, s2c_baseline) = self.netem_baseline.unwrap_or_default();
         for observation in &self.netem {
             write_netem_row(
                 &mut out,
                 observation.elapsed,
                 observation.trace_elapsed,
                 "c2s",
-                observation.c2s,
+                netem_since(observation.c2s, c2s_baseline),
             )?;
             write_netem_row(
                 &mut out,
                 observation.elapsed,
                 observation.trace_elapsed,
                 "s2c",
-                observation.s2c,
+                netem_since(observation.s2c, s2c_baseline),
             )?;
         }
         Ok(())
@@ -1190,6 +1206,41 @@ fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<S
     fields.push(trace_elapsed.as_micros().to_string());
     debug_assert_eq!(fields.len(), RTP_TRACE_COLUMNS);
     fields
+}
+
+/// Express a netem counter snapshot relative to the measurement-window
+/// baseline: every event counter becomes the number of events the window saw,
+/// which is what a per-window price (bytes on the wire per byte delivered) has
+/// to be divided by. `scheduled_drain_max_packets` is a running maximum rather
+/// than an event count and `queue_len` is an instantaneous gauge, so both are
+/// passed through unchanged — subtracting a baseline from either would be
+/// meaningless. Each direction has a single writer, so its event counters are
+/// monotone and the subtraction is exact rather than a clamp.
+fn netem_since(snapshot: CountersSnapshot, baseline: CountersSnapshot) -> CountersSnapshot {
+    let stats = snapshot.stats;
+    let base = baseline.stats;
+    CountersSnapshot {
+        stats: Counters {
+            delayed: stats.delayed.saturating_sub(base.delayed),
+            dropped: stats.dropped.saturating_sub(base.dropped),
+            duplicated: stats.duplicated.saturating_sub(base.duplicated),
+            reordered: stats.reordered.saturating_sub(base.reordered),
+            rate_limited: stats.rate_limited.saturating_sub(base.rate_limited),
+            forwarded: stats.forwarded.saturating_sub(base.forwarded),
+            received: stats.received.saturating_sub(base.received),
+            forwarded_bytes: stats.forwarded_bytes.saturating_sub(base.forwarded_bytes),
+            received_bytes: stats.received_bytes.saturating_sub(base.received_bytes),
+            overflow_dropped: stats.overflow_dropped.saturating_sub(base.overflow_dropped),
+            scheduled_drain_batches: stats
+                .scheduled_drain_batches
+                .saturating_sub(base.scheduled_drain_batches),
+            scheduled_drain_packets: stats
+                .scheduled_drain_packets
+                .saturating_sub(base.scheduled_drain_packets),
+            scheduled_drain_max_packets: stats.scheduled_drain_max_packets,
+        },
+        queue_len: snapshot.queue_len,
+    }
 }
 
 fn write_netem_row(
@@ -1577,6 +1628,147 @@ mod tests {
         let trace = PerfTrace::new(PathBuf::from("unused"), false);
         assert!(trace.rtp_observer().is_none());
         assert!(trace.rtp_peer_observer().is_none());
+    }
+
+    /// The netem instrument counts for its whole lifetime, so every warmup
+    /// byte of the unmeasured run is already in the counters when the first
+    /// in-window sample is taken, while `delivered_bytes` counts from the
+    /// measurement boundary. The trace must rebase, because the ratio a trace
+    /// is read for — `wire_bytes_per_delivered_byte`, which the harness's
+    /// `rtp_trace_compare.py` computes as each direction's final netem row's
+    /// `forwarded_bytes`, summed, over `delivered_bytes` — is a window price
+    /// and is meaningless if its numerator spans the process.
+    #[test]
+    fn netem_counters_are_rebased_to_the_measurement_window() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "rtp-netem-rebase-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&output_dir);
+        let mut trace = PerfTrace::new(output_dir.clone(), false);
+        // The baseline sample already carries the whole warmup.
+        let warmup = CountersSnapshot {
+            stats: Counters {
+                delayed: 900,
+                dropped: 9,
+                duplicated: 1,
+                reordered: 2,
+                rate_limited: 900,
+                forwarded: 1_000,
+                received: 1_010,
+                forwarded_bytes: 8_000_000,
+                received_bytes: 8_080_000,
+                overflow_dropped: 3,
+                scheduled_drain_batches: 990,
+                scheduled_drain_packets: 1_000,
+                scheduled_drain_max_packets: 12,
+            },
+            queue_len: 7,
+        };
+        trace.mark_measurement_start(Instant::now());
+        trace.record_netem(Duration::from_micros(500), warmup, warmup, 0);
+        trace.record_netem(
+            Duration::from_millis(50),
+            CountersSnapshot {
+                stats: Counters {
+                    delayed: 930,
+                    dropped: 10,
+                    duplicated: 1,
+                    reordered: 2,
+                    rate_limited: 930,
+                    forwarded: 1_100,
+                    received: 1_111,
+                    forwarded_bytes: 8_800_000,
+                    received_bytes: 8_888_000,
+                    overflow_dropped: 3,
+                    scheduled_drain_batches: 1_090,
+                    scheduled_drain_packets: 1_100,
+                    scheduled_drain_max_packets: 12,
+                },
+                queue_len: 3,
+            },
+            CountersSnapshot {
+                stats: Counters {
+                    forwarded: 1_010,
+                    received: 1_010,
+                    forwarded_bytes: 8_088_888,
+                    received_bytes: 8_080_000,
+                    scheduled_drain_max_packets: 12,
+                    ..warmup.stats
+                },
+                queue_len: 1,
+            },
+            4_096,
+        );
+        trace.finish(&[]).unwrap();
+
+        let netem = std::fs::read_to_string(output_dir.join("netem.csv")).unwrap();
+        let rows: Vec<Vec<&str>> = netem
+            .lines()
+            .skip(1)
+            .map(|line| line.split(',').collect())
+            .collect();
+        assert_eq!(rows.len(), 4, "one c2s and one s2c row per sample");
+        assert_eq!(rows[0][2], "c2s");
+        assert_eq!(rows[1][2], "s2c");
+        assert_eq!(rows[2][2], "c2s");
+        assert_eq!(rows[3][2], "s2c");
+        // The baseline sample is the window origin: no traffic yet, and the
+        // gauge is the live queue length rather than a difference.
+        assert_eq!(
+            &rows[0][3..16],
+            &[
+                "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "12"
+            ],
+            "the first in-window sample must be the zeroed baseline, with the \
+             running-maximum drain counter passed through"
+        );
+        assert_eq!(rows[0][16], "7");
+        // The last row per direction is what a comparison prices: the c2s
+        // excess over the baseline is 800_000 bytes, and the s2c excess is
+        // 88_888 bytes. Under the un-rebased counters the same rows would read
+        // 8_800_000 and 8_088_888, i.e. the warmup would be charged to the
+        // window.
+        assert_eq!(rows[2][8], "100");
+        assert_eq!(rows[2][9], "101");
+        assert_eq!(rows[2][10], "800000");
+        assert_eq!(rows[2][11], "808000");
+        assert_eq!(rows[3][8], "10");
+        assert_eq!(rows[3][10], "88888");
+        // The denominator really is the window: the progress row that a
+        // comparison reads is the same cumulative-with-warmup-subtracted
+        // number.
+        let progress = std::fs::read_to_string(output_dir.join("progress.csv")).unwrap();
+        assert_eq!(
+            progress.lines().nth(1).unwrap().rsplit(',').next(),
+            Some("0")
+        );
+        assert_eq!(
+            progress.lines().nth(2).unwrap().rsplit(',').next(),
+            Some("4096")
+        );
+        // The price a comparison derives from this trace, spelled the way
+        // `rtp_trace_compare.py` spells it: the final netem row of each
+        // direction over the measurement-window delivery. Every term is a
+        // window quantity, so the price is what the transfer cost rather than
+        // what the process spent.
+        let delivered: f64 = progress
+            .lines()
+            .nth(2)
+            .unwrap()
+            .rsplit(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let c2s_window: f64 = rows[2][10].parse().unwrap();
+        let s2c_window: f64 = rows[3][10].parse().unwrap();
+        assert_eq!(c2s_window, 800_000.0);
+        assert_eq!(s2c_window, 88_888.0);
+        assert_eq!(delivered, 4_096.0);
+        assert_eq!((c2s_window + s2c_window) / delivered, 217.013671875);
+        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     #[test]
