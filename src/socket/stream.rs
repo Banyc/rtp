@@ -496,7 +496,7 @@ mod tests {
     };
 
     use super::super::session::socket;
-    use crate::transmission::test_doubles::PendingRead;
+    use crate::transmission::test_doubles::{PendingRead, PendingWrite};
     use crate::udp::wrap_fec;
 
     use super::*;
@@ -2035,6 +2035,67 @@ mod tests {
             .await
             .expect("send queue must resume after driver progress")
             .expect("send after cancellation must succeed");
+    }
+
+    /// `send_buf_empty` is a staging barrier, not a delivery barrier: it
+    /// returns as soon as the send driver has claimed the staged bytes, even
+    /// while the underlay send is still parked. Tearing the session down at
+    /// that point aborts the parked send, so a teardown that stops at
+    /// `send_buf_empty` can drop a datagram the peer is waiting for.
+    /// `all_sent_data_acked` must not return until the datagram has been
+    /// transmitted and acknowledged. A parked underlay write pins both halves
+    /// deterministically.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_buf_empty_does_not_wait_for_the_underlay_but_all_sent_data_acked_does() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let layer = wrap_fec(
+            Box::new(PendingRead),
+            Box::new(PendingWrite {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                cancelled: Arc::clone(&cancelled),
+            }),
+            false,
+        );
+        let (read, mut write, supervisor) = socket(layer, None);
+
+        // Stage one datagram; the driver claims it out of the staging buffer
+        // and parks inside the underlay send.
+        write.send(b"payload").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("the send driver must reach the parked underlay send");
+
+        // The staging barrier returns while the datagram is still parked...
+        tokio::time::timeout(Duration::from_millis(200), write.send_buf_empty())
+            .await
+            .expect("send_buf_empty must not wait for the underlay send")
+            .unwrap();
+
+        // ...and the acknowledged barrier must not.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), write.all_sent_data_acked())
+                .await
+                .is_err(),
+            "all_sent_data_acked returned while the datagram was still parked"
+        );
+
+        // Tearing the session down at the staging barrier cancels the parked
+        // send: the datagram never reaches the wire.
+        drop(write);
+        drop(read);
+        drop(supervisor);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the session must cancel the parked underlay send");
     }
 
     #[tokio::test(flavor = "multi_thread")]
