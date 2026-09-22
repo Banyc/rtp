@@ -72,13 +72,56 @@ fn apply_send_park_safety(
     }
 }
 
+/// The connection's reliable-layer mutex.
+///
+/// A thin wrapper around `std::sync::Mutex` whose only job is to count
+/// acquisitions in test builds.  The count is the load-independent proof that
+/// the receive path takes the mutex once per datagram rather than twice, and
+/// it can only be honest if *every* acquisition goes through this wrapper.
+/// In non-test builds the counter field is compiled out and the type is a
+/// zero-cost newtype over `std::sync::Mutex`.
+#[derive(Debug)]
+pub(crate) struct ReliableLayerMutex {
+    inner: Mutex<ReliableLayer>,
+    #[cfg(test)]
+    acquisitions: std::sync::atomic::AtomicU64,
+}
+
+impl ReliableLayerMutex {
+    fn new(layer: ReliableLayer) -> Self {
+        Self {
+            inner: Mutex::new(layer),
+            #[cfg(test)]
+            acquisitions: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ReliableLayer>> {
+        #[cfg(test)]
+        self.acquisitions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.lock()
+    }
+
+    /// Test-only read of the acquisition count.
+    #[cfg(test)]
+    fn acquisitions(&self) -> u64 {
+        self.acquisitions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug)]
 pub struct Connection {
-    reliable_layer: Mutex<ReliableLayer>,
+    reliable_layer: ReliableLayerMutex,
     /// `ReliableLayer::max_data_size_per_pkt`, captured at construction.  It
     /// is fixed for the connection's life (derived from the MSS), so the
     /// receive hot path reads it without taking the reliable-layer lock.
     max_data_size_per_pkt: usize,
+    /// `ReliableLayer::frame_delivery_enabled`, captured at construction.
+    /// Frame delivery is chosen once per connection (from the accept/connect
+    /// config) and never re-chosen, so the application read path reads this
+    /// instead of taking the reliable-layer lock for a constant.
+    frame_delivery_enabled: bool,
     ack_feedback: Arc<AckFeedback>,
     post_open_recovery: PostOpenRecovery,
     /// Session tag authenticating codec control-plane datagrams; `None` on
@@ -145,12 +188,14 @@ fn new_connection_inner(
     let observability = ConnectionObservability::new(now, log_config, metrics_observer);
     reliable_layer.set_congestion_metrics_enabled(observability.enabled());
     let max_data_size_per_pkt = reliable_layer.max_data_size_per_pkt();
+    let frame_delivery_enabled = reliable_layer.frame_delivery_enabled();
     let (termination, termination_writer, termination_reaper) = new_termination();
     let post_open_recovery = PostOpenRecovery::new(unreliable_layer.post_open_handshake);
     let ack_feedback = Arc::new(AckFeedback::new());
     let shared = Arc::new(Connection {
-        reliable_layer: Mutex::new(reliable_layer),
+        reliable_layer: ReliableLayerMutex::new(reliable_layer),
         max_data_size_per_pkt,
+        frame_delivery_enabled,
         ack_feedback: Arc::clone(&ack_feedback),
         post_open_recovery,
         session_tag: unreliable_layer.session_tag,
@@ -230,6 +275,30 @@ impl Connection {
         use_layer(&mut self.reliable_layer.lock().unwrap())
     }
 
+    /// Run `use_layer` against the reliable layer under its lock, applying a
+    /// prepared RTT sample in the *same* critical section when one is
+    /// supplied.
+    ///
+    /// The receive path gets one echo timestamp per datagram, and sampling it
+    /// used to be a second acquisition of this same mutex (`sample_rtt` and
+    /// then `with_reliable_layer_mut`).  Folding the sample into the critical
+    /// section the datagram already takes halves the acquisitions on that
+    /// path.  The sample is applied first — exactly where the standalone
+    /// `sample_rtt` call sat — so the reliable layer observes the same
+    /// sequence of operations; only the intervening release and re-acquire
+    /// (during which the write half could run) is gone.
+    pub(super) fn with_reliable_layer_mut_and_rtt_sample<R>(
+        &self,
+        rtt_sample: Option<(Duration, Instant)>,
+        use_layer: impl FnOnce(&mut ReliableLayer) -> R,
+    ) -> R {
+        let mut reliable_layer = self.reliable_layer.lock().unwrap();
+        if let Some((rtt, now)) = rtt_sample {
+            self.sample_rtt_locked(&mut reliable_layer, rtt, now);
+        }
+        use_layer(&mut reliable_layer)
+    }
+
     pub(crate) fn request_send_driver_resume(&self, source: MetricsSendDriverResumeSource) {
         self.log(MetricsEvent::SendDriverResumeRequest(source));
         self.signals.resume_send().notify_one();
@@ -260,7 +329,7 @@ impl Connection {
     }
 
     pub(crate) fn frame_delivery_enabled(&self) -> bool {
-        self.reliable_layer.lock().unwrap().frame_delivery_enabled()
+        self.frame_delivery_enabled
     }
 
     pub(crate) fn is_send_buf_empty(&self) -> bool {
@@ -288,8 +357,16 @@ impl Connection {
     }
 
     #[cfg(test)]
-    pub(crate) fn reliable_layer_for_test(&self) -> &Mutex<ReliableLayer> {
+    pub(crate) fn reliable_layer_for_test(&self) -> &ReliableLayerMutex {
         &self.reliable_layer
+    }
+
+    /// Test-only: how many times this connection has acquired the
+    /// reliable-layer mutex.  The receive-path test pins the acquisitions per
+    /// datagram against this count.
+    #[cfg(test)]
+    pub(crate) fn reliable_layer_acquisitions_for_test(&self) -> u64 {
+        self.reliable_layer.acquisitions()
     }
 
     pub fn fec_recovered_symbols(&self) -> Option<usize> {
@@ -732,6 +809,23 @@ impl Connection {
     }
 
     pub(crate) fn sample_rtt(&self, rtt: std::time::Duration, now: Instant) {
+        self.with_reliable_layer_mut_and_rtt_sample(Some((rtt, now)), |_| ());
+    }
+
+    /// Sample an RTT against an already-held reliable layer.
+    ///
+    /// Never acquires the mutex, so it is safe — and intended — to call from
+    /// inside a `with_reliable_layer*` closure: the receive path applies the
+    /// datagram's echo sample in the critical section it already holds instead
+    /// of releasing and re-acquiring.  The observability decision, the
+    /// estimator update, and the event publication are unchanged; publication
+    /// never locks the reliable layer (see [`Self::log_at`]).
+    fn sample_rtt_locked(
+        &self,
+        reliable_layer: &mut ReliableLayer,
+        rtt: std::time::Duration,
+        now: Instant,
+    ) {
         let elapsed = self
             .observability
             .enabled()
@@ -743,27 +837,22 @@ impl Connection {
             })
             .unwrap_or(MetricsInterest::Skip);
         let enabled = observer_interest != MetricsInterest::Skip || self.observability.has_logger();
-        let captured = {
-            let mut reliable_layer = self.reliable_layer.lock().unwrap();
-            reliable_layer.sample_rtt(rtt, now);
-            enabled.then(|| {
-                let snapshot = (observer_interest == MetricsInterest::Snapshot
-                    || self.observability.has_logger())
-                .then(|| self.metrics_snapshot(&reliable_layer, now));
-                let event_index = self.observability.next_event_index();
-                (event_index, snapshot)
-            })
-        };
-        if let Some((event_index, snapshot)) = captured {
-            self.observability.publish(
-                event_index,
-                MetricsEvent::RttSample,
-                Some(rtt),
-                elapsed.expect("enabled metrics capture includes elapsed time"),
-                snapshot,
-                observer_interest,
-            );
+        reliable_layer.sample_rtt(rtt, now);
+        if !enabled {
+            return;
         }
+        let snapshot = (observer_interest == MetricsInterest::Snapshot
+            || self.observability.has_logger())
+        .then(|| self.metrics_snapshot(reliable_layer, now));
+        let event_index = self.observability.next_event_index();
+        self.observability.publish(
+            event_index,
+            MetricsEvent::RttSample,
+            Some(rtt),
+            elapsed.expect("enabled metrics capture includes elapsed time"),
+            snapshot,
+            observer_interest,
+        );
     }
 
     pub(crate) fn log(&self, event: MetricsEvent) {

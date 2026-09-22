@@ -142,6 +142,124 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ImmediateWrite;
+    #[async_trait]
+    impl UnreliableWrite for ImmediateWrite {
+        async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+            Ok(buf.len())
+        }
+    }
+
+    #[derive(Debug)]
+    struct DatagramQueue(std::collections::VecDeque<Vec<u8>>);
+    impl DatagramQueue {
+        fn take(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            let Some(datagram) = self.0.pop_front() else {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            };
+            buf[..datagram.len()].copy_from_slice(&datagram);
+            Ok(datagram.len())
+        }
+    }
+    #[async_trait]
+    impl UnreliableRead for DatagramQueue {
+        fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            self.take(buf)
+        }
+        async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+            self.take(buf)
+        }
+    }
+
+    /// One echo-carrying data datagram must cost exactly ONE reliable-layer
+    /// mutex acquisition.  The receive path samples the echoed timestamp and
+    /// then inserts the packet; when those are two separate critical sections
+    /// the count doubles.  The count is exact and load-independent, so this
+    /// fails the moment the second acquisition comes back.
+    #[tokio::test]
+    async fn an_echo_carrying_datagram_takes_one_reliable_layer_acquisition() {
+        const DATAGRAMS: u32 = 8;
+        let mut datagrams = std::collections::VecDeque::new();
+        for seq in 0..DATAGRAMS {
+            let mut datagram = vec![0u8; 64];
+            let data = crate::codec::EncodeData {
+                seq: crate::sequence::SequenceNumber::from_wire(u64::from(seq)),
+                send_ts: None,
+                frame_len: None,
+                data: b"payload",
+            };
+            // A distinct echo timestamp per datagram, so `RecentEchoes` does not
+            // dedup them: every datagram really feeds the RTT estimator.
+            let len =
+                crate::codec::encode_ack_data(None, None, Some(seq + 1), Some(data), &mut datagram)
+                    .unwrap();
+            datagram.truncate(len);
+            datagrams.push_back(datagram);
+        }
+        let layer = crate::udp::wrap_fec(
+            Box::new(DatagramQueue(datagrams)),
+            Box::new(ImmediateWrite),
+            false,
+        );
+        let mut transmission = TransmissionLayer::new(layer, None);
+        // The connection clock starts at construction; let it advance past the
+        // crafted echo timestamps so `rtt_from_echo` yields a sample for each.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let shared = Arc::clone(transmission.shared_for_test());
+        let before = shared.reliable_layer_acquisitions_for_test();
+        let mut recv_bufs = RecvBufs::new();
+        let recv_pkts = transmission.recv_pkts(&mut recv_bufs).await.unwrap();
+        let acquisitions = shared.reliable_layer_acquisitions_for_test() - before;
+        assert_eq!(
+            recv_pkts.num_ack_segments, DATAGRAMS as usize,
+            "the fixture must deliver every crafted datagram to the reliable layer"
+        );
+        assert_eq!(
+            acquisitions,
+            u64::from(DATAGRAMS),
+            "each echo-carrying datagram must take exactly one reliable-layer \
+             acquisition; a second acquisition (a separate `sample_rtt` lock) is a \
+             regression"
+        );
+    }
+
+    /// Frame delivery is chosen once at construction, so the application read
+    /// path must not take the reliable-layer mutex to read the flag.  The
+    /// accessor has to agree with the layer's own flag for both settings, and
+    /// reading it must not move the acquisition counter.
+    #[tokio::test]
+    async fn frame_delivery_flag_is_read_without_a_reliable_layer_acquisition() {
+        for enabled in [false, true] {
+            let mut layer = crate::udp::wrap_fec(
+                Box::new(crate::transmission::test_doubles::PendingRead),
+                Box::new(ImmediateWrite),
+                false,
+            );
+            layer.frame_delivery =
+                crate::delivery::frame::mode::FrameMode::default().with_enabled(enabled);
+            let transmission = TransmissionLayer::new(layer, None);
+            let shared = transmission.shared_for_test();
+            assert_eq!(
+                shared
+                    .reliable_layer_for_test()
+                    .lock()
+                    .unwrap()
+                    .frame_delivery_enabled(),
+                enabled,
+                "the fixture must actually select the requested frame-delivery mode"
+            );
+            let before = shared.reliable_layer_acquisitions_for_test();
+            assert_eq!(shared.frame_delivery_enabled(), enabled);
+            assert_eq!(
+                shared.reliable_layer_acquisitions_for_test(),
+                before,
+                "reading the construction-fixed frame-delivery flag must not acquire \
+                 the reliable-layer mutex"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn accepted_out_of_order_fin_publishes_fin_before_eof() {
         #[derive(Debug)]

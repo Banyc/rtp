@@ -170,15 +170,28 @@ impl ReadHalf {
                         continue;
                     }
                 }
-                if let Some(echo_ts) = data.echo_ts {
+                // Prepare the echo-derived RTT sample without the
+                // reliable-layer lock: `with_reliable_layer_mut_and_rtt_sample`
+                // below applies it inside the critical section this datagram
+                // already takes, so an echo-carrying datagram costs one
+                // acquisition instead of two.
+                let rtt_sample = data.echo_ts.and_then(|echo_ts| {
                     let local_ts = shared.wire_ts(now);
                     if recent_echoes.should_sample(echo_ts, now)
                         && let Some(rtt) = TsEcho::rtt_from_echo(local_ts, echo_ts)
                     {
+                        Some((rtt, now))
+                    } else {
+                        None
+                    }
+                });
+                if data.killed {
+                    // The kill path returns before that critical section, so it
+                    // applies the prepared sample itself to keep the sample
+                    // stream identical to the pre-fold order.
+                    if let Some((rtt, now)) = rtt_sample {
                         shared.sample_rtt(rtt, now);
                     }
-                }
-                if data.killed {
                     let e = IoErr::from(std::io::ErrorKind::BrokenPipe);
                     record_error(e, MetricsTerminationCause::PeerKill);
                     return Err((e, SendKillPkt::No));
@@ -188,8 +201,8 @@ impl ReadHalf {
                     .as_ref()
                     .is_some_and(|data| data.buf_range.is_empty() && data.frame_len.is_none());
                 let ack_next = data.ack_next;
-                let (disposition, recv_eof, gentle_mode_exit) =
-                    shared.with_reliable_layer_mut(|reliable_layer| {
+                let (disposition, recv_eof, gentle_mode_exit) = shared
+                    .with_reliable_layer_mut_and_rtt_sample(rtt_sample, |reliable_layer| {
                         // An ACK event exists only when the datagram carried an
                         // ACK command (ack_next is Some); a data-only packet must
                         // not fabricate one.
