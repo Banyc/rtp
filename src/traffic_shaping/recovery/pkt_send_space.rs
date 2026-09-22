@@ -954,11 +954,34 @@ impl PktSendSpace {
             return true;
         }
 
-        self.rtt_stats.record_rtt(rtt);
+        self.rtt_stats.record_rtt(self.clamp_rtt_sample(rtt));
         if self.fast_loss_armed() != fast_loss_was_armed {
             self.sync_rtx_index();
         }
         false
+    }
+
+    /// Upper bound on how far one echo sample may move the estimator away
+    /// from the current smoothed RTT, as a multiple of it.
+    ///
+    /// The echo round trip is measured on the local wall clock, so a host that
+    /// deschedules the receive task (scheduling pressure, a stop-the-world
+    /// pause) inflates it arbitrarily even though the path did not change. A
+    /// single such sample would otherwise dominate the RFC 6298 filter and
+    /// push the RTO to tens of seconds, which in turn paces retransmission
+    /// that far apart and stalls a connection that is merely starved, not
+    /// broken. The bound still admits a real path step: consecutive samples
+    /// may each grow the estimate by this factor, so a sustained change is
+    /// tracked within a few round trips, while an isolated spike cannot
+    /// explode it.
+    const MAX_RTT_SAMPLE_GROWTH: u32 = 32;
+
+    fn clamp_rtt_sample(&self, rtt: Duration) -> Duration {
+        rtt.min(
+            self.rtt_stats
+                .smooth_rtt()
+                .saturating_mul(Self::MAX_RTT_SAMPLE_GROWTH),
+        )
     }
 
     pub fn accepts_new_pkt(&self) -> bool {
@@ -2437,6 +2460,87 @@ mod tests {
             space.detect_outage_recovery(t),
             "zero-progress ACKs should not prevent outage detection"
         );
+    }
+
+    #[test]
+    fn a_blackout_echo_cannot_inflate_the_rto_that_should_detect_it() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Make progress so outage detection is eligible, then leave one packet
+        // in flight and let it stall past the (pre-sample) RTO.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        let rto_before = space.rto_duration();
+        assert!(rto_before >= ms(1000), "rto={rto_before:?}");
+
+        // The echo for the stalled packet finally arrives after a blackout
+        // many RTOs long. Folding it in unbounded would inflate the RTO past
+        // the stall, so the outage detector — which runs after the sample on
+        // the receive path — would no longer see the stall and open the epoch.
+        let blackout = rto_before * 1000;
+        let now = t0 + ms(11) + blackout;
+        assert!(!space.sample_rtt(blackout, now));
+        assert!(
+            space.rto_duration() < blackout / 2,
+            "the blackout sample must be clamped, not folded in: {:?}",
+            space.rto_duration()
+        );
+        assert!(
+            space.detect_outage_recovery(now),
+            "the pre-sample RTO must still see the stall as an outage"
+        );
+        assert!(space.in_outage_recovery());
+    }
+
+    /// A high-RTT sample with no stall behind it is a path observation, not a
+    /// blackout: it must still update the estimator even though it exceeds the
+    /// pre-sample RTO.
+    #[test]
+    fn a_path_change_above_the_rto_still_updates_the_estimator() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        space.sample_rtt(ms(625), t0);
+        let rto_before = space.rto_duration();
+        let path_rtt = rto_before + ms(1);
+        assert!(
+            !space.sample_rtt(path_rtt, t0 + ms(1)),
+            "a path change does not close an epoch"
+        );
+        assert!(!space.in_outage_recovery());
+        assert!(
+            space.smooth_rtt() > ms(625),
+            "the path observation must be folded in: {:?}",
+            space.smooth_rtt()
+        );
+    }
+
+    #[test]
+    fn a_fresh_post_outage_sample_still_closes_the_epoch() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+
+        let blackout = space.rto_duration() * 1000;
+        let stall_at = t0 + ms(11) + blackout;
+        assert!(!space.sample_rtt(blackout, stall_at));
+        assert!(space.detect_outage_recovery(stall_at));
+        assert!(space.in_outage_recovery());
+
+        // A fresh, plausible sample whose send post-dates the outage cut is
+        // not a blackout: it must still close the epoch and reseed sRTT.
+        let fresh = ms(100);
+        let now = stall_at + fresh;
+        assert!(
+            space.sample_rtt(fresh, now),
+            "a fresh post-outage sample must close the epoch"
+        );
+        assert!(!space.in_outage_recovery());
     }
 
     #[test]

@@ -1,5 +1,16 @@
 use std::time::Duration;
 
+/// Budgets for the peer-liveness watchdogs that terminate a connection whose
+/// peer has stopped responding.
+///
+/// Both budgets are **wall clock**: they fire when `now` outruns the deadline
+/// armed from the last peer response, whatever the local process was doing in
+/// between. A host that deschedules the receive path for longer than a budget
+/// can therefore look like a dead peer, and the connection is terminated even
+/// though the peer is alive. The RTT estimator bounds how far a single
+/// scheduling-delayed echo may inflate the retransmission timer, which keeps
+/// the common starvation case from reaching the budget, but a long enough
+/// starvation still terminates a live connection by design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchdogTuning {
     pub(crate) rto_multiplier: u32,
