@@ -565,6 +565,14 @@ mod tests {
         let addr = server.local_addr();
         let key = 42;
         let msg_1 = b"hello";
+        // The echo must reach the client's application, not merely be staged or
+        // packetized on the server: `send` only stages bytes, and the handler is
+        // done as soon as it has read the request, so dropping the session would
+        // abort the write driver with the echo still staged or unacknowledged
+        // and the client would wait forever. The client signals receipt after its
+        // read and the server holds the session until then.
+        let echo_received = Arc::new(tokio::sync::Notify::new());
+        let server_echo_received = Arc::clone(&echo_received);
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             let server = Arc::new(server);
@@ -595,10 +603,9 @@ mod tests {
             let m = &buf[..n];
             assert_eq!(m, msg_1);
             accepted.write.send(msg_1).await.unwrap();
-            // Drain the send buffer before releasing the supervisor: `send`
-            // only stages bytes, so the echo must reach the wire before the
-            // write driver may be reaped.
-            accepted.write.send_buf_empty().await.unwrap();
+            // Hold the session — and so the write driver — until the client
+            // has the echo in hand; only then is dropping it lossless.
+            server_echo_received.notified().await;
         });
         tasks.spawn(async move {
             let client = Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
@@ -629,6 +636,8 @@ mod tests {
             let n = accepted.read.recv(&mut buf).await.unwrap();
             let m = &buf[..n];
             assert_eq!(m, msg_1);
+            // The echo is in the application's hands; release the server.
+            echo_received.notify_one();
         });
         while let Some(res) = tasks.join_next().await {
             res.unwrap();
@@ -642,6 +651,14 @@ mod tests {
         let addr = server.local_addr();
         let key = 42;
         let msg_1 = b"obfuscated keyed hello";
+        // The echo must reach the client's application, not merely be staged or
+        // packetized on the server: `send` only stages bytes, and the handler is
+        // done as soon as it has read the request, so dropping the session would
+        // abort the write driver with the echo still staged or unacknowledged
+        // and the client would wait forever. The client signals receipt after its
+        // read and the server holds the session until then.
+        let echo_received = Arc::new(tokio::sync::Notify::new());
+        let server_echo_received = Arc::clone(&echo_received);
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move {
             let server = Arc::new(server);
@@ -672,7 +689,9 @@ mod tests {
             let m = &buf[..n];
             assert_eq!(m, msg_1);
             accepted.write.send(msg_1).await.unwrap();
-            accepted.write.send_buf_empty().await.unwrap();
+            // Hold the session — and so the write driver — until the client
+            // has the echo in hand; only then is dropping it lossless.
+            server_echo_received.notified().await;
         });
         tasks.spawn(async move {
             let client = Connector::<u8>::connect_without_handshake("0.0.0.0:0", addr)
@@ -702,6 +721,8 @@ mod tests {
             let n = accepted.read.recv(&mut buf).await.unwrap();
             let m = &buf[..n];
             assert_eq!(m, msg_1);
+            // The echo is in the application's hands; release the server.
+            echo_received.notify_one();
         });
         while let Some(res) = tasks.join_next().await {
             res.unwrap();

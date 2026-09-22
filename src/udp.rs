@@ -1571,10 +1571,19 @@ mod tests {
                     }
                     assert_eq!(msg, &buf[..offset]);
                     accepted.write.send(b"\x01").await.unwrap();
-                    // Drain the send buffer before releasing the supervisor:
-                    // `send` only stages the one-byte ack, so it must reach
-                    // the wire before the write driver may be reaped.
-                    accepted.write.send_buf_empty().await.unwrap();
+                    // `send` only stages the ack; it returns before the byte
+                    // reaches the wire. The handler is done as soon as it has
+                    // read the message, so dropping the session here aborts
+                    // the write driver and discards an ack that is merely
+                    // staged or in flight, and the client waits for a
+                    // datagram that was never sent. Hold the session until
+                    // the peer's reliable layer has acknowledged the ack —
+                    // the barrier that means the wire has it.
+                    accepted
+                        .write
+                        .all_sent_data_acked()
+                        .await
+                        .expect("server ack was never acknowledged");
                 });
             }
         });
