@@ -1912,20 +1912,48 @@ mod tests {
                     "the probe magic leaked onto the wire"
                 );
                 // A raw (unobfuscated) probe is NOT echoed: with a key set,
-                // the listener only answers obfuscated probes, and the raw
-                // datagram is dropped as an invalid obfuscated datagram.
-                let raw = crate::probe::encode_probe(probe);
+                // the listener only answers obfuscated probes. The raw
+                // datagram is de-obfuscated in place, fails the probe
+                // plaintext check and is routed as data, so it may elicit
+                // session traffic (the FIN of the session the accept loop
+                // drops) but never a probe echo. Assert that by CONTENT: the
+                // window may deliver unrelated datagrams, but none may be an
+                // echo of the raw probe. The raw probe carries a nonce
+                // distinct from the obfuscated probe's, so an echo of the
+                // earlier obfuscated probe cannot be mistaken for an answer
+                // to it.
+                let raw_probe = crate::probe::ProbeEcho {
+                    nonce: 0x0BAD_F00D,
+                    timestamp_micros: 54321,
+                };
+                let raw = crate::probe::encode_probe(raw_probe);
                 prober.send(&raw).await.unwrap();
-                let mut buf2 = [0u8; 64];
-                let timed = tokio::time::timeout(
-                    std::time::Duration::from_millis(300),
-                    prober.recv(&mut buf2),
-                )
-                .await;
-                assert!(
-                    timed.is_err(),
-                    "a raw probe must not be echoed when the probe key is set"
-                );
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+                let mut buf2 = [0u8; 512];
+                loop {
+                    let n2 = match tokio::time::timeout_at(deadline, prober.recv(&mut buf2)).await {
+                        // The window closed without an answer to the raw probe.
+                        Err(_) => break,
+                        Ok(Ok(n2)) => n2,
+                        Ok(Err(error)) => panic!("prober recv failed: {error}"),
+                    };
+                    let stray = &buf2[..n2];
+                    assert_ne!(
+                        crate::probe::decode_echo(stray),
+                        Some(raw_probe),
+                        "a raw probe must not be echoed when the probe key is set"
+                    );
+                    assert_ne!(
+                        crate::probe::decode_echo_obfuscated(
+                            stray,
+                            KEY,
+                            crate::probe::probe_settings()
+                        ),
+                        Some(raw_probe),
+                        "a raw probe must not be echoed when the probe key is set"
+                    );
+                }
             } => {}
         }
     }

@@ -1012,4 +1012,55 @@ mod tests {
             "the echo must decode back to the probe"
         );
     }
+
+    /// With a key set, a raw (unobfuscated) probe is not a probe: the
+    /// responder de-obfuscates it in place, the plaintext fails the probe
+    /// format check, and it is routed as data. The echo path is only reached
+    /// on [`Observe::Consumed`], so the probe channel never answers it. This
+    /// pins the distinction deterministically — no wall-clock window — by
+    /// driving the same responder with both forms: the raw probe returns
+    /// `Data` and produces no datagram, the obfuscated probe is consumed and
+    /// produces exactly the one echo.
+    #[test]
+    fn responder_with_key_routes_a_raw_probe_and_echoes_only_the_obfuscated_one() {
+        let key = [7; crate::obfuscate::KEY_LEN];
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let responder = ProbeResponder::new(Some(echo), Some(key), probe_settings(), None);
+        let prober = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let from = prober.local_addr().unwrap();
+        let probe = ProbeEcho {
+            nonce: 0xDEAD_BEEF,
+            timestamp_micros: 12345,
+        };
+        // The raw datagram leaves `PROBE_LEN - NONCE_LEN` bytes of
+        // de-obfuscated plaintext for the data path.
+        let mut raw = encode_probe(probe);
+        assert_eq!(
+            responder.observe(&from, &mut raw),
+            Observe::Data(PROBE_LEN - crate::obfuscate::NONCE_LEN),
+            "a raw probe must be routed as data, not consumed as a probe"
+        );
+        // The obfuscated form of the same probe IS a probe.
+        let mut wire = Vec::new();
+        encode_probe_obfuscated(probe, key, probe_settings(), &mut wire);
+        assert_eq!(
+            responder.observe(&from, &mut wire),
+            Observe::Consumed,
+            "an obfuscated probe must be consumed (echoed)"
+        );
+        // Exactly one datagram: the echo of the obfuscated probe. The raw
+        // probe contributed none.
+        let mut buf = [0u8; 1024];
+        let (n, _) = prober.recv_from(&mut buf).unwrap();
+        assert_eq!(
+            decode_echo_obfuscated(&buf[..n], key, probe_settings()),
+            Some(probe),
+            "the single reply must be the echo of the obfuscated probe"
+        );
+        prober.set_nonblocking(true).unwrap();
+        assert!(
+            prober.recv_from(&mut buf).is_err(),
+            "a raw probe must not produce a datagram"
+        );
+    }
 }
