@@ -196,6 +196,13 @@ pub struct ReliableLayer {
     /// Windowed ACK-clock ramp for the dedicated lane's bounded fast start.
     fast_start: FastStartEpisode,
     last_congestion_loss_ratio: Option<f64>,
+    /// Test-only pinned congestion-loss ratio.  When set,
+    /// [`Self::congestion_loss_ratio`] reports it instead of the latest
+    /// measured sample: the measured field is refreshed from the
+    /// delivery-rate controller's RTT-keyed event window on every rate
+    /// sample, so without a pin a test's loss premise races that window.
+    #[cfg(test)]
+    congestion_loss_ratio_pin: Option<f64>,
     last_congestion_action: Option<crate::metrics::MetricsCongestionAction>,
     /// Whether congestion-controller interval accounting is on.  Set once at
     /// connection construction to `metrics_observer.is_some() ||
@@ -271,6 +278,8 @@ impl ReliableLayer {
             slow_start_acked_pkts: 0,
             fast_start: FastStartEpisode::new(now),
             last_congestion_loss_ratio: None,
+            #[cfg(test)]
+            congestion_loss_ratio_pin: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
             gentle_exit_pending: None,
@@ -321,6 +330,8 @@ impl ReliableLayer {
             slow_start_acked_pkts: 0,
             fast_start: FastStartEpisode::new(now),
             last_congestion_loss_ratio: None,
+            #[cfg(test)]
+            congestion_loss_ratio_pin: None,
             last_congestion_action: None,
             congestion_metrics_enabled: false,
             gentle_exit_pending: None,
@@ -466,9 +477,29 @@ impl ReliableLayer {
 
     /// The most recent congestion-loss ratio measured by the delivery-rate
     /// controller (`None` before the first rate sample).  Feeds the FEC
-    /// condition gate's loss evidence.
+    /// condition gate's loss evidence.  A test that pinned the ratio through
+    /// [`Self::pin_congestion_loss_ratio_for_test`] gets the pinned value.
     pub(crate) fn congestion_loss_ratio(&self) -> Option<f64> {
+        #[cfg(test)]
+        if let Some(pinned) = self.congestion_loss_ratio_pin {
+            return Some(pinned);
+        }
         self.last_congestion_loss_ratio
+    }
+
+    /// Test-only: pin the congestion-loss ratio that the FEC condition gate
+    /// reads as its loss evidence, and keep it pinned across rate samples.
+    ///
+    /// The delivery-rate controller's estimate is the loss-event rate over a
+    /// window two smoothed RTTs wide that needs `LOSS_RATE_MIN_SAMPLES`
+    /// samples, so a lane with fewer datagrams per round trip than that (a
+    /// single-packet ping-pong, say) has no congestion evidence at all and the
+    /// gate falls back to the sender-side recovery ratio.  Pinning states the
+    /// loss premise of an impairment for the whole run instead of binding a
+    /// test's outcome to when repairs happened to fall in that ring.
+    #[cfg(test)]
+    pub(crate) fn pin_congestion_loss_ratio_for_test(&mut self, loss: f64) {
+        self.congestion_loss_ratio_pin = Some(loss);
     }
 
     /// Test-only: force the congestion-loss ratio so the FEC condition gate

@@ -496,11 +496,44 @@ mod tests {
     };
 
     use super::super::session::socket;
+    use crate::transmission::connection::Connection;
     use crate::transmission::test_doubles::{PendingRead, PendingWrite};
     use crate::udp::wrap_fec;
 
     use super::*;
     use core::time::Duration;
+
+    /// The loss both `test_fec_recovers_under_loss*` impairments inject, as a
+    /// fraction.  Their assertions read the receiver's recovered-symbol
+    /// counter, which is only non-zero if the sender's FEC condition gate was
+    /// open when a group whose data symbol was lost reached its burst tail,
+    /// so the tests pin this as the gate's loss evidence (see
+    /// [`pin_fec_loss_evidence`]).
+    const IMPAIRED_LOSS: f64 = 0.08;
+
+    /// Pin the FEC condition gate's loss evidence to the loss the impairment
+    /// stands for.
+    ///
+    /// The gate decides on `max(congestion loss, sender-side recovery ratio)`.
+    /// The congestion term comes from the delivery-rate controller's
+    /// loss-event window: two smoothed RTTs wide, and it abstains until it
+    /// holds 16 samples.  A single-packet ping-pong over loopback never
+    /// accumulates that many, so the term is `None` on every gate refresh
+    /// (measured) and the gate is driven by the recovery ratio alone — which
+    /// is 0 whenever the last 64 primary sends held no retransmission, and
+    /// which the hysteresis then turns into a closed gate.  A run whose
+    /// repairs all happened to fall outside that ring therefore emits no
+    /// parity at all and reports zero recovered symbols even though 8% of the
+    /// traffic is being lost and repaired by ARQ.  Pin the loss evidence so an
+    /// 8% loss path is treated as one for the whole run, and the recovered
+    /// count measures the parity path instead of the timing of the repairs.
+    fn pin_fec_loss_evidence(sender: &Arc<Connection>) {
+        sender
+            .reliable_layer_for_test()
+            .lock()
+            .unwrap()
+            .pin_congestion_loss_ratio_for_test(IMPAIRED_LOSS);
+    }
 
     /// Counts every datagram the layer above hands to the underlay.  Installed
     /// *inside* the loss wrapper, so it counts forwarded (wire) datagrams only;
@@ -691,7 +724,7 @@ mod tests {
     async fn test_fec_recovers_under_loss() {
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy};
         // 8% loss: the FEC condition gate enables at 5% measured congestion
-        // loss, so the loss evidence here deterministically opens the gate.
+        // loss, and the pinned loss evidence below presents that 8% to it.
         let rate_a = BasisPoints::new(800);
         let rate_b = BasisPoints::new(800);
         let fec = true;
@@ -703,6 +736,7 @@ mod tests {
         let b = wrap_fec_lossy(b.clone(), b, fec, rate_b);
         let (a_r, a_w, _a_supervisor) = socket(a, None);
         let (b_r, b_w, _b_supervisor) = socket(b, None);
+        pin_fec_loss_evidence(&a_w.transmission_layer);
         let mut a_w = a_w;
         let mut a_r = a_r;
         let mut b_r = b_r;
@@ -781,7 +815,12 @@ mod tests {
         use crate::udp::testing::{BasisPoints, wrap_fec_lossy_with_mss_and_fec_tuning};
         // 8% loss: the FEC condition gate enables at 5% measured congestion
         // loss.  A wired-but-inert gate (configured yet never opened) would
-        // emit no sender parity and fail the parity_sent assertion.
+        // emit no sender parity and fail the parity_sent assertion.  The
+        // pinned loss evidence below presents that 8% to the gate: this lane
+        // is a single-packet ping-pong whose delivery-rate loss-event window
+        // never reaches its sample minimum, so without the pin the gate sees
+        // no congestion loss at all and its openness would be a draw on when
+        // retransmissions fell in the last 64 primary sends.
         let rate_a = BasisPoints::new(800);
         let rate_b = BasisPoints::new(800);
         let fec = true;
@@ -804,16 +843,29 @@ mod tests {
             };
             *observed_a_fec_counters.lock().unwrap() = Some(counters);
         }));
-        let b_layer =
+        let mut b_layer =
             wrap_fec_lossy_with_mss_and_fec_tuning(b.clone(), b, fec, mss, tuning, rate_b);
+        let b_fec_counters = Arc::new(std::sync::Mutex::new(None));
+        let observed_b_fec_counters = Arc::clone(&b_fec_counters);
+        b_layer.metrics_observer = Some(crate::metrics::MetricsObserver::new(move |observation| {
+            let Some(counters) = observation
+                .snapshot
+                .and_then(|snapshot| snapshot.fec_counters)
+            else {
+                return;
+            };
+            *observed_b_fec_counters.lock().unwrap() = Some(counters);
+        }));
         let (a_r, a_w, _a_supervisor) = socket(a_layer, None);
         let (b_r, b_w, _b_supervisor) = socket(b_layer, None);
+        pin_fec_loss_evidence(&a_w.transmission_layer);
         let mut b_r = b_r;
         let mut a_w = a_w;
         let mut a_r = a_r;
         let mut b_w = b_w;
         let msg_len = 256;
         let n_msgs = 512;
+        let transfer_started = std::time::Instant::now();
         let mut sent = Vec::with_capacity(n_msgs);
         for i in 0..n_msgs {
             let mut m = vec![0u8; msg_len];
@@ -864,20 +916,25 @@ mod tests {
             .await
             .expect("the FEC-under-loss echo exchange stalled");
         let recovered = server_tasks.join_next().await.unwrap().unwrap();
-        assert!(recovered.is_some(), "FEC should be enabled on the receiver");
-        assert!(
-            recovered.unwrap() > 0,
-            "FEC should recover >0 symbols under 8% loss, got 0"
-        );
-        let counters = a_fec_counters
+        let sender_counters = a_fec_counters
             .lock()
             .unwrap()
             .expect("sender FEC counters must be observed");
+        let receiver_counters = b_fec_counters
+            .lock()
+            .unwrap()
+            .expect("receiver FEC counters must be observed");
+        let parity_sent_direct = sender.fec_parity_sent_for_test();
+        assert!(recovered.is_some(), "FEC should be enabled on the receiver");
         assert!(
-            counters.parity_sent > 0,
-            "loss-triggered FEC should emit parity through typed observations; counters={counters:?}"
+            recovered.unwrap() > 0,
+            "FEC should recover >0 symbols under 8% loss, got 0; elapsed={:?} sender={sender_counters:?} receiver={receiver_counters:?} parity_sent_direct={parity_sent_direct:?}",
+            transfer_started.elapsed()
         );
-
+        assert!(
+            sender_counters.parity_sent > 0,
+            "loss-triggered FEC should emit parity through typed observations; counters={sender_counters:?}"
+        );
         let parity_sent = sender.fec_parity_sent_for_test();
         assert!(
             parity_sent.is_some() && parity_sent.unwrap() > 0,
