@@ -294,6 +294,14 @@ pub struct Connected {
     pub supervisor: SessionHandle,
 }
 
+/// Conn-write half that prefixes each datagram with its dispatch key and
+/// carries the socket's raw fd for the interface-backpressure fallback on
+/// Unix.
+///
+/// `raw_fd` must be the descriptor of the socket held by `write`: that socket
+/// is what keeps the descriptor open (the fallback borrows it without owning
+/// it — see `borrowed_udp_socket` in `raw_send`), and `write` is mutably
+/// borrowed across the fallback's awaits.
 #[derive(Debug)]
 pub struct KeyedConnWrite {
     write: ConnWrite<UdpSocket>,
@@ -303,6 +311,9 @@ pub struct KeyedConnWrite {
     data_offset: usize,
 }
 impl KeyedConnWrite {
+    /// `raw_fd` must be the descriptor of the socket held by `write` (see
+    /// [`KeyedConnWrite`]); the constructor cannot check that, because
+    /// `udp_listener::ConnWrite` does not expose its socket.
     pub fn new<K: DispatchKey>(
         write: ConnWrite<UdpSocket>,
         conn_key: &K,

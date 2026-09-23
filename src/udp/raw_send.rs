@@ -96,6 +96,34 @@ pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
     }
 }
 
+/// Borrow `raw_fd` as a [`std::net::UdpSocket`] without taking ownership of
+/// the descriptor.
+///
+/// # Safety
+///
+/// `raw_fd` must name an open UDP socket whose owner stays alive for as long
+/// as the returned value is used.  The wrapper is a [`std::mem::ManuallyDrop`],
+/// so dropping it never closes the descriptor — the hazard is the mirror image
+/// of a double close: using a descriptor the OS has already released, and
+/// possibly handed to an unrelated file.  A caller therefore borrows a
+/// descriptor out of a socket it holds across the whole use, rather than
+/// storing one.
+#[cfg(unix)]
+unsafe fn borrowed_udp_socket(raw_fd: MaybeRawFd) -> std::mem::ManuallyDrop<std::net::UdpSocket> {
+    use std::os::fd::FromRawFd;
+    let socket = std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) });
+    // `getsockname` is the cheapest probe `std` exposes for "this descriptor is
+    // an open socket": it fails with `EBADF` for a released descriptor and
+    // with `ENOTSOCK` for any other kind of file.  It cannot tell whether the
+    // descriptor names the *right* socket, so it supplements the caller's
+    // invariant instead of replacing it.
+    debug_assert!(
+        socket.local_addr().is_ok(),
+        "borrowed_udp_socket: descriptor {raw_fd:?} is not an open socket"
+    );
+    socket
+}
+
 /// On macOS, kqueue EVFILT_WRITE tracks only socket sndbuf, not mbuf/
 /// interface-queue pressure — so tokio UDP writability readiness is
 /// *poisoned* under interface backpressure: it reports writable, the send
@@ -107,20 +135,21 @@ pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
 ///
 /// When `peer` is `Some`, the socket is unconnected and `send_to` is used
 /// to address the peer directly.  When `None`, the socket is connected
-#[cfg(unix)]
-unsafe fn borrowed_udp_socket(raw_fd: MaybeRawFd) -> std::mem::ManuallyDrop<std::net::UdpSocket> {
-    use std::os::fd::FromRawFd;
-    std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) })
-}
-
 /// and a plain `send` suffices.
 ///
 /// The raw fd is borrowed via `std::net::UdpSocket::from_raw_fd` so the
 /// OS handles the sockaddr encoding — this avoids both the byte-order bug
 /// of hand-rolled `sockaddr_in` (`from_be_bytes` stores 127.0.0.1 as
 /// memory [1,0,0,127] on little-endian) and the Linux build break from
-/// the BSD-only `sin_len`/`sin6_len` fields.  The borrowed socket is
-/// `mem::forget`ten so the fd is never closed.
+/// the BSD-only `sin_len`/`sin6_len` fields.  The borrowed socket is held in
+/// a `ManuallyDrop`, so the fd is never closed.
+///
+/// `raw_fd` must be the descriptor of a socket that outlives the call (see
+/// [`borrowed_udp_socket`]).  Each production caller takes it from a socket it
+/// also holds across every await here — `RawFdConnWrite` and `KeyedConnWrite`
+/// sit beside the `udp_listener::ConnWrite` whose `Arc` owns that socket, and
+/// `UnreliableWrite for Arc<UdpSocket>` reads `self.as_raw_fd()` from the very
+/// `Arc` it is borrowing — so no caller carries the obligation separately.
 ///
 /// Returns `Err(WouldBlock)` when retry budget is exhausted — the caller
 /// must retry later, not treat the packet as sent.
@@ -310,5 +339,19 @@ mod tests {
         original
             .send_to(b"alive", original.local_addr().unwrap())
             .unwrap();
+    }
+
+    /// The debug probe in [`borrowed_udp_socket`] must reject a descriptor that
+    /// is open but is not a socket, so the assertion is a check rather than
+    /// decoration.  A regular file is used rather than a released descriptor:
+    /// a released number can be reused by another thread's socket at any
+    /// moment, which would make the test race.
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    #[should_panic(expected = "is not an open socket")]
+    fn borrowed_socket_rejects_a_non_socket_descriptor() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let _socket = unsafe { borrowed_udp_socket(raw_fd) };
     }
 }
