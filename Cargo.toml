@@ -23,8 +23,8 @@ tokio-util = "0.7"
 tokio_chacha20 = { git = "https://github.com/Banyc/tokio_chacha20.git", tag = "v0.0.8" }
 tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.4" }
 # tokio_udp = { path = "../tokio_udp" }
-udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.18" }
-# udp_listener = { path = "../udp_listener" }
+# udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.18" }
+udp_listener = { path = "../udp_listener" }
 # The layer-testing kit (`rtp::testkit`, behind `testing`) consumes the
 # generic helpers and the impairment instrument from the local harness
 # checkout; the optional dependency is activated by the same feature so the
