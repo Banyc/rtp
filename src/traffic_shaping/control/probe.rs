@@ -955,15 +955,19 @@ mod tests {
         );
     }
 
+    /// A failed echo send is counted, and the probe is still consumed. The
+    /// failure is induced by addressing an IPv6 peer from the IPv4 echo
+    /// socket: the kernel rejects the send as an address-family mismatch
+    /// (`EAFNOSUPPORT` on Linux, `EHOSTUNREACH` on macOS), so the socket
+    /// keeps sole ownership of its descriptor throughout. The responder is
+    /// dropped normally at the end of the test, which closes that descriptor
+    /// exactly once, and there is no cleanup guard whose execution depends on
+    /// the assertion passing.
     #[test]
     fn responder_counts_echo_send_failures() {
-        use std::os::fd::{AsRawFd, FromRawFd};
         let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let raw = echo.as_raw_fd();
-        let closer = unsafe { std::fs::File::from_raw_fd(raw) };
         let responder = ProbeResponder::new(Some(echo), None, probe_settings(), None);
-        drop(closer);
-        let from: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let from: SocketAddr = "[::1]:9".parse().unwrap();
         let mut probe = encode_probe(ProbeEcho {
             nonce: 1,
             timestamp_micros: 2,
@@ -974,7 +978,6 @@ mod tests {
             "a probe must be consumed (echoed)"
         );
         assert_eq!(responder.send_error_count(), 1);
-        std::mem::forget(responder);
     }
 
     #[test]
