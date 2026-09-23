@@ -395,7 +395,10 @@ pub enum DecodeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, EncodeData, decode, encode_ack_data, encode_kill};
+    use super::{
+        ACK_CMD, DATA_CMD, DecodeError, ECHO_TS_CMD, EncodeData, TAG_CMD, decode, encode_ack_data,
+        encode_kill,
+    };
     use crate::ack::{AckHistory, EncodeAck};
     use crate::sequence::SequenceNumber;
 
@@ -462,7 +465,7 @@ mod tests {
     #[test]
     fn ack_wire_rejects_more_than_the_protocol_block_bound() {
         // Hand-craft an ACK with a count above MAX_ACK_BLOCKS.
-        let mut buf = vec![0u8]; // ACK_CMD
+        let mut buf = vec![ACK_CMD];
         buf.extend_from_slice(&7u64.to_be_bytes()); // cumulative next
         buf.push(crate::ack::MAX_ACK_BLOCKS as u8 + 1); // count above the bound
         let mut acks = Vec::new();
@@ -471,10 +474,10 @@ mod tests {
             Err(DecodeError::Corrupted)
         ));
         // A second ACK_CMD in one datagram is rejected.
-        let mut buf2 = vec![0u8];
+        let mut buf2 = vec![ACK_CMD];
         buf2.extend_from_slice(&7u64.to_be_bytes());
         buf2.push(0);
-        buf2.push(0); // second ACK_CMD
+        buf2.push(ACK_CMD); // second ACK_CMD
         buf2.extend_from_slice(&8u64.to_be_bytes());
         buf2.push(0);
         let mut acks = Vec::new();
@@ -483,7 +486,7 @@ mod tests {
             Err(DecodeError::Corrupted)
         ));
         // A zero-size interval is rejected.
-        let mut buf3 = vec![0u8];
+        let mut buf3 = vec![ACK_CMD];
         buf3.extend_from_slice(&7u64.to_be_bytes());
         buf3.push(1);
         buf3.extend_from_slice(&9u64.to_be_bytes()); // start
@@ -494,7 +497,7 @@ mod tests {
             Err(DecodeError::Corrupted)
         ));
         // A truncated interval is rejected.
-        let mut buf4 = vec![0u8];
+        let mut buf4 = vec![ACK_CMD];
         buf4.extend_from_slice(&7u64.to_be_bytes());
         buf4.push(1);
         buf4.extend_from_slice(&9u64.to_be_bytes()); // start only, no size
@@ -511,7 +514,7 @@ mod tests {
         // selective intervals is a legitimately-encoded datagram (the
         // encoder clamps to the same bound), and only a count past it is
         // Corrupted.
-        let mut buf = vec![0u8]; // ACK_CMD
+        let mut buf = vec![ACK_CMD];
         buf.extend_from_slice(&7u64.to_be_bytes()); // cumulative next
         buf.push(crate::ack::MAX_ACK_BLOCKS as u8); // exactly the bound
         for i in 0..crate::ack::MAX_ACK_BLOCKS as u64 {
@@ -528,7 +531,7 @@ mod tests {
     fn decodes_legacy_data_without_ts() {
         // DATA_CMD: cmd u8 + seq u64 BE + len u16 BE + payload
         let mut buf = Vec::new();
-        buf.push(1); // DATA_CMD
+        buf.push(DATA_CMD);
         buf.extend_from_slice(&42u64.to_be_bytes());
         buf.extend_from_slice(&5u16.to_be_bytes());
         buf.extend_from_slice(b"hello");
@@ -616,9 +619,9 @@ mod tests {
         // A forged tag on a data-only datagram is still rejected.  (The
         // encoder only emits a tag for control-bearing datagrams, so craft
         // the bytes by hand: TAG_CMD 6 + 8-byte tag + DATA_CMD payload.)
-        let mut forged = vec![6u8];
+        let mut forged = vec![TAG_CMD];
         forged.extend_from_slice(&(tag ^ 0xff).to_be_bytes());
-        forged.push(1); // DATA_CMD
+        forged.push(DATA_CMD);
         forged.extend_from_slice(&7u64.to_be_bytes());
         forged.extend_from_slice(&7u16.to_be_bytes());
         forged.extend_from_slice(b"payload");
@@ -628,9 +631,9 @@ mod tests {
             Err(DecodeError::Unauthenticated)
         ));
         // A valid tag on a data-only datagram is accepted.
-        let mut tagged = vec![6u8];
+        let mut tagged = vec![TAG_CMD];
         tagged.extend_from_slice(&tag.to_be_bytes());
-        tagged.push(1); // DATA_CMD
+        tagged.push(DATA_CMD);
         tagged.extend_from_slice(&7u64.to_be_bytes());
         tagged.extend_from_slice(&7u16.to_be_bytes());
         tagged.extend_from_slice(b"payload");
@@ -693,7 +696,7 @@ mod tests {
         assert_eq!(acks[0].size.get(), 5);
         // A TAGGED padded ACK also decodes (flush_acks pages carry the tag
         // on handshaked connections).
-        let mut tagged = vec![6u8];
+        let mut tagged = vec![TAG_CMD];
         tagged.extend_from_slice(&tag.to_be_bytes());
         tagged.extend_from_slice(&content);
         tagged.extend_from_slice(&[0x00; 64]);
@@ -708,10 +711,10 @@ mod tests {
     fn a_nonzero_tail_after_an_ack_is_corrupted() {
         // [ACK content][0x00 — second ACK_CMD: enters padding mode]
         // [0x00 x 3][0xAB] — a nonzero byte in the tail is rejected.
-        let mut buf = vec![0u8];
+        let mut buf = vec![ACK_CMD];
         buf.extend_from_slice(&7u64.to_be_bytes());
         buf.push(0); // count 0
-        buf.push(0); // second ACK_CMD → padding mode
+        buf.push(ACK_CMD); // second ACK_CMD → padding mode
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0xAB]);
         let mut acks = Vec::new();
         assert!(matches!(
@@ -720,7 +723,7 @@ mod tests {
         ));
         // The same tail with NO zero padding start byte (a nonzero byte read
         // as a command) is Corrupted too.
-        let mut buf2 = vec![0u8];
+        let mut buf2 = vec![ACK_CMD];
         buf2.extend_from_slice(&7u64.to_be_bytes());
         buf2.push(0);
         buf2.push(0xAB); // unknown command after the ACK
@@ -739,7 +742,7 @@ mod tests {
         //
         // Data-only: DATA_CMD + all-zero body cut off before the length
         // field completes.
-        let mut data = vec![1u8]; // DATA_CMD
+        let mut data = vec![DATA_CMD];
         data.extend_from_slice(&[0x00; 8]); // seq
         data.push(0x00); // truncated u16 length field
         let mut acks = Vec::new();
@@ -750,7 +753,7 @@ mod tests {
         // Echo-only: ECHO_TS_CMD + timestamp + an all-zero tail that
         // truncates the ACK parse (no count byte), so the padding rule must
         // not rescue it.
-        let mut echo = vec![4u8]; // ECHO_TS_CMD
+        let mut echo = vec![ECHO_TS_CMD];
         echo.extend_from_slice(&0u32.to_be_bytes()); // ts
         echo.extend_from_slice(&[0x00; 9]); // 0x00 (ACK_CMD) + 8 zero bytes, no count
         let mut acks = Vec::new();
@@ -764,10 +767,10 @@ mod tests {
     fn a_zero_tail_containing_a_nonzero_byte_is_corrupted() {
         // A valid ACK followed by padding that mixes zeros and a nonzero
         // byte is rejected — the fill must be exactly zeros.
-        let mut buf = vec![0u8];
+        let mut buf = vec![ACK_CMD];
         buf.extend_from_slice(&3u64.to_be_bytes());
         buf.push(0); // count 0
-        buf.push(0); // second ACK_CMD → padding mode
+        buf.push(ACK_CMD); // second ACK_CMD → padding mode
         buf.extend_from_slice(&[0x00, 0x00, 0x07, 0x00, 0x00]);
         let mut acks = Vec::new();
         assert!(matches!(

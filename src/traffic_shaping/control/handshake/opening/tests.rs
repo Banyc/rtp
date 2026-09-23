@@ -2,6 +2,7 @@ use super::super::wire::PACKET_LEN;
 use super::super::wire::SEND_RETRY_INTERVAL;
 use super::*;
 use crate::{
+    ack::{AckHistory, EncodeAck, MAX_ACK_BLOCKS},
     codec,
     io_err::IoErr,
     sequence::InitialSequences,
@@ -749,20 +750,36 @@ async fn forged_control_datagrams_are_ignored_after_open() {
     assert_eq!(&buf[..n], b"ack");
 
     // Forged control datagrams delivered from the peer address: an
-    // untagged KILL_CMD (2), a KILL_CMD behind a wrong session tag
-    // (TAG_CMD 6 + 8-byte tag + KILL_CMD), and an untagged ACK block
-    // claiming {start:0, size:u64::MAX} that would release the peer's
-    // entire send window.  All three must be dropped by the session-tag
-    // check, not honoured.
-    forged_tx.send(vec![0x02]).await.unwrap();
-    let mut wrong_tag_kill = vec![6u8];
-    wrong_tag_kill.extend_from_slice(&0x1111_2222_3333_4444u64.to_be_bytes());
-    wrong_tag_kill.push(0x02);
-    forged_tx.send(wrong_tag_kill).await.unwrap();
-    let mut forged_ack = vec![0u8]; // ACK_CMD
-    forged_ack.extend_from_slice(&0u64.to_be_bytes()); // start 0
-    forged_ack.extend_from_slice(&u64::MAX.to_be_bytes()); // size u64::MAX
-    forged_tx.send(forged_ack).await.unwrap();
+    // untagged KILL, a KILL behind a wrong session tag (TAG_CMD + 8-byte tag
+    // + KILL_CMD), and an untagged ACK.  All three must be dropped by the
+    // session-tag check, not honoured — an honoured untagged KILL ends the
+    // session below.  Each is built with the codec's own encoder, so the
+    // datagrams are the codec's current wire shape rather than a hand-written
+    // copy of it.
+    let mut untagged_kill = [0u8; 16];
+    let untagged_kill_len = codec::encode_kill(None, &mut untagged_kill).unwrap();
+    forged_tx
+        .send(untagged_kill[..untagged_kill_len].to_vec())
+        .await
+        .unwrap();
+    let mut wrong_tag_kill = [0u8; 16];
+    let n = codec::encode_kill(Some(0x1111_2222_3333_4444), &mut wrong_tag_kill).unwrap();
+    forged_tx.send(wrong_tag_kill[..n].to_vec()).await.unwrap();
+    let ack_history = AckHistory::new();
+    let mut forged_ack = [0u8; 32];
+    let n = codec::encode_ack_data(
+        None,
+        Some(EncodeAck {
+            queue: &ack_history,
+            first_block_index: 0,
+            max_blocks: MAX_ACK_BLOCKS,
+        }),
+        None,
+        None,
+        &mut forged_ack,
+    )
+    .unwrap();
+    forged_tx.send(forged_ack[..n].to_vec()).await.unwrap();
 
     // The session must survive: traffic still flows both ways.
     client_write.send(b"still-alive").await.unwrap();

@@ -774,7 +774,6 @@ mod tests {
         use std::time::Duration;
 
         const KEY: [u8; KEY_LEN] = [7; KEY_LEN];
-        const KILL_CMD: u8 = 0x02;
 
         let server = Arc::new(Listener::<u8>::bind("127.0.0.1:0").await.unwrap());
         let addr = server.local_addr();
@@ -798,9 +797,14 @@ mod tests {
             let msg2_confirmed = Arc::clone(&msg2_confirmed);
             tasks.spawn(async move {
                 let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                // (a) forged UNTAGGED kill, once the session exists.
+                // (a) forged UNTAGGED kill, once the session exists. Built by
+                // the production encoder so the datagram really is a KILL with
+                // no tag prefix: the assertions below are about the codec's tag
+                // gate, not about a byte written out here.
                 session_established.notified().await;
-                let forged = obfuscated_keyed_datagram(key, KEY, &[KILL_CMD]);
+                let mut kill = [0u8; 16];
+                let n = encode_kill(None, &mut kill).unwrap();
+                let forged = obfuscated_keyed_datagram(key, KEY, &kill[..n]);
                 attacker.send_to(&forged, addr).await.unwrap();
                 forgery_sent.notify_one();
                 // (b) valid TAGGED kill, after the survival of (a) is proven.
