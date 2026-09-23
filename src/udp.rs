@@ -285,6 +285,29 @@ impl Listener {
         self.local_addr
     }
 
+    /// Accept the next connection, draining a connection already queued by an
+    /// earlier accept before reading another datagram.
+    ///
+    /// [`udp_listener::UtpListener::poll_next_conn`] drains its accept queue
+    /// only when a datagram opens a *new* connection, and it awaits the queue
+    /// read after the connection has already been enqueued.  A caller that
+    /// drops that future (for example a `select!` branch recreated on every
+    /// loop iteration) between those two steps therefore strands the
+    /// connection in the queue until the next new source appears, so the
+    /// accept never completes.  Checking the queue before each datagram read
+    /// closes that window: a connection enqueued by any earlier, cancelled
+    /// accept is returned without waiting for another datagram.
+    async fn accept_next_conn(&self) -> std::io::Result<IdentityConn> {
+        loop {
+            if let Some(conn) = self.listener.try_accept_next() {
+                return Ok(conn);
+            }
+            match self.listener.dispatch_next().await? {
+                Dispatch::Routed | Dispatch::Accepted => {}
+            }
+        }
+    }
+
     /// [`Self::accept_without_handshake_with()`] with the default
     /// [`AcceptConfig`] (env-tuned).
     pub async fn accept_without_handshake(&self) -> std::io::Result<Accepted> {
@@ -304,7 +327,7 @@ impl Listener {
     /// block the accept loop on the handshake.  You should keep this method in
     /// a loop.
     pub async fn accept_with(&self, config: AcceptConfig) -> std::io::Result<AcceptTask> {
-        let accepted = self.listener.poll_next_conn().await?;
+        let accepted = self.accept_next_conn().await?;
         let raw_fd = self.raw_fd;
         let key = self.key;
         let policy = self.policy;
@@ -328,7 +351,7 @@ impl Listener {
         &self,
         config: AcceptConfig,
     ) -> std::io::Result<Accepted> {
-        let accepted = self.listener.poll_next_conn().await?;
+        let accepted = self.accept_next_conn().await?;
         accept(
             accepted,
             self.raw_fd,
@@ -371,7 +394,7 @@ impl Listener {
         handshake: bool,
         config: AcceptConfig,
     ) -> std::io::Result<FrameDeliveryAccept> {
-        let accepted = self.listener.poll_next_conn().await?;
+        let accepted = self.accept_next_conn().await?;
         let raw_fd = self.raw_fd;
         let local_addr = self.local_addr;
         let key = self.key;
@@ -993,7 +1016,7 @@ impl LogConfig<'_> {
 }
 
 use udp_listener::{
-    Classified, Classify, Conn, ConnRead, ConnWrite, DispatchPolicy, Packet, UtpListener,
+    Classified, Classify, Conn, ConnRead, ConnWrite, Dispatch, DispatchPolicy, Packet, UtpListener,
 };
 fn probe_echo_socket(udp: &VectoredUdpSocket) -> Option<std::net::UdpSocket> {
     let echo = udp.try_clone_std().ok()?;
@@ -2622,6 +2645,43 @@ mod nohandshake_obf {
             .expect("timed out")
             .unwrap();
         assert_eq!(msg, &buf[..n]);
+    }
+}
+
+#[cfg(test)]
+mod cancelled_accept {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// A connection enqueued by an accept that was cancelled before it could
+    /// drain the queue must still be accepted without waiting for another
+    /// datagram.  [`Listener::accept_next_conn`] checks the queue before each
+    /// datagram read, so the queued connection is returned immediately;
+    /// [`udp_listener::UtpListener::poll_next_conn`] would park here waiting
+    /// for a new source, stranding the lane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_queued_by_a_cancelled_accept_is_still_accepted() {
+        let listener = Listener::bind("127.0.0.1:0", ListenerConfig::default())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(addr).await.unwrap();
+        client.send(b"open").await.unwrap();
+        // Enqueue one connection exactly as an accept does before its queue
+        // drain, then model that accept being dropped by not draining here.
+        assert_eq!(
+            listener.listener.dispatch_next().await.unwrap(),
+            Dispatch::Accepted,
+            "one datagram from a new source must open a connection"
+        );
+        let conn = tokio::time::timeout(Duration::from_millis(500), listener.accept_next_conn())
+            .await
+            .expect("a queued connection must be accepted without another datagram")
+            .expect("accepting the queued connection must not error");
+        drop(conn);
+        drop(client);
     }
 }
 
