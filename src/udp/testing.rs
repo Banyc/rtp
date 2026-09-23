@@ -8,12 +8,27 @@
 //! with each other.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::*;
 use crate::obfuscate::padding::AckPaddingMode;
+
+/// Fixed seed for the iid loss stream of every [`BasisPoints`] created
+/// through [`BasisPoints::new`]. The stream is a pure function of this seed
+/// and the number of rolls, so an impaired run no longer depends on the OS
+/// RNG: the realized loss rate and the recovered-symbol count are stable
+/// across runs instead of probabilistic.
+const DEFAULT_LOSS_SEED: u64 = 0x5EED_1055;
+
+/// Distinct seeds for the three roles of [`ImpairRate`]. Loss, reordering
+/// and duplication must draw from independent streams; sharing one seed
+/// would make their draws at each send identical, so a duplication rate
+/// below the loss and reorder rates could never fire.
+const IMPAIR_LOSS_SEED: u64 = DEFAULT_LOSS_SEED;
+const IMPAIR_REORDER_SEED: u64 = DEFAULT_LOSS_SEED ^ 0x1111_1111_1111_1111;
+const IMPAIR_DUPLICATE_SEED: u64 = DEFAULT_LOSS_SEED ^ 0x2222_2222_2222_2222;
 
 /// A toggable rate in basis points (0–10_000), owned by a single test
 /// and shared (via `Arc`) between the read and write wrappers of one
@@ -22,30 +37,45 @@ use crate::obfuscate::padding::AckPaddingMode;
 /// Create one per test with [`BasisPoints::new`] and pass clones to
 /// [`LossyRead::new`] / [`LossyWrite::new`].
 #[derive(Debug, Clone)]
-pub struct BasisPoints(Arc<AtomicUsize>);
+pub struct BasisPoints {
+    bps: Arc<AtomicUsize>,
+    rng: Arc<Mutex<netem_test::RndState>>,
+}
 
 impl BasisPoints {
     /// New rate of `bps` basis points (500 = 5%). Clamped to
     /// `[0, 10_000]`.
     pub fn new(bps: usize) -> Self {
-        Self(Arc::new(AtomicUsize::new(bps.min(10_000))))
+        Self::with_seed(bps, DEFAULT_LOSS_SEED)
+    }
+
+    /// Rate `bps` drawn from a stream seeded with `seed`. The seed fixes the
+    /// draw sequence, so the drops are reproducible from the seed and the
+    /// roll count rather than sampled from the OS RNG. Callers that place
+    /// several impairments side by side must give each a distinct seed.
+    fn with_seed(bps: usize, seed: u64) -> Self {
+        Self {
+            bps: Arc::new(AtomicUsize::new(bps.min(10_000))),
+            rng: Arc::new(Mutex::new(netem_test::RndState::seed(seed))),
+        }
     }
 
     /// Set the rate to `bps` basis points. Clamped to
     /// `[0, 10_000]`.
     pub fn set(&self, bps: usize) {
-        self.0.store(bps.min(10_000), Ordering::Relaxed);
+        self.bps.store(bps.min(10_000), Ordering::Relaxed);
     }
 
     /// Current rate in basis points.
     pub fn get(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        self.bps.load(Ordering::Relaxed)
     }
 
-    /// Returns `true` with probability `bps / 10_000`.
+    /// Returns `true` with probability `bps / 10_000`. A zero rate draws
+    /// nothing, so an inert impairment never advances its stream.
     fn roll(&self) -> bool {
-        let bps = self.0.load(Ordering::Relaxed);
-        bps > 0 && rand::random::<u32>() % 10_000 < bps as u32
+        let bps = self.bps.load(Ordering::Relaxed);
+        bps > 0 && self.rng.lock().unwrap().next_u32() % 10_000 < bps as u32
     }
 }
 
@@ -307,9 +337,9 @@ pub struct ImpairRate {
 impl ImpairRate {
     pub fn new(loss_bps: usize, reorder_bps: usize, duplicate_bps: usize) -> Self {
         Self {
-            loss: BasisPoints::new(loss_bps),
-            reorder: BasisPoints::new(reorder_bps),
-            duplicate: BasisPoints::new(duplicate_bps),
+            loss: BasisPoints::with_seed(loss_bps, IMPAIR_LOSS_SEED),
+            reorder: BasisPoints::with_seed(reorder_bps, IMPAIR_REORDER_SEED),
+            duplicate: BasisPoints::with_seed(duplicate_bps, IMPAIR_DUPLICATE_SEED),
             applied: Arc::new([const { AtomicUsize::new(0) }; 3]),
         }
     }
@@ -675,6 +705,46 @@ mod tests {
         let loss = BurstLoss::new(0, 1, 1, 7);
         assert!((0..100).all(|_| !loss.roll()));
         assert_eq!(loss.dropped(), 0);
+    }
+
+    /// The iid loss stream is a pure function of its seed and the number of
+    /// rolls, and it still realizes the configured rate: two instances built
+    /// through [`BasisPoints::new`] reproduce the same drops, and 8 % over a
+    /// hundred thousand rolls lands on 8 %. This keeps an impairment
+    /// assertion such as "FEC recovers > 0 under 8 % loss" a fact about the
+    /// transport rather than a draw from the OS RNG.
+    #[test]
+    fn basis_points_stream_is_deterministic_and_realizes_its_rate() {
+        const ROLLS: usize = 100_000;
+        let stream = |bps: usize| -> Vec<bool> {
+            let rate = BasisPoints::new(bps);
+            (0..ROLLS).map(|_| rate.roll()).collect()
+        };
+        let first = stream(800);
+        assert_eq!(
+            first,
+            stream(800),
+            "two identically seeded streams must produce identical drops"
+        );
+        let realized = first.iter().filter(|dropped| **dropped).count() as f64 / ROLLS as f64;
+        assert!(
+            (realized - 0.08).abs() < 0.005,
+            "8% configured loss realized {realized:.4} over {ROLLS} rolls"
+        );
+    }
+
+    /// The three [`ImpairRate`] roles draw from independent streams. Sharing
+    /// one seed would make the loss, reorder and duplication draws at each
+    /// send identical, so a duplication rate below the other two could never
+    /// fire.
+    #[test]
+    fn impair_rate_roles_use_independent_streams() {
+        let rate = ImpairRate::new(1500, 3000, 1000);
+        let stream =
+            |points: &BasisPoints| -> Vec<bool> { (0..1_000).map(|_| points.roll()).collect() };
+        assert_ne!(stream(&rate.loss), stream(&rate.reorder));
+        assert_ne!(stream(&rate.reorder), stream(&rate.duplicate));
+        assert_ne!(stream(&rate.loss), stream(&rate.duplicate));
     }
 
     #[derive(Debug)]
