@@ -96,32 +96,40 @@ pub(crate) fn should_wait_after_try_send(e: &std::io::Error) -> bool {
     }
 }
 
-/// Borrow `raw_fd` as a [`std::net::UdpSocket`] without taking ownership of
-/// the descriptor.
+/// Duplicate the descriptor `raw_fd` names into an independently owned
+/// [`std::net::UdpSocket`].
 ///
-/// # Safety
+/// The duplicate shares the original's open file description — the same
+/// socket, bound address, connected peer and send buffer — so a datagram sent
+/// through it goes where the original would have sent it, while dropping it
+/// releases only the duplicate.  Owning the caller's descriptor is therefore
+/// not represented anywhere on this path: no drop, panic or early return can
+/// close, alias or double-close it.
 ///
-/// `raw_fd` must name an open UDP socket whose owner stays alive for as long
-/// as the returned value is used.  The wrapper is a [`std::mem::ManuallyDrop`],
-/// so dropping it never closes the descriptor — the hazard is the mirror image
-/// of a double close: using a descriptor the OS has already released, and
-/// possibly handed to an unrelated file.  A caller therefore borrows a
-/// descriptor out of a socket it holds across the whole use, rather than
-/// storing one.
+/// A descriptor that is not an open socket is reported, not trusted: the
+/// duplicate is either refused (`EBADF`) or names some other file, on which the
+/// first `send` fails with `ENOTSOCK`.  A descriptor below `0` — which
+/// [`std::os::fd::BorrowedFd::borrow_raw`] would panic on — is reported as
+/// `EBADF` too.
 #[cfg(unix)]
-unsafe fn borrowed_udp_socket(raw_fd: MaybeRawFd) -> std::mem::ManuallyDrop<std::net::UdpSocket> {
-    use std::os::fd::FromRawFd;
-    let socket = std::mem::ManuallyDrop::new(unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) });
-    // `getsockname` is the cheapest probe `std` exposes for "this descriptor is
-    // an open socket": it fails with `EBADF` for a released descriptor and
-    // with `ENOTSOCK` for any other kind of file.  It cannot tell whether the
-    // descriptor names the *right* socket, so it supplements the caller's
-    // invariant instead of replacing it.
-    debug_assert!(
-        socket.local_addr().is_ok(),
-        "borrowed_udp_socket: descriptor {raw_fd:?} is not an open socket"
-    );
-    socket
+fn owned_udp_socket(raw_fd: MaybeRawFd) -> std::io::Result<std::net::UdpSocket> {
+    use std::os::fd::BorrowedFd;
+    /// POSIX `EBADF`, 9 on every platform this crate builds for.
+    const EBADF: i32 = 9;
+    if raw_fd < 0 {
+        return Err(std::io::Error::from_raw_os_error(EBADF));
+    }
+    // SAFETY: `borrow_raw` requires `raw_fd` to stay open for the duration of
+    // the borrow, which ends here — before any caller's first await — and every
+    // in-crate caller reads the number from a socket it holds alive across it.
+    // The borrow is a view only: never dereferenced, stored or dropped, and its
+    // sole use is the `dup` below, which for a descriptor that is not open
+    // fails with `EBADF` instead of touching a released resource.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+    // `F_DUPFD_CLOEXEC`: the returned handle owns a fresh descriptor, so its
+    // drop can only ever release that one.
+    let owned = borrowed.try_clone_to_owned()?;
+    Ok(std::net::UdpSocket::from(owned))
 }
 
 /// On macOS, kqueue EVFILT_WRITE tracks only socket sndbuf, not mbuf/
@@ -137,19 +145,24 @@ unsafe fn borrowed_udp_socket(raw_fd: MaybeRawFd) -> std::mem::ManuallyDrop<std:
 /// to address the peer directly.  When `None`, the socket is connected
 /// and a plain `send` suffices.
 ///
-/// The raw fd is borrowed via `std::net::UdpSocket::from_raw_fd` so the
-/// OS handles the sockaddr encoding — this avoids both the byte-order bug
-/// of hand-rolled `sockaddr_in` (`from_be_bytes` stores 127.0.0.1 as
-/// memory [1,0,0,127] on little-endian) and the Linux build break from
-/// the BSD-only `sin_len`/`sin6_len` fields.  The borrowed socket is held in
-/// a `ManuallyDrop`, so the fd is never closed.
+/// The descriptor is duplicated for the call ([`owned_udp_socket`]) and sent
+/// through as a [`std::net::UdpSocket`], so the OS handles the sockaddr
+/// encoding — this avoids both the byte-order bug of hand-rolled `sockaddr_in`
+/// (`from_be_bytes` stores 127.0.0.1 as memory [1,0,0,127] on little-endian)
+/// and the Linux build break from the BSD-only `sin_len`/`sin6_len` fields —
+/// and only the duplicate is ever owned: the caller's descriptor must be open
+/// when the call starts, but need not outlive it, and no outcome here closes
+/// it.  The price is one `dup` + `close` per fallback call.
 ///
-/// `raw_fd` must be the descriptor of a socket that outlives the call (see
-/// [`borrowed_udp_socket`]).  Each production caller takes it from a socket it
-/// also holds across every await here — `RawFdConnWrite` and `KeyedConnWrite`
-/// sit beside the `udp_listener::ConnWrite` whose `Arc` owns that socket, and
+/// `raw_fd` must name the socket the datagram should leave on.  Each production
+/// caller reads it from the socket it also sends through — `RawFdConnWrite` and
+/// `KeyedConnWrite` sit beside the `udp_listener::ConnWrite` whose `Arc` owns
+/// that socket (which does not expose it), and
 /// `UnreliableWrite for Arc<UdpSocket>` reads `self.as_raw_fd()` from the very
-/// `Arc` it is borrowing — so no caller carries the obligation separately.
+/// `Arc` it is borrowing.  A descriptor that names something else is a
+/// wrong-argument bug rather than a soundness one: the duplicate is either
+/// refused (`EBADF`), the send fails (`ENOTSOCK`), or the datagram leaves on
+/// the descriptor the caller named — never on a descriptor this crate owns.
 ///
 /// Returns `Err(WouldBlock)` when retry budget is exhausted — the caller
 /// must retry later, not treat the packet as sent.
@@ -166,7 +179,7 @@ pub(crate) async fn raw_sendto_fallback(
     }
     #[cfg(unix)]
     {
-        let socket = unsafe { borrowed_udp_socket(raw_fd) };
+        let socket = owned_udp_socket(raw_fd).map_err(normalize_send_err)?;
         let mut attempt = 0;
         loop {
             let res = match &peer {
@@ -328,30 +341,116 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    /// The fallback sends through a duplicate: it must deliver to the named
+    /// peer *and* leave the caller's descriptor open.  A descriptor borrowed as
+    /// an owned socket — the shape the fix replaced — is closed by the fallback
+    /// and makes the trailing `send_to` fail with `EBADF`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raw_fallback_delivers_and_leaves_the_caller_descriptor_open() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&sender);
+        let sender_addr = sender.local_addr().unwrap();
+
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw_sendto_fallback(raw_fd, b"via-duplicate", Some(peer_addr)),
+        )
+        .await
+        .expect("raw_sendto_fallback hung")
+        .expect("raw_sendto_fallback failed");
+        assert_eq!(sent, b"via-duplicate".len());
+
+        let mut buf = [0u8; 32];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv_from(&mut buf))
+                .await
+                .expect("peer recv timed out")
+                .expect("peer recv failed");
+        assert_eq!(&buf[..n], b"via-duplicate");
+
+        // The caller's descriptor must still be open and name the same socket —
+        // an owned borrow closed here either fails with `EBADF` or, if the
+        // number was reused, names another socket's address.
+        assert_eq!(
+            sender.local_addr().unwrap(),
+            sender_addr,
+            "the fallback must leave the caller's descriptor alone"
+        );
+        sender.send_to(b"still-open", peer_addr).unwrap();
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv_from(&mut buf))
+                .await
+                .expect("peer recv timed out")
+                .expect("peer recv failed");
+        assert_eq!(&buf[..n], b"still-open");
+    }
+
+    /// The duplicate is a descriptor of its own for the same socket: it is not
+    /// the caller's descriptor, and releasing it releases nothing of the
+    /// caller's.
+    #[cfg(unix)]
     #[test]
-    fn dropping_borrowed_socket_never_closes_original_fd() {
+    fn owned_udp_socket_duplicates_without_owning_the_caller_descriptor() {
         let original = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&original);
-        {
-            let _socket = unsafe { borrowed_udp_socket(raw_fd) };
-        }
+        let duplicate = owned_udp_socket(raw_fd).unwrap();
+        assert_ne!(
+            std::os::fd::AsRawFd::as_raw_fd(&duplicate),
+            raw_fd,
+            "the fallback must own a descriptor of its own"
+        );
+        assert_eq!(
+            duplicate.local_addr().unwrap(),
+            original.local_addr().unwrap(),
+            "the duplicate must name the socket the caller passed"
+        );
+        drop(duplicate);
         original
             .send_to(b"alive", original.local_addr().unwrap())
             .unwrap();
     }
 
-    /// The debug probe in [`borrowed_udp_socket`] must reject a descriptor that
-    /// is open but is not a socket, so the assertion is a check rather than
-    /// decoration.  A regular file is used rather than a released descriptor:
-    /// a released number can be reused by another thread's socket at any
-    /// moment, which would make the test race.
-    #[cfg(all(unix, debug_assertions))]
-    #[test]
-    #[should_panic(expected = "is not an open socket")]
-    fn borrowed_socket_rejects_a_non_socket_descriptor() {
+    /// A descriptor that is open but is not a socket is reported rather than
+    /// trusted: the duplicate is a plain `dup`, so the first `send` on it fails
+    /// with `ENOTSOCK` instead of the fallback claiming the descriptor.  A
+    /// regular file is used rather than a released descriptor, whose number can
+    /// be reused by another thread's socket at any moment.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_fallback_reports_a_non_socket_descriptor() {
         let file = std::fs::File::open("/dev/null").unwrap();
         let raw_fd = std::os::fd::AsRawFd::as_raw_fd(&file);
-        let _socket = unsafe { borrowed_udp_socket(raw_fd) };
+        let err = raw_sendto_fallback(raw_fd, b"x", None)
+            .await
+            .expect_err("a non-socket descriptor must not report a successful send");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a non-socket is not transient backpressure: {err}"
+        );
+        assert!(
+            file.metadata().is_ok(),
+            "the caller's descriptor must survive the fallback"
+        );
+    }
+
+    /// No descriptor is negative, and reporting that costs nothing: the
+    /// fallback returns the `EBADF` the missing socket would produce instead of
+    /// panicking on the way in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn raw_fallback_rejects_a_negative_descriptor() {
+        let err = raw_sendto_fallback(-1, b"x", None)
+            .await
+            .expect_err("a negative descriptor must not report a successful send");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(9),
+            "a negative descriptor must surface EBADF: {err}"
+        );
     }
 }

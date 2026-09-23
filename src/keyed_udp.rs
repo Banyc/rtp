@@ -299,9 +299,9 @@ pub struct Connected {
 /// Unix.
 ///
 /// `raw_fd` must be the descriptor of the socket held by `write`: that socket
-/// is what keeps the descriptor open (the fallback borrows it without owning
-/// it — see `borrowed_udp_socket` in `raw_send`), and `write` is mutably
-/// borrowed across the fallback's awaits.
+/// is what keeps the descriptor open while the fallback duplicates it (see
+/// `owned_udp_socket` in `raw_send`), and only the duplicate is ever owned, so
+/// no call can close the descriptor `write` holds.
 #[derive(Debug)]
 pub struct KeyedConnWrite {
     write: ConnWrite<UdpSocket>,
@@ -313,7 +313,9 @@ pub struct KeyedConnWrite {
 impl KeyedConnWrite {
     /// `raw_fd` must be the descriptor of the socket held by `write` (see
     /// [`KeyedConnWrite`]); the constructor cannot check that, because
-    /// `udp_listener::ConnWrite` does not expose its socket.
+    /// `udp_listener::ConnWrite` does not expose its socket, but the fallback
+    /// only duplicates the descriptor, so a wrong one cannot close or
+    /// double-close a descriptor.
     pub fn new<K: DispatchKey>(
         write: ConnWrite<UdpSocket>,
         conn_key: &K,

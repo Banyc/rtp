@@ -857,9 +857,9 @@ impl UnreliableRead for IdentityConnRead {
 /// identically to the stock `ConnWrite<VectoredUdpSocket>` path.
 ///
 /// `raw_fd` is the descriptor of the socket owned by `inner` (an `Arc` clone of
-/// the listener's socket).  `send` borrows `self` across the raw fallback's
-/// awaits, so `inner` — and with it the descriptor — stays alive for as long as
-/// the fallback can use it; see `borrowed_udp_socket` in `raw_send`.
+/// the listener's socket).  The fallback duplicates it for the duration of the
+/// call (see `owned_udp_socket` in `raw_send`), so `inner` keeps the descriptor
+/// open across the call's entry and no path here closes it.
 #[derive(Debug)]
 pub(crate) struct RawFdConnWrite {
     inner: ConnWrite<VectoredUdpSocket>,
