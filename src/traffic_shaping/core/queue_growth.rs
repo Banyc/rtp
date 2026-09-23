@@ -430,7 +430,13 @@ impl QueueGrowth {
     }
 }
 
-fn queue_tolerance(
+/// The delay gate's tolerated standing queue: the jitter margin, plus (on a
+/// lane whose queue is its own) a fraction of the propagation floor.
+///
+/// `floor_scaled` must be the caller's lane policy (`QueueGrowth` derives it
+/// from `common_mode_queue`/`reorder_tolerant`); callers, including tests that
+/// need the same threshold as a reference, must not restate this arithmetic.
+pub(crate) fn queue_tolerance(
     rttvar: Duration,
     floor: Duration,
     coefficient: f64,

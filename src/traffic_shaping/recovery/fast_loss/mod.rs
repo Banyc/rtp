@@ -8,9 +8,7 @@
 
 use std::time::Duration;
 
-use crate::traffic_shaping::core::queue_growth::{
-    QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
-};
+use crate::traffic_shaping::core::queue_growth::{QUEUE_RTT_FACTOR, queue_tolerance};
 
 /// The jitter tolerance the queue-gate machinery uses to tell a standing
 /// queue from the path's own jitter: `2 * rttvar`, never below 5 ms, and
@@ -20,10 +18,7 @@ use crate::traffic_shaping::core::queue_growth::{
 /// elevated by queueing, not by jitter": the rescue must stay reachable at
 /// the queue the delay gate's drain actually permits.
 fn queue_jitter_margin(floor: Duration, smooth_rtt_var: Duration) -> Duration {
-    smooth_rtt_var
-        .mul_f64(QUEUE_RTT_FACTOR)
-        .max(QUEUE_RTT_FLOOR)
-        .max(floor.mul_f64(QUEUE_TOL_RTT_FRACTION))
+    queue_tolerance(smooth_rtt_var, floor, QUEUE_RTT_FACTOR, true)
 }
 
 /// Queue-premised fast-loss arming: the smoothed RTT variation is below the

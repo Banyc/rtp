@@ -85,7 +85,7 @@ fn metrics_gentle_exit_cause(cause: GentleExitCause) -> MetricsGentleExitCause {
 use crate::traffic_shaping::core::{
     DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS, GENTLE_REENTRY_COOLDOWN,
     GENTLE_REENTRY_COOLDOWN_RTTS, ORDINARY_PROBE_MAX_GAIN, PERSISTENT_QUEUE_RTTVAR_FACTOR,
-    QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION, WindowedRttMin,
+    QUEUE_RTT_FACTOR, WindowedRttMin,
 };
 
 #[derive(Debug, Clone)]
@@ -1750,12 +1750,11 @@ mod tests {
         DRAIN_FLOOR_PEAK_FRACTION, GENTLE_DRAIN_GAP_SHRINK, GENTLE_ENTER_RTTS,
         GENTLE_REENTRY_COOLDOWN, GENTLE_REENTRY_COOLDOWN_RTTS, HUGE_DATA_LOSS_CHECK_INTERVAL,
         INIT_SEND_RATE, MAX_SEND_DATA_BUF_LEN, MetricsGentleExitCause, ORDINARY_PROBE_MAX_GAIN,
-        PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
-        WindowedRttMin, should_exit_slow_start,
+        PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, WindowedRttMin, should_exit_slow_start,
     };
     use crate::delivery::byte_stream::send::send_data_buf_len;
     use crate::traffic_shaping::core::{
-        CongestionResponse, has_spare_capacity, has_spare_capacity_interactive,
+        CongestionResponse, has_spare_capacity, has_spare_capacity_interactive, queue_tolerance,
     };
     use crate::traffic_shaping::recovery::reorder_tolerance::{
         RTT_MIN_BUCKET, RTT_MIN_BUCKET_RTT_SCALE, cap_probe_target,
@@ -3366,14 +3365,13 @@ mod tests {
         let smooth = rl.pkt_send_space().smooth_rtt();
         let rttvar = rl.pkt_send_space().smooth_rtt_var();
         let floor_est = prime_rtt;
-        let tol = rttvar
-            .mul_f64(QUEUE_RTT_FACTOR)
-            .max(floor_est.mul_f64(QUEUE_TOL_RTT_FRACTION))
-            .max(QUEUE_RTT_FLOOR);
-        let enter_tol = rttvar
-            .mul_f64(QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR)
-            .max(floor_est.mul_f64(QUEUE_TOL_RTT_FRACTION))
-            .max(QUEUE_RTT_FLOOR);
+        let tol = queue_tolerance(rttvar, floor_est, QUEUE_RTT_FACTOR, true);
+        let enter_tol = queue_tolerance(
+            rttvar,
+            floor_est,
+            QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            true,
+        );
         let gap = smooth.saturating_sub(floor_est);
 
         let margin_above_tol = gap.saturating_sub(tol);
@@ -4158,11 +4156,15 @@ mod tests {
 
         let smooth = rl.pkt_send_space().smooth_rtt();
         let rttvar = rl.pkt_send_space().smooth_rtt_var();
-        let tol = rttvar.mul_f64(QUEUE_RTT_FACTOR).max(QUEUE_RTT_FLOOR);
-        let persistent_tol = rttvar
-            .mul_f64(QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR)
-            .max(QUEUE_RTT_FLOOR);
-        let gap = smooth.saturating_sub(Duration::from_millis(10));
+        let floor_est = Duration::from_millis(10);
+        let tol = queue_tolerance(rttvar, floor_est, QUEUE_RTT_FACTOR, false);
+        let persistent_tol = queue_tolerance(
+            rttvar,
+            floor_est,
+            QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            false,
+        );
+        let gap = smooth.saturating_sub(floor_est);
         assert!(
             gap > tol,
             "gap {gap:?} must exceed the queue gate {tol:?} (smooth {smooth:?}, rttvar {rttvar:?})"
@@ -4195,11 +4197,15 @@ mod tests {
 
         let smooth = rl.pkt_send_space().smooth_rtt();
         let rttvar = rl.pkt_send_space().smooth_rtt_var();
-        let persistent_tol = rttvar
-            .mul_f64(QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR)
-            .max(QUEUE_RTT_FLOOR);
+        let floor_est = Duration::from_millis(10);
+        let persistent_tol = queue_tolerance(
+            rttvar,
+            floor_est,
+            QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
+            false,
+        );
         assert!(
-            smooth.saturating_sub(Duration::from_millis(10)) > persistent_tol,
+            smooth.saturating_sub(floor_est) > persistent_tol,
             "smooth {smooth:?} must cross the persistent margin {persistent_tol:?}"
         );
         assert_eq!(

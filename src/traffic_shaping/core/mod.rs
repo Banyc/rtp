@@ -30,6 +30,5 @@ pub(crate) use gentle::{
 };
 #[cfg(test)]
 pub(crate) use queue_growth::{
-    PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, QUEUE_RTT_FLOOR, QUEUE_TOL_RTT_FRACTION,
-    WindowedRttMin,
+    PERSISTENT_QUEUE_RTTVAR_FACTOR, QUEUE_RTT_FACTOR, WindowedRttMin, queue_tolerance,
 };
