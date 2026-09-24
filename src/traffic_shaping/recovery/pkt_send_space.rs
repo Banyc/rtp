@@ -2209,6 +2209,141 @@ mod tests {
         );
     }
 
+    /// An outage-recovery epoch is declared over a path that is gone, so the
+    /// fresh sample that closes it must discard the whole pre-outage estimator
+    /// state --- the rolling minimum and the delay gate's one-sided deviation
+    /// and variance window, not merely the smoothed RTT.  Retaining any of them
+    /// leaves the reorder-suspicion floor and the delay gate's queue margin
+    /// describing the path the epoch was declared over.
+    ///
+    /// The contract is asserted differentially: after the close the estimators
+    /// must evolve exactly like a fresh estimator that has seen only the same
+    /// sample through the ordinary sampling path, so no assertion here can pass
+    /// because an estimator happens to hold an equal value once, and none of
+    /// them restates the reseed's implementation.  The lifetime `min_rtt` is
+    /// the deliberate exception: the connection's floor outlives the epoch.
+    #[test]
+    fn closing_an_epoch_discards_the_pre_outage_estimator_state() {
+        use crate::traffic_shaping::recovery::rtt_stats::{GATE_VAR_MATURE_SAMPLES, RttStats};
+
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+
+        // Pre-outage: a quiet stretch long enough to mature the steady-state
+        // window (which drives its two-sided variance to ~0), then a queue ramp
+        // that lifts the smoothed RTT and the gate's one-sided deviation far
+        // above it.  Both stale traces are therefore present at the close.
+        for i in 0..(GATE_VAR_MATURE_SAMPLES + 4) {
+            space.sample_rtt(ms(100), t0 + ms(i as u64));
+        }
+        let ramp_at = t0 + ms(GATE_VAR_MATURE_SAMPLES as u64 + 5);
+        for (i, rtt) in [300u64, 500, 900].into_iter().enumerate() {
+            space.sample_rtt(ms(rtt), ramp_at + ms(i as u64));
+        }
+        let stale_floor = space
+            .rtt_stats
+            .recent_min_rtt()
+            .expect("the quiet stretch set a rolling floor");
+        assert_eq!(
+            stale_floor,
+            ms(100),
+            "the quiet stretch is the rolling floor"
+        );
+        assert!(
+            space.gate_jitter().trending > Duration::ZERO,
+            "the ramp must leave an upward trace to carry forward: {:?}",
+            space.gate_jitter().trending
+        );
+
+        // Open the epoch: one packet of progress, one lost packet, and one RTO
+        // of silence.
+        let t1 = ramp_at + ms(10);
+        send_packet(&mut space, t1);
+        ack_one(&mut space, 0, t1 + ms(10));
+        send_packet(&mut space, t1 + ms(11));
+        lose_packet(&mut space, 1, t1 + ms(50));
+        let detect_at = t1 + ms(10) + space.rto_duration() + ms(1);
+        assert!(
+            space.detect_outage_recovery(detect_at),
+            "the epoch must open"
+        );
+
+        // The condition that must not trigger the close: a sample censored as a
+        // stale pre-outage echo leaves every estimator exactly as it was.
+        let before_srtt = space.smooth_rtt();
+        assert!(
+            !space.sample_rtt(ms(300), detect_at + ms(1)),
+            "a stale echo must not close the epoch"
+        );
+        assert!(space.in_outage_recovery());
+        assert_eq!(space.smooth_rtt(), before_srtt);
+        assert_eq!(space.rtt_stats.recent_min_rtt(), Some(stale_floor));
+
+        // The condition that must: a fresh sample whose implied send post-dates
+        // the cut closes the epoch and reseeds the estimator.
+        let sample = ms(400);
+        let mut now = detect_at + sample + ms(1);
+        assert!(
+            space.sample_rtt(sample, now),
+            "a fresh post-outage sample must close the epoch"
+        );
+        assert!(!space.in_outage_recovery());
+
+        // Oracle: a new estimator that has seen only that sample, through the
+        // ordinary sampling path (RFC 6298 seeds the variance at half the
+        // sample).
+        let mut oracle = RttStats::new();
+        oracle.record_rtt(sample);
+
+        // With the epoch closed, every further sample folds into the estimators
+        // exactly as it folds into the oracle's.  The samples climb by less than
+        // a factor of two each step, so neither estimator arms the step
+        // transient and the maturity rule and the variance window stay the only
+        // things distinguishing them.  A retained pre-outage field, or a second
+        // reseed, shows up as divergence.
+        for rtt in [ms(500), ms(600), ms(700), ms(800), ms(900), ms(1_000)] {
+            now += rtt + ms(1);
+            assert!(
+                !space.sample_rtt(rtt, now),
+                "no epoch is open for {rtt:?} to close"
+            );
+            oracle.record_rtt(rtt);
+            assert_eq!(
+                space.smooth_rtt(),
+                oracle.smooth_rtt(),
+                "sRTT after {rtt:?}"
+            );
+            assert_eq!(
+                space.smooth_rtt_var(),
+                oracle.smooth_rtt_var(),
+                "RTTVAR after {rtt:?}"
+            );
+            assert_eq!(
+                space.rto_duration(),
+                oracle.rto_duration(),
+                "RTO after {rtt:?}"
+            );
+            assert_eq!(
+                space.rtt_stats.recent_min_rtt(),
+                oracle.recent_min_rtt(),
+                "rolling floor after {rtt:?}"
+            );
+            assert_eq!(
+                space.gate_jitter().steady,
+                oracle.gate_jitter().steady,
+                "steady gate jitter after {rtt:?}"
+            );
+            assert_eq!(
+                space.gate_jitter().trending,
+                oracle.gate_jitter().trending,
+                "trending gate jitter after {rtt:?}"
+            );
+        }
+
+        // The lifetime floor is the one estimator the close does not rebuild.
+        assert_eq!(space.min_rtt(), Some(stale_floor));
+    }
+
     #[test]
     fn outage_recovery_clamps_cwnd_until_fresh_sample() {
         let t0 = Instant::now();
