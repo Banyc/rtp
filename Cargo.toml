@@ -23,15 +23,15 @@ tokio-util = "0.7"
 tokio_chacha20 = { git = "https://github.com/Banyc/tokio_chacha20.git", tag = "v0.0.8" }
 tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.4" }
 # tokio_udp = { path = "../tokio_udp" }
-# udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.18" }
-udp_listener = { path = "../udp_listener" }
+udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.19" }
+# udp_listener = { path = "../udp_listener" }
 # The layer-testing kit (`rtp::testkit`, behind `testing`) consumes the
 # generic helpers and the impairment instrument from the local harness
 # checkout; the optional dependency is activated by the same feature so the
 # kit compiles both in-crate (`cargo test --features testing`) and when rtp is
 # itself a dependency with `testing` enabled.
-# netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.1", features = ["test-kit"], optional = true }
-netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
+netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"], optional = true }
+# netem-test = { path = "../netem_test/netem-test", features = ["test-kit"], optional = true }
 
 [features]
 default = []
@@ -44,8 +44,8 @@ file_transfer = { git = "https://github.com/Banyc/file_transfer.git", tag = "v0.
 # impairment instrument and the generic helpers from the local harness
 # checkout behind its `test-kit` feature; the layer kit (`rtp::testkit`) is
 # enabled for the same test builds through the self dev-dependency below.
-# netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.1", features = ["test-kit"] }
-netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
+netem-test = { git = "https://github.com/Banyc/netem_test.git", tag = "v0.0.2", features = ["test-kit"] }
+# netem-test = { path = "../netem_test/netem-test", features = ["test-kit"] }
 rtp = { path = ".", features = ["testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 

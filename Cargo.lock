@@ -567,6 +567,7 @@ dependencies = [
 [[package]]
 name = "netem-test"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/netem_test.git?tag=v0.0.2#4c315e8f60980c43ea692ca42b5f45e767010d46"
 dependencies = [
  "dfsql",
  "parking_lot 0.12.5",
@@ -942,7 +943,7 @@ dependencies = [
  "tokio-util",
  "tokio_chacha20",
  "tokio_udp",
- "udp_listener 0.1.0",
+ "udp_listener 0.1.0 (git+https://github.com/Banyc/udp_listener.git?tag=v0.0.19)",
 ]
 
 [[package]]
@@ -1190,22 +1191,23 @@ dependencies = [
 [[package]]
 name = "udp_listener"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
+dependencies = [
+ "bytes",
+ "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
+ "tokio",
+]
+
+[[package]]
+name = "udp_listener"
+version = "0.1.0"
+source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.19#e28afd889ac8a405ccaa7095f2f7e22f266ae163"
 dependencies = [
  "bytes",
  "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.59)",
  "tokio",
  "tokio_udp",
  "tracing",
-]
-
-[[package]]
-name = "udp_listener"
-version = "0.1.0"
-source = "git+https://github.com/Banyc/udp_listener.git?tag=v0.0.13#076920b9a83f9472e7d6209502f1fecb58f7d665"
-dependencies = [
- "bytes",
- "primitive 0.1.0 (git+https://github.com/Banyc/primitive.git?tag=v0.0.55)",
- "tokio",
 ]
 
 [[package]]
