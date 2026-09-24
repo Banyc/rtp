@@ -75,8 +75,15 @@ pub(crate) fn checked_mss_and_fec(
         // truncated-datagram detection headroom: the largest parity
         // datagram is `symbol_size + 11 = mss - 1`, never exactly the
         // receive buffer size.
+        //
+        // A validated `Mss` is strictly larger than the codec data overhead
+        // (15 bytes), so `mss >= 16`: `symbol_size(mss - 1) = mss - 12 >= 4`
+        // and `data_mss(mss) = mss - 13 >= 3` are always `Some`.  The fec
+        // helpers return `Option` because they accept raw sizes; the
+        // precondition is discharged by `Mss::try_new`, so neither call can
+        // fail here.
         let symbol_size = symbol_size(mss - crate::mss::TRUNCATION_DETECTION_BYTES)
-            .ok_or(MssError::TooSmallForFec { mss })?;
+            .expect("a validated Mss always leaves room for the FEC symbol header");
         Some(FecState::new(FecConfig {
             symbol_size,
             small_group_parity_count: tuning.small_group_parity_count,
@@ -85,7 +92,7 @@ pub(crate) fn checked_mss_and_fec(
         None
     };
     let mss = if fec {
-        data_mss(mss).ok_or(MssError::TooSmallForFec { mss })?
+        data_mss(mss).expect("a validated Mss always leaves room for the FEC data-symbol header")
     } else {
         mss
     };

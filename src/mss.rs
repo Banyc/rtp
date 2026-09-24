@@ -82,8 +82,6 @@ impl Mss {
 pub enum MssError {
     #[error("mss {mss} exceeds the {max}-byte datagram ceiling")]
     ExceedsDatagramCeiling { mss: usize, max: usize },
-    #[error("mss {mss} is too small for the FEC header")]
-    TooSmallForFec { mss: usize },
     #[error("mss {mss} leaves no room for the codec payload")]
     NoRoomForCodecPayload { mss: usize },
     #[error("mss {mss} leaves no room for the {nonce}-byte obfuscation nonce")]
