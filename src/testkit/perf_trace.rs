@@ -9,17 +9,17 @@ use crate::metrics::{
     MetricsAckFlushReason, MetricsEvent, MetricsFecCounters, MetricsFecGroupSizeBuckets,
     MetricsGentleExitCause, MetricsInterest, MetricsObservation, MetricsObserver,
     MetricsRetransmissionCounters, MetricsSendDriverResumeSource, MetricsSendDriverWake,
-    MetricsSnapshot,
+    MetricsSnapshot, MetricsTermination,
 };
 use netem_test::{Counters, CountersSnapshot};
 
 /// Trace schema 32: RTP rows carry the complete congestion-controller and
-/// retransmission-scheduler snapshot (73 columns) plus the 30 typed FEC
-/// work/recovery columns and `trace_elapsed_us` so endpoint, netem, and
-/// progress samples share one clock (`PerfTrace::trace_start`). Event-only
-/// rows leave every snapshot column empty; the retransmission-active/ready,
-/// RTO timing, controller-decision, and FEC evidence is present only on
-/// snapshot rows.
+/// retransmission-scheduler snapshot plus the typed FEC work/recovery columns
+/// and `trace_elapsed_us`, so endpoint, netem, and progress samples share one
+/// clock (`PerfTrace::trace_start`). Event-only rows leave every snapshot
+/// column empty; the retransmission-active/ready, RTO timing,
+/// controller-decision, and FEC evidence is present only on snapshot rows.
+/// [`RTP_TRACE_COLUMNS`] is the single authority for the column set.
 const TRACE_SCHEMA_VERSION: u16 = 32;
 const DEFAULT_CAPACITY: usize = 100_000;
 const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -30,8 +30,410 @@ const STATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 /// fast lane cannot exhaust the bounded storage and long runs degrade
 /// evidence resolution uniformly rather than losing their tail.
 const RTT_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
-const RTP_TRACE_COLUMNS: usize = 103;
-const RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_1,fec_flushed_groups_2_to_4,fec_flushed_groups_5_to_7,fec_flushed_groups_8,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_1,fec_no_surplus_groups_2_to_4,fec_no_surplus_groups_5_to_7,fec_no_surplus_groups_8,fec_groups_skipped_burst_end,fec_burst_end_groups_1,fec_burst_end_groups_2_to_4,fec_burst_end_groups_5_to_7,fec_burst_end_groups_8,fec_groups_skipped_loss_gate,fec_loss_gate_groups_1,fec_loss_gate_groups_2_to_4,fec_loss_gate_groups_5_to_7,fec_loss_gate_groups_8,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_1,fec_no_spare_capacity_groups_2_to_4,fec_no_spare_capacity_groups_5_to_7,fec_no_spare_capacity_groups_8,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,fec_rejected_recovered_symbols,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
+/// One RTP trace column: `(header_name, value_accessor)`, in wire order.
+///
+/// `header_name` is the CSV header spelling a consumer reads the column by and
+/// `value_accessor` renders that same column for one observation. The header
+/// and every row are both derived from [`RTP_TRACE_COLUMNS`], so a name can
+/// never be emitted against another column's value: adding, removing, or
+/// reordering a column is a single edit here, and both sides move together.
+type RtpTraceColumn = (&'static str, fn(&MetricsObservation, Duration) -> String);
+
+/// The single authority for the RTP trace schema: one entry per column, in
+/// wire order, pairing the header name with the accessor that produces its
+/// value. [`rtp_trace_header`] and [`rtp_fields`] are both rendered from this
+/// table, so they cannot disagree.
+const RTP_TRACE_COLUMNS: &[RtpTraceColumn] = &[
+    ("schema_version", |o, _| o.schema_version.to_string()),
+    ("event_index", |o, _| o.event_index.to_string()),
+    ("elapsed_us", |o, _| o.elapsed.as_micros().to_string()),
+    ("event", |o, _| o.event.as_str().to_owned()),
+    ("termination_cause", |o, _| {
+        termination(o)
+            .map(|termination| termination.cause.as_str().to_owned())
+            .unwrap_or_default()
+    }),
+    ("termination_error_kind", |o, _| {
+        termination(o)
+            .map(|termination| termination.error_kind_str().to_owned())
+            .unwrap_or_default()
+    }),
+    ("termination_raw_os_error", |o, _| {
+        termination(o)
+            .and_then(|termination| termination.raw_os_error)
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+    }),
+    ("raw_rtt_us", |o, _| {
+        optional_u128(o.raw_rtt_sample.map(|value| value.as_micros()))
+    }),
+    ("pacer_tokens_packets", |o, _| {
+        snapshot_value(o, |s| s.pacer_tokens_packets.to_string())
+    }),
+    ("send_rate_packets_per_second", |o, _| {
+        snapshot_value(o, |s| s.send_rate_packets_per_second.to_string())
+    }),
+    ("loss_ratio", |o, _| {
+        snapshot_value(o, |s| optional_f64(s.loss_ratio))
+    }),
+    ("in_flight_packets", |o, _| {
+        snapshot_value(o, |s| s.in_flight_packets.to_string())
+    }),
+    ("packets_in_pipe", |o, _| {
+        snapshot_value(o, |s| s.packets_in_pipe.to_string())
+    }),
+    ("retransmission_active_packets", |o, _| {
+        snapshot_value(o, |s| s.retransmission_active_packets.to_string())
+    }),
+    ("retransmission_ready_packets", |o, _| {
+        snapshot_value(o, |s| s.retransmission_ready_packets.to_string())
+    }),
+    ("retransmitted_packets", |o, _| {
+        snapshot_value(o, |s| s.retransmitted_packets.to_string())
+    }),
+    ("retransmission_attempts", |o, _| {
+        snapshot_value(o, |s| s.retransmission_counters.attempts.to_string())
+    }),
+    ("retransmission_first_attempts", |o, _| {
+        snapshot_value(o, |s| s.retransmission_counters.first_attempts.to_string())
+    }),
+    ("retransmission_repeat_attempts", |o, _| {
+        snapshot_value(o, |s| s.retransmission_counters.repeat_attempts.to_string())
+    }),
+    ("retransmission_rto_reason", |o, _| {
+        snapshot_value(o, |s| s.retransmission_counters.rto_reason.to_string())
+    }),
+    ("retransmission_reorder_reason", |o, _| {
+        snapshot_value(o, |s| s.retransmission_counters.reorder_reason.to_string())
+    }),
+    ("retransmission_fast_loss_reason", |o, _| {
+        snapshot_value(o, |s| {
+            s.retransmission_counters.fast_loss_reason.to_string()
+        })
+    }),
+    ("retransmission_pre_outage_reason", |o, _| {
+        snapshot_value(o, |s| {
+            s.retransmission_counters.pre_outage_reason.to_string()
+        })
+    }),
+    ("tail_probe_attempts", |o, _| {
+        snapshot_value(o, |s| s.retransmission_counters.tail_probes.to_string())
+    }),
+    ("fec_parity_sent", |o, _| {
+        fec_value(o, |f| f.parity_sent.to_string())
+    }),
+    ("fec_groups_flushed", |o, _| {
+        fec_value(o, |f| f.groups_flushed.to_string())
+    }),
+    ("fec_flushed_groups_1", |o, _| {
+        fec_value(o, |f| f.flushed_group_sizes.one.to_string())
+    }),
+    ("fec_flushed_groups_2_to_4", |o, _| {
+        fec_value(o, |f| f.flushed_group_sizes.two_to_four.to_string())
+    }),
+    ("fec_flushed_groups_5_to_7", |o, _| {
+        fec_value(o, |f| f.flushed_group_sizes.five_to_seven.to_string())
+    }),
+    ("fec_flushed_groups_8", |o, _| {
+        fec_value(o, |f| f.flushed_group_sizes.full_eight.to_string())
+    }),
+    ("fec_groups_skipped_no_surplus_tokens", |o, _| {
+        fec_value(o, |f| f.groups_skipped_no_surplus_tokens.to_string())
+    }),
+    ("fec_no_surplus_groups_1", |o, _| {
+        fec_value(o, |f| f.no_surplus_group_sizes.one.to_string())
+    }),
+    ("fec_no_surplus_groups_2_to_4", |o, _| {
+        fec_value(o, |f| f.no_surplus_group_sizes.two_to_four.to_string())
+    }),
+    ("fec_no_surplus_groups_5_to_7", |o, _| {
+        fec_value(o, |f| f.no_surplus_group_sizes.five_to_seven.to_string())
+    }),
+    ("fec_no_surplus_groups_8", |o, _| {
+        fec_value(o, |f| f.no_surplus_group_sizes.full_eight.to_string())
+    }),
+    ("fec_groups_skipped_burst_end", |o, _| {
+        fec_value(o, |f| f.groups_skipped_burst_end.to_string())
+    }),
+    ("fec_burst_end_groups_1", |o, _| {
+        fec_value(o, |f| f.burst_end_group_sizes.one.to_string())
+    }),
+    ("fec_burst_end_groups_2_to_4", |o, _| {
+        fec_value(o, |f| f.burst_end_group_sizes.two_to_four.to_string())
+    }),
+    ("fec_burst_end_groups_5_to_7", |o, _| {
+        fec_value(o, |f| f.burst_end_group_sizes.five_to_seven.to_string())
+    }),
+    ("fec_burst_end_groups_8", |o, _| {
+        fec_value(o, |f| f.burst_end_group_sizes.full_eight.to_string())
+    }),
+    ("fec_groups_skipped_loss_gate", |o, _| {
+        fec_value(o, |f| f.groups_skipped_loss_gate.to_string())
+    }),
+    ("fec_loss_gate_groups_1", |o, _| {
+        fec_value(o, |f| f.loss_gate_group_sizes.one.to_string())
+    }),
+    ("fec_loss_gate_groups_2_to_4", |o, _| {
+        fec_value(o, |f| f.loss_gate_group_sizes.two_to_four.to_string())
+    }),
+    ("fec_loss_gate_groups_5_to_7", |o, _| {
+        fec_value(o, |f| f.loss_gate_group_sizes.five_to_seven.to_string())
+    }),
+    ("fec_loss_gate_groups_8", |o, _| {
+        fec_value(o, |f| f.loss_gate_group_sizes.full_eight.to_string())
+    }),
+    ("fec_groups_skipped_no_spare_capacity", |o, _| {
+        fec_value(o, |f| f.groups_skipped_no_spare_capacity.to_string())
+    }),
+    ("fec_no_spare_capacity_groups_1", |o, _| {
+        fec_value(o, |f| f.no_spare_capacity_group_sizes.one.to_string())
+    }),
+    ("fec_no_spare_capacity_groups_2_to_4", |o, _| {
+        fec_value(o, |f| {
+            f.no_spare_capacity_group_sizes.two_to_four.to_string()
+        })
+    }),
+    ("fec_no_spare_capacity_groups_5_to_7", |o, _| {
+        fec_value(o, |f| {
+            f.no_spare_capacity_group_sizes.five_to_seven.to_string()
+        })
+    }),
+    ("fec_no_spare_capacity_groups_8", |o, _| {
+        fec_value(o, |f| {
+            f.no_spare_capacity_group_sizes.full_eight.to_string()
+        })
+    }),
+    ("fec_recovered_symbols", |o, _| {
+        fec_value(o, |f| f.recovered_symbols.to_string())
+    }),
+    ("fec_dropped_malformed_packets", |o, _| {
+        fec_value(o, |f| f.dropped_malformed_packets.to_string())
+    }),
+    ("fec_dropped_decoder_panics", |o, _| {
+        fec_value(o, |f| f.dropped_decoder_panics.to_string())
+    }),
+    ("fec_rejected_recovered_symbols", |o, _| {
+        fec_value(o, |f| f.rejected_recovered_symbols.to_string())
+    }),
+    ("next_send_sequence", |o, _| {
+        snapshot_value(o, |s| s.next_send_sequence.to_string())
+    }),
+    ("minimum_rtt_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.minimum_rtt.map(|value| value.as_micros()))
+        })
+    }),
+    ("smoothed_rtt_us", |o, _| {
+        snapshot_value(o, |s| s.smoothed_rtt.as_micros().to_string())
+    }),
+    ("retransmission_timeout_us", |o, _| {
+        snapshot_value(o, |s| s.retransmission_timeout.as_micros().to_string())
+    }),
+    ("oldest_pipe_packet_age_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.oldest_pipe_packet_age.map(|value| value.as_micros()))
+        })
+    }),
+    ("maximum_packet_rto_overdue_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.maximum_packet_rto_overdue.map(|value| value.as_micros()))
+        })
+    }),
+    ("rto_deadline_postponements", |o, _| {
+        snapshot_value(o, |s| s.rto_deadline_postponements.to_string())
+    }),
+    ("congestion_window_packets", |o, _| {
+        snapshot_value(o, |s| s.congestion_window_packets.to_string())
+    }),
+    ("received_packets", |o, _| {
+        snapshot_value(o, |s| s.received_packets.to_string())
+    }),
+    ("next_receive_sequence", |o, _| {
+        snapshot_value(o, |s| optional_u64(s.next_receive_sequence))
+    }),
+    ("delivery_rate_packets_per_second", |o, _| {
+        snapshot_value(o, |s| optional_f64(s.delivery_rate_packets_per_second))
+    }),
+    ("delivery_sample_app_limited", |o, _| {
+        snapshot_value(o, |s| optional_bool(s.delivery_sample_app_limited))
+    }),
+    ("application_write_waiters", |o, _| {
+        snapshot_value(o, |s| s.application_write_waiters.to_string())
+    }),
+    ("application_limited_detections", |o, _| {
+        snapshot_value(o, |s| s.application_limited_detections.to_string())
+    }),
+    (
+        "application_limited_detections_suppressed_by_waiting_writer",
+        |o, _| {
+            snapshot_value(o, |s| {
+                s.application_limited_detections_suppressed_by_waiting_writer
+                    .to_string()
+            })
+        },
+    ),
+    ("congestion_control_rtt_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.congestion_control_rtt.map(|value| value.as_micros()))
+        })
+    }),
+    ("congestion_rtt_floor_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.congestion_rtt_floor.map(|value| value.as_micros()))
+        })
+    }),
+    ("congestion_queue_tolerance_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.congestion_queue_tolerance.map(|value| value.as_micros()))
+        })
+    }),
+    ("congestion_persistent_queue_for_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(
+                s.congestion_persistent_queue_for
+                    .map(|value| value.as_micros()),
+            )
+        })
+    }),
+    ("congestion_persistent_queue_resets", |o, _| {
+        snapshot_value(o, |s| s.congestion_persistent_queue_resets.to_string())
+    }),
+    ("congestion_delivery_peak_packets_per_second", |o, _| {
+        snapshot_value(o, |s| {
+            optional_f64(s.congestion_delivery_peak_packets_per_second)
+        })
+    }),
+    ("congestion_drain_floor_packets_per_second", |o, _| {
+        snapshot_value(o, |s| {
+            optional_f64(s.congestion_drain_floor_packets_per_second)
+        })
+    }),
+    ("congestion_drain_target_packets_per_second", |o, _| {
+        snapshot_value(o, |s| {
+            optional_f64(s.congestion_drain_target_packets_per_second)
+        })
+    }),
+    (
+        "congestion_loss_backoff_floor_packets_per_second",
+        |o, _| {
+            snapshot_value(o, |s| {
+                optional_f64(s.congestion_loss_backoff_floor_packets_per_second)
+            })
+        },
+    ),
+    (
+        "congestion_loss_backoff_raw_target_packets_per_second",
+        |o, _| {
+            snapshot_value(o, |s| {
+                optional_f64(s.congestion_loss_backoff_raw_target_packets_per_second)
+            })
+        },
+    ),
+    (
+        "congestion_loss_backoff_target_packets_per_second",
+        |o, _| {
+            snapshot_value(o, |s| {
+                optional_f64(s.congestion_loss_backoff_target_packets_per_second)
+            })
+        },
+    ),
+    ("congestion_loss_backoffs", |o, _| {
+        snapshot_value(o, |s| s.congestion_loss_backoffs.to_string())
+    }),
+    ("congestion_loss_backoff_floor_bindings", |o, _| {
+        snapshot_value(o, |s| s.congestion_loss_backoff_floor_bindings.to_string())
+    }),
+    ("congestion_rate_samples", |o, _| {
+        snapshot_value(o, |s| s.congestion_rate_samples.to_string())
+    }),
+    ("congestion_bandwidth_probe_decisions", |o, _| {
+        snapshot_value(o, |s| s.congestion_bandwidth_probe_decisions.to_string())
+    }),
+    ("congestion_bandwidth_probe_increases", |o, _| {
+        snapshot_value(o, |s| s.congestion_bandwidth_probe_increases.to_string())
+    }),
+    ("congestion_bandwidth_probe_before_feedback", |o, _| {
+        snapshot_value(o, |s| {
+            s.congestion_bandwidth_probe_before_feedback.to_string()
+        })
+    }),
+    ("congestion_last_bandwidth_probe_interval_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(
+                s.congestion_last_bandwidth_probe_interval
+                    .map(|value| value.as_micros()),
+            )
+        })
+    }),
+    ("congestion_delay_drains", |o, _| {
+        snapshot_value(o, |s| s.congestion_delay_drains.to_string())
+    }),
+    ("pending_send_bytes", |o, _| {
+        snapshot_value(o, |s| s.pending_send_bytes.to_string())
+    }),
+    ("send_stage_capacity_bytes", |o, _| {
+        snapshot_value(o, |s| s.send_stage_capacity_bytes.to_string())
+    }),
+    ("accepts_new_packet", |o, _| {
+        snapshot_value(o, |s| s.accepts_new_packet.to_string())
+    }),
+    ("slow_start", |o, _| {
+        snapshot_value(o, |s| s.slow_start.to_string())
+    }),
+    ("gentle_mode", |o, _| {
+        snapshot_value(o, |s| s.gentle_mode.to_string())
+    }),
+    ("gentle_draining", |o, _| {
+        snapshot_value(o, |s| s.gentle_draining.to_string())
+    }),
+    ("queue_building", |o, _| {
+        snapshot_value(o, |s| s.queue_building.to_string())
+    }),
+    ("drain_floor_binding", |o, _| {
+        snapshot_value(o, |s| s.drain_floor_binding.to_string())
+    }),
+    ("outage_recovery", |o, _| {
+        snapshot_value(o, |s| s.outage_recovery.to_string())
+    }),
+    ("no_response_for_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.no_response_for.map(|value| value.as_micros()))
+        })
+    }),
+    ("no_progress_for_us", |o, _| {
+        snapshot_value(o, |s| {
+            optional_u128(s.no_progress_for.map(|value| value.as_micros()))
+        })
+    }),
+    ("stall_reason", |o, _| {
+        snapshot_value(o, |s| {
+            s.stall_reason
+                .map(|reason| reason.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+    }),
+    ("congestion_loss_ratio", |o, _| {
+        snapshot_value(o, |s| optional_f64(s.congestion_loss_ratio))
+    }),
+    ("congestion_action", |o, _| {
+        snapshot_value(o, |s| {
+            s.congestion_action
+                .map(|action| action.as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+    }),
+    ("trace_elapsed_us", |_, trace_elapsed| {
+        trace_elapsed.as_micros().to_string()
+    }),
+];
+/// The RTP trace header as emitted, frozen. The production schema is
+/// [`RTP_TRACE_COLUMNS`]; this literal is a test fixture proving that the
+/// rendered header still matches it byte for byte, so a rename, reorder,
+/// insertion, or removal is loud instead of silently relabelling a metric.
+#[cfg(test)]
+const FROZEN_RTP_TRACE_HEADER: &str = "schema_version,event_index,elapsed_us,event,termination_cause,termination_error_kind,termination_raw_os_error,raw_rtt_us,pacer_tokens_packets,send_rate_packets_per_second,loss_ratio,in_flight_packets,packets_in_pipe,retransmission_active_packets,retransmission_ready_packets,retransmitted_packets,retransmission_attempts,retransmission_first_attempts,retransmission_repeat_attempts,retransmission_rto_reason,retransmission_reorder_reason,retransmission_fast_loss_reason,retransmission_pre_outage_reason,tail_probe_attempts,fec_parity_sent,fec_groups_flushed,fec_flushed_groups_1,fec_flushed_groups_2_to_4,fec_flushed_groups_5_to_7,fec_flushed_groups_8,fec_groups_skipped_no_surplus_tokens,fec_no_surplus_groups_1,fec_no_surplus_groups_2_to_4,fec_no_surplus_groups_5_to_7,fec_no_surplus_groups_8,fec_groups_skipped_burst_end,fec_burst_end_groups_1,fec_burst_end_groups_2_to_4,fec_burst_end_groups_5_to_7,fec_burst_end_groups_8,fec_groups_skipped_loss_gate,fec_loss_gate_groups_1,fec_loss_gate_groups_2_to_4,fec_loss_gate_groups_5_to_7,fec_loss_gate_groups_8,fec_groups_skipped_no_spare_capacity,fec_no_spare_capacity_groups_1,fec_no_spare_capacity_groups_2_to_4,fec_no_spare_capacity_groups_5_to_7,fec_no_spare_capacity_groups_8,fec_recovered_symbols,fec_dropped_malformed_packets,fec_dropped_decoder_panics,fec_rejected_recovered_symbols,next_send_sequence,minimum_rtt_us,smoothed_rtt_us,retransmission_timeout_us,oldest_pipe_packet_age_us,maximum_packet_rto_overdue_us,rto_deadline_postponements,congestion_window_packets,received_packets,next_receive_sequence,delivery_rate_packets_per_second,delivery_sample_app_limited,application_write_waiters,application_limited_detections,application_limited_detections_suppressed_by_waiting_writer,congestion_control_rtt_us,congestion_rtt_floor_us,congestion_queue_tolerance_us,congestion_persistent_queue_for_us,congestion_persistent_queue_resets,congestion_delivery_peak_packets_per_second,congestion_drain_floor_packets_per_second,congestion_drain_target_packets_per_second,congestion_loss_backoff_floor_packets_per_second,congestion_loss_backoff_raw_target_packets_per_second,congestion_loss_backoff_target_packets_per_second,congestion_loss_backoffs,congestion_loss_backoff_floor_bindings,congestion_rate_samples,congestion_bandwidth_probe_decisions,congestion_bandwidth_probe_increases,congestion_bandwidth_probe_before_feedback,congestion_last_bandwidth_probe_interval_us,congestion_delay_drains,pending_send_bytes,send_stage_capacity_bytes,accepts_new_packet,slow_start,gentle_mode,gentle_draining,queue_building,drain_floor_binding,outage_recovery,no_response_for_us,no_progress_for_us,stall_reason,congestion_loss_ratio,congestion_action,trace_elapsed_us";
 
 /// Exact per-cause gentle-mode exit counters. Rare transitions are aggregated
 /// atomically and never consume bounded state-row capacity.
@@ -803,7 +1205,7 @@ impl PerfTrace {
         observations.sort_unstable_by_key(|captured| captured.observation.event_index);
         let counter_baseline = *capture.counter_baseline.lock().unwrap();
         let mut out = csv_writer(self.output_dir.join(filename))?;
-        writeln!(out, "{RTP_TRACE_HEADER}")?;
+        writeln!(out, "{}", rtp_trace_header())?;
         for captured in observations {
             let mut observation = captured.observation;
             if let (Some(baseline), Some(mut snapshot)) = (counter_baseline, observation.snapshot) {
@@ -1031,181 +1433,58 @@ fn csv_writer(path: impl AsRef<Path>) -> io::Result<BufWriter<File>> {
     Ok(BufWriter::new(File::create(path)?))
 }
 
-fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<String> {
-    let termination = match observation.event {
+/// The CSV header for the RTP trace, rendered from the single schema table so
+/// that it can never disagree with the row [`rtp_fields`] produces.
+fn rtp_trace_header() -> String {
+    RTP_TRACE_COLUMNS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The termination carried by a session-termination observation, if any.
+fn termination(observation: &MetricsObservation) -> Option<MetricsTermination> {
+    match observation.event {
         MetricsEvent::SessionTermination(termination) => Some(termination),
         _ => None,
-    };
-    let mut fields = vec![
-        observation.schema_version.to_string(),
-        observation.event_index.to_string(),
-        observation.elapsed.as_micros().to_string(),
-        observation.event.as_str().to_owned(),
-        termination
-            .map(|termination| termination.cause.as_str().to_owned())
-            .unwrap_or_default(),
-        termination
-            .map(|termination| termination.error_kind_str().to_owned())
-            .unwrap_or_default(),
-        termination
-            .and_then(|termination| termination.raw_os_error)
-            .map(|error| error.to_string())
-            .unwrap_or_default(),
-        optional_u128(observation.raw_rtt_sample.map(|value| value.as_micros())),
-    ];
-    if let Some(snapshot) = observation.snapshot {
-        fields.extend([
-            snapshot.pacer_tokens_packets.to_string(),
-            snapshot.send_rate_packets_per_second.to_string(),
-            optional_f64(snapshot.loss_ratio),
-            snapshot.in_flight_packets.to_string(),
-            snapshot.packets_in_pipe.to_string(),
-            snapshot.retransmission_active_packets.to_string(),
-            snapshot.retransmission_ready_packets.to_string(),
-            snapshot.retransmitted_packets.to_string(),
-            snapshot.retransmission_counters.attempts.to_string(),
-            snapshot.retransmission_counters.first_attempts.to_string(),
-            snapshot.retransmission_counters.repeat_attempts.to_string(),
-            snapshot.retransmission_counters.rto_reason.to_string(),
-            snapshot.retransmission_counters.reorder_reason.to_string(),
-            snapshot
-                .retransmission_counters
-                .fast_loss_reason
-                .to_string(),
-            snapshot
-                .retransmission_counters
-                .pre_outage_reason
-                .to_string(),
-            snapshot.retransmission_counters.tail_probes.to_string(),
-        ]);
-        if let Some(fec) = snapshot.fec_counters {
-            fields.extend([
-                fec.parity_sent.to_string(),
-                fec.groups_flushed.to_string(),
-                fec.flushed_group_sizes.one.to_string(),
-                fec.flushed_group_sizes.two_to_four.to_string(),
-                fec.flushed_group_sizes.five_to_seven.to_string(),
-                fec.flushed_group_sizes.full_eight.to_string(),
-                fec.groups_skipped_no_surplus_tokens.to_string(),
-                fec.no_surplus_group_sizes.one.to_string(),
-                fec.no_surplus_group_sizes.two_to_four.to_string(),
-                fec.no_surplus_group_sizes.five_to_seven.to_string(),
-                fec.no_surplus_group_sizes.full_eight.to_string(),
-                fec.groups_skipped_burst_end.to_string(),
-                fec.burst_end_group_sizes.one.to_string(),
-                fec.burst_end_group_sizes.two_to_four.to_string(),
-                fec.burst_end_group_sizes.five_to_seven.to_string(),
-                fec.burst_end_group_sizes.full_eight.to_string(),
-                fec.groups_skipped_loss_gate.to_string(),
-                fec.loss_gate_group_sizes.one.to_string(),
-                fec.loss_gate_group_sizes.two_to_four.to_string(),
-                fec.loss_gate_group_sizes.five_to_seven.to_string(),
-                fec.loss_gate_group_sizes.full_eight.to_string(),
-                fec.groups_skipped_no_spare_capacity.to_string(),
-                fec.no_spare_capacity_group_sizes.one.to_string(),
-                fec.no_spare_capacity_group_sizes.two_to_four.to_string(),
-                fec.no_spare_capacity_group_sizes.five_to_seven.to_string(),
-                fec.no_spare_capacity_group_sizes.full_eight.to_string(),
-                fec.recovered_symbols.to_string(),
-                fec.dropped_malformed_packets.to_string(),
-                fec.dropped_decoder_panics.to_string(),
-                fec.rejected_recovered_symbols.to_string(),
-            ]);
-        } else {
-            fields.extend(std::iter::repeat_with(String::new).take(30));
-        }
-        fields.extend([
-            snapshot.next_send_sequence.to_string(),
-            optional_u128(snapshot.minimum_rtt.map(|value| value.as_micros())),
-            snapshot.smoothed_rtt.as_micros().to_string(),
-            snapshot.retransmission_timeout.as_micros().to_string(),
-            optional_u128(
-                snapshot
-                    .oldest_pipe_packet_age
-                    .map(|value| value.as_micros()),
-            ),
-            optional_u128(
-                snapshot
-                    .maximum_packet_rto_overdue
-                    .map(|value| value.as_micros()),
-            ),
-            snapshot.rto_deadline_postponements.to_string(),
-            snapshot.congestion_window_packets.to_string(),
-            snapshot.received_packets.to_string(),
-            optional_u64(snapshot.next_receive_sequence),
-            optional_f64(snapshot.delivery_rate_packets_per_second),
-            optional_bool(snapshot.delivery_sample_app_limited),
-            snapshot.application_write_waiters.to_string(),
-            snapshot.application_limited_detections.to_string(),
-            snapshot
-                .application_limited_detections_suppressed_by_waiting_writer
-                .to_string(),
-            optional_u128(
-                snapshot
-                    .congestion_control_rtt
-                    .map(|value| value.as_micros()),
-            ),
-            optional_u128(snapshot.congestion_rtt_floor.map(|value| value.as_micros())),
-            optional_u128(
-                snapshot
-                    .congestion_queue_tolerance
-                    .map(|value| value.as_micros()),
-            ),
-            optional_u128(
-                snapshot
-                    .congestion_persistent_queue_for
-                    .map(|value| value.as_micros()),
-            ),
-            snapshot.congestion_persistent_queue_resets.to_string(),
-            optional_f64(snapshot.congestion_delivery_peak_packets_per_second),
-            optional_f64(snapshot.congestion_drain_floor_packets_per_second),
-            optional_f64(snapshot.congestion_drain_target_packets_per_second),
-            optional_f64(snapshot.congestion_loss_backoff_floor_packets_per_second),
-            optional_f64(snapshot.congestion_loss_backoff_raw_target_packets_per_second),
-            optional_f64(snapshot.congestion_loss_backoff_target_packets_per_second),
-            snapshot.congestion_loss_backoffs.to_string(),
-            snapshot.congestion_loss_backoff_floor_bindings.to_string(),
-            snapshot.congestion_rate_samples.to_string(),
-            snapshot.congestion_bandwidth_probe_decisions.to_string(),
-            snapshot.congestion_bandwidth_probe_increases.to_string(),
-            snapshot
-                .congestion_bandwidth_probe_before_feedback
-                .to_string(),
-            optional_u128(
-                snapshot
-                    .congestion_last_bandwidth_probe_interval
-                    .map(|value| value.as_micros()),
-            ),
-            snapshot.congestion_delay_drains.to_string(),
-            snapshot.pending_send_bytes.to_string(),
-            snapshot.send_stage_capacity_bytes.to_string(),
-            snapshot.accepts_new_packet.to_string(),
-            snapshot.slow_start.to_string(),
-            snapshot.gentle_mode.to_string(),
-            snapshot.gentle_draining.to_string(),
-            snapshot.queue_building.to_string(),
-            snapshot.drain_floor_binding.to_string(),
-            snapshot.outage_recovery.to_string(),
-            optional_u128(snapshot.no_response_for.map(|value| value.as_micros())),
-            optional_u128(snapshot.no_progress_for.map(|value| value.as_micros())),
-            snapshot
-                .stall_reason
-                .map(|reason| reason.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-            optional_f64(snapshot.congestion_loss_ratio),
-            snapshot
-                .congestion_action
-                .map(|action| action.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-        ]);
-    } else {
-        fields.resize(RTP_TRACE_COLUMNS - 1, String::new());
     }
-    fields.push(trace_elapsed.as_micros().to_string());
-    debug_assert_eq!(fields.len(), RTP_TRACE_COLUMNS);
-    fields
+}
+
+/// Render a snapshot column, empty when the observation carries no snapshot:
+/// event-only rows keep every snapshot column empty rather than fabricating a
+/// value.
+fn snapshot_value(
+    observation: &MetricsObservation,
+    accessor: fn(&MetricsSnapshot) -> String,
+) -> String {
+    observation
+        .snapshot
+        .as_ref()
+        .map(accessor)
+        .unwrap_or_default()
+}
+
+/// Render a FEC column, empty when the observation carries no snapshot or the
+/// connection ran with FEC disabled.
+fn fec_value(
+    observation: &MetricsObservation,
+    accessor: fn(&MetricsFecCounters) -> String,
+) -> String {
+    observation
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.fec_counters.as_ref())
+        .map(accessor)
+        .unwrap_or_default()
+}
+
+/// One RTP trace row, in the exact column order of [`RTP_TRACE_COLUMNS`].
+fn rtp_fields(observation: MetricsObservation, trace_elapsed: Duration) -> Vec<String> {
+    RTP_TRACE_COLUMNS
+        .iter()
+        .map(|(_, value)| value(&observation, trace_elapsed))
+        .collect()
 }
 
 /// Express a netem counter snapshot relative to the measurement-window
@@ -1378,6 +1657,204 @@ mod tests {
         }
     }
 
+    fn rich_observation() -> MetricsObservation {
+        MetricsObservation {
+            schema_version: SCHEMA_VERSION,
+            event_index: 7,
+            elapsed: Duration::from_micros(100),
+            event: MetricsEvent::SessionTermination(MetricsTermination {
+                cause: MetricsTerminationCause::PeerKill,
+                error_kind: std::io::ErrorKind::BrokenPipe,
+                raw_os_error: Some(1234),
+            }),
+            raw_rtt_sample: Some(Duration::from_micros(1001)),
+            snapshot: Some(MetricsSnapshot {
+                pacer_tokens_packets: 8.0,
+                send_rate_packets_per_second: 9.0,
+                loss_ratio: Some(10.0),
+                congestion_loss_ratio: Some(98.0),
+                congestion_action: Some(crate::metrics::MetricsCongestionAction::DelayDrain),
+                in_flight_packets: 11,
+                packets_in_pipe: 12,
+                retransmission_active_packets: 13,
+                retransmission_ready_packets: 14,
+                retransmitted_packets: 15,
+                retransmission_counters: MetricsRetransmissionCounters {
+                    attempts: 16,
+                    first_attempts: 17,
+                    repeat_attempts: 18,
+                    rto_reason: 19,
+                    reorder_reason: 20,
+                    fast_loss_reason: 21,
+                    pre_outage_reason: 22,
+                    tail_probes: 23,
+                },
+                fec_counters: Some(MetricsFecCounters {
+                    parity_sent: 24,
+                    groups_flushed: 25,
+                    flushed_group_sizes: MetricsFecGroupSizeBuckets {
+                        one: 26,
+                        two_to_four: 27,
+                        five_to_seven: 28,
+                        full_eight: 29,
+                    },
+                    groups_skipped_no_surplus_tokens: 30,
+                    no_surplus_group_sizes: MetricsFecGroupSizeBuckets {
+                        one: 31,
+                        two_to_four: 32,
+                        five_to_seven: 33,
+                        full_eight: 34,
+                    },
+                    groups_skipped_burst_end: 35,
+                    burst_end_group_sizes: MetricsFecGroupSizeBuckets {
+                        one: 36,
+                        two_to_four: 37,
+                        five_to_seven: 38,
+                        full_eight: 39,
+                    },
+                    groups_skipped_loss_gate: 40,
+                    loss_gate_group_sizes: MetricsFecGroupSizeBuckets {
+                        one: 41,
+                        two_to_four: 42,
+                        five_to_seven: 43,
+                        full_eight: 44,
+                    },
+                    groups_skipped_no_spare_capacity: 45,
+                    no_spare_capacity_group_sizes: MetricsFecGroupSizeBuckets {
+                        one: 46,
+                        two_to_four: 47,
+                        five_to_seven: 48,
+                        full_eight: 49,
+                    },
+                    recovered_symbols: 50,
+                    dropped_malformed_packets: 51,
+                    dropped_decoder_panics: 52,
+                    rejected_recovered_symbols: 53,
+                }),
+                next_send_sequence: 54,
+                minimum_rtt: Some(Duration::from_micros(55)),
+                smoothed_rtt: Duration::from_micros(56),
+                retransmission_timeout: Duration::from_micros(57),
+                oldest_pipe_packet_age: Some(Duration::from_micros(58)),
+                maximum_packet_rto_overdue: Some(Duration::from_micros(59)),
+                rto_deadline_postponements: 60,
+                congestion_window_packets: 61,
+                received_packets: 62,
+                next_receive_sequence: Some(63),
+                delivery_rate_packets_per_second: Some(64.0),
+                delivery_sample_app_limited: Some(true),
+                application_write_waiters: 66,
+                application_limited_detections: 67,
+                application_limited_detections_suppressed_by_waiting_writer: 68,
+                congestion_control_rtt: Some(Duration::from_micros(69)),
+                congestion_rtt_floor: Some(Duration::from_micros(70)),
+                congestion_queue_tolerance: Some(Duration::from_micros(71)),
+                congestion_persistent_queue_for: Some(Duration::from_micros(72)),
+                congestion_persistent_queue_resets: 73,
+                congestion_delivery_peak_packets_per_second: Some(74.0),
+                congestion_drain_floor_packets_per_second: Some(75.0),
+                congestion_drain_target_packets_per_second: Some(76.0),
+                congestion_loss_backoff_floor_packets_per_second: Some(77.0),
+                congestion_loss_backoff_raw_target_packets_per_second: Some(78.0),
+                congestion_loss_backoff_target_packets_per_second: Some(79.0),
+                congestion_loss_backoffs: 80,
+                congestion_loss_backoff_floor_bindings: 81,
+                congestion_rate_samples: 82,
+                congestion_bandwidth_probe_decisions: 83,
+                congestion_bandwidth_probe_increases: 84,
+                congestion_bandwidth_probe_before_feedback: 85,
+                congestion_last_bandwidth_probe_interval: Some(Duration::from_micros(86)),
+                congestion_delay_drains: 87,
+                pending_send_bytes: 88,
+                send_stage_capacity_bytes: 89,
+                accepts_new_packet: true,
+                slow_start: false,
+                gentle_mode: true,
+                gentle_draining: false,
+                queue_building: true,
+                drain_floor_binding: false,
+                outage_recovery: true,
+                no_response_for: Some(Duration::from_micros(95)),
+                no_progress_for: Some(Duration::from_micros(96)),
+                stall_reason: Some(crate::metrics::MetricsStallReason::NoProgress),
+            }),
+        }
+    }
+
+    /// The emitted RTP trace bytes are frozen. The header and the row are both
+    /// rendered from [`RTP_TRACE_COLUMNS`], so this pins the schema end to end:
+    /// a renamed, reordered, inserted, or removed column — or a name paired
+    /// with another column's accessor — fails here instead of silently
+    /// relabelling a metric in the evidence perf verdicts are read from.
+    #[test]
+    fn rtp_trace_schema_matches_the_frozen_wire_bytes() {
+        const FROZEN_RTP_TRACE_ROW: &str = "29,7,100,session_termination,peer_kill,broken_pipe,1234,1001,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,true,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,true,false,true,false,true,false,true,95,96,no_progress,98,delay_drain,4242424";
+
+        let header = rtp_trace_header();
+        assert_eq!(
+            header, FROZEN_RTP_TRACE_HEADER,
+            "the column names and their order are frozen"
+        );
+        let columns: Vec<&str> = header.split(',').collect();
+        let unique: std::collections::BTreeSet<&str> = columns.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            columns.len(),
+            "a duplicate column name would make a name-keyed reader keep only the last one"
+        );
+        let row = rtp_fields(rich_observation(), Duration::from_micros(4_242_424));
+        assert_eq!(row.len(), columns.len(), "one value per column");
+        assert_eq!(
+            row.join(","),
+            FROZEN_RTP_TRACE_ROW,
+            "each column must still carry its own value in wire order"
+        );
+
+        // A snapshot row with FEC disabled keeps the 30 FEC columns empty
+        // without shifting any other column.
+        let mut no_fec = rich_observation();
+        no_fec.snapshot.as_mut().unwrap().fec_counters = None;
+        let no_fec_row = rtp_fields(no_fec, Duration::from_micros(4_242_424));
+        assert_eq!(no_fec_row.len(), columns.len());
+        let fec_start = columns
+            .iter()
+            .position(|column| *column == "tail_probe_attempts")
+            .unwrap()
+            + 1;
+        let fec_end = columns
+            .iter()
+            .position(|column| *column == "next_send_sequence")
+            .unwrap();
+        assert!(no_fec_row[fec_start..fec_end].iter().all(String::is_empty));
+        for index in (0..fec_start).chain(fec_end..columns.len() - 1) {
+            assert_eq!(
+                no_fec_row[index], row[index],
+                "disabling FEC must not shift column {index}"
+            );
+        }
+
+        // The writer must emit those same bytes through the real path, not just
+        // the renderers in isolation.
+        let output_dir = std::env::temp_dir().join(format!(
+            "rtp-trace-frozen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&output_dir);
+        let trace = PerfTrace::new(output_dir.clone(), false);
+        trace.rtp.record(rich_observation());
+        trace.finish(&[]).unwrap();
+        let emitted = std::fs::read_to_string(output_dir.join("rtp.csv")).unwrap();
+        let mut lines = emitted.lines();
+        assert_eq!(lines.next().unwrap(), FROZEN_RTP_TRACE_HEADER);
+        let emitted_row: Vec<&str> = lines.next().unwrap().split(',').collect();
+        assert_eq!(emitted_row.len(), columns.len());
+        // The last column is wall-clock trace elapsed; everything else is the
+        // frozen observation and must match byte for byte.
+        assert_eq!(&emitted_row[..columns.len() - 1], &row[..columns.len() - 1]);
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
     fn capture(trace_start: Instant, capacity: usize) -> RtpCapture {
         RtpCapture::new(trace_start, capacity)
     }
@@ -1515,7 +1992,8 @@ mod tests {
 
     #[test]
     fn event_only_and_snapshot_rows_match_the_schema_width() {
-        assert_eq!(RTP_TRACE_HEADER.split(',').count(), RTP_TRACE_COLUMNS);
+        let header = rtp_trace_header();
+        assert_eq!(header.split(',').count(), RTP_TRACE_COLUMNS.len());
         let mut snapshot = observation(0, 0, MetricsEvent::SendDataPacketAttempt);
         snapshot.snapshot.as_mut().unwrap().fec_counters = Some(MetricsFecCounters {
             parity_sent: 1,
@@ -1563,19 +2041,19 @@ mod tests {
         event_only.snapshot = None;
         let trace_elapsed = Duration::from_micros(123);
         let snapshot_fields = rtp_fields(snapshot, trace_elapsed);
-        assert_eq!(snapshot_fields.len(), RTP_TRACE_COLUMNS);
+        assert_eq!(snapshot_fields.len(), RTP_TRACE_COLUMNS.len());
         let event_only_fields = rtp_fields(event_only, trace_elapsed);
-        assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS);
+        assert_eq!(event_only_fields.len(), RTP_TRACE_COLUMNS.len());
         assert_eq!(event_only_fields[7], "20000");
         assert!(
-            event_only_fields[8..RTP_TRACE_COLUMNS - 1]
+            event_only_fields[8..RTP_TRACE_COLUMNS.len() - 1]
                 .iter()
                 .all(String::is_empty)
         );
-        assert_eq!(event_only_fields[RTP_TRACE_COLUMNS - 1], "123");
+        assert_eq!(event_only_fields[RTP_TRACE_COLUMNS.len() - 1], "123");
 
         // The 30 typed FEC columns sit immediately after `tail_probe_attempts`.
-        let columns: Vec<&str> = RTP_TRACE_HEADER.split(',').collect();
+        let columns: Vec<&str> = header.split(',').collect();
         let fec_start = columns
             .iter()
             .position(|column| *column == "tail_probe_attempts")
