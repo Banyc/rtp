@@ -1099,4 +1099,57 @@ mod tests {
             "the low floor moved into the previous bucket is still a candidate"
         );
     }
+
+    /// The persistent-queue timer measures one *continuous* stretch.  A queue
+    /// that falls back out of the persistent band voids it, so a later
+    /// excursion starts a fresh stretch rather than inheriting the earlier
+    /// one.  A timer that survived the band exit would report every transient
+    /// blip as a standing queue once enough total time had elapsed: gentle
+    /// mode would engage on a path that never held a queue, and the
+    /// `select_path` `Hold` branch (the non-persistent response) would become
+    /// unreachable because `persistent_for.is_some()` would never be false
+    /// again.
+    #[test]
+    fn leaving_the_persistent_band_voids_the_persistent_queue_timer() {
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        let t0 = Instant::now();
+        let control_rtt = ms(100);
+        let jitter = GateJitter::uniform(ms(50));
+
+        // Establish the floor at the propagation baseline.
+        let mut growth = QueueGrowth::new(t0, false);
+        let base = growth.observe(ms(100), jitter, Some(0.0), t0, control_rtt);
+        assert!(!base.building, "the baseline must not look like a queue");
+
+        // A deep standing queue: far past the persistent margin whatever the
+        // lane's scaling makes it (the persistent margin is at most twice the
+        // normal one).
+        let deep = base.floor + base.tolerance * 8 + ms(1);
+        let first = growth.observe(deep, jitter, Some(0.0), t0 + ms(1), control_rtt);
+        assert!(first.building);
+        assert!(
+            first.persistent_for.is_some(),
+            "a deep queue must start the persistent timer"
+        );
+
+        // Back to the baseline: the queue is gone, so the persistent stretch
+        // ends even though it is only a millisecond old.
+        let quiet = growth.observe(base.floor, jitter, Some(0.0), t0 + ms(2), control_rtt);
+        assert!(!quiet.building);
+        assert_eq!(
+            quiet.persistent_for, None,
+            "leaving the persistent band must void the persistent-queue timer"
+        );
+
+        // A second deep excursion starts its own stretch.
+        let again = growth.observe(deep, jitter, Some(0.0), t0 + ms(3), control_rtt);
+        assert_eq!(
+            again.persistent_for,
+            Some(Duration::ZERO),
+            "the new excursion must start its own stretch, not resume the old one"
+        );
+    }
 }

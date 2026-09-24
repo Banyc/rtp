@@ -2067,6 +2067,12 @@ mod tests {
         assert_eq!(space.retransmission_counters.attempts, 0);
     }
 
+    /// The probe budget belongs to a tail *episode*: a delivering ACK starts
+    /// the next one even when the tail itself is still unacked and the
+    /// application pushes nothing new (the ACK-path reset), and a new push
+    /// starts one too.  Both assertions below are non-vacuous: the first
+    /// reads the budget while the tail is still in flight, so only the ACK
+    /// reset can satisfy it.
     #[test]
     fn tail_probe_budget_resets_on_ack_progress_and_new_send() {
         let t0 = Instant::now();
@@ -2076,18 +2082,63 @@ mod tests {
         send_packet(&mut space, t0);
         send_packet(&mut space, t0 + ms(1));
 
+        // Exhaust the budget on the tail.
         let t1 = t0 + ms(250);
-        let _ = space.tail_probe(t1);
+        assert_eq!(space.tail_probe(t1).unwrap().seq, sq(1));
+        let t2 = t1 + ms(250);
+        assert_eq!(space.tail_probe(t2).unwrap().seq, sq(1));
+        assert!(!space.has_tail_probe(t2 + ms(500)), "budget exhausted");
+        assert_eq!(space.retransmission_counters.tail_probes, 2);
 
-        // ACK progress resets the budget.
-        ack_up_to(&mut space, 1, t1 + ms(1));
-        // Window is now empty; no tail, so has_tail_probe is false.
-        assert!(!space.has_tail_probe(t1 + ms(1)));
+        // ACK progress that leaves the tail in flight (seq 0 delivered, seq 1
+        // still unacked) refills the budget: the next episode may probe again
+        // with no new send.
+        let t3 = t2 + ms(250);
+        ack_one(&mut space, 0, t3);
+        assert!(!space.no_pkts_in_flight());
+        assert!(
+            space.has_tail_probe(t3 + ms(250)),
+            "a delivering ACK must refill the probe budget for the still-unacked tail"
+        );
+
+        // ACK progress that empties the window leaves no tail at all.
+        ack_up_to(&mut space, 1, t3 + ms(1));
+        assert!(!space.has_tail_probe(t3 + ms(2)));
 
         // New tail after sending again starts fresh.
-        send_packet(&mut space, t1 + ms(2));
-        assert!(!space.has_tail_probe(t1 + ms(2)));
-        assert!(space.has_tail_probe(t1 + ms(252)));
+        send_packet(&mut space, t3 + ms(2));
+        assert!(!space.has_tail_probe(t3 + ms(2)));
+        assert!(space.has_tail_probe(t3 + ms(252)));
+    }
+
+    /// The budget also belongs to a *new tail pushed with no intervening
+    /// ACK*: an outage in which the application keeps writing starts a new
+    /// tail episode on every push, and without the push-path reset a
+    /// connection could only ever send the first episode's two probes.
+    #[test]
+    fn a_new_push_refills_the_tail_probe_budget_without_an_ack() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        send_packet(&mut space, t0);
+
+        // Exhaust the budget on the first tail.
+        let t1 = t0 + ms(250);
+        assert_eq!(space.tail_probe(t1).unwrap().seq, sq(0));
+        let t2 = t1 + ms(250);
+        assert_eq!(space.tail_probe(t2).unwrap().seq, sq(0));
+        assert_eq!(space.retransmission_counters.tail_probes, 2);
+        assert!(!space.has_tail_probe(t2 + ms(500)), "budget exhausted");
+
+        // Push a new packet with no intervening ACK: the new tail starts its
+        // own probe episode.
+        send_packet(&mut space, t2 + ms(1));
+        let t3 = t2 + ms(251);
+        assert!(
+            space.has_tail_probe(t3),
+            "a new push must refill the probe budget for the new tail"
+        );
+        assert_eq!(space.tail_probe(t3).unwrap().seq, sq(1));
     }
 
     #[test]
@@ -2495,6 +2546,58 @@ mod tests {
             space.outage_cut(),
             Some(first_cut),
             "cut must have been refreshed"
+        );
+    }
+
+    /// Re-arming an epoch that is still open refreshes only the cut.  The
+    /// caller must not treat it as a brand-new epoch: a new epoch re-seeds the
+    /// RTO filter and clears the loss-event history, and a re-seed seeds SRTT
+    /// at the *current* RTO, so doing it on every re-arm compounds.  A long
+    /// outage would then ratchet the RTO upward once per stall (R -> 3R -> 9R
+    /// ...) until the deadline cap, delaying every repair long after the link
+    /// returns, and the outage's own loss evidence would be discarded on each
+    /// re-arm instead of feeding the loss response.
+    #[test]
+    fn rearming_an_open_epoch_preserves_the_estimator_and_loss_history() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Open the epoch: progress, then a loss and a one-RTO stall.
+        send_packet(&mut space, t0);
+        ack_one(&mut space, 0, t0 + ms(10));
+        send_packet(&mut space, t0 + ms(11));
+        lose_packet(&mut space, 1, t0 + ms(50));
+        let detect_at = t0 + ms(10) + space.rto_duration() + ms(1);
+        assert!(space.detect_outage_recovery(detect_at), "epoch must open");
+        assert!(space.in_outage_recovery());
+
+        // The new epoch's own reseed is the last thing that may move either
+        // quantity before the re-arm.
+        let rto_after_new_epoch = space.rto_duration();
+        space.inject_loss_event(detect_at + ms(2));
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "the post-epoch loss event must be recorded"
+        );
+
+        // A second outage-length stall with the epoch still open (no fresh
+        // post-cut RTT sample arrives) is a RE-ARM, not a new epoch.
+        send_packet(&mut space, detect_at + ms(3));
+        let detect_at2 = detect_at + ms(3) + space.rto_duration() * 2 + ms(1);
+        assert!(
+            space.detect_outage_recovery(detect_at2),
+            "flapping outage should refresh while still open"
+        );
+        assert!(space.in_outage_recovery());
+        assert!(
+            space.loss_event_window.raw_has_loss_event(),
+            "a re-arm must not clear the loss-event history"
+        );
+        assert_eq!(
+            space.rto_duration(),
+            rto_after_new_epoch,
+            "a re-arm must not re-seed the RTO filter"
         );
     }
 
@@ -3543,9 +3646,75 @@ mod tests {
         sack_one(space, 1, t0 + ms(10));
         sack_one(space, 2, t0 + ms(11));
         sack_one(space, 3, t0 + ms(12));
-        // seq 0 is below out_of_order_seq_end (= 1, the highest SACKed
+        // seq 0 is below out_of_order_seq_end (= 3, the highest SACKed
         // block start), so the reorder-window path applies to it.
         assert!(space.out_of_order_seq_end.is_some());
+    }
+
+    /// The observed-reordering boundary is a high-water mark whose meaning
+    /// expires with the window it was measured against: once the send window
+    /// has advanced past it, no live packet can be below it, so the mark must
+    /// be forgotten.
+    #[test]
+    fn a_reorder_boundary_the_window_has_passed_is_forgotten() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // seq 1 is SACKed while seq 0 is still in flight.
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        sack_one(&mut space, 1, t0 + ms(2));
+        assert_eq!(space.out_of_order_seq_end, Some(sq(1)));
+
+        // Acking seq 0 empties the window, so the boundary is now behind it.
+        ack_one(&mut space, 0, t0 + ms(3));
+        assert!(space.no_pkts_in_flight(), "the window must be empty");
+        assert_eq!(
+            space.out_of_order_seq_end, None,
+            "a reorder boundary the send window has passed must be forgotten"
+        );
+    }
+
+    /// A boundary left behind the window is not merely stale: every later SACK
+    /// is compared against it through the wrap-aware `lt`, and a value behind
+    /// the window loses that comparison to every in-window candidate, so the
+    /// boundary is frozen and no packet is ever reorder-eligible again for the
+    /// rest of the connection.  A genuinely reordered packet would then wait
+    /// the full RTO instead of the tight reorder window.
+    #[test]
+    fn a_stale_reorder_boundary_cannot_hide_a_later_reorder() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+
+        // Boundary at seq 1, then the window empties (the pass that must
+        // forget it).
+        send_packet(&mut space, t0);
+        send_packet(&mut space, t0 + ms(1));
+        sack_one(&mut space, 1, t0 + ms(2));
+        ack_one(&mut space, 0, t0 + ms(3));
+
+        // A fresh reorder entirely inside the new window: seqs 2 and 3 are in
+        // flight and seq 3 arrives (out of order) at the peer.
+        send_packet(&mut space, t0 + ms(4));
+        send_packet(&mut space, t0 + ms(5));
+        sack_one(&mut space, 3, t0 + ms(6));
+
+        assert!(
+            space
+                .rtx_index
+                .reorder_sent_snapshot()
+                .iter()
+                .any(|(_, seq)| *seq == sq(2)),
+            "seq 2 sits below the fresh reorder boundary and must be armed for \
+             reorder-window repair"
+        );
+        assert_eq!(
+            space.out_of_order_seq_end,
+            Some(sq(3)),
+            "a fresh in-window SACK must set the boundary"
+        );
     }
 
     #[test]

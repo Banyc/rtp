@@ -2597,16 +2597,21 @@ mod tests {
     }
 
     /// A cold-start delivery sample on a long-RTT, high-BDP path. The shared
-    /// lane uses the stock exit: a single app-limited sample below the probe
-    /// target leaves slow start. Loss and queue growth also leave slow start.
+    /// lane uses the stock exit: an app-limited sample leaves slow start even
+    /// when the paced rate is above the probe target (the sample says nothing
+    /// about the pipe), a rate below the probe target leaves it, and loss and
+    /// queue growth leave it.  The two app-limited assertions differ only in
+    /// the `app_limited` flag, so each pins its own term.
     #[test]
     fn shared_lane_uses_the_stock_slow_start_exit() {
         let send = 140.0;
         let probed = 156.0; // 1.5 * delivery(104) while the pipe is still filling
 
         assert!(
-            should_exit_slow_start(send, probed, true, false, false),
-            "an app-limited cold-start sample must leave slow start"
+            should_exit_slow_start(160.0, probed, true, false, false),
+            "an app-limited sample above the probe target must still leave slow start: \
+             the application had nothing to send, so the sampled delivery rate is not \
+             evidence that the pipe is full, and the cwnd must not keep doubling on it"
         );
         assert!(
             should_exit_slow_start(send, probed, false, false, false),

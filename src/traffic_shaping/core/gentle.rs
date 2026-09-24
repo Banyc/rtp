@@ -314,7 +314,8 @@ mod tests {
         GENTLE_DRAIN_FRAC,
     };
     use super::{
-        GENTLE_DRAIN_CHECK_RTTS, GENTLE_ENTER_MIN, GentleExitCause, GentleMode, GentleProbeOutcome,
+        GENTLE_DRAIN_CHECK_RTTS, GENTLE_ENTER_MIN, GENTLE_EXIT_LOSS, GentleExitCause, GentleMode,
+        GentleProbeOutcome,
     };
 
     #[test]
@@ -590,5 +591,102 @@ mod tests {
         let _ = outage.update_mode(Some(GENTLE_ENTER_MIN), Some(0.0), entered_at, control_rtt);
         assert_eq!(outage.reset(), Some(GentleExitCause::OutageReset));
         assert_eq!(outage.reset(), None);
+    }
+
+    /// A gate-open threshold the tests below cannot reach in one probe step:
+    /// the first probe of an episode applies, and only a later probe on the
+    /// same episode's accumulated timer may exit it.
+    const PROBE_OPEN_THRESHOLD: Duration = Duration::from_millis(100);
+
+    /// Enter gentle mode at `entered_at` and leave its continuous-gate-open
+    /// timer running (its single probe applies a gentle target).
+    fn gentle_episode_with_a_running_open_timer(
+        entered_at: Instant,
+        control_rtt: Duration,
+    ) -> GentleMode {
+        let mut gentle = GentleMode::new();
+        let _ = gentle.update_mode(Some(GENTLE_ENTER_MIN), Some(0.0), entered_at, control_rtt);
+        assert!(gentle.gentle_mode());
+        assert!(matches!(
+            gentle.probe(
+                100.0,
+                100.0,
+                control_rtt,
+                PROBE_OPEN_THRESHOLD,
+                entered_at,
+                Some(0.0),
+            ),
+            GentleProbeOutcome::Apply(_)
+        ));
+        assert_eq!(gentle.gentle_gate_open_since(), Some(entered_at));
+        gentle
+    }
+
+    /// A loss exit ends the gentle episode, so the continuous-gate-open timer
+    /// goes with it: leaving it would let the *next* episode inherit an
+    /// already-elapsed timer.
+    #[test]
+    fn loss_exit_voids_the_continuous_gate_open_timer() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let entered_at = t0 + GENTLE_ENTER_MIN;
+        let mut gentle = gentle_episode_with_a_running_open_timer(entered_at, control_rtt);
+
+        assert_eq!(
+            gentle.update_mode(
+                Some(GENTLE_ENTER_MIN),
+                Some(GENTLE_EXIT_LOSS),
+                entered_at,
+                control_rtt,
+            ),
+            Some(GentleExitCause::Loss)
+        );
+        assert!(!gentle.gentle_mode());
+        assert_eq!(
+            gentle.gentle_gate_open_since(),
+            None,
+            "the loss exit must void the continuous-gate-open timer with the episode"
+        );
+    }
+
+    /// The loss exit sets no re-entry cooldown, so a queue that builds again
+    /// re-enters gentle mode at the next sustained stretch.  That episode must
+    /// start its own open timer: a timer inherited from the previous episode
+    /// is already past the threshold, so the first probe would exit with
+    /// `GateOpen` at once and gentle mode could never outlive a single probe
+    /// after one loss exit.
+    #[test]
+    fn the_episode_after_a_loss_exit_starts_its_own_open_timer() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let entered_at = t0 + GENTLE_ENTER_MIN;
+        let mut gentle = gentle_episode_with_a_running_open_timer(entered_at, control_rtt);
+        let _ = gentle.update_mode(
+            Some(GENTLE_ENTER_MIN),
+            Some(GENTLE_EXIT_LOSS),
+            entered_at,
+            control_rtt,
+        );
+
+        let reenter_at = entered_at + Duration::from_secs(1);
+        let _ = gentle.update_mode(Some(GENTLE_ENTER_MIN), Some(0.0), reenter_at, control_rtt);
+        assert!(
+            gentle.gentle_mode(),
+            "the loss exit must not block re-entry"
+        );
+        assert!(
+            matches!(
+                gentle.probe(
+                    100.0,
+                    100.0,
+                    control_rtt,
+                    PROBE_OPEN_THRESHOLD,
+                    reenter_at,
+                    Some(0.0),
+                ),
+                GentleProbeOutcome::Apply(_)
+            ),
+            "the new episode's first probe must not inherit the previous episode's open timer"
+        );
     }
 }
