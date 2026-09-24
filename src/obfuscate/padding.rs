@@ -275,24 +275,19 @@ pub(crate) fn decode_plaintext_in_place(
     settings: Option<PaddingSettings>,
 ) -> Option<usize> {
     match settings {
-        Some(settings) => match settings.payload_sized {
-            PayloadSized::Dynamic => {
-                let len = read_len_prefix(&buf[..n])?;
-                if LEN_LEN + len > n {
-                    return None;
-                }
-                buf.copy_within(LEN_LEN..LEN_LEN + len, 0);
-                Some(len)
+        // The length prefix is always present: every caller passes the data
+        // channel's settings, and `PaddingSettings`'s only public constructor
+        // is `dynamic_target`, so the receiver never knows the payload size.
+        // The static format (a known payload size, used by the handshake) is
+        // decoded by `decode_plaintext`, whose buffer is exactly the payload.
+        Some(_) => {
+            let len = read_len_prefix(&buf[..n])?;
+            if LEN_LEN + len > n {
+                return None;
             }
-            PayloadSized::Static => {
-                // The payload size is known: the caller's buffer is the
-                // payload size.
-                if n < buf.len() {
-                    return None;
-                }
-                Some(buf.len())
-            }
-        },
+            buf.copy_within(LEN_LEN..LEN_LEN + len, 0);
+            Some(len)
+        }
         None => Some(n),
     }
 }
