@@ -433,6 +433,29 @@ mod tests {
     }
 
     #[test]
+    fn in_place_decode_rejects_a_length_prefix_longer_than_the_plaintext() {
+        // A hostile or corrupt datagram can declare more payload bytes than it
+        // carries; the in-place decode must reject it before the bounded copy
+        // rather than move bytes from past `n`.
+        let settings = triangular();
+        let mut plaintext = vec![0u8; 64];
+        plaintext[..LEN_LEN].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(
+            decode_plaintext_in_place(&mut plaintext, 8, Some(settings)),
+            None
+        );
+        // A prefix that exactly fills `n` is the boundary the check must let
+        // through, so this pins the comparison rather than only its reject arm.
+        let mut exact = vec![0xAA_u8; 8];
+        exact[..LEN_LEN].copy_from_slice(&6_u16.to_be_bytes());
+        assert_eq!(
+            decode_plaintext_in_place(&mut exact, 8, Some(settings)),
+            Some(6)
+        );
+        assert_eq!(&exact[..6], &[0xAA_u8; 6]);
+    }
+
+    #[test]
     fn dynamic_mode_rejects_payload_larger_than_u16() {
         let settings = PaddingSettings::dynamic_target(TargetKind::Fixed(70000));
         let payload = vec![0xAB; 65536];
