@@ -204,4 +204,36 @@ mod tests {
         };
         assert!(second.is_none(), "duplicate must not produce an RTT sample");
     }
+
+    /// An echoed timestamp is only a usable RTT sample if its age is
+    /// plausible.  A stale or hostile echo must be rejected outright rather
+    /// than folded into the estimator, where a single datagram would pin sRTT
+    /// and the RTO to a value on the order of the u32 microsecond wrap
+    /// (~71 minutes).  Both halves of the comparison are built from the
+    /// production ceiling, so the boundary is exact rather than probed with a
+    /// literal.
+    #[test]
+    fn an_echo_past_the_plausibility_ceiling_is_rejected() {
+        assert_eq!(TsEcho::MAX_ECHO_RTT, Duration::from_secs(60));
+        let ceiling_us = u32::try_from(TsEcho::MAX_ECHO_RTT.as_micros()).unwrap();
+        assert_eq!(
+            TsEcho::rtt_from_echo(ceiling_us, 0),
+            Some(TsEcho::MAX_ECHO_RTT),
+            "an echo exactly at the ceiling is still a sample"
+        );
+        assert_eq!(
+            TsEcho::rtt_from_echo(ceiling_us + 1, 0),
+            None,
+            "an echo past the ceiling must be rejected, not folded in"
+        );
+        // The stale-echo shape: the peer's timestamp is newer than this
+        // node's wire clock, so the wrapping subtraction yields an age near
+        // the full u32 microsecond range.  That is implausible, not a
+        // ~71-minute RTT.
+        assert_eq!(
+            TsEcho::rtt_from_echo(0, 1_000),
+            None,
+            "a wrapping-subtracted age must be rejected"
+        );
+    }
 }

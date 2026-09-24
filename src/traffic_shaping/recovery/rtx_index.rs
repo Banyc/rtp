@@ -1289,6 +1289,49 @@ mod tests {
         assert!(index.has_rto_due(at_boundary, ms(50)));
     }
 
+    /// The latched instant stored in an active entry must always equal the key
+    /// that entry holds in the deadline index.  `promote_due` postpones a
+    /// stale non-tail-probe deadline to `sent_at + live_rto`, so it must
+    /// relatch `rto_at` to the instant it re-inserts; otherwise `deactivate`
+    /// removes a key that is no longer present and the real key is left behind
+    /// in `rto_deadlines`.  The next `promote_due` then reaches a deadline key
+    /// whose packet is no longer active and panics on the
+    /// "RTO deadline must belong to an active packet" invariant, which is the
+    /// shape this test pins: after the packet is deactivated its deadline key
+    /// must be gone.
+    #[test]
+    fn lazy_postponement_relatches_the_deadline_the_entry_holds() {
+        let t0 = Instant::now();
+        let mut index = RetransmissionIndex::new(sq(0));
+        index.activate(RetransmissionActivation {
+            seq: sq(0),
+            rto_at: t0 + ms(30),
+            sent_at: t0,
+            apply_live_rto_floor: true,
+            reorder_eligible: false,
+            fast_loss_eligible: false,
+            pre_outage_eligible: false,
+        });
+        // The estimator spikes above the packet's own RTO: the stored key is
+        // postponed to the effective `sent_at + live_rto` deadline.
+        assert_eq!(
+            index.promote_due(t0 + ms(30), ms(100), ms(60)),
+            1,
+            "the spike must postpone the stored deadline"
+        );
+        assert!(index.deactivate(sq(0)));
+        assert!(
+            index.rto_deadlines.is_empty(),
+            "deactivation must remove the packet's re-latched RTO deadline key"
+        );
+        assert!(!index.has_rto_due(t0 + ms(120), ms(60)));
+        assert_eq!(
+            index.promote_due(t0 + ms(120), ms(100), ms(60)),
+            0,
+            "an inactive packet's deadline must not be promoted"
+        );
+    }
+
     #[test]
     fn next_deadline_floor_wake_uses_the_minimum_effective_deadline_over_the_floor_prefix() {
         let t0 = Instant::now();

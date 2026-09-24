@@ -2386,31 +2386,36 @@ mod tests {
         );
     }
 
+    /// A duplicate echo must feed the RTT estimator exactly once: a
+    /// parity-recovered ACK and its original carry the same peer timestamp,
+    /// and folding it in twice biases sRTT and the RTT variance toward the
+    /// older sample.  The duplicate is delivered at a visibly later local
+    /// clock — the sample is `local_ts - echo_ts`, so a second fold-in would
+    /// move both estimators — while a deduped duplicate leaves them exactly
+    /// where the first echo put them.  Both halves are asserted: the first
+    /// echo must be recorded at all, so "no movement" cannot be satisfied by
+    /// the estimator never having sampled anything.
     #[tokio::test]
     async fn duplicate_echo_updates_rtt_once() {
         use async_trait::async_trait;
         use std::sync::Mutex;
+        /// A read half the test arms by hand: one `recv_pkts` pass drains what
+        /// is queued and stops on `WouldBlock`, so the duplicate can be handed
+        /// over only after a real delay has elapsed.
         #[derive(Debug)]
-        struct DupEchoRead {
-            sent: Mutex<usize>,
-        }
+        struct ArmedRead(Arc<Mutex<std::collections::VecDeque<Vec<u8>>>>);
         #[async_trait]
-        impl UnreliableRead for DupEchoRead {
-            fn try_recv(&mut self, _buf: &mut [u8]) -> Result<usize, IoErr> {
-                Err(std::io::ErrorKind::WouldBlock.into())
+        impl UnreliableRead for ArmedRead {
+            fn try_recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
+                let Some(datagram) = self.0.lock().unwrap().pop_front() else {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                };
+                let n = datagram.len().min(buf.len());
+                buf[..n].copy_from_slice(&datagram[..n]);
+                Ok(n)
             }
             async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, IoErr> {
-                let mut sent = self.sent.lock().unwrap();
-                if *sent >= 2 {
-                    return Err(std::io::ErrorKind::UnexpectedEof.into());
-                }
-                *sent += 1;
-                let mut pkt = [0u8; 1 + 4];
-                pkt[0] = 4;
-                pkt[1..5].copy_from_slice(&1000u32.to_be_bytes());
-                let n = pkt.len().min(buf.len());
-                buf[..n].copy_from_slice(&pkt[..n]);
-                Ok(n)
+                self.try_recv(buf)
             }
         }
         #[derive(Debug)]
@@ -2421,22 +2426,88 @@ mod tests {
                 Ok(buf.len())
             }
         }
-        let read = DupEchoRead {
-            sent: Mutex::new(0),
-        };
+        const ECHO_TS: u32 = 1_000;
+        let queue = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let read = ArmedRead(Arc::clone(&queue));
         let write = OkWrite;
         let ul = crate::udp::wrap_fec(Box::new(read), Box::new(write), false);
         let mut tl = TransmissionLayer::new(ul, None);
         let mut recv_bufs = RecvBufs::new();
-        let _ = tl.recv_pkts(&mut recv_bufs).await;
-        let rtt = tl
-            .shared_for_test()
-            .reliable_layer_for_test()
-            .lock()
-            .unwrap()
-            .pkt_send_space()
-            .smooth_rtt();
-        let _ = rtt;
+        // The datagram carries a data packet as well as the echo, so the pass
+        // leaves ACK work behind and therefore drains with `try_recv`: an
+        // echo-only datagram would make the pass block on the next read
+        // instead of returning.
+        let datagram = {
+            let mut datagram = vec![0u8; 64];
+            let data = crate::codec::EncodeData {
+                seq: crate::sequence::SequenceNumber::from_wire(0),
+                send_ts: None,
+                frame_len: None,
+                data: b"payload",
+            };
+            let len =
+                crate::codec::encode_ack_data(None, None, Some(ECHO_TS), Some(data), &mut datagram)
+                    .unwrap();
+            datagram.truncate(len);
+            datagram
+        };
+        let srtt = |tl: &TransmissionLayer| {
+            tl.shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap()
+                .pkt_send_space()
+                .smooth_rtt()
+        };
+        let rttvar = |tl: &TransmissionLayer| {
+            tl.shared_for_test()
+                .reliable_layer_for_test()
+                .lock()
+                .unwrap()
+                .pkt_send_space()
+                .smooth_rtt_var()
+        };
+        let before = srtt(&tl);
+
+        // The connection clock starts at construction, so let it advance past
+        // the crafted echo timestamp first: an echo older than the local wire
+        // clock is not a usable sample at all (it is rejected as implausible),
+        // and then neither half of this test could be observed.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        queue.lock().unwrap().push_back(datagram.clone());
+        let first = tl
+            .recv_pkts(&mut recv_bufs)
+            .await
+            .expect("the first echo must be delivered");
+        assert_eq!(first.num_ack_segments, 1, "one datagram per pass");
+        let after_first = srtt(&tl);
+        let var_after_first = rttvar(&tl);
+        assert_ne!(
+            after_first, before,
+            "the first echo must be recorded as an RTT sample"
+        );
+
+        // The duplicate carries the same peer timestamp but arrives at a later
+        // local clock (the wire clock is microsecond-granular, and the sleep
+        // below is three orders of magnitude above that), so a second fold-in
+        // would move both estimators by a visible amount.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        queue.lock().unwrap().push_back(datagram);
+        let second = tl
+            .recv_pkts(&mut recv_bufs)
+            .await
+            .expect("the duplicate echo must be delivered");
+        assert_eq!(second.num_ack_segments, 1, "one datagram per pass");
+        assert_eq!(
+            srtt(&tl),
+            after_first,
+            "a duplicate echo must not move sRTT a second time"
+        );
+        assert_eq!(
+            rttvar(&tl),
+            var_after_first,
+            "a duplicate echo must not move the RTT variance a second time"
+        );
     }
 
     #[tokio::test]

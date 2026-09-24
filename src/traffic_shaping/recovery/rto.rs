@@ -242,4 +242,41 @@ mod tests {
             "K*rttvar exactly at srtt/4 must leave the structural gate disarmed"
         );
     }
+
+    /// The first RTT sample seeds the filters at `SRTT = R` and
+    /// `RTTVAR = R / 2` (RFC 6298), so the initial RTO is `R + 4 * R/2 = 3R`
+    /// before the 1 s floor and the initial reorder window is
+    /// `R + max(2R, R/4) = 3R`.  Seeding the variance from the sample itself
+    /// instead doubles the variance term: it takes the initial RTO to `5R`
+    /// and the reorder window to `5R`, which on a 200-400 ms path is a
+    /// materially later first retransmission.  The second sample must then
+    /// follow the RFC EWMA (`RTTVAR = 3/4 * RTTVAR + 1/4 * |SRTT - R|`) rather
+    /// than re-seeding.
+    #[test]
+    fn the_first_sample_seeds_srtt_and_half_rttvar_then_the_ewma_takes_over() {
+        let mut timer = RtxTimer::new();
+        let rtt = Duration::from_millis(400);
+        timer.set(rtt);
+        assert_eq!(timer.smooth_rtt(), rtt, "the first sample IS the sRTT");
+        assert_eq!(
+            timer.smooth_rtt_var(),
+            rtt / 2,
+            "the first sample seeds the variance at half the RTT"
+        );
+        assert_eq!(
+            timer.raw_rto(),
+            Duration::from_millis(1_200),
+            "the pre-floor RTO after one sample is 3R"
+        );
+
+        // A repeat sample leaves sRTT where it is and decays the variance by
+        // 3/4 toward |sRTT - R| = 0: the seed no longer applies.
+        timer.set(rtt);
+        assert_eq!(timer.smooth_rtt(), rtt);
+        assert_eq!(
+            timer.smooth_rtt_var(),
+            Duration::from_millis(150),
+            "the second sample must follow the 3/4 smoothing, not re-seed"
+        );
+    }
 }

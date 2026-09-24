@@ -470,4 +470,35 @@ mod tests {
             "an immature connection must keep the trending margin"
         );
     }
+
+    /// A genuine RTT *step* — a sample more than double the smoothed RTT it is
+    /// measured against — must arm the transient that falls back to the
+    /// trending margin, so the ordinary delay gate uses the estimate that
+    /// tracks the new path instead of the pre-step windowed steady-state
+    /// floor.  Without the fallback the window still holds the quiet pre-step
+    /// stretch, reports a near-zero variance, and the delay controller reads
+    /// the step itself as a standing queue.  The companion
+    /// [`steady_state_window_ignores_a_transient_variance_spike`] pins the
+    /// other direction (a sub-doubling ramp must NOT arm it), so together the
+    /// two cover both sides of the arming predicate.
+    #[test]
+    fn a_step_jump_arms_the_trending_fallback_until_the_window_moves() {
+        let mut stats = RttStats::new();
+        for _ in 0..(GATE_VAR_MATURE_SAMPLES + 8) {
+            stats.record_rtt(ms(50));
+        }
+        // The step: 400 ms measured against a pre-update sRTT of 50 ms.
+        stats.record_rtt(ms(400));
+        let jitter = stats.gate_jitter();
+        assert!(
+            jitter.trending > Duration::ZERO,
+            "the step must leave a real trending margin: {:?}",
+            jitter.trending
+        );
+        assert_eq!(
+            jitter.steady, jitter.trending,
+            "a raw step must fall back to the trending margin instead of the \
+             stale pre-step steady-state floor"
+        );
+    }
 }
