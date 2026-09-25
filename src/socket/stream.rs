@@ -1172,6 +1172,20 @@ mod tests {
     /// fall-through to the reorder-window ARQ repair costs at least one extra
     /// RTT. Run with `--ignored --nocapture`.
     ///
+    /// The connection is built handshake-less (`initial_rtt: None`), so its
+    /// first data packet carries no RTT sample and its first tail-loss probe
+    /// waits the 1 s initial-RTO floor.  That cold start is an artefact of
+    /// this layer's construction (a production connection seeds the RTT from
+    /// the handshake, see `Connection`'s `initial_rtt` sampling), and it shows
+    /// up in the reported tail as one isolated ~1 s echo — seed
+    /// `a_layer.initial_rtt = Some(owd * 2)` to see the same arm without it.
+    ///
+    /// Each arm also prints its repair-path tail: every echo above 55 ms with
+    /// its message index, so a repair is attributable to the parity path (a
+    /// same-round-trip recovery) or to the tail-loss-probe path (roughly two
+    /// smoothed RTTs plus a round trip) instead of being read as one opaque
+    /// maximum.
+    ///
     /// Report-only: prints the measurements and asserts nothing (see GATE.md).
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process burst-loss interactive repair probe; ~145 s; run with --ignored --nocapture"]
@@ -1264,6 +1278,7 @@ mod tests {
                 }
             });
             let mut latencies = Vec::with_capacity(n);
+            let mut tail_probe: Vec<(usize, Duration)> = Vec::with_capacity(n);
             let mut timeouts = 0usize;
             for i in 0..n {
                 let mut msg = vec![(i % 251) as u8; msg_len];
@@ -1294,6 +1309,7 @@ mod tests {
                 }
                 if let Some(latency) = matched {
                     latencies.push(latency);
+                    tail_probe.push((i, latency));
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1315,6 +1331,12 @@ mod tests {
                     .count()
             };
             let counters = *observed.lock().unwrap();
+            let tail: Vec<(usize, u128)> = tail_probe
+                .iter()
+                .filter(|(_, latency)| *latency > Duration::from_millis(55))
+                .map(|(i, latency)| (*i, latency.as_millis()))
+                .collect();
+            eprintln!("[probe burst tail {label}] (msg, ms) {tail:?}");
             eprintln!(
                 "[probe burst {label}] samples={} timeouts={} gt60ms={} gt90ms={} gt150ms={} p50={:?} p90={:?} p99={:?} max={:?} armor_duplicates={} dropped={} recovered={} counters={counters:?}",
                 latencies.len(),
