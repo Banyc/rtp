@@ -27,8 +27,7 @@ use crate::traffic_shaping::redundancy::{
     fec::in_stream_group::{CapacityGate, InStreamGroupFlush},
     fec::parity_burst::PendingParityBurst,
     retransmission_armor::fresh_tail::{
-        fresh_tail_armor_copy_count, is_fresh_interactive_tail, is_lone_tail,
-        is_single_symbol_frame,
+        fresh_tail_armor_copy_count, is_fresh_interactive_tail, is_single_symbol_frame,
     },
 };
 
@@ -911,34 +910,28 @@ impl WriteHalf {
                     }
                     if armor_decision == ArmorDecision::Duplicate {
                         // A recovery send gets one armor copy; a fresh
-                        // interactive single-symbol tail gets the copy count
-                        // the load-bearing condition calls for.  The count is
-                        // decided by *window sparsity*, not by the measured
-                        // loss ratio: a **lone** tail (nothing else unacked on
-                        // the connection) pays the six-slot burst cover, since
-                        // a burst can wipe its whole group with nothing newer
-                        // behind it to SACK the hole; a **pipelined** tail pays
-                        // only the lone-loss cover, because the peer's next ACK
-                        // SACKs the hole and the one-reorder-window ARQ repair
-                        // lands within a round trip (see
-                        // [`is_lone_tail`](crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::is_lone_tail))
-                        // and [`fresh_tail_armor_copies`](crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::fresh_tail_armor_copies).
-                        // Reading the live window rather than a loss estimate
-                        // keeps the per-message datagram budget
-                        // non-increasing in loss: the ladder may only ever
-                        // shrink as measured loss rises, and it shrinks further
-                        // once the gated parity path owns the repair.  Only
+                        // interactive single-symbol tail gets a loss-adaptive
+                        // copy count.  The interactive lane's redundancy while
+                        // the FEC loss gate is closed is primary + armor only,
+                        // so a single copy still falls through to the
+                        // one-reorder-window ARQ repair when it is lost.  The
+                        // count is monotone non-increasing in the measured
+                        // loss (see [`fresh_tail_armor_copies`](crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::fresh_tail_armor_copies)): the extra
+                        // burst-cover copy is only paid while the link is
+                        // low/moderate loss and is withdrawn as loss rises, so
+                        // redundancy never amplifies a hostile link.  At the
+                        // burst-cover tier the count compensates for a closed
+                        // FEC loss gate: a fourth small copy stands in for the
+                        // parity datagram that would otherwise trail the burst
+                        // as the fifth wire slot, keeping the per-message
+                        // datagram budget at five without an 8 KB parity.  Only
                         // this lane pays the extra pacer token (bulk/stock
                         // never force `fec_instream_flush`).
-                        let lone_tail = self.shared.with_reliable_layer(|reliable_layer| {
-                            is_lone_tail(reliable_layer.pkt_send_space().num_in_flight_pkts())
-                        });
                         let copies = fresh_tail_armor_copy_count(
                             fresh_interactive_tail,
                             self.fresh_tail_armor_copies_override,
                             self.fec_gate.effective_loss_ratio(),
                             self.fec_gate.loss_active(),
-                            lone_tail,
                         );
                         for _ in 0..copies {
                             if !self.send_pacer.take_exact_tokens(1, now) {

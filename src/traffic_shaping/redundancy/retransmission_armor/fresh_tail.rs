@@ -5,13 +5,12 @@
 //! this; stock/bulk tuning never forces in-stream flushing.
 
 /// Armor duplicate copies emitted for a fresh interactive single-symbol tail
-/// (in addition to the primary datagram) while the FEC loss gate is OPEN and a
-/// *message-sized* parity symbol will therefore trail the same burst as the
-/// sixth wire slot.  Primary + four copies + the small parity is six
-/// back-to-back datagrams, so a five-packet burst always leaves a survivor;
-/// the parity is a ~256 B symbol, not the 8 KB full-MSS symbol a stock flush
-/// would emit, so the sixth slot is cheap.  Paid only when the tail is *lone*
-/// (see [`is_lone_tail`]).
+/// (in addition to the primary datagram) at the burst-cover tier when the FEC
+/// loss gate is OPEN and a *message-sized* parity symbol will therefore trail
+/// the same burst as the sixth wire slot.  Primary + four copies + the small
+/// parity is six back-to-back datagrams, so a five-packet burst always leaves
+/// a survivor; the parity is a ~256 B symbol, not the 8 KB full-MSS symbol a
+/// stock flush would emit, so the sixth slot is cheap.
 const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY: usize = 4;
 
 /// Armor duplicate copies at the burst-cover tier when the FEC loss gate is
@@ -19,8 +18,7 @@ const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY: usize = 4;
 /// wire slot the parity would have occupied: primary + five copies is still
 /// six back-to-back 256-byte datagrams, covering a five-packet burst.  The
 /// copy count is monotone non-increasing with loss, so the closed-gate tier
-/// never grows redundancy as the link degrades.  Paid only when the tail is
-/// *lone* (see [`is_lone_tail`]).
+/// never grows redundancy as the link degrades.
 const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY: usize = 5;
 
 /// Armor duplicate copies retained once the measured loss passes
@@ -34,27 +32,6 @@ const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE: usize = 2;
 /// packets amplify queue pressure instead of helping, so the fresh tail backs
 /// off to the primary datagram alone and leaves repair to FEC/ARQ.
 const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN: usize = 0;
-
-/// Armor duplicate copies emitted for a *pipelined* fresh interactive
-/// single-symbol tail (in addition to the primary datagram) while the FEC
-/// loss gate is closed: the **lone-loss cover**, the minimum that recovers a
-/// single lost datagram on the same round trip.
-///
-/// A pipelined tail — one with another data packet already unacked on the
-/// connection, so the application is offering more than one packet per round
-/// trip — is the regime where the six-slot burst cover is *not* load-bearing.
-/// The peer's next ACK covers a newer packet and therefore SACKs this tail's
-/// hole, so the one-reorder-window ARQ repair lands within a round trip even
-/// when a multi-packet burst wipes every copy of *this* message.  Measured on
-/// the 2 %-loss dual-lane constitution arm, the interactive fresh tails are
-/// almost all pipelined (1202 of 1211 in one 30 s run, two to four packets in
-/// flight), while an interactive request/response pair is almost all lone
-/// (3734 of 4007 in the burst-loss repair probe); the historical
-/// burst-cover ladder therefore spent its premium on a regime that never
-/// needed it: armor was the interactive lane's dominant wire cost (2.5x the
-/// offered payload in byte-identical re-sends) while the gated parity path
-/// emitted nothing and every ARQ counter stayed at zero.
-const FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_LONE_LOSS: usize = 1;
 
 /// Measured effective loss ratio above which the fresh interactive tail drops
 /// from the burst-cover copy count to the historical two-copy base.
@@ -90,67 +67,31 @@ pub(crate) fn is_fresh_interactive_tail(
     !is_recovery && instream_flush && (single_symbol_frame || open_group_data_count == Some(1))
 }
 
-/// Whether a fresh interactive tail is *lone*: it is the only unacked data
-/// packet on the connection, so no newer packet is in flight for the peer to
-/// SACK its hole with and the application is offering at most one packet per
-/// round trip.  `in_flight_pkts` is the sender's live in-flight count read
-/// after the tail's primary datagram was minted, so the tail itself is
-/// already counted: `1` means nothing else is outstanding, `2` or more means
-/// the stream is pipelined.
-///
-/// The distinction is the load-bearing condition for the burst cover, not the
-/// measured loss ratio: a burst-cover ladder protects a *lone* tail whose
-/// whole redundancy group can be wiped by one burst with nothing newer behind
-/// it, while a pipelined tail's hole is SACKed by the peer's next ACK and the
-/// lone-loss cover carries it.  Because it reads the dynamic window rather
-/// than a loss estimate, gating on it cannot make redundancy grow with loss.
-pub(crate) fn is_lone_tail(in_flight_pkts: usize) -> bool {
-    in_flight_pkts <= 1
-}
-
-/// Armor duplicate copies for a fresh interactive single-symbol tail, from the
-/// measured effective loss ratio, whether the FEC loss gate reports that
-/// measured loss warrants recovery, and whether the tail is a lone tail (see
-/// [`is_lone_tail`]).
-///
-/// A lone tail pays the **burst-cover ladder**: sized so primary + copies +
-/// the (at most one) parity symbol fill six back-to-back wire slots, so a
-/// five-packet burst always leaves a survivor.  It is monotone
-/// non-increasing in loss, so a hostile link never sees more redundancy than
-/// a clean one.
-///
-/// A pipelined tail pays the **lone-loss cover** while the gate is closed and
-/// nothing at all once it opens: one small datagram recovers a lone loss on
-/// the same round trip, and the ARQ fall-through repairs what one copy cannot
-/// because the peer's next ACK SACKs the hole.  Either way the pipelined
-/// tail's per-message budget (primary plus one repair slot) does not grow as
-/// measured loss crosses the gate's enable threshold.
-///
-/// Only the interactive lane consults this: stock/bulk tuning never forces
-/// `fec_instream_flush`.
+/// Armor duplicate copies for a fresh interactive single-symbol tail as a
+/// function of the measured effective loss ratio and whether a parity
+/// datagram will trail the same burst (the FEC loss gate is open).  The
+/// mapping is **monotone non-increasing** in loss: it may only ever shrink
+/// the per-message packet count as the wire loss rate rises, so a hostile
+/// link never sees more redundancy than a clean one.  `None` (no loss
+/// evidence yet) is treated as the low-loss tier.  At the burst-cover tier
+/// the copy count compensates for the parity gate: with a trailing
+/// message-sized parity four copies suffice (six datagrams total), without it
+/// a fifth copy fills the same sixth slot so a five-packet burst still leaves
+/// a survivor.  The per-message datagram budget is therefore six either way
+/// and only ever shrinks with loss.  Only the interactive lane consults this:
+/// stock/bulk tuning never forces `fec_instream_flush`.
 pub(crate) fn fresh_tail_armor_copies(
     effective_loss: Option<f64>,
-    loss_gate_open: bool,
-    lone_tail: bool,
+    parity_covers_burst: bool,
 ) -> usize {
-    if effective_loss.is_some_and(|loss| loss >= FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS) {
-        // A hostile link must not amplify congestion with extra packets: the
-        // defensive floor withdraws armor from either tail and leaves repair
-        // to the gated parity path and ARQ.
-        return FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN;
-    }
-    if !lone_tail {
-        return if loss_gate_open {
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN
-        } else {
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_LONE_LOSS
-        };
-    }
     match effective_loss {
+        Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_HOSTILE_LOSS => {
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN
+        }
         Some(loss) if loss >= FRESH_INTERACTIVE_TAIL_ARMOR_MODERATE_LOSS => {
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE
         }
-        _ if loss_gate_open => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
+        _ if parity_covers_burst => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
         _ => FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
     }
 }
@@ -163,12 +104,11 @@ pub(crate) fn fresh_tail_armor_copy_count(
     fresh_interactive_tail: bool,
     override_copies: Option<usize>,
     effective_loss: Option<f64>,
-    loss_gate_open: bool,
-    lone_tail: bool,
+    parity_covers_burst: bool,
 ) -> usize {
     if fresh_interactive_tail {
         override_copies
-            .unwrap_or_else(|| fresh_tail_armor_copies(effective_loss, loss_gate_open, lone_tail))
+            .unwrap_or_else(|| fresh_tail_armor_copies(effective_loss, parity_covers_burst))
     } else {
         1
     }
@@ -177,132 +117,83 @@ pub(crate) fn fresh_tail_armor_copy_count(
 #[cfg(test)]
 mod tests {
     /// The fresh interactive tail's armor copy count is monotone
-    /// non-increasing in the measured loss ratio, for either load-bearing
-    /// condition: a hostile link can never emit more redundancy per message
-    /// than a clean one.  A lone tail's low/unmeasured tier pays the
-    /// burst-cover copy, its mid band keeps the historical base, and its
-    /// hostile tier backs off to the primary datagram alone; a pipelined tail
-    /// pays the flat lone-loss cover that the gated parity path then replaces.
+    /// non-increasing in the measured loss ratio: a hostile link can never
+    /// emit more redundancy per message than a clean one.  The low/unmeasured
+    /// tier pays the burst-cover copy, the mid band keeps the historical base,
+    /// and the hostile tier backs off to the primary datagram alone.  At the
+    /// burst-cover tier the count compensates for the parity gate: with a
+    /// trailing message-sized parity four copies, without it five, so the
+    /// total per-message datagram budget stays at six either way.
     #[test]
     fn fresh_tail_armor_copies_are_monotone_non_increasing_in_loss() {
         use super::{
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_LONE_LOSS, FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
-            fresh_tail_armor_copies,
+            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN, fresh_tail_armor_copies,
         };
-        for loss_gate_open in [true, false] {
+        for parity in [true, false] {
             assert_eq!(
-                fresh_tail_armor_copies(None, loss_gate_open, true),
-                if loss_gate_open {
+                fresh_tail_armor_copies(None, parity),
+                if parity {
                     FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY
                 } else {
                     FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY
                 },
-                "a lone tail with no loss evidence yet must use the burst-cover tier (gate={loss_gate_open})"
+                "no loss evidence yet must use the burst-cover tier (parity={parity})"
             );
             assert_eq!(
-                fresh_tail_armor_copies(Some(0.0), loss_gate_open, true),
-                fresh_tail_armor_copies(None, loss_gate_open, true),
-                "a clean link's lone tail must use the burst-cover tier (gate={loss_gate_open})"
+                fresh_tail_armor_copies(Some(0.0), parity),
+                fresh_tail_armor_copies(None, parity),
+                "a clean link must use the burst-cover tier (parity={parity})"
             );
             assert_eq!(
-                fresh_tail_armor_copies(Some(0.14), loss_gate_open, true),
-                fresh_tail_armor_copies(None, loss_gate_open, true),
-                "just below the moderate threshold keeps the lone tail's burst-cover tier (gate={loss_gate_open})"
+                fresh_tail_armor_copies(Some(0.14), parity),
+                fresh_tail_armor_copies(None, parity),
+                "just below the moderate threshold keeps the burst-cover tier (parity={parity})"
             );
         }
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.14), false, true),
+            fresh_tail_armor_copies(
+                Some(0.14),
+                false // parity irrelevant below the moderate threshold
+            ),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
-            "the closed-gate lone tail pays the fifth copy (the parity's slot)"
+            "the no-parity burst-cover tier pays the fifth copy"
         );
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.14), true, true),
+            fresh_tail_armor_copies(
+                Some(0.14),
+                true // parity irrelevant below the moderate threshold
+            ),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_WITH_PARITY,
-            "the open-gate lone tail pays four copies, the parity taking the sixth slot"
+            "the with-parity burst-cover tier pays four copies"
         );
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.15), false, true),
+            fresh_tail_armor_copies(Some(0.15), false),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BASE,
-            "the moderate threshold drops the lone tail to the two-copy base"
+            "the moderate threshold drops to the two-copy base"
         );
         assert_eq!(
-            fresh_tail_armor_copies(Some(0.30), true, true),
+            fresh_tail_armor_copies(Some(0.30), true),
             FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
-            "the hostile threshold backs the lone tail off to the primary alone"
+            "the hostile threshold backs off to the primary alone"
         );
-        assert_eq!(
-            fresh_tail_armor_copies(Some(0.02), false, false),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_LONE_LOSS,
-            "a pipelined tail under the constitution arm's 2% loss pays the lone-loss cover"
-        );
-        assert_eq!(
-            fresh_tail_armor_copies(None, true, false),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
-            "an open gate means the parity path owns a pipelined tail's repair"
-        );
-        // Non-increasing in loss for each load-bearing condition and gate
-        // state: neither twin may grow with loss, and the pipelined twin may
-        // never spend more than the lone one at the same loss.
-        for lone_tail in [true, false] {
-            for loss_gate_open in [true, false] {
-                let mut previous = usize::MAX;
-                for step in 0..=100 {
-                    let loss = Some(step as f64 / 100.0);
-                    let copies = fresh_tail_armor_copies(loss, loss_gate_open, lone_tail);
-                    assert!(
-                        copies <= previous,
-                        "loss {loss:?} (gate={loss_gate_open}, lone={lone_tail}) emitted {copies} copies, more than a lower loss ({previous})"
-                    );
-                    assert!(
-                        copies <= fresh_tail_armor_copies(loss, loss_gate_open, true),
-                        "loss {loss:?} (gate={loss_gate_open}) let a pipelined tail spend more than a lone one"
-                    );
-                    previous = copies;
-                }
+        // Non-increasing in loss for either gate state: an open gate (parity
+        // trails the burst) must never emit more copies than a closed one, and
+        // neither may grow with loss.
+        for parity in [true, false] {
+            let mut previous = usize::MAX;
+            for step in 0..=100 {
+                let loss = Some(step as f64 / 100.0);
+                let copies = fresh_tail_armor_copies(loss, parity);
+                assert!(
+                    copies <= previous,
+                    "loss {loss:?} (parity={parity}) emitted {copies} copies, more than a lower loss ({previous})"
+                );
+                previous = copies;
             }
         }
-    }
-
-    /// The load-bearing condition for the burst cover is the live send window,
-    /// not the measured loss: a tail with nothing else unacked on the
-    /// connection is *lone* (no newer packet the peer's ACK could SACK the
-    /// hole with) and pays the six-slot cover, while a tail with another
-    /// unacked packet is *pipelined* and pays only the lone-loss cover while
-    /// the gate is closed, nothing once it opens.  The pipelined composition is
-    /// exactly two datagrams (primary + lone-loss copy) and the lone
-    /// composition exactly six, so the two regimes differ by 3x of wire.
-    #[test]
-    fn the_send_window_sparsity_decides_the_burst_cover() {
-        use super::{
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY,
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_LONE_LOSS, FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN,
-            fresh_tail_armor_copies, is_lone_tail,
-        };
-        // The primary datagram is minted before the count is read, so an
-        // unopposed tail reads 1; anything above that has another data packet
-        // (and therefore a future SACK source) in flight.
-        assert!(is_lone_tail(0), "a tail with an empty window is alone");
-        assert!(is_lone_tail(1), "the tail's own primary is the only flight");
-        assert!(!is_lone_tail(2), "one more unacked packet is a pipeline");
-        assert!(!is_lone_tail(64), "a deep pipeline is never a lone tail");
-        const PRIMARY: usize = 1;
-        let lone = fresh_tail_armor_copies(Some(0.02), false, true);
-        let pipelined = fresh_tail_armor_copies(Some(0.02), false, false);
-        assert_eq!(lone, FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_NO_PARITY);
-        assert_eq!(pipelined, FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_LONE_LOSS);
-        assert_eq!(PRIMARY + lone, 6, "the lone tail spends the six-slot cover");
-        assert_eq!(
-            PRIMARY + pipelined,
-            2,
-            "the pipelined tail spends the lone-loss cover"
-        );
-        assert_eq!(
-            fresh_tail_armor_copies(None, true, false),
-            FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_MIN
-        );
     }
 
     /// Only a whole single-symbol frame qualifies for the interactive tail's
@@ -358,56 +249,48 @@ mod tests {
     }
 
     /// A non-tail (recovery) send carries exactly one armor copy regardless of
-    /// the measured loss, the send-window sparsity, or a test override, and a
-    /// fresh interactive tail uses the override when set, else the
-    /// loss-adaptive ladder.  Keeping the override beside the ladder means a
-    /// forced count can never leak into the recovery path and a hostile loss
-    /// tier can never inflate a recovery send's copies.
+    /// the measured loss or a test override, and a fresh interactive tail uses
+    /// the override when set, else the loss-adaptive ladder.  Keeping the
+    /// override beside the ladder means a forced count can never leak into the
+    /// recovery path and a hostile loss tier can never inflate a recovery
+    /// send's copies.
     #[test]
     fn armor_copy_count_never_leaks_the_override_into_recovery() {
         use super::{fresh_tail_armor_copies, fresh_tail_armor_copy_count};
         for loss in [None, Some(0.0), Some(0.15), Some(0.30), Some(1.0)] {
-            for lone_tail in [true, false] {
-                for override_copies in [None, Some(0usize), Some(7)] {
-                    assert_eq!(
-                        fresh_tail_armor_copy_count(false, override_copies, loss, false, lone_tail),
-                        1,
-                        "a recovery send must carry exactly one copy (loss={loss:?}, lone={lone_tail}, override={override_copies:?})"
-                    );
-                }
+            for override_copies in [None, Some(0usize), Some(7)] {
+                assert_eq!(
+                    fresh_tail_armor_copy_count(false, override_copies, loss, false),
+                    1,
+                    "a recovery send must carry exactly one copy (loss={loss:?}, override={override_copies:?})"
+                );
             }
         }
         // A fresh interactive tail: the override wins, else the ladder.
         assert_eq!(
-            fresh_tail_armor_copy_count(true, Some(7), Some(0.5), false, false),
+            fresh_tail_armor_copy_count(true, Some(7), Some(0.5), false),
             7,
             "the test override must force the fresh tail's copy count"
         );
         assert_eq!(
-            fresh_tail_armor_copy_count(true, None, Some(0.30), true, true),
-            fresh_tail_armor_copies(Some(0.30), true, true),
+            fresh_tail_armor_copy_count(true, None, Some(0.30), true),
+            fresh_tail_armor_copies(Some(0.30), true),
             "without an override the fresh tail must use the loss-adaptive ladder"
         );
         assert_eq!(
-            fresh_tail_armor_copy_count(true, None, Some(0.0), false, true),
-            fresh_tail_armor_copies(Some(0.0), false, true),
-            "without an override a clean-link lone tail must use the burst-cover tier"
-        );
-        assert_eq!(
-            fresh_tail_armor_copy_count(true, None, Some(0.0), false, false),
-            fresh_tail_armor_copies(Some(0.0), false, false),
-            "without an override a clean-link pipelined tail must use the lone-loss cover"
+            fresh_tail_armor_copy_count(true, None, Some(0.0), false),
+            fresh_tail_armor_copies(Some(0.0), false),
+            "without an override the clean-link fresh tail must use the burst-cover tier"
         );
     }
 
     /// The interactive fresh tail's per-message wire is bounded by six
-    /// back-to-back datagrams at every loss tier, for either load-bearing
-    /// condition, and never grows with loss.  The primary datagram plus the
-    /// armor copies plus the (at most one) trailing message-sized parity is the
-    /// whole budget; the closed-gate lone tier pays one more 256-byte copy in
-    /// place of the parity, so both lone low-loss compositions land on six
-    /// slots and the byte cost stays bounded far below a single full-MSS parity
-    /// symbol, while the pipelined tier spends two.
+    /// back-to-back datagrams at every loss tier and never grows with loss.
+    /// The primary datagram plus the armor copies plus the (at most one)
+    /// trailing message-sized parity is the whole budget; the closed-gate
+    /// tier pays one more 256-byte copy in place of the parity, so both
+    /// low-loss compositions land on six slots and the byte cost stays
+    /// bounded far below a single full-MSS parity symbol.
     #[test]
     fn fresh_tail_burst_cover_stays_within_the_six_datagram_budget() {
         use super::fresh_tail_armor_copies;
@@ -416,41 +299,37 @@ mod tests {
         const MESSAGE_WIRE_BYTES: usize = 256;
         const BUDGET_DATAGRAMS: usize = 6;
         const BUDGET_WIRE_BYTES: usize = BUDGET_DATAGRAMS * MESSAGE_WIRE_BYTES;
-        for lone_tail in [true, false] {
-            for loss_gate_open in [true, false] {
-                let mut previous = usize::MAX;
-                for step in 0..=100 {
-                    let loss = Some(step as f64 / 100.0);
-                    let copies = fresh_tail_armor_copies(loss, loss_gate_open, lone_tail);
-                    let total = PRIMARY + copies + usize::from(loss_gate_open) * PARITY_SLOT;
-                    assert!(
-                        total <= BUDGET_DATAGRAMS,
-                        "loss {loss:?} (gate={loss_gate_open}, lone={lone_tail}) spent {total} datagrams, over the {BUDGET_DATAGRAMS}-slot budget"
-                    );
-                    assert!(
-                        total <= previous,
-                        "loss {loss:?} (gate={loss_gate_open}, lone={lone_tail}) spent {total} datagrams, more than a lower loss ({previous})"
-                    );
-                    previous = total;
-                    assert!(
-                        total * MESSAGE_WIRE_BYTES <= BUDGET_WIRE_BYTES,
-                        "the per-message wire must stay under the {BUDGET_WIRE_BYTES}-byte ceiling"
-                    );
-                }
+        for parity in [true, false] {
+            let mut previous = usize::MAX;
+            for step in 0..=100 {
+                let loss = Some(step as f64 / 100.0);
+                let copies = fresh_tail_armor_copies(loss, parity);
+                let total = PRIMARY + copies + usize::from(parity) * PARITY_SLOT;
+                assert!(
+                    total <= BUDGET_DATAGRAMS,
+                    "loss {loss:?} (parity={parity}) spent {total} datagrams, over the {BUDGET_DATAGRAMS}-slot budget"
+                );
+                assert!(
+                    total <= previous,
+                    "loss {loss:?} (parity={parity}) spent {total} datagrams, more than a lower loss ({previous})"
+                );
+                previous = total;
+                assert!(
+                    total * MESSAGE_WIRE_BYTES <= BUDGET_WIRE_BYTES,
+                    "the per-message wire must stay under the {BUDGET_WIRE_BYTES}-byte ceiling"
+                );
             }
         }
-        // The two lone low-loss compositions are exactly six slots: five
-        // copies when no parity trails, four copies plus the small parity when
-        // one does.  The pipelined low-loss composition is exactly two: the
-        // primary plus the lone-loss copy.
+        // The two low-loss compositions are exactly six slots: five copies
+        // when no parity trails, four copies plus the small parity when one
+        // does.
         assert_eq!(
-            PRIMARY + fresh_tail_armor_copies(None, false, true),
+            PRIMARY + fresh_tail_armor_copies(None, false),
             BUDGET_DATAGRAMS
         );
         assert_eq!(
-            PRIMARY + fresh_tail_armor_copies(None, true, true) + PARITY_SLOT,
+            PRIMARY + fresh_tail_armor_copies(None, true) + PARITY_SLOT,
             BUDGET_DATAGRAMS
         );
-        assert_eq!(PRIMARY + fresh_tail_armor_copies(None, false, false), 2);
     }
 }

@@ -858,16 +858,13 @@ mod tests {
     }
 
     /// A single-symbol interactive frame that follows earlier data symbols in
-    /// the SAME open FEC group still gets its fresh-tail armor duplicate: the
+    /// the SAME open FEC group still gets its fresh-tail armor duplicates: the
     /// whole-frame `frame_len` recognises it independently of the group's
     /// symbol count, so a co-located stream's preceding data cannot withhold
     /// the same-round-trip repair and force a full-RTT ARQ fall-through.  The
-    /// two-symbol leading frame fills the group first and, being the only
-    /// unacked data on the connection, is a *lone* tail and pays the six-slot
-    /// burst cover; the trailing message follows two unacked symbols, so it is
-    /// *pipelined*, pays the lone-loss cover, and its single duplicate reuses
-    /// the exact encoded symbol bytes.  Both tiers are pinned here so the
-    /// sparsity condition cannot silently collapse one into the other.
+    /// two-symbol leading frame fills the group first; the trailing message
+    /// then emits primary + five armor copies (the gate is closed, so no
+    /// parity trails) and the duplicates reuse the exact encoded symbol bytes.
     #[tokio::test]
     async fn interactive_single_symbol_frame_after_group_data_gets_armor() {
         use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
@@ -895,32 +892,25 @@ mod tests {
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
         let dg = recorder.lock().unwrap().datagrams();
-        // The leading frame's first symbol opens the group and is the only
-        // unacked packet, so it is a lone tail and pays the burst cover: its
-        // primary plus five duplicates.  Its remainder symbol is not a frame
-        // start (`frame_len` is `None`) and gets nothing.  The trailing whole
-        // single-symbol frame follows those two symbols in the same open group,
-        // so only the whole-frame `frame_len` rule can recognise it: it must
-        // still emit a repair datagram, now the lone-loss cover because two
-        // other packets are in flight behind it.
+        // The leading frame's first symbol is a fresh group and is armoured by
+        // the existing group-count rule; its remainder symbol is not a frame
+        // start (`frame_len` is `None`).  The trailing whole single-symbol
+        // frame follows those two symbols in the same open group, so only the
+        // whole-frame `frame_len` rule can recognise it: it must still emit
+        // primary + five armor copies (the gate is closed, so no parity trails).
         assert_eq!(
             dg.len(),
-            9,
-            "leading first symbol + five burst-cover copies + leading remainder + trailing primary + one lone-loss copy (got {} datagrams)",
+            13,
+            "leading first symbol + five copies + leading remainder + trailing primary + five copies (got {} datagrams)",
             dg.len()
         );
-        let leading_tail = &dg[..6];
-        for (index, duplicate) in leading_tail.iter().enumerate().skip(1) {
+        let trailing = &dg[dg.len() - 6..];
+        for (index, duplicate) in trailing.iter().enumerate().skip(1) {
             assert_eq!(
-                leading_tail[0], *duplicate,
-                "lone leading-frame armor duplicate {index} must reuse the exact encoded symbol bytes"
+                trailing[0], *duplicate,
+                "trailing-frame armor duplicate {index} must reuse the exact encoded symbol bytes"
             );
         }
-        let trailing_tail = &dg[dg.len() - 2..];
-        assert_eq!(
-            trailing_tail[0], trailing_tail[1],
-            "the pipelined trailing frame's lone-loss copy must reuse the exact encoded symbol bytes"
-        );
     }
 
     /// A fresh interactive single-symbol tail (the interactive FEC preset
