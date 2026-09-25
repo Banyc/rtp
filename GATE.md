@@ -79,8 +79,11 @@ comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
   Every scenario here is seeded (deterministic impairment) and finishes in a
   few seconds. This is the gate that runs on every `cargo test`.
 - **standard** — `#[ignore]`d, runs in well under a minute per target and
-  asserts a correctness or transport-floor property. Run with
-  `cargo test -p rtp -- --ignored --test-threads=1`.
+  asserts a correctness or transport-floor property. Run the target
+  explicitly, e.g. `cargo test --release -p rtp --test rtp_bufferbloat --
+  --ignored --nocapture --test-threads=1` (a bare `cargo test -p rtp --
+  --ignored` runs the whole opt-in inventory, including the `full` tier and
+  the 90-minute `longrun`).
 - **full** — `#[ignore]`d, minutes per target; still asserts a property, but
   too slow for the default gate. Run the target explicitly
   (`cargo test --release -p rtp --test rtp_burst_loss -- --ignored
