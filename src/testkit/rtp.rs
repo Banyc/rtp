@@ -344,6 +344,43 @@ pub async fn rtp_connect_max_diversity_via(
     (read, write)
 }
 
+/// [`rtp_connect_max_diversity_via`] with a caller-supplied metrics observer,
+/// so the max-diversity coverage scenario can assert the sender's FEC counters
+/// (parity emitted) as well as the delivered stream.  The connection config is
+/// identical to the observer-less helper's.
+pub async fn rtp_connect_max_diversity_with_observer_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    observer: crate::metrics::MetricsObserver,
+) -> (
+    crate::socket::AsyncReadAdapter,
+    crate::socket::AsyncWriteAdapter,
+) {
+    let connected = crate::udp::connect_with(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        crate::udp::ConnectConfig {
+            handshake: false,
+            fec: true,
+            fec_tuning: crate::FecTuning::max_diversity(),
+            metrics_observer: Some(observer),
+            ..crate::udp::ConnectConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let read = connected.read.into_async_read();
+    let write = connected.write.into_async_write();
+    let supervisor = connected.supervisor;
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let _ = supervisor.await;
+        }),
+    );
+    (read, write)
+}
+
 /// [`rtp_connect_with_mss_via`] with a caller-supplied metrics observer, so a
 /// scenario can capture the connection's transport-state snapshots (used by
 /// the mux bulk stall watchdog).  The supervisor is a non-required keepalive.
