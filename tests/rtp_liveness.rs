@@ -12,7 +12,7 @@
 //! Run the end-to-end tests with:
 //!
 //! ```sh
-//! cargo test -p rtp --test rtp_liveness rtp_fresh_sacks -- --ignored --exact --nocapture
+//! cargo test --release -p rtp --test rtp_liveness -- --ignored --nocapture --test-threads=1
 //! ```
 
 use std::time::{Duration, Instant};
@@ -292,7 +292,7 @@ fn rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive() {
 }
 
 #[test]
-#[ignore = "runs up to MAX_DURATION (65s) end-to-end; keep out of normal test builds (see module header)"]
+#[ignore = "runs up to its own 5s cap end-to-end with the shortened watchdog; keep out of normal test builds (see module header)"]
 fn rtp_permanent_hole_liveness_smoke() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

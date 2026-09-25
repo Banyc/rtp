@@ -12,6 +12,13 @@
 //! ```sh
 //! cargo test -p rtp --test rtp_fec
 //! ```
+//!
+//! The `max_diversity` coverage scenario in this file is `#[ignore]`d; run it
+//! with:
+//!
+//! ```sh
+//! cargo test --release -p rtp --test rtp_fec -- --ignored --nocapture --test-threads=1
+//! ```
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

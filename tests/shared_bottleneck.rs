@@ -9,6 +9,12 @@
 //! ```sh
 //! cargo test --test shared_bottleneck -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! `shared_bneck_fairness_longrun` is a separate order of magnitude: it runs
+//! `RTP_FAIR_LONGRUN_REPS` (default 3) repetitions of each of six
+//! configurations for `RTP_FAIR_LONGRUN_SECS` (default 300) each, about 90
+//! minutes of measured time by default.  `RTP_FAIR_CONFIGS`,
+//! `RTP_FAIR_LONGRUN_SECS` and `RTP_FAIR_LONGRUN_REPS` narrow it.
 
 #![allow(dead_code)]
 
@@ -1108,7 +1114,7 @@ async fn shared_bneck_reorder_tolerant_fairness() {
 /// Knobs: `RTP_FAIR_LONGRUN_SECS` (default 300), `RTP_FAIR_LONGRUN_REPS`
 /// (default 3), `RTP_FAIR_WINDOW_SECS` (default 20).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "long-run fairness measurement (multi-minute, real time); run with --ignored --nocapture --test-threads=1"]
+#[ignore = "long-run fairness measurement: 6 configurations x RTP_FAIR_LONGRUN_REPS (default 3) reps x RTP_FAIR_LONGRUN_SECS (default 300) each, about 90 minutes by default; run with --ignored --nocapture --test-threads=1"]
 async fn shared_bneck_fairness_longrun() {
     let total_run = Duration::from_secs(env_u64("RTP_FAIR_LONGRUN_SECS", 300));
     let reps = env_u64("RTP_FAIR_LONGRUN_REPS", 3);
