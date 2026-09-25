@@ -1355,6 +1355,197 @@ mod tests {
         }
     }
 
+    /// Lone-tail repair-deadline probe: the *production* request/response
+    /// shape.
+    ///
+    /// `probe_fresh_tail_burst_loss_latency` builds its connection
+    /// handshake-less, so its first flight has no RTT sample and its one
+    /// ~1 s echo is the initial `MIN_RTO`, not a lone-tail deadline.  This
+    /// probe seeds `initial_rtt` from the round trip (the production shape,
+    /// see `Connection`'s handshake sampling) so every repair it measures is
+    /// an RTT-estimated deadline, and lengthens the sender-to-receiver burst
+    /// past the six-datagram fresh-tail cover so a burst can wipe the cover
+    /// *and* the first tail-loss probe.
+    ///
+    /// Two arms isolate the lone tail's repair deadline at the deployment's
+    /// WAN scale (100 ms one way -> ~200 ms RTT):
+    ///
+    /// - `burst6`: the burst is exactly the cover, so the first tail-loss
+    ///   probe (PTO = 2*srtt) survives and the echo lands at ~2*srtt + RTT.
+    /// - `burst8`: the burst also eats that first probe, so the repair waits
+    ///   the second PTO at ~4*srtt + RTT — the ~1 s lone-tail episode the
+    ///   field reports.
+    ///
+    /// Prints the per-arm echo percentiles, the repair-path tail (every echo
+    /// with its message index), the armour-duplicate count, and the sender's
+    /// retransmission counters (`tail_probes` vs `rto_reason`) so the arm's
+    /// repair is attributable to the tail-loss probe or to the RTO.  Also
+    /// prints a `BURST_TRIANGLE` line naming the deadline the two arms imply:
+    /// the arm-to-arm max delta is the first PTO, so the second PTO follows.
+    /// Run with `--ignored --nocapture`.
+    ///
+    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "in-process lone-tail repair-deadline probe; ~45 s; run with --ignored --nocapture"]
+    async fn probe_lone_tail_repair_deadline_latency() {
+        use crate::metrics::MetricsSnapshot;
+        use crate::socket::socket;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
+        use crate::udp::testing::{
+            BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
+            wrap_fec_delayed_with_mss_and_fec_tuning,
+        };
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use std::time::Instant;
+
+        let msg_len = 256usize;
+        let n = 200usize;
+        let mss = 8192usize;
+        // A 100 ms one-way delay puts the round trip at the deployment's
+        // WAN-scale RTT, so the first and second PTOs are 400 ms and 800 ms
+        // and the double-PTO lone-tail episode lands at the ~1 s the field
+        // reports.
+        let owd = Duration::from_millis(100);
+        for (label, burst, quiet_min, quiet_max, seed) in [
+            ("burst6_owd100", 6usize, 26usize, 34usize, 0x5EED_0006u64),
+            ("burst8_owd100", 8usize, 26usize, 34usize, 0x5EED_0008u64),
+        ] {
+            let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+            let loss = BurstLoss::new(burst, quiet_min, quiet_max, seed);
+            let loss_sink = loss.clone();
+            let mut a_layer = wrap_fec_burst_delayed_with_mss_and_fec_tuning(
+                a.clone(),
+                a,
+                true,
+                mss,
+                FecTuning::interactive_prompt(),
+                loss,
+                owd,
+            );
+            // The production shape: the handshake seeds the estimator, so no
+            // arm here waits the initial `MIN_RTO` floor.
+            a_layer.initial_rtt = Some(owd * 2);
+            let observed: Arc<Mutex<Option<MetricsSnapshot>>> = Arc::new(Mutex::new(None));
+            let armor_duplicates = Arc::new(AtomicU64::new(0));
+            let sink = Arc::clone(&observed);
+            let armor_sink = Arc::clone(&armor_duplicates);
+            a_layer.metrics_observer =
+                Some(crate::metrics::MetricsObserver::new(move |observation| {
+                    if observation.event
+                        == crate::metrics::MetricsEvent::RetransmissionArmorDuplicate
+                    {
+                        armor_sink.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if let Some(snapshot) = observation.snapshot {
+                        *sink.lock().unwrap() = Some(snapshot);
+                    }
+                }));
+            let b_layer = wrap_fec_delayed_with_mss_and_fec_tuning(
+                b.clone(),
+                b,
+                true,
+                mss,
+                FecTuning::interactive_prompt(),
+                owd,
+            );
+            let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
+            let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
+            let mut echo_tasks = tokio::task::JoinSet::new();
+            echo_tasks.spawn(async move {
+                let mut buf = vec![0u8; msg_len];
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(3000), b_r.recv(&mut buf))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(len)) => {
+                            let _ = b_w.send(&buf[..len]).await;
+                        }
+                    }
+                }
+            });
+            let mut latencies = Vec::with_capacity(n);
+            let mut tail: Vec<(usize, u128)> = Vec::new();
+            let mut timeouts = 0usize;
+            for i in 0..n {
+                let mut msg = vec![(i % 251) as u8; msg_len];
+                msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let started = Instant::now();
+                let _ = tokio::time::timeout(Duration::from_secs(3), a_w.send(&msg)).await;
+                let mut echo_buf = vec![0u8; msg_len];
+                let mut matched = None;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(3), a_r.recv(&mut echo_buf))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) => break,
+                        Ok(Ok(_)) => {
+                            if echo_buf[..4] == msg[..4] {
+                                matched = Some(started.elapsed());
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            timeouts += 1;
+                            break;
+                        }
+                    }
+                }
+                if let Some(latency) = matched {
+                    latencies.push(latency);
+                    if latency > Duration::from_millis(250) {
+                        tail.push((i, latency.as_millis()));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            drop(a_w);
+            drop(a_r);
+            let _ = tokio::time::timeout(Duration::from_secs(5), echo_tasks.join_next()).await;
+            latencies.sort_unstable();
+            let pick = |q: f64| -> Duration {
+                if latencies.is_empty() {
+                    return Duration::ZERO;
+                }
+                let idx = ((latencies.len() - 1) as f64 * q).round() as usize;
+                latencies[idx]
+            };
+            let count_gt = |ms: u64| {
+                latencies
+                    .iter()
+                    .filter(|latency| **latency > Duration::from_millis(ms))
+                    .count()
+            };
+            let snapshot = *observed.lock().unwrap();
+            let counters = snapshot.map(|snapshot| snapshot.retransmission_counters);
+            eprintln!("[probe lone-tail {label}] first-PTO tail (msg, ms) {tail:?}");
+            eprintln!(
+                "[probe lone-tail {label}] samples={} timeouts={} gt90ms={} gt150ms={} gt300ms={} gt600ms={} p50={:?} p90={:?} p99={:?} max={:?} armor_duplicates={} dropped={} counters={counters:?}",
+                latencies.len(),
+                timeouts,
+                count_gt(90),
+                count_gt(150),
+                count_gt(300),
+                count_gt(600),
+                pick(0.50),
+                pick(0.90),
+                pick(0.99),
+                latencies.last().copied().unwrap_or_default(),
+                armor_duplicates.load(AtomicOrdering::Relaxed),
+                loss_sink.dropped(),
+            );
+        }
+        eprintln!(
+            "[probe lone-tail BURST_TRIANGLE] burst6 (cover wiped, first PTO survives) vs burst8 \
+             (cover and first PTO wiped): the max delta between the arms is the first PTO \
+             (2*srtt); the burst8 max is the second (4*srtt) plus one RTT."
+        );
+    }
+
     /// Efficiency-frontier probe for the interactive fresh-tail armor.
     ///
     /// One request/response cell of the 256-byte / 25 ms interactive stream

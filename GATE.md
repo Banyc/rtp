@@ -47,6 +47,7 @@ opt-in sets are recorded here and machine-checked:
   cargo test --release -p rtp --lib -- --ignored probe_single_symbol_interactive_fec_repair
   cargo test --release -p rtp --lib -- --ignored probe_fresh_tail_armor_latency
   cargo test --release -p rtp --lib -- --ignored probe_fresh_tail_burst_loss_latency
+  cargo test --release -p rtp --lib -- --ignored probe_lone_tail_repair_deadline_latency
   cargo test --release -p rtp --lib -- --ignored probe_armor_copy_cell
   ```
 
@@ -133,6 +134,19 @@ not a magic constant; the harness never restates one.
    same mandate under a queue-bound bottleneck: the topology's one-way delay
    floor (20 ms) plus the bottleneck queue-residence (256-packet limit at
    10 Mbit/s) and a repair margin ⇒ p50 ≤ 800 ms.
+
+   The lone tail's *repair deadline* is measured report-only by
+   `probe_lone_tail_repair_deadline_latency`, which seeds the RTT estimate
+   from the handshake (the production shape, unlike
+   `probe_fresh_tail_burst_loss_latency`, whose handshake-less construction
+   makes its one ~1 s echo the initial `MIN_RTO`) and sweeps a burst that is
+   exactly the six-datagram fresh-tail cover versus one that also eats the
+   first tail-loss probe.  The two arms bracket the deadline: the first
+   repairs at the first PTO (`2*srtt + RTT`), the second at the second
+   (`4*srtt + RTT`) and, once the cover is gone, at every subsequent
+   `TAIL_PROBED_MIN_RTO` rung — the multi-rung episode the field reports as
+   one to three seconds.  No bound is asserted here: the bars above are the
+   mandate's, and this probe attributes which of them a regression moves.
 2. **Reasonable goodput of the interactive lane** — the lane delivers what it
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,
@@ -186,6 +200,7 @@ src/recv_queue/pkt_recv_space.rs::withholding_frames_behind_a_hole_costs_no_more
 src/socket/stream.rs::probe_armor_copy_cell = probe
 src/socket/stream.rs::probe_fresh_tail_armor_latency = probe
 src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = probe
+src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = probe
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = probe
 src/traffic_shaping/recovery/pkt_send_space.rs::applying_many_sacks_remains_linear_in_the_send_window = perf-lane
 src/traffic_shaping/recovery/rtx_index.rs::deferred_loss_cancellation_does_not_rescan_the_pending_set = perf-lane
