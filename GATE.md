@@ -151,6 +151,17 @@ not a magic constant; the harness never restates one.
      `rtp_bufferbloat` precedent for the shape of a capacity-relative floor,
      plus zero overflow drops (the 256-packet queue exceeds the in-flight
      bound) and a bounded c2s queue depth.
+   - `rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe`
+     (opt-in `full`): on the perf battery's `deterministic-iid-loss-fat-pipe`
+     topology (100 Mbit/s, 150 ms OWD, 16k queue, 8192-byte MSS, ~1 % seeded
+     iid loss), the loss arm must keep
+     `MIN_IID_LOSS_VS_LOSS_FREE_RATIO = 0.85` of a concurrently measured
+     loss-free arm on the identical topology, with each arm above a 1 MiB/s
+     anti-stall floor. Stock aggregate 0.985-1.017 (per-rep 0.972-1.035 over
+     two 3-rep x 20 s runs after a 40 s convergence warmup); the guard-drop
+     fast-loss re-fire collapses it to 0.775. The burst-vs-random ratio above cannot see this
+     shape: it compares two *impaired* arms, so a collapse common to both
+     leaves its ratio at ~1.0.
    - `rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random`
      (opt-in `full`): burst-loss bulk must not collapse below
      `MIN_BURST_VS_RANDOM_RATIO = 0.60` of the same-rate random-loss baseline
@@ -180,6 +191,7 @@ src/traffic_shaping/recovery/pkt_send_space.rs::applying_many_sacks_remains_line
 src/traffic_shaping/recovery/rtx_index.rs::deferred_loss_cancellation_does_not_rescan_the_pending_set = perf-lane
 tests/rtp_bufferbloat.rs::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 tests/rtp_burst_loss.rs::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
+tests/rtp_burst_loss.rs::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe = full
 tests/rtp_burst_loss.rs::rtp_sparse_message_tail_latency_under_burst_loss = full
 tests/rtp_fec.rs::rtp_max_diversity_fec_covers_single_packet_messages_under_loss = standard
 tests/rtp_gentle.rs::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains = standard
@@ -213,6 +225,7 @@ hol_verify4::v4_clean_rawbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
+rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe = full
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss = full
 rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss = standard
 rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains = standard
@@ -268,6 +281,7 @@ shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
+rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss
 rtp_clean::rtp_over_netem_clean_link_delivers_400kib
 rtp_clean::rtp_over_netem_clean_link_delivers_data
