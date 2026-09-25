@@ -18,9 +18,10 @@ The in-crate (`src/`) inventory has one of two honest classifications:
   and (b) the test body to still contain an assertion token. A perf lane that
   loses its assertion has silently stopped being a gate and is an error.
 - `probe` — a *report-only* measurement probe: it prints counters or latency
-  summaries and asserts nothing. The checker requires its body to contain no
-  assertion token, so a probe cannot silently grow a check under the ignore
-  flag (the same class of hole the netem_test gate closes for its `perf` tier).
+  summaries and asserts nothing. The checker requires no assertion token to be
+  reachable from its body — in the body itself or through a helper defined in
+  the same file — so a probe cannot silently grow a check under the ignore flag
+  (the same class of hole the netem_test gate closes for its `perf` tier).
 
 The relocated scenario targets (`tests/`) keep the harness tier vocabulary:
 
@@ -33,7 +34,17 @@ The relocated scenario targets (`tests/`) keep the harness tier vocabulary:
   followed, so it cannot silently supply the assertion.
 - `perf` — a *report-only* scenario (A/B bench, measurement). The checker
   requires its body to contain no assertion token, so a check cannot hide
-  under the report-only tier.
+  under the report-only tier. The helper reach of this tier is *not* left to
+  this file's own-body scan: the shared scenario gate
+  (`netem_test/tools/check-gate.py`) follows the call graph from every `perf`
+  scenario and requires each asserting helper it reaches to be declared in
+  the crate's `gate-perf-guard-helpers` block.
+
+The classification also fixes the tier a test belongs to: `perf-lane` and
+`probe` are the in-crate (`src/`) ignored set, `standard`/`full`/`perf` are the
+relocated scenario targets under `tests/`. A manifest entry that crosses that
+split is an error, so a scenario cannot be filed under an in-crate tier (and
+vice versa) and escape the tier's rules.
 
 Files under `fuzz/`, `examples/`, and `local/` are not scanned (besides
 `tests/`, the opt-in inventory is the in-crate `src/` set). The
@@ -59,8 +70,11 @@ TESTS = REPO / "tests"
 # `perf-lane`/`probe` classify the in-crate (`src/`) ignored tests;
 # `standard`/`full`/`perf` are the scenario tiers for the relocated
 # `tests/` targets and use the same names as the netem_test scenario gate.
+# The split is enforced: a manifest entry whose classification does not match
+# the tree its path lives under is an error.
 CLASSIFICATIONS = {"perf-lane", "probe", "standard", "full", "perf"}
-ASSERTING_CLASSIFICATIONS = {"perf-lane", "standard", "full"}
+IN_CRATE_CLASSIFICATIONS = {"perf-lane", "probe"}
+SCENARIO_CLASSIFICATIONS = {"standard", "full", "perf"}
 ASSERTION_TOKENS = re.compile(
     r"(debug_assert_ne!|debug_assert_eq!|debug_assert!|assert_ne!|assert_eq!|assert!|panic!|unreachable!)"
 )
@@ -168,6 +182,27 @@ def local_functions(text: str) -> dict[str, str]:
     return found
 
 
+def reached_assertions(body: str, functions: dict[str, str]) -> set[str]:
+    """Every assertion token ``body`` or a transitively called local function
+    contains.
+
+    Only functions defined in the same scanned file are followed, so a call
+    whose callee lives outside it cannot silently supply the token.
+    """
+    seen: set[str] = set()
+    found: set[str] = set()
+    stack = [body]
+    while stack:
+        current = stack.pop()
+        found.update(ASSERTION_TOKENS.findall(current))
+        for call in CALL_RE.finditer(current):
+            name = call.group(1).rsplit("::", 1)[-1]
+            if name in functions and name not in seen:
+                seen.add(name)
+                stack.append(functions[name])
+    return found
+
+
 def reaches_assertion(body: str, functions: dict[str, str]) -> bool:
     """True when ``body`` or a transitively called local function asserts.
 
@@ -177,18 +212,7 @@ def reaches_assertion(body: str, functions: dict[str, str]) -> bool:
     defined in the same scanned file are followed, so a call whose callee
     lives outside it cannot silently supply the token.
     """
-    seen: set[str] = set()
-    stack = [body]
-    while stack:
-        current = stack.pop()
-        if ASSERTION_TOKENS.search(current):
-            return True
-        for call in CALL_RE.finditer(current):
-            name = call.group(1).rsplit("::", 1)[-1]
-            if name in functions and name not in seen:
-                seen.add(name)
-                stack.append(functions[name])
-    return False
+    return bool(reached_assertions(body, functions))
 
 
 def ignored_tests() -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
@@ -238,6 +262,21 @@ def main() -> int:
     for name, classification in sorted(manifest.items()):
         if name not in actual:
             continue
+        in_crate = name.startswith("src/")
+        if classification in IN_CRATE_CLASSIFICATIONS and not in_crate:
+            print(
+                f"{classification} {name} is not an in-crate test: `perf-lane` and "
+                f"`probe` classify the ignored tests under `src/` "
+                f"(reclassify as standard/full/perf)"
+            )
+            bad = True
+        if classification in SCENARIO_CLASSIFICATIONS and in_crate:
+            print(
+                f"{classification} {name} is not a `tests/` scenario target: "
+                f"`standard`, `full` and `perf` classify the relocated scenario tiers "
+                f"(reclassify as perf-lane/probe)"
+            )
+            bad = True
         reason, body = actual[name]
         tokens = ASSERTION_TOKENS.findall(body)
         if classification == "perf-lane":
@@ -254,11 +293,14 @@ def main() -> int:
                 )
                 bad = True
         elif classification == "probe":
-            if tokens:
+            rel = name.rsplit("::", 1)[0]
+            reached = reached_assertions(body, functions.get(rel, {}))
+            if reached:
                 print(
-                    f"probe {name} contains assertion token(s) "
-                    f"({', '.join(sorted(set(tokens)))}): a report-only probe must "
-                    f"assert nothing (reclassify as perf-lane or remove the assertion)"
+                    f"probe {name} reaches assertion token(s) "
+                    f"({', '.join(sorted(reached))}): a report-only probe must "
+                    f"assert nothing, in its body or through a same-file helper "
+                    f"(reclassify as perf-lane or remove the assertion)"
                 )
                 bad = True
         elif classification in ("standard", "full"):
