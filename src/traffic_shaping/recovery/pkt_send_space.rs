@@ -4178,6 +4178,39 @@ mod tests {
         );
     }
 
+    /// A full send window plus the SACK blocks of one ACK that partitions the
+    /// upper half of that window into `num_blocks` adjacent blocks.  The
+    /// covered span is the same for every block count, so measurements built
+    /// on this differ only in the block structure of the ACK.
+    fn full_window_with_sack_blocks(
+        num_blocks: usize,
+    ) -> (
+        PktSendSpace,
+        SequenceNumber,
+        u64,
+        Vec<crate::ack::AckInterval>,
+    ) {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        for _ in 0..crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS {
+            send_packet(&mut space, t0);
+        }
+        let send_start = space.send_wnd.start();
+        let sent_span = space.send_wnd.len() as u64;
+        let region_start = sent_span / 2;
+        let region_len = sent_span - region_start;
+        let block_size = region_len / num_blocks as u64;
+        let mut balls = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks as u64 {
+            let start = send_start.advance(region_start + i * block_size);
+            balls.push(crate::ack::AckInterval {
+                start,
+                size: std::num::NonZeroU64::new(block_size.max(1)).unwrap(),
+            });
+        }
+        (space, send_start, sent_span, balls)
+    }
+
     fn sack_apply_cost(num_blocks: usize) -> f64 {
         // One timing pass: a full send window, then one ack carrying
         // `num_blocks` adjacent SACK blocks over the upper half of the
@@ -4185,23 +4218,7 @@ mod tests {
         let mut best = f64::MAX;
         for _ in 0..3 {
             let t0 = Instant::now();
-            let mut space = PktSendSpace::new();
-            for _ in 0..crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS {
-                send_packet(&mut space, t0);
-            }
-            let send_start = space.send_wnd.start();
-            let sent_span = space.send_wnd.len() as u64;
-            let region_start = sent_span / 2;
-            let region_len = sent_span - region_start;
-            let block_size = region_len / num_blocks as u64;
-            let mut balls = Vec::with_capacity(num_blocks);
-            for i in 0..num_blocks as u64 {
-                let start = send_start.advance(region_start + i * block_size);
-                balls.push(crate::ack::AckInterval {
-                    start,
-                    size: std::num::NonZeroU64::new(block_size.max(1)).unwrap(),
-                });
-            }
+            let (mut space, send_start, _, balls) = full_window_with_sack_blocks(num_blocks);
             let recved = crate::ack::AckBlocks::new(send_start, &balls);
             let mut acked = Vec::new();
             let start = Instant::now();
@@ -4211,15 +4228,120 @@ mod tests {
         best
     }
 
+    /// Time only the ACK analysis: the block-matching pass over the unacked
+    /// prefix plus the selective-evidence pass.  The whole-call bound in
+    /// [`sack_apply_cost`] cannot see a block-linear regression in the
+    /// analysis: the `ack` call is dominated by the per-acked-packet
+    /// application loop, and the covered span (hence the acked count) is the
+    /// same for every block count.  This measurement isolates the pass whose
+    /// cost is supposed to stay flat in the block count.
+    fn sack_analysis_cost(num_blocks: usize) -> f64 {
+        let (_space, send_start, sent_span, balls) = full_window_with_sack_blocks(num_blocks);
+        // `PktSendSpace::ack` hands the analysis the occupied prefix of the
+        // send window; every sent packet here is still unacked, so that is the
+        // whole window.
+        let unacked: Vec<SequenceNumber> = (0..sent_span)
+            .map(|offset| send_start.advance(offset))
+            .collect();
+        let recved = crate::ack::AckBlocks::new(send_start, &balls);
+        let mut block_offsets = Vec::new();
+        let mut acked = Vec::new();
+        let mut sacked_above = Vec::new();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let prepared = recved.prepare(send_start, sent_span, &mut block_offsets);
+            recved.analyze_prepared(
+                prepared,
+                send_start,
+                &unacked,
+                &block_offsets,
+                &mut acked,
+                &mut sacked_above,
+            );
+            best = best.min(start.elapsed().as_nanos() as f64);
+        }
+        std::hint::black_box((&acked, &sacked_above));
+        best
+    }
+
+    /// The `(start, end)` forward-offset ranges of the SACK blocks
+    /// [`full_window_with_sack_blocks`] builds, in the same order.
+    fn sack_block_offsets(num_blocks: usize, sent_span: u64) -> Vec<(u64, u64)> {
+        let region_start = sent_span / 2;
+        let region_len = sent_span - region_start;
+        let block_size = region_len / num_blocks as u64;
+        (0..num_blocks as u64)
+            .map(|i| {
+                let start = region_start + i * block_size;
+                (start, start + block_size)
+            })
+            .collect()
+    }
+
+    /// A deliberately quadratic-in-blocks reference for the block-matching
+    /// pass: the same matches, computed by rescanning the whole SACK block
+    /// list for every unacked sequence.  That is the shape the analysis takes
+    /// when the monotone block cursor is dropped, so timing it calibrates the
+    /// assertion below against this host rather than against an absolute time.
+    fn sack_analysis_quadratic_reference(num_blocks: usize) -> f64 {
+        let (_space, send_start, sent_span, _balls) = full_window_with_sack_blocks(num_blocks);
+        let unacked: Vec<SequenceNumber> = (0..sent_span)
+            .map(|offset| send_start.advance(offset))
+            .collect();
+        let blocks = sack_block_offsets(num_blocks, sent_span);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let mut matched = 0u64;
+            let start = Instant::now();
+            for &seq in &unacked {
+                let offset = send_start.forward_distance_to(seq);
+                matched += blocks
+                    .iter()
+                    .filter(|(block_start, block_end)| {
+                        *block_start <= offset && offset < *block_end
+                    })
+                    .count() as u64;
+            }
+            best = best.min(start.elapsed().as_nanos() as f64);
+            std::hint::black_box(matched);
+        }
+        best
+    }
+
     #[test]
-    #[ignore = "perf lane: wall-clock ns/ack ratio; run with cargo test --release -- --ignored"]
+    #[ignore = "perf lane: wall-clock ns/ack and ns/ack-analysis ratios; run with cargo test --release -- --ignored"]
     fn applying_many_sacks_remains_linear_in_the_send_window() {
         let one = sack_apply_cost(1);
         let many = sack_apply_cost(MAX_ACK_BLOCKS);
+        let analysis_one = sack_analysis_cost(1);
+        let analysis_many = sack_analysis_cost(MAX_ACK_BLOCKS);
+        let quadratic_reference = sack_analysis_quadratic_reference(MAX_ACK_BLOCKS);
+        eprintln!(
+            "SACK block-count scaling: whole ack {one:.0} -> {many:.0} ns; analysis {analysis_one:.0} -> {analysis_many:.0} ns; quadratic-in-blocks reference {quadratic_reference:.0} ns (1 vs {MAX_ACK_BLOCKS} blocks)"
+        );
         assert!(
             many < one * 16.0,
             "{many:.1} ns/ack with {MAX_ACK_BLOCKS} SACK blocks against {one:.1} ns with one over a full {} packet window: the per-ack cost grows with the number of blocks",
             crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
+        );
+        // The whole-`ack` bound above cannot see a block-linear regression in
+        // the ACK analysis: that call is dominated by the per-acked-packet
+        // application loop, whose size is the same for every block count (the
+        // SACK blocks partition one covered span).  This bound measures the
+        // analysis alone, the pass whose cost must stay flat in the number of
+        // blocks.
+        assert!(
+            analysis_many < analysis_one * 8.0,
+            "{analysis_many:.1} ns for the ACK analysis with {MAX_ACK_BLOCKS} SACK blocks against {analysis_one:.1} ns with one over the same {} packet unacked prefix: the block-matching pass grows with the number of blocks",
+            crate::recv_queue::pkt_recv_space::MAX_NUM_RECVING_PKTS,
+        );
+        // The same-host quadratic reference is the calibrated form of the same
+        // bound: dropping the monotone block cursor drives the analysis towards
+        // it, while a loaded host moves both measurements together.
+        assert!(
+            analysis_many < quadratic_reference * 0.5,
+            "{analysis_many:.1} ns for the ACK analysis with {MAX_ACK_BLOCKS} SACK blocks is not materially below the {quadratic_reference:.1} ns block-rescanning reference: the block-matching pass rescans the SACK block list per sequence"
         );
     }
 
