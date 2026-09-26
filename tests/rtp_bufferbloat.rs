@@ -179,6 +179,16 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
             );
             eprintln!("[rtp_bufferbloat] max_queue={max_queue} stats={stats:?}");
 
+            // `MAX_QUEUE_FLOOR` is the link's own `queue_limit_pkts` and the
+            // harness tail-drops at `len() >= queue_limit_pkts`, so the
+            // observable maximum is 255: that bound restates the limit the
+            // instrument is configured with rather than bounding the build.
+            // Do not "fix" it by lowering the floor or by adding an arm at a
+            // smaller `queue_limit_pkts` — an existing bound is frozen. The
+            // invariant this arm can still prove is that the sampler ran: a
+            // zero maximum means the observation never happened, which would
+            // leave the bound below passing vacuously.
+            assert!(max_queue > 0, "the queue sampler never ran");
             assert!(
                 max_queue <= MAX_QUEUE_FLOOR,
                 "max c2s queue {max_queue} > {MAX_QUEUE_FLOOR}"
