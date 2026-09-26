@@ -3,7 +3,7 @@
 //! The dual-lane `DualMux` architecture intends its bulk lane to be a full
 //! `mux` session over its own `rtp` connection. These report-only probes
 //! measure the raw `rtp` bulk lane on identically-seeded netem links; the mux
-//! bulk-lane arms live in the owning crate (`mux/tests/hol_verify4.rs`,
+//! bulk-lane arms live in the owning crate (`rtp_mux/tests/hol_verify4.rs`,
 //! `v4_clean_muxbulk` / `v4_ge5_muxbulk`), so each crate owns its half of the
 //! A/B comparison and the links stay reproducible from the seeds.
 //!

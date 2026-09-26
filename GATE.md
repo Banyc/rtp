@@ -81,7 +81,7 @@ The relocated `tests/` set is: the earlier `rtp_bufferbloat`, `rtp_burst_loss`,
 `rtp_fec`, `rtp_gentle`, `rtp_liveness`, `rtp_loss`, `rtp_mss` and
 `rtp_padding_bench` suites, plus the raw-`rtp` arms of the DualMux-v4 A/B
 comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
-`mux/tests/hol_verify4.rs`) and the shared-bottleneck fairness/latency battery
+`rtp_mux/tests/hol_verify4.rs`) and the shared-bottleneck fairness/latency battery
 (`shared_bottleneck.rs`, which drives `rtp` flows through a shared
 `BottleneckShaper`).
 
