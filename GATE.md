@@ -47,6 +47,17 @@ opt-in sets are recorded here and machine-checked:
   assertion there would be a flake source, not a signal. The checker keeps
   them honest — a perf lane whose body loses its assertion token, or whose
   reason stops documenting the run command, is an error.
+
+  The four perf lanes are the in-crate asserting opt-in tests, so they are also
+  rows of the perf declaration below, at the `standard` tier. `standard` is the
+  harness's tier for an *asserting* opt-in test, and the block cannot be given
+  the crate's own tier name: `check-gate.py` resolves an `#[ignore]`d `lib`
+  row to `perf`, which this file reserves for report-only measurement, and it
+  body-scans a `perf` tier entry for assertion tokens — so tiering an asserting
+  `lib` row `perf` would fail the gate rather than classify it. The mapping is
+  `perf-lane` (this file's classification) = `standard` (the harness tier), and
+  the two names describe the same tests: the four whose `#[ignore]` reasons say
+  `perf lane`.
 - **probe** — a *self-validating, report-only* in-process measurement probe:
   it prints the sender parity/gate counters, echo-latency percentiles, or
   repair-path classification, and asserts **its own measurement's integrity** —
@@ -65,6 +76,7 @@ opt-in sets are recorded here and machine-checked:
   cargo test --release -p rtp --lib -- --ignored probe_fresh_tail_burst_loss_latency
   cargo test --release -p rtp --lib -- --ignored probe_lone_tail_repair_deadline_latency
   cargo test --release -p rtp --lib -- --ignored probe_lone_tail_repair_ladder
+  cargo test --release -p rtp --lib -- --ignored probe_lone_tail_finite_loss_ladder
   cargo test --release -p rtp --lib -- --ignored probe_armor_copy_cell
   ```
 
@@ -77,10 +89,11 @@ opt-in sets are recorded here and machine-checked:
   visible in this file), and when the block names a test that is not a probe.
 
 The whole in-crate opt-in battery is `cargo test --release -p rtp --lib --
---ignored`; the six probes' own `#[ignore]` reasons sum to ~388 s (~6.5
-minutes), plus a few seconds for the four perf lanes. Neither that sum nor any
-single probe has been measured: the perf declaration below cites those reasons
-and records the measurement itself as a gap.
+--ignored`; the seven probes' own `#[ignore]` reasons sum to ~389 s (~6.5
+minutes), and the four perf lanes are declared in the perf block below with
+measured costs rather than cited ones. The 389 s is the sum of the probes'
+own `#[ignore]` reasons; the perf block cites each probe at the figure its
+reason states.
 
 ## Scenario gate tiers
 
@@ -119,8 +132,8 @@ comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
   they do not assert a gate floor (the padding distribution/ACK-hiding floors
   they touch are asserted by the default-tier padding tests). A `perf`
   scenario must not contain an assertion in its own body, nor reach an
-  assertion through a helper: `check-gate.py --crate . rtp` fails with the
-  scenario name, its file, and the token if it does.
+  assertion through a helper: `check-gate.py --crate . rtp tests GATE.md`
+  fails with the scenario name, its file, and the token if it does.
 - **standard** / **full** asserting scenarios may keep their assertion in a
   helper defined in the same target file (the shared-bottleneck `full` arms
   assert inside `rr_under_bulk_ab`); `tools/check-ignored.py` follows those
@@ -593,8 +606,10 @@ negative-control deadline against an admission measured at 0.67-1.46 ms, and
 100 ms now bounds it. The two session-bounds rows that stood at 3.00 s each in
 the list above now cost 0.01 s each: each wait was the bound it asserts, driven
 by a paused runtime clock. Second, the in-crate opt-in battery is **not** "about
-four minutes" — the six probes' own `#[ignore]` reasons sum to ~388 s — and
-neither figure has been measured, which is recorded as a gap below.
+four minutes" — the seven probes' own `#[ignore]` reasons sum to ~389 s —
+which is what the perf block cites for them, and that sum has not been measured
+as such. (The four perf lanes are not part of it: their rows' costs are
+measured, not cited, and are recorded in the `perf-lane` family below.)
 
 **Neither FEC decoder-fuzz row is a single-test target, and neither cost is
 recoverable by shortening.** Both rows are two of the 721 tests in the `--lib`
@@ -661,21 +676,33 @@ No cost below is invented; each is one of two things.
   isolated measurement and confirmed by the serialized pass (1.92 s and 1.93 s
   against 1.88 s and 1.87 s), because a CPU-bound row's contended time is the
   other tests' cost as much as its own.
+- **measured, release** — the four `perf-lane` rows are asserting opt-in rows
+  whose `#[ignore]` reasons state no wall clock, so they cannot be cited: each
+  cost is the max of three serialized reps of the test binary the gate itself
+  built, run directly with libtest's `--report-time` (`RUSTC_BOOTSTRAP=1 -Z
+  unstable-options` at runtime, a flag gate rather than a different build) in
+  **release**, the mode the ratio is meaningful in. Measured `advancing_the_receive_window_costs_no_more_per_packet`
+  0.001 s, `withholding_frames_behind_a_hole_costs_no_more_per_pop` 0.002 s,
+  `applying_many_sacks_remains_linear_in_the_send_window` 0.103 s and
+  `deferred_loss_cancellation_does_not_rescan_the_pending_set` 0.041 s at load
+  average 1.98-2.84 on 10 cores; the two sub-grain rows are declared at the
+  0.01 s grain like the default-tier ones.
 - **cited** — an opt-in row's cost is the wall clock its own `#[ignore]`
   reason states: `probe_single_symbol_interactive_fec_repair` ~45 s,
   `probe_fresh_tail_armor_latency` ~25 s,
   `probe_fresh_tail_burst_loss_latency` ~145 s,
   `probe_lone_tail_repair_deadline_latency` ~2.7 min (162 s),
   `probe_armor_copy_cell` ~10 s for its one cell,
-  `probe_lone_tail_repair_ladder` <1 s (1 s), and the two standard-tier
+  `probe_lone_tail_repair_ladder` <1 s (1 s),
+  `probe_lone_tail_finite_loss_ladder` <1 s (1 s), and the two standard-tier
   liveness arms 65 s and 5 s.
 
 A row whose wall clock appears in no document *and* was not measured is not
 given a number: it is recorded as a gap below, so an unmeasured cost is
 visibly pending instead of plausibly guessed.
 
-The declared sums are `default` 14.30 s of a 60 s budget, `standard` 70 s of
-300 s, `perf` 388 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
+The declared sums are `default` 14.30 s of a 60 s budget, `standard` 70.18 s of
+300 s, `perf` 389 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
 declared so a later row cannot be added without one — `full` is the tier the
 ~90-minute `shared_bneck_fairness_longrun` lives in.
 
@@ -697,9 +724,14 @@ shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = 
 rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard | 5 | composite(impairment,metric,scale)@liveness | transport-liveness@impairment=permanent-mtu-hole+metric=connection-liveness+layer=rtp+scale=short-watchdog
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard | 65 | composite(fresh-sacks,impairment,metric)@liveness | transport-liveness@impairment=permanent-mtu-hole+fresh-sacks=on+metric=connection-liveness+layer=rtp
+lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet = standard | 0.01 | baseline@perf-lane | op-cost-scaling@layer=recv-window+metric=in-order-advance+scale=two-point
+lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_no_more_per_pop = standard | 0.01 | orthogonal@perf-lane | op-cost-scaling@layer=recv-window+metric=withheld-pop+scale=two-point
+lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window = standard | 0.11 | composite(layer,metric)@perf-lane | op-cost-scaling@layer=send-window+metric=sack-analysis+scale=two-point
+lib::traffic_shaping::recovery::rtx_index::tests::deferred_loss_cancellation_does_not_rescan_the_pending_set = standard | 0.05 | composite(layer,metric)@perf-lane | op-cost-scaling@layer=rtx-index+metric=indexed-cancel+scale=two-point
 lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder = default | 1.88 | baseline@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
 lib::traffic_shaping::redundancy::fec::tests::a_guarded_hostile_datagram_never_panics_the_fec_decoder = default | 1.87 | re-measurement(direct-decoder-path-bypasses-catch-unwind-so-a-panicking-hostile-datagram-fails-the-test-instead-of-being-counted-malformed)@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
 lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder = perf | 1 | baseline@probe | probe-ladder@impairment=jitter+metric=rung-spacing+layer=rtp+scale=4-arms
+lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_finite_loss_ladder = perf | 1 | composite(impairment,metric,scale)@probe | probe-ladder@impairment=burst-loss+metric=finite-burst-cost+layer=rtp+scale=2-rtt-2-cover-8-burst
 lib::socket::stream::tests::probe_fresh_tail_armor_latency = perf | 25 | composite(impairment,metric)@probe | probe-armor@impairment=clean+metric=armour-latency+layer=rtp
 lib::socket::stream::tests::probe_fresh_tail_burst_loss_latency = perf | 145 | composite(handshake,impairment,metric)@probe | probe-armor@impairment=burst-loss+metric=armour-latency+layer=rtp+handshake=none
 lib::socket::stream::tests::probe_single_symbol_interactive_fec_repair = perf | 45 | composite(fec,impairment,metric)@probe | probe-fec@impairment=loss+metric=repair-latency+layer=rtp+fec=on
@@ -709,20 +741,22 @@ lib::socket::stream::tests::probe_armor_copy_cell = perf | 10 | composite(impair
 
 ### The families
 
-Six references cover the declared subset. The **residual** (default) family is
+Seven references cover the declared subset. The **residual** (default) family is
 the always-run transport floors, stated against the clean-link byte-exact
 delivery point; two of its rows are one dimension away from it (`scale`, and
 `mss`) and the rest are labelled with the dimensions they actually move, which
 is the honest reading of pre-existing arms that were never built as a
-one-axis set. The five named families each carry their own reference:
+one-axis set. The six named families each carry their own reference:
 `padding` (wire-shape at one 256 KiB transfer), `contested` (the
 shared-bottleneck instrument's own sanity pair, one dimension apart),
 `liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
 hostile-datagram FEC decoder fuzz pair, a deliberate repeat through the
-unguarded path) and `probe` (the six report-only repair-latency instruments).
-The bulk of the declared rows are `composite` because the arms genuinely vary
-several dimensions at once — labelling them orthogonal would be the confound
-the mandate exists to prevent.
+unguarded path), `probe` (the seven report-only repair-latency instruments) and
+`perf-lane` (the four asserting in-crate scaling gates: one reference, the
+in-order receive-window advance, and the three rows that vary one or two
+dimensions from it). The bulk of the declared rows are `composite` because the
+arms genuinely vary several dimensions at once — labelling them orthogonal
+would be the confound the mandate exists to prevent.
 
 The `padding` family's fitted-ACK arm is the one row whose cost fell without a
 retune: its 24 trials x 2 arms x 256 KiB are now pooled with two transfers in
@@ -755,11 +789,13 @@ baseline.contested = shared_bottleneck::a_slow_reply_resynchronizes_instead_of_e
 baseline.liveness = rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets
 baseline.decoder-fuzz = lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder
 baseline.probe = lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder
+baseline.perf-lane = lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet
 members.padding = padding-wire
 members.contested = contested-instrument
 members.liveness = transport-liveness
 members.decoder-fuzz = decoder-fuzz
 members.probe = probe-*
+members.perf-lane = op-cost-scaling
 drift = 0.5
 drift_floor_s = 2.0
 ```
@@ -780,7 +816,6 @@ attribution@baseline-family=gentle = rtp_gentle::gentle_mode_exits_via_gate_open
 attribution@baseline-family=fec-diversity = rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss measures a different property from the declared default-tier FEC row (max-diversity cover of single-packet messages versus whole-stream recovery) and is two declared dimensions away from it (fec-mode, metric). The repair is either a max-diversity arm one dimension from the declared FEC row or a composite label naming both, plus the row's cost.
 attribution@baseline-family=padding-perf = the six perf-tier rtp_padding_bench rows are report-only A/B measurements (bulk throughput and small-echo latency across three presets) whose `#[ignore]` reasons state no wall clock, and whose cells are the A/B preset axis rather than the declared `padding-wire` axis. The repair is one streamed run per row plus a `padding-ab` cell name and a reference row of its own.
 attribution@baseline-family=hol-verify4 = hol_verify4::v4_clean_rawbulk and v4_ge5_rawbulk are one dimension apart (impairment) and internally coherent, so only their costs are missing: neither `#[ignore]` reason states a wall clock and no document does either. One streamed release run per row declares the family with no cell change.
-attribution@baseline-family=perf-lane = the four in-crate perf-lane tests are asserting gates, but this grammar resolves an `#[ignore]`d lib row's tier to `perf`, which this crate's own tier vocabulary reserves for report-only measurement; declaring an asserting perf lane as `perf` would file a gate under the tier that must contain no assertion. The repair is a tier the grammar can name for an in-crate asserting opt-in test, or reading the perf lanes' tier from the `ignored-manifest` classification the crate already keeps.
 cost@metric=wall-clock = the remaining 719 default-tier lib tests have no per-test cost in any document. Their suite cost is measured (4.08-9.25 s parallel, 34.34-38.40 s serialized) but a row names one test, so the repair is to declare the expensive ones with cells of their own from the harness-native per-test map (libtest `--report-time`, max of three serialized reps, with the contended figure at the default 10-thread parallelism in brackets; every cost below is well under its target's total, and the two decoder fuzzes already declared are omitted): socket::stream::tests::test_fec_recovers_under_loss 9.44 s [9.03], traffic_shaping::control::handshake::opening::tests::lost_ready_is_recovered_by_a_duplicate_confirmation 1.65 s [1.65], socket::session::tests::a_stuck_underlay_still_resolves_the_session_handle 0.01 s [0.01], socket::session::tests::the_post_terminal_kill_tail_is_bounded 0.01 s [0.01], transmission::transmission_layer_test_facade::tests::proactive_watchdog_aborts_locally_before_best_effort_kill_completes 0.01 s [0.01], socket::stream::tests::test_fec_recovers_under_loss_with_mss_8192 0.96 s [1.54], traffic_shaping::control::handshake::opening::tests::post_open_timer_recovers_without_another_client_confirmation 1.51 s [1.52], traffic_shaping::control::handshake::opening::tests::nonce_bound_ready_retires_post_open_retransmissions 1.66 s [1.66], traffic_shaping::control::handshake::opening::tests::post_open_guard_recovers_after_three_lost_confirmations 0.89 s [0.86], socket::session::tests::read_drop_keeps_session_alive_until_recv_window_saturates 0.66 s [0.85] and socket::stream::tests::a_bulk_transfer_survives_loss_reorder_and_duplication 0.55 s [0.58], and `traffic_shaping::control::handshake::opening::tests::the_opening_completes_at_the_fields_worst_round_trip` 0.01 s [0.01]; nothing else in the target reaches 0.9 s in either mode. A row has left this list by having its wall anchor replaced with a driven clock. `the_opening_completes_at_the_fields_worst_round_trip` is the field-spike opening pin: it drives the opening over a channel pair whose every hop is delayed by half the field's worst measured round trip, so the pair crosses 3204 ms of round trip twice. The handshake's leg deadlines and every retry now read the connection's `clock::ClockRef` seam (`src/clock.rs`, mirroring `proxy/common/src/clock.rs` rather than reusing it — `proxy` depends on this crate, so the dependency cannot run upward), and the row runs under `#[tokio::test(start_paused = true)]` with a `VirtualClock` aligned to the runtime's own epoch, so the two delayed round trips and the retry intervals advance the paused clock instead of wall time. Measured 0.003 s with libtest's `--report-time` run isolated, against a max-of-three 6.43 s before. The delay relays are `tokio::time::sleep`, so the mock delay is on the same driven clock, and the row's elapsed assertion is now exact virtual time (`>= 3205 ms + 3205 ms`) rather than a wall-clock floor. Both vacuity directions hold: with the value back at 3 s the relation row fails on `its budget (3s) must outlast the field's worst measured round trip (3.205s)` and this row fails with `Kind(TimedOut)`; with the value at 4 s but the two client legs sharing one deadline — the shape the budget had before — the relation stays green and this row still fails with `Kind(TimedOut)`. A guard (`tools/check-clock-seam.py`) fails on any direct `Instant::now()`/`SystemTime::now()`/`.elapsed()` reintroduced into the opening module, so the wall anchor cannot come back silently. No other row in any tier reaches the regime where an opening has to outlast a multi-second round trip. It also displaced an older reading: the `--lib` target now measures 2.69 / 7.20 / 5.66 s at the default parallelism and 27.03 / 22.98 / 26.57 s of serialized per-test sum (27.04 / 22.99 / 26.59 s of wall clock in the paired reps, so the fit check still holds exactly), and `cargo test -p rtp` measures 19.99 / 11.65 / 11.59 s end to end over 736 passing and 33 ignored tests (load average 2.6-3.2 on 10 cores). The parallel figure moves less than the row's own 6.43 s because the FEC row above is still the target's longest. Earlier readings in this same gap are the earlier state of the target: they were measured before the seam migrated the opening row, and their serialized sums carry that row's ~6.4 s. Two rows this gap listed at 5.06 s and 5.01 s are gone from it: each waited out a 5 s refusal deadline against a refused admission measured at 5-34 ms, so each now waits 500 ms and costs 0.50-0.55 s. A third row has left it the same way: `mpudp::tests::a_session_wider_than_the_cap_is_refused` waited out a 3 s refusal deadline against an admission measured at 0.67-1.46 ms (57 runs, 5 serialized through 12 and 40 concurrent, load average 3.3-3.8 on 10 cores), so it now waits 100 ms and costs 0.21 s [0.21], below this list's 0.9 s cutoff. A row left it under the same mandate without shortening a wait at all: `traffic_shaping::control::handshake::opening::tests::every_handshake_leg_recovers_from_one_lost_datagram` ran four independent single-loss legs — one per dropped handshake kind, each over its own channel pair with its own nonce, each recovering in one opening retry interval (250 ms + jitter) rather than in a fixed sleep — sequentially, so the tier paid four retry intervals for four cells that share nothing but the code under test. The legs are now polled concurrently (`tokio::join!` over the same four pairs, the same drop filter, the same kind-specific RTT assertions), which costs 0.35 s [0.35] against 1.22 s [1.22] before, below this list's 0.9 s cutoff. The cells are unchanged: a run with the drop recorded at each leg's write filter shows all four kinds dropped exactly once (Hello, HelloAck, Confirm, ConfirmAck), and breaking either the retransmission interval or the never-sample-after-a-retransmission rule still fails the test. A fourth was shortened rather than removed from the list: `transmission::transmission_layer_test_facade::tests::proactive_watchdog_aborts_locally_before_best_effort_kill_completes` slept the 2 s `max_timeout` of its own test-supplied `WatchdogTuning`, which is the watchdog deadline's upper bound rather than the deadline: the deadline is `clamp(rto * rto_multiplier, floor, max_timeout)`, and with the test's settled 1 ms RTT the estimator RTO sits on the 1 s `MIN_RTO` floor against a multiplier of 1, so a 50 us-resolution probe of `stall_reason` measures it at 1.00005 s (five runs) and the 2 s cap never binds. The wait was then removed rather than shortened: the next send pass takes its decision instant by argument (`WriteHalf::send_pkts_at`, a `#[cfg(test)]` facade over the same `send_pkts_inner(bufs, now)` that production's `send_pass` calls with its own fixed `now`), so the pass is evaluated at 1.2x the measured deadline with no wall clock. The row costs 0.001 s against 1.20 s [1.20] after the first shortening and 2.00/2.00/2.00 before it. No assertion changed and the tuning is untouched: the decision instant the sleep produced and the one now passed in are the same instant 1.2 s past the arming pass, so the exercised configuration — including which term of the clamp binds — is byte-identical. The row still fails when the deadline is not crossed: at 900 ms the watchdog does not fire, no KILL is attempted, and the test blocks on the KILL notification it awaits rather than passing. A fifth was shortened with its coverage relocated rather than dropped: `traffic_shaping::control::handshake::opening::tests::lost_ready_is_recovered_by_a_duplicate_confirmation` waited 3.2 s for the product's `POST_OPEN_RETRY_DELAYS` chain, of which only the +1 s slot is a cadence its assertions need — the server's duplicate confirmation and the client's retried Ready land 1.0368-1.3833 s after the opening (eight probed runs; the slot is `1s + 0-499 ms` per-nonce jitter) — and eight further probed runs found no event at all between 1.39 s and 4 s, because the retried Ready retires the recovery. The 3.2 s window did not cover the +3 s slot deterministically in any case, that slot's jitter placing it in [3.0, 3.5) s, so the retirement the window was said to prove was not in fact proven; it now is, exactly and at no wall clock, by `transmission::post_open_recovery::tests::retried_ready_retires_the_scheduled_retransmission_chain`, which drives the same `PostOpenRecovery` by argument — withholding the retirement in `PostOpenRecovery::observe` fails that test, and withholding the client's re-queue fails the integration test on `ready_attempts` at the shortened wait. The row costs 1.61-1.65 s serialized and 1.63-1.65 s contended against 3.23-3.25 s before, with no assertion or configuration changed. A sixth row was re-bounded upward rather than shortened, because its assertion forbids an event and the wait has to outlast the event it forbids: `traffic_shaping::control::handshake::opening::tests::nonce_bound_ready_retires_post_open_retransmissions` asserts that the server's post-open recovery sent no second `ConfirmAck`, and the slot such a send would come from is `1 s + retry_delay`, whose per-nonce jitter places it in [1.0, 1.5) s with the nonce drawn per connection from `SysRng`, so the former 1.1 s wait reached the slot only on the runs whose jitter was at most 100 ms: with the retirement withheld in `PostOpenRecovery::observe`, the test still passed 9 of 10 runs at 1.1 s and failed all 6 runs at the 1.6 s that bounds the 1.499 s worst case plus ~100 ms for the write driver's wake. The row costs 1.63-1.67 s against 1.13-1.16 s before, and no assertion or configuration changed. The property itself -- that a `Ready` retires the schedule so no later slot sends -- is pinned at no wall clock by `transmission::post_open_recovery::tests::retried_ready_retires_the_scheduled_retransmission_chain`; what the wall clock still buys in the integration row is the driver wiring, which only a wait past the slot can expose. The 2.9 s that the `mpudp` row gave back is not resolvable in the suite totals: the `--lib` target re-measured 4.20-9.19 s parallel and 35.07-35.88 s serialized (two reps) after the shortening, inside the 4.08-9.25 / 34.34-38.40 s range recorded here, so that range was left as measured then. The two shortenings above remove a further 2.4 s of serialized per-test sleep, and three fresh reps of the `--lib` binary after them measure 3.20-3.31 s at the default parallelism and 32.64-35.47 s serialized (load average 3.3-4.2 on 10 cores; the fit check still holds exactly — 35.46/35.48, 35.47/35.48 and 32.64/32.66 s of per-test sum against reported wall clock), with three end-to-end reps of `cargo test -p rtp` at 11.91-13.81 s (the sum of the harness's per-binary `finished in` figures, 734 passing and 33 ignored tests). The two row changes above move both halves of that fit check by their net -0.35 s and nothing else: the per-test sums land at 35.11, 35.12 and 32.29 s, inside the 33.99-38.05 s serialized range the same shift gives the target. Three fresh serialized reps of the `--lib` binary re-measure 32.43-33.95 s, and three end-to-end reps of `cargo test -p rtp` measure 12.35-13.45 s real against 12.03-12.34 s of `finished in` figures (load average 3.4-5.3 on 10 cores). Those reps are the current reading: the serialized floor moved down by the 2.4 s, and the parallel ones landed below the 4.08 s floor, which is this session's lighter load rather than the change — the tier's wall clock is a maximum over concurrently run sleeping tests, and both shortened rows are shorter than the `lib` target's longest, so the 2.4 s cannot have raised it. The 7.32 / 5.02 / 5.00 s set this gap originally named was read from the streamed instrument and is superseded above. A seventh pair left it by having the wait it was named for driven instead of slept through: `socket::session::tests::a_stuck_underlay_still_resolves_the_session_handle` and `socket::session::tests::the_post_terminal_kill_tail_is_bounded` each parked on the bound they assert — the reaper's `DRIVER_JOIN_TIMEOUT` KILL tail, and the supervisor's `DRIVER_JOIN_TIMEOUT` join of its stuck children — and now run with the runtime clock paused, pinning the resolution instant to that same deadline: 0.007 s and 0.002 s, the max of eight serialized reps (load average 4.2-7.4 on 10 cores), against 3.007/3.003 s and 3.004/3.004 s, the max of three (load average 3.9). Widening `DRIVER_JOIN_TIMEOUT` to 30 s fails both rows on their gates, and removing the bound from `reaper_ready` and `join_drivers` leaves both unresolved so both fail those same gates. This gap's top row, `socket::stream::tests::test_fec_recovers_under_loss`, was probed rather than shortened and is irreducible — the map paragraph above records the measurement (1.03-9.37 s over twelve serialized reps, a 0.17-0.24 s zero-loss floor for the same 512-message exchange, and 1-4 production repair stalls per run), and its stalls are re-tested as driven-clock-resistant on this revision (a forced `start_paused` runtime leaves 1.78-3.40 s of wall clock over five reps against 2.40-3.37 s on its multi-thread runtime) — so its 9.44 s max-of-three cost is left unchanged.
 transport-delivery@impairment=correlated-loss = no default-tier row drops four-state Gilbert-Elliot loss at the transport layer: the always-run impaired delivery rows use the harness's 5 % iid mild-loss preset and the 3 % iid FEC preset, and GE loss is exercised only by the opt-in burst-loss arms. An always-run GE arm is what closes this, and it is a new arm rather than a retune of a frozen one.
 transport-delivery@metric=goodput-fraction = no default-tier row measures goodput as a fraction of the configured link rate: the capacity-relative floors are opt-in (bufferbloat `standard`, burst-loss `full`). The cell is knowingly empty in the always-run tier because the arm it needs is a multi-second rate-shaped run, which the 60 s budget's headroom over the measured 16.8-18.6 s does not currently buy; the deliberate answer is to measure the opt-in arm rather than to move a floor into a tier that cannot pay for it.
@@ -794,6 +829,21 @@ Each line is `RELATIVE_PATH::fn = classification`. The set must equal the
 `perf-lane`/`probe` classify the in-crate (`src/`) tests; `standard`/`full`/
 `perf` are the scenario tiers of the relocated `tests/` targets (same names
 as the scenario gate below).
+
+This block and the scenario gate below are two authorities over one inventory,
+and they name the same in-crate tests differently. This one is the crate's own:
+`tools/check-ignored.py` derives it from the source files, owns the
+`src/`-vs-`tests/` split, and holds each in-crate test to its own rule (a
+`perf-lane` must still assert; a `probe` must still assert its own measurement
+and match the count in `gate-probe-selfchecks`). The scenario gate is the
+harness's: `check-gate.py` resolves a `lib::<module>::<test>` entry against the
+compiled `--lib` target and owns the *tier*, whose vocabulary is the harness's
+(`standard`/`full`/`perf`) rather than this file's. An asserting in-crate opt-in
+therefore appears in both blocks under the two names that mean the same thing —
+`perf-lane` here, `standard` there — because the harness tier that may carry an
+assertion is `standard` and its `perf` tier is report-only by definition. The
+seven `probe`s appear here as `probe` and in the perf block as `perf`-tier rows,
+which is the same statement in each vocabulary.
 
 ```ignored-manifest
 src/recv_queue/pkt_recv_space.rs::advancing_the_receive_window_costs_no_more_per_packet = perf-lane
@@ -852,11 +902,21 @@ src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_finite_loss_ladd
 
 Each line is `target::test_name = tier`. The set must equal the set of
 non-`support` tests reported by `cargo test -p rtp --test <target> -- --list
---ignored`.
+--ignored`, plus — for the reserved `lib` target that names this package's
+`--lib` target — the same query against `--lib`. The four `lib::…` entries are
+the in-crate perf lanes: `standard` is the harness tier for an asserting opt-in
+test, and `perf` cannot carry them because the checker body-scans a `perf` entry
+for assertion tokens and each of the four asserts a wall-clock ratio. They are
+the `perf-lane` classification of the `ignored-manifest` above, under this
+block's vocabulary.
 
 ```gate-manifest
 hol_verify4::v4_clean_rawbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
+lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet = standard
+lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_no_more_per_pop = standard
+lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window = standard
+lib::traffic_shaping::recovery::rtx_index::tests::deferred_loss_cancellation_does_not_rescan_the_pending_set = standard
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
 rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe = full
@@ -904,6 +964,10 @@ rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
 ```
 
 ```gate-asserting
+lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet
+lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_no_more_per_pop
+lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window
+lib::traffic_shaping::recovery::rtx_index::tests::deferred_loss_cancellation_does_not_rescan_the_pending_set
 shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
 shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse
 shared_bottleneck::shared_bneck_fairness_longrun
