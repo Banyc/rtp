@@ -1473,21 +1473,31 @@ mod tests {
     /// past the six-datagram fresh-tail cover so a burst can wipe the cover
     /// *and* the first tail-loss probe.
     ///
-    /// Two arms isolate the lone tail's repair deadline at the deployment's
-    /// WAN scale (100 ms one way -> ~200 ms RTT):
+    /// Two jitter-free arms isolate the lone tail's repair deadline at the
+    /// deployment's WAN scale (100 ms one way -> ~200 ms RTT), and a third
+    /// carries the field's own per-packet delay jitter:
     ///
-    /// - `burst6`: the burst is exactly the cover, so the first tail-loss
-    ///   probe (PTO = 2*srtt) survives and the echo lands at ~2*srtt + RTT.
-    /// - `burst8`: the burst also eats that first probe, so the repair waits
-    ///   the second PTO at ~4*srtt + RTT — the ~1 s lone-tail episode the
-    ///   field reports.
+    /// - `burst6_owd100`: the burst is exactly the cover, so the first
+    ///   tail-loss probe (PTO = 2*srtt) survives and the echo lands at
+    ///   ~2*srtt + RTT.
+    /// - `burst8_owd100`: the burst also eats that first probe, so the repair
+    ///   waits the second PTO at ~4*srtt + RTT — the ~1 s lone-tail episode
+    ///   the field reports.
+    /// - `burst8_owd95_jitter100`: the same burst on a 95 ms one-way path that
+    ///   also carries `sch_netem`'s ±100 ms per-direction delay jitter.  This
+    ///   is the regime the RTT estimator's variance term dominates in, so a
+    ///   corroborated repair rung is `raw_rto` and not the 300 ms post-probe
+    ///   floor; without it the probe could not see that regime at all.  Its
+    ///   round-trip floor is the one-way delay, because per-packet jitter
+    ///   makes the two-way minimum zero.
     ///
     /// Prints the per-arm echo percentiles, the repair-path tail (every echo
     /// with its message index), the armour-duplicate count, and the sender's
     /// retransmission counters (`tail_probes` vs `rto_reason`) so the arm's
     /// repair is attributable to the tail-loss probe or to the RTO.  Also
-    /// prints a `BURST_TRIANGLE` line naming the deadline the two arms imply:
-    /// the arm-to-arm max delta is the first PTO, so the second PTO follows.
+    /// prints a `BURST_TRIANGLE` line naming the deadline the two jitter-free
+    /// arms imply: the arm-to-arm max delta is the first PTO, so the second
+    /// PTO follows.
     /// Run with `--ignored --nocapture`.
     ///
     /// Self-validating report-only: prints the measurements and asserts the
@@ -1496,14 +1506,16 @@ mod tests {
     /// arm's label) so a dead instrument fails instead of printing a table of
     /// zeros.  It asserts no bound from this crate's GATE.md.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "in-process lone-tail repair-deadline probe; ~45 s; run with --ignored --nocapture"]
+    #[ignore = "in-process lone-tail repair-deadline probe; ~2.7 min; run with --ignored --nocapture"]
     async fn probe_lone_tail_repair_deadline_latency() {
         use crate::metrics::MetricsSnapshot;
         use crate::socket::socket;
         use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
         use crate::udp::testing::{
-            BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
+            BurstLoss, DelayImpairment, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
             wrap_fec_delayed_with_mss_and_fec_tuning,
+            wrap_fec_jittered_burst_delayed_with_mss_and_fec_tuning,
+            wrap_fec_jittered_delayed_with_mss_and_fec_tuning,
         };
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1515,11 +1527,46 @@ mod tests {
         // A 100 ms one-way delay puts the round trip at the deployment's
         // WAN-scale RTT, so the first and second PTOs are 400 ms and 800 ms
         // and the double-PTO lone-tail episode lands at the ~1 s the field
-        // reports.
+        // reports.  The third arm is the field's *own* impairment: the same
+        // burst shape on a 95 ms one-way path that also carries `sch_netem`'s
+        // ±100 ms per-direction delay jitter, the regime where the RTT
+        // estimator's variance term dominates its raw RTO and a corroborated
+        // repair rung is `raw_rto` rather than the 300 ms floor.  Its
+        // `rtt_floor` is the one-way delay rather than the round trip:
+        // per-packet jitter makes the two-way minimum zero, so the round-trip
+        // invariant the jitter-free arms assert cannot hold there.
         let owd = Duration::from_millis(100);
-        for (label, burst, quiet_min, quiet_max, seed) in [
-            ("burst6_owd100", 6usize, 26usize, 34usize, 0x5EED_0006u64),
-            ("burst8_owd100", 8usize, 26usize, 34usize, 0x5EED_0008u64),
+        for (label, burst, quiet_min, quiet_max, seed, owd, jitter, rtt_floor) in [
+            (
+                "burst6_owd100",
+                6usize,
+                26usize,
+                34usize,
+                0x5EED_0006u64,
+                owd,
+                Duration::ZERO,
+                owd * 2,
+            ),
+            (
+                "burst8_owd100",
+                8usize,
+                26usize,
+                34usize,
+                0x5EED_0008u64,
+                owd,
+                Duration::ZERO,
+                owd * 2,
+            ),
+            (
+                "burst8_owd95_jitter100",
+                8usize,
+                26usize,
+                34usize,
+                0x5EED_0010u64,
+                Duration::from_millis(95),
+                Duration::from_millis(100),
+                Duration::from_millis(95),
+            ),
         ] {
             let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
             let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -1527,15 +1574,31 @@ mod tests {
             b.connect(a.local_addr().unwrap()).await.unwrap();
             let loss = BurstLoss::new(burst, quiet_min, quiet_max, seed);
             let loss_sink = loss.clone();
-            let mut a_layer = wrap_fec_burst_delayed_with_mss_and_fec_tuning(
-                a.clone(),
-                a,
-                true,
-                mss,
-                FecTuning::interactive_prompt(),
-                loss,
-                owd,
-            );
+            let mut a_layer = if jitter.is_zero() {
+                wrap_fec_burst_delayed_with_mss_and_fec_tuning(
+                    a.clone(),
+                    a,
+                    true,
+                    mss,
+                    FecTuning::interactive_prompt(),
+                    loss,
+                    owd,
+                )
+            } else {
+                wrap_fec_jittered_burst_delayed_with_mss_and_fec_tuning(
+                    a.clone(),
+                    a,
+                    true,
+                    mss,
+                    FecTuning::interactive_prompt(),
+                    loss,
+                    DelayImpairment {
+                        delay: owd,
+                        jitter,
+                        seed: seed ^ 0x_0000_0000_0000_00A1,
+                    },
+                )
+            };
             // The production shape: the handshake seeds the estimator, so no
             // arm here waits the initial `MIN_RTO` floor.
             a_layer.initial_rtt = Some(owd * 2);
@@ -1554,14 +1617,29 @@ mod tests {
                         *sink.lock().unwrap() = Some(snapshot);
                     }
                 }));
-            let b_layer = wrap_fec_delayed_with_mss_and_fec_tuning(
-                b.clone(),
-                b,
-                true,
-                mss,
-                FecTuning::interactive_prompt(),
-                owd,
-            );
+            let b_layer = if jitter.is_zero() {
+                wrap_fec_delayed_with_mss_and_fec_tuning(
+                    b.clone(),
+                    b,
+                    true,
+                    mss,
+                    FecTuning::interactive_prompt(),
+                    owd,
+                )
+            } else {
+                wrap_fec_jittered_delayed_with_mss_and_fec_tuning(
+                    b.clone(),
+                    b,
+                    true,
+                    mss,
+                    FecTuning::interactive_prompt(),
+                    DelayImpairment {
+                        delay: owd,
+                        jitter,
+                        seed: seed ^ 0x_0000_0000_0000_00B2,
+                    },
+                )
+            };
             let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
             let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
             let mut echo_tasks = tokio::task::JoinSet::new();
@@ -1682,11 +1760,28 @@ mod tests {
                 "[probe lone-tail {label}] the sender re-sent no fresh-tail armour cover: the armour path this probe measures never fired"
             );
             assert!(
-                pick(0.50) >= owd * 2,
-                "[probe lone-tail {label}] p50 {:?} is below the link's two-way floor {:?}: these samples are not round trips of this link",
+                pick(0.50) >= rtt_floor,
+                "[probe lone-tail {label}] p50 {:?} is below the arm's round-trip floor {:?}: these samples are not round trips of this link",
                 pick(0.50),
-                owd * 2
+                rtt_floor
             );
+            // A jitter-named arm must prove its jitter reached the path.  The
+            // delay line never delivers a packet sooner than the nominal
+            // one-way delay (its draw is clamped at zero), so a round trip
+            // *faster* than the arm's two-way nominal delay is only possible
+            // if packets are being released early — i.e. if the jitter draw is
+            // live.  Repairs can only add latency, so a repair-heavy run makes
+            // this harder to satisfy, never easier; and with the draw skipped
+            // the arm is a fixed-delay arm that measures nothing about the
+            // regime it is named for.
+            if !jitter.is_zero() {
+                assert!(
+                    latencies.first().copied().unwrap_or(Duration::MAX) < owd * 2,
+                    "[probe lone-tail {label}] no round trip beat the arm's two-way nominal delay {:?} (fastest {:?}): this arm did not carry the delay jitter it is named for",
+                    owd * 2,
+                    latencies.first().copied().unwrap_or(Duration::MAX)
+                );
+            }
         }
         eprintln!(
             "[probe lone-tail BURST_TRIANGLE] burst6 (cover wiped, first PTO survives) vs burst8 \

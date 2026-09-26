@@ -257,30 +257,82 @@ impl<W: UnreliableWrite> UnreliableWrite for BurstLossyWrite<W> {
 /// until the oldest datagram is due. This models a WAN propagation delay so an
 /// ARQ fall-through shows up as a `reorder_window + one round trip` tail,
 /// instead of the sub-millisecond loopback floor.
+///
+/// `sch_netem`'s `delay TIME JITTER` impairment: a fixed one-way propagation
+/// delay, the per-packet jitter half-width, and the seed its draw is taken
+/// from.  With `jitter == ZERO` the draw is skipped entirely and the delay is
+/// exactly `delay`, so a jitter-free arm is byte-for-byte what it was before
+/// the knob existed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DelayImpairment {
+    pub delay: std::time::Duration,
+    pub jitter: std::time::Duration,
+    pub seed: u64,
+}
+
+/// One-way delay with `sch_netem`'s per-packet jitter: every packet's delay is
+/// drawn uniformly from `delay ± jitter` and clamped at zero, exactly as the
+/// kernel's `sample_delay` does, so a probe can reproduce the field's
+/// `delay TIME JITTER` impairment in-process.  With `jitter` zero the
+/// draw is skipped entirely and the delay is fixed, so the jitter-free arms
+/// are byte-for-byte what they were before the jitter knob existed.
 #[derive(Debug)]
 pub struct DelayedRead<R: UnreliableRead> {
     inner: R,
     delay: std::time::Duration,
+    jitter: std::time::Duration,
+    jitter_state: u64,
     pending: std::collections::VecDeque<(std::time::Instant, Vec<u8>)>,
 }
 
 impl<R: UnreliableRead> DelayedRead<R> {
     pub fn new(read: R, delay: std::time::Duration) -> Self {
+        Self::with_jitter(read, delay, std::time::Duration::ZERO, 0)
+    }
+
+    /// Fixed delay plus a seeded `delay ± jitter` draw per packet (SplitMix64,
+    /// so an arm is reproducible and load-independent).
+    pub fn with_jitter(
+        read: R,
+        delay: std::time::Duration,
+        jitter: std::time::Duration,
+        seed: u64,
+    ) -> Self {
         Self {
             inner: read,
             delay,
+            jitter,
+            jitter_state: seed,
             pending: std::collections::VecDeque::new(),
         }
+    }
+
+    /// The delay for one packet: `delay` when the jitter knob is zero,
+    /// otherwise a uniform draw from `delay ± jitter` clamped at zero.
+    fn next_delay(&mut self) -> std::time::Duration {
+        if self.jitter.is_zero() {
+            return self.delay;
+        }
+        self.jitter_state = self.jitter_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.jitter_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        let span = self.jitter.as_nanos() as u64;
+        let delta = (z % (span * 2 + 1)) as i64 - span as i64;
+        let ns = self.delay.as_nanos() as i64 + delta;
+        std::time::Duration::from_nanos(ns.max(0) as u64)
     }
 
     fn enqueue_ripe_candidates(&mut self) {
         let mut scratch = vec![0u8; 64 * 1024];
         loop {
             match self.inner.try_recv(&mut scratch) {
-                Ok(n) => self.pending.push_back((
-                    std::time::Instant::now() + self.delay,
-                    scratch[..n].to_vec(),
-                )),
+                Ok(n) => {
+                    let delay = self.next_delay();
+                    self.pending
+                        .push_back((std::time::Instant::now() + delay, scratch[..n].to_vec()));
+                }
                 Err(error) if error == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
@@ -399,21 +451,27 @@ impl<W: UnreliableWrite> UnreliableWrite for ImpairedWrite<W> {
     }
 }
 
-pub fn wrap_fec_impaired<R, W>(read: R, write: W, fec: bool, rate: ImpairRate) -> UnreliableLayer
-where
-    R: UnreliableRead + Send + Sync + 'static,
-    W: UnreliableWrite,
-{
+/// Shared body of the impairment constructors: every one of them differs only
+/// in which read/write wrappers are installed, and all of them go through the
+/// same `checked_mss_and_fec` normalisation so a probe cannot accidentally
+/// measure a different FEC state, MSS, or tuning than production uses.
+fn fec_layer(
+    utp_read: Box<dyn UnreliableRead>,
+    utp_write: Box<dyn UnreliableWrite>,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+) -> UnreliableLayer {
     let (mss, fec_state, tuning) = checked_mss_and_fec(
         fec,
-        Mss::try_new(NO_FEC_MSS).unwrap(),
-        fec_tuning_from_env(),
+        Mss::try_new(mss).unwrap(),
+        tuning,
         FrameMode::default(),
     )
     .unwrap();
     UnreliableLayer {
-        utp_read: Box::new(read),
-        utp_write: Box::new(ImpairedWrite::new(write, rate)),
+        utp_read,
+        utp_write,
         post_open_handshake: None,
         session_tag: None,
         initial_sequences: crate::sequence::InitialSequences::ZERO,
@@ -429,6 +487,20 @@ where
         ack_padding: AckPaddingMode::None,
         fresh_tail_armor_copies_override: None,
     }
+}
+
+pub fn wrap_fec_impaired<R, W>(read: R, write: W, fec: bool, rate: ImpairRate) -> UnreliableLayer
+where
+    R: UnreliableRead + Send + Sync + 'static,
+    W: UnreliableWrite,
+{
+    fec_layer(
+        Box::new(read),
+        Box::new(ImpairedWrite::new(write, rate)),
+        fec,
+        NO_FEC_MSS,
+        fec_tuning_from_env(),
+    )
 }
 
 /// Like `wrap_fec` but wraps the read/write pair in lossy injectors driven
@@ -474,31 +546,13 @@ where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
 {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(
+    fec_layer(
+        Box::new(LossyRead::new(read, rate.clone())),
+        Box::new(LossyWrite::new(write, rate)),
         fec,
-        Mss::try_new(mss).unwrap(),
-        tuning,
-        FrameMode::default(),
-    )
-    .unwrap();
-    UnreliableLayer {
-        utp_read: Box::new(LossyRead::new(read, rate.clone())),
-        utp_write: Box::new(LossyWrite::new(write, rate)),
-        post_open_handshake: None,
-        session_tag: None,
-        initial_sequences: crate::sequence::InitialSequences::ZERO,
-        initial_rtt: None,
-        metrics_observer: None,
         mss,
-        fec: fec_state,
-        fec_tuning: tuning,
-        frame_delivery: FrameMode::default(),
-        congestion_lane: crate::CongestionLane::default(),
-        retransmission_armor: RetransmissionArmorConfig::disabled(),
-        instream_group_fec: false,
-        ack_padding: AckPaddingMode::None,
-        fresh_tail_armor_copies_override: None,
-    }
+        tuning,
+    )
 }
 
 /// Like [`wrap_fec_lossy_with_mss_and_fec_tuning`] but impairs only the write
@@ -518,31 +572,13 @@ where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
 {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(
+    fec_layer(
+        Box::new(read),
+        Box::new(BurstLossyWrite::new(write, loss)),
         fec,
-        Mss::try_new(mss).unwrap(),
-        tuning,
-        FrameMode::default(),
-    )
-    .unwrap();
-    UnreliableLayer {
-        utp_read: Box::new(read),
-        utp_write: Box::new(BurstLossyWrite::new(write, loss)),
-        post_open_handshake: None,
-        session_tag: None,
-        initial_sequences: crate::sequence::InitialSequences::ZERO,
-        initial_rtt: None,
-        metrics_observer: None,
         mss,
-        fec: fec_state,
-        fec_tuning: tuning,
-        frame_delivery: FrameMode::default(),
-        congestion_lane: crate::CongestionLane::default(),
-        retransmission_armor: RetransmissionArmorConfig::disabled(),
-        instream_group_fec: false,
-        ack_padding: AckPaddingMode::None,
-        fresh_tail_armor_copies_override: None,
-    }
+        tuning,
+    )
 }
 
 /// Like [`wrap_fec_burst_lossy_with_mss_and_fec_tuning`], but the read
@@ -563,31 +599,48 @@ where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
 {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(
+    fec_layer(
+        Box::new(DelayedRead::new(read, delay)),
+        Box::new(BurstLossyWrite::new(write, loss)),
         fec,
-        Mss::try_new(mss).unwrap(),
-        tuning,
-        FrameMode::default(),
-    )
-    .unwrap();
-    UnreliableLayer {
-        utp_read: Box::new(DelayedRead::new(read, delay)),
-        utp_write: Box::new(BurstLossyWrite::new(write, loss)),
-        post_open_handshake: None,
-        session_tag: None,
-        initial_sequences: crate::sequence::InitialSequences::ZERO,
-        initial_rtt: None,
-        metrics_observer: None,
         mss,
-        fec: fec_state,
-        fec_tuning: tuning,
-        frame_delivery: FrameMode::default(),
-        congestion_lane: crate::CongestionLane::default(),
-        retransmission_armor: RetransmissionArmorConfig::disabled(),
-        instream_group_fec: false,
-        ack_padding: AckPaddingMode::None,
-        fresh_tail_armor_copies_override: None,
-    }
+        tuning,
+    )
+}
+
+/// Like [`wrap_fec_burst_delayed_with_mss_and_fec_tuning`], but the read
+/// direction's one-way delay carries `sch_netem`'s `delay TIME JITTER` draw
+/// ([`DelayedRead::with_jitter`]) instead of a fixed value.
+///
+/// This is the field's own impairment shape: a WAN-scale round trip whose
+/// delay is jittered per packet, so the RTT estimator's variance term is
+/// large relative to its smoothed RTT and a corroborated repair rung is
+/// `raw_rto` rather than the 300 ms floor.
+pub fn wrap_fec_jittered_burst_delayed_with_mss_and_fec_tuning<R, W>(
+    read: R,
+    write: W,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+    loss: BurstLoss,
+    impairment: DelayImpairment,
+) -> UnreliableLayer
+where
+    R: UnreliableRead + Send + Sync + 'static,
+    W: UnreliableWrite,
+{
+    let DelayImpairment {
+        delay,
+        jitter,
+        seed,
+    } = impairment;
+    fec_layer(
+        Box::new(DelayedRead::with_jitter(read, delay, jitter, seed)),
+        Box::new(BurstLossyWrite::new(write, loss)),
+        fec,
+        mss,
+        tuning,
+    )
 }
 
 /// iid-loss + WAN-delay variant of
@@ -609,31 +662,13 @@ where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
 {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(
+    fec_layer(
+        Box::new(DelayedRead::new(read, delay)),
+        Box::new(LossyWrite::new(write, loss)),
         fec,
-        Mss::try_new(mss).unwrap(),
-        tuning,
-        FrameMode::default(),
-    )
-    .unwrap();
-    UnreliableLayer {
-        utp_read: Box::new(DelayedRead::new(read, delay)),
-        utp_write: Box::new(LossyWrite::new(write, loss)),
-        post_open_handshake: None,
-        session_tag: None,
-        initial_sequences: crate::sequence::InitialSequences::ZERO,
-        initial_rtt: None,
-        metrics_observer: None,
         mss,
-        fec: fec_state,
-        fec_tuning: tuning,
-        frame_delivery: FrameMode::default(),
-        congestion_lane: crate::CongestionLane::default(),
-        retransmission_armor: RetransmissionArmorConfig::disabled(),
-        instream_group_fec: false,
-        ack_padding: AckPaddingMode::None,
-        fresh_tail_armor_copies_override: None,
-    }
+        tuning,
+    )
 }
 
 /// Clean-write partner for [`wrap_fec_burst_delayed_with_mss_and_fec_tuning`]:
@@ -650,31 +685,42 @@ where
     R: UnreliableRead + Send + Sync + 'static,
     W: UnreliableWrite,
 {
-    let (mss, fec_state, tuning) = checked_mss_and_fec(
+    fec_layer(
+        Box::new(DelayedRead::new(read, delay)),
+        Box::new(write),
         fec,
-        Mss::try_new(mss).unwrap(),
-        tuning,
-        FrameMode::default(),
-    )
-    .unwrap();
-    UnreliableLayer {
-        utp_read: Box::new(DelayedRead::new(read, delay)),
-        utp_write: Box::new(write),
-        post_open_handshake: None,
-        session_tag: None,
-        initial_sequences: crate::sequence::InitialSequences::ZERO,
-        initial_rtt: None,
-        metrics_observer: None,
         mss,
-        fec: fec_state,
-        fec_tuning: tuning,
-        frame_delivery: FrameMode::default(),
-        congestion_lane: crate::CongestionLane::default(),
-        retransmission_armor: RetransmissionArmorConfig::disabled(),
-        instream_group_fec: false,
-        ack_padding: AckPaddingMode::None,
-        fresh_tail_armor_copies_override: None,
-    }
+        tuning,
+    )
+}
+
+/// Jittered-delay partner for
+/// [`wrap_fec_jittered_burst_delayed_with_mss_and_fec_tuning`]: the echo
+/// direction adds the same `delay ± jitter` draw, no loss.
+pub fn wrap_fec_jittered_delayed_with_mss_and_fec_tuning<R, W>(
+    read: R,
+    write: W,
+    fec: bool,
+    mss: usize,
+    tuning: FecTuning,
+    impairment: DelayImpairment,
+) -> UnreliableLayer
+where
+    R: UnreliableRead + Send + Sync + 'static,
+    W: UnreliableWrite,
+{
+    let DelayImpairment {
+        delay,
+        jitter,
+        seed,
+    } = impairment;
+    fec_layer(
+        Box::new(DelayedRead::with_jitter(read, delay, jitter, seed)),
+        Box::new(write),
+        fec,
+        mss,
+        tuning,
+    )
 }
 
 #[cfg(test)]
@@ -782,6 +828,49 @@ mod tests {
             started.elapsed() >= Duration::from_millis(30),
             "a delayed read returned after only {:?}",
             started.elapsed()
+        );
+    }
+
+    /// `DelayedRead`'s jitter knob is `sch_netem`'s `delay TIME JITTER` draw:
+    /// uniform over `delay ± jitter`, clamped at zero, and reproducible from
+    /// its seed so a jittered measurement arm is a fact about the transport
+    /// rather than a draw from the OS RNG.  With the knob zero the delay is
+    /// exactly the fixed value and no draw is taken, so every delay-only arm
+    /// predating the knob keeps its timing byte-for-byte.
+    #[test]
+    fn delayed_read_jitter_is_the_netem_draw_and_zero_jitter_is_fixed() {
+        let read = || OneShotRead(Some(b"x".to_vec()));
+        let mut fixed = DelayedRead::new(read(), Duration::from_millis(50));
+        assert!(
+            (0..64).all(|_| fixed.next_delay() == Duration::from_millis(50)),
+            "a zero-jitter delay line must never draw"
+        );
+
+        let delay = Duration::from_millis(100);
+        let jitter = Duration::from_millis(100);
+        let draws = |seed: u64| -> Vec<Duration> {
+            let mut line = DelayedRead::with_jitter(read(), delay, jitter, seed);
+            (0..4_096).map(|_| line.next_delay()).collect()
+        };
+        let stream = draws(0x5EED);
+        assert_eq!(
+            stream,
+            draws(0x5EED),
+            "the jitter draw must be seeded, not random"
+        );
+        assert!(
+            stream.iter().all(|d| *d <= delay + jitter),
+            "a draw above `delay + jitter` is outside the netem window"
+        );
+        assert!(
+            stream.iter().any(|d| *d < delay) && stream.iter().any(|d| *d > delay),
+            "the draw must straddle the nominal delay, or no jitter is applied"
+        );
+        let mean_ms =
+            stream.iter().map(|d| d.as_millis() as f64).sum::<f64>() / stream.len() as f64;
+        assert!(
+            (mean_ms - 100.0).abs() < 5.0,
+            "the ±100 ms draw's mean must be the nominal 100 ms, got {mean_ms:.1}"
         );
     }
 }

@@ -156,7 +156,11 @@ not a magic constant; the harness never restates one.
    (`2*srtt + RTT`); the second loses that PTO too, and repairs once the burst
    being crossed has taken its remaining datagrams — one or two rungs, not the
    multi-second ladder the field reported before the three departures below.
-   No bound is asserted here: the bars above are the mandate's, and
+   A third arm — `burst8_owd95_jitter100` — adds `sch_netem`'s ±100 ms
+   per-direction delay jitter, the regime where the estimator's variance term
+   dominates and the post-probe floor stops binding; its round-trip floor is
+   the one-way delay, because per-packet jitter makes the two-way minimum
+   zero.  No bound is asserted here: the bars above are the mandate's, and
    this probe attributes which of them a regression moves.
    The *ladder* itself — the rung spacing the field stall is made of — is
    measured deterministically and load-independently by
@@ -223,6 +227,26 @@ not a magic constant; the harness never restates one.
      and `tlp::tests::post_probe_rto_tightens_to_the_corroborated_margin_on_a_jittery_link`
      — and each goes red when the corroborated margin is reverted.
 
+     What the tightening does *not* buy, measured rather than assumed: on the
+     two end-to-end arms that reach the field regime the tail is
+     indistinguishable between the two rungs.  On
+     `probe_lone_tail_repair_deadline_latency`'s `burst8_owd95_jitter100` arm
+     (median of three runs, reverted → landed) p50 250 → 240 ms, p90 382 →
+     378, p99 733 → 754, max 783 → 824 ms, with >300 ms samples 56 → 46 and
+     >600 ms 11 → 13 and the RTO rung firing 0 → 2 times per 200 messages —
+     every difference inside the arm's own run-to-run spread (the reverted
+     arm's p90 alone ranged 358-557 ms), because at ±100 ms per-direction
+     jitter the path's own delay spread is the same order as the ~207 ms the
+     rung gives up.  On the dual-lane `rtp_mux` jitter gate re-run at the
+     field regime (95 ms one way, ±100 ms jitter) the interactive lane's own
+     wire multiple moved 3.83× → 4.01× (median of three reverted and five
+     landed runs; ranges 3.76-4.04 and 3.76-4.25) with p99 167 → 174 ms, still
+     inside the 6× budget.  The tightening is therefore landed as a
+     mechanism-correct, structurally bounded change whose end-to-end payoff at
+     the field's jitter level is **not demonstrated** by any arm here; it is
+     provable only on the deterministic ladder, where the rung is the binding
+     term.
+2. **Reasonable goodput of the interactive lane** — the lane delivers what it
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,
    asserted in the **default tier**: `rtp_clean` (clean link, small and
@@ -315,7 +339,7 @@ a change to this file.
 src/socket/stream.rs::probe_armor_copy_cell = 6
 src/socket/stream.rs::probe_fresh_tail_armor_latency = 4
 src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = 7
-src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 7
+src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 8
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = 4
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = 12
 ```
