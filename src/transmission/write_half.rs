@@ -851,12 +851,43 @@ impl WriteHalf {
                 single_symbol_frame,
                 self.fec.as_ref().map(|fec| fec.open_group_data_count()),
             );
-            let armor_decision =
+            // A *repair* of an interactive single-symbol tail re-sends the
+            // cover that tail's original transmission carried, instead of a
+            // lone datagram.  The repair only fires after the whole original
+            // transmission was lost, so the link has just demonstrated it can
+            // drop that many consecutive datagrams: a lone repair is known to
+            // be dropped too while the burst is still pending, and the episode
+            // then climbs one rung per dropped datagram.  Re-sending the same
+            // cover spends the burst's remaining drop budget inside one rung.
+            // The interactive lane opts in through its own FEC tuning, exactly
+            // as the fresh tail does, so the recovery-armour session toggle
+            // does not gate it; the copy count is the packet's own recorded
+            // cover, so a packet that never carried one (bulk/stock lanes, or
+            // an interactive tail sent while the loss-adaptive ladder had
+            // withdrawn the cover) is repaired exactly as before.
+            let tail_cover_copies = if is_recovery {
+                self.shared
+                    .with_reliable_layer(|reliable_layer| reliable_layer.cover_copies(p.seq))
+            } else {
+                0
+            };
+            let cover_repair = is_recovery && tail_cover_copies > 0;
+            let armor_decision = if cover_repair {
+                if self
+                    .shared
+                    .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
+                {
+                    ArmorDecision::SkipQueueBuilding
+                } else {
+                    ArmorDecision::Duplicate
+                }
+            } else {
                 self.retransmission_armor
                     .decide(is_recovery, fresh_interactive_tail, || {
                         self.shared
                             .with_reliable_layer(|reliable_layer| reliable_layer.queue_building())
-                    });
+                    })
+            };
             if crate::debug::debug_send() {
                 eprintln!(
                     "[send] conn={:x} seq={} len={} recovery={} piggyback={}",
@@ -927,12 +958,25 @@ impl WriteHalf {
                         // datagram budget at five without an 8 KB parity.  Only
                         // this lane pays the extra pacer token (bulk/stock
                         // never force `fec_instream_flush`).
-                        let copies = fresh_tail_armor_copy_count(
-                            fresh_interactive_tail,
-                            self.fresh_tail_armor_copies_override,
-                            self.fec_gate.effective_loss_ratio(),
-                            self.fec_gate.loss_active(),
-                        );
+                        let copies = if cover_repair {
+                            usize::from(tail_cover_copies)
+                        } else {
+                            fresh_tail_armor_copy_count(
+                                fresh_interactive_tail,
+                                self.fresh_tail_armor_copies_override,
+                                self.fec_gate.effective_loss_ratio(),
+                                self.fec_gate.loss_active(),
+                            )
+                        };
+                        if !is_recovery && fresh_interactive_tail {
+                            // Remember what cover this tail's original
+                            // transmission carried so a later repair of it
+                            // re-sends the same one (see `cover_repair`).
+                            let copies = u8::try_from(copies).unwrap_or(u8::MAX);
+                            self.shared.with_reliable_layer_mut(|reliable_layer| {
+                                reliable_layer.set_cover_copies(p.seq, copies)
+                            });
+                        }
                         for _ in 0..copies {
                             if !self.send_pacer.take_exact_tokens(1, now) {
                                 break;

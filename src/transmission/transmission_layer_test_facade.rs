@@ -1123,6 +1123,47 @@ mod tests {
             "the tail probe still sends once from an empty bucket; the armor duplicate is skipped (no token)"
         );
     }
+    /// A tail-loss probe of an interactive single-symbol tail re-sends the
+    /// cover the tail's *original* transmission carried, not a lone datagram.
+    /// The recovery-armor session toggle is OFF here, so nothing but the
+    /// packet's own recorded cover can produce the copies; and the copy count
+    /// is the fresh tail's burst-cover width (primary + four), exactly the
+    /// width the original spent.  A lone repair is provably insufficient when
+    /// a probe fires: the whole original transmission was just dropped.
+    #[tokio::test]
+    async fn a_tail_probe_resends_the_cover_the_original_tail_carried() {
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
+        let (mut tl, recorder) = harness_with_tuning(
+            true,
+            // Recovery-armor toggle off: the cover must come from the packet's
+            // own recorded cover, not from a session toggle or from the fresh
+            // ladder re-evaluated at probe time.
+            false,
+            FecTuning::max_diversity(),
+        );
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        stage_small_message(&tl);
+        let mut bufs = SendBufs::new();
+        assert!(tl.send_pkts(&mut bufs).await.unwrap(), "data must go out");
+        let fresh = recorder.lock().unwrap().count();
+        assert_eq!(
+            fresh, 6,
+            "M1: the fresh interactive tail must emit primary + the five-copy burst cover, got {fresh}"
+        );
+        recorder.lock().unwrap().clear();
+
+        // Wait out the tail-loss-probe window (PTO = max(2*srtt, 10 ms) at the
+        // 1 ms settled RTT); the regular RTO is still far off.
+        wait_for_rtx_window().await;
+        let mut bufs = SendBufs::new();
+        let _ = tl.send_pkts(&mut bufs).await;
+        let repair = recorder.lock().unwrap().count();
+        assert_eq!(
+            repair, fresh,
+            "M1: the tail probe must re-send the tail's own cover (as many datagrams as the fresh send), not a lone datagram; fresh={fresh} repair={repair}"
+        );
+    }
+
     #[tokio::test]
     async fn recovery_non_fec_data_uses_the_canonical_contiguous_encoding() {
         let (mut tl, recorder) = harness(false, false);

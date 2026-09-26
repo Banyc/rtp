@@ -475,6 +475,18 @@ impl ReliableLayer {
         self.congestion_response.queue_building()
     }
 
+    /// Record the armour cover an interactive single-symbol tail's original
+    /// transmission carried (see [`PktSendSpace::set_cover_copies`]).
+    pub(crate) fn set_cover_copies(&mut self, seq: SequenceNumber, copies: u8) {
+        self.pkt_send_space.set_cover_copies(seq, copies);
+    }
+
+    /// The recorded armour cover for `seq` (see
+    /// [`PktSendSpace::cover_copies`]).
+    pub(crate) fn cover_copies(&self, seq: SequenceNumber) -> u8 {
+        self.pkt_send_space.cover_copies(seq)
+    }
+
     /// The most recent congestion-loss ratio measured by the delivery-rate
     /// controller (`None` before the first rate sample).  Feeds the FEC
     /// condition gate's loss evidence.  A test that pinned the ratio through

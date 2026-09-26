@@ -1014,6 +1014,34 @@ impl PktSendSpace {
         self.tlp.is_due(p.sent_time, &self.rtt_stats, now)
     }
 
+    /// Record the armour cover an interactive single-symbol tail's original
+    /// transmission carried.  A later repair of that tail re-sends the same
+    /// cover rather than a lone datagram: a probe or window-expiry
+    /// retransmission fires only once the whole original transmission —
+    /// primary plus this many armour copies — was lost, which is direct
+    /// evidence that the link just dropped that many consecutive datagrams.
+    /// A lone repair datagram is therefore *known* to be insufficient while
+    /// the burst is still pending, and the episode would climb one rung per
+    /// dropped datagram; re-sending the same cover spends the burst's
+    /// remaining drop budget within one rung instead.  The datagram count per
+    /// episode stays bounded by the burst being crossed, because the repair
+    /// repeats only while the tail is unacked.
+    pub(crate) fn set_cover_copies(&mut self, seq: SequenceNumber, copies: u8) {
+        if let Some(p) = self.send_wnd.get_mut(&seq).and_then(|p| p.as_mut()) {
+            p.cover_copies = copies;
+        }
+    }
+
+    /// The armour cover [`Self::set_cover_copies`] recorded for `seq`, or `0`
+    /// when the packet never had one (bulk/stock lanes, or an interactive
+    /// tail sent while the loss-adaptive ladder had withdrawn the cover).
+    pub(crate) fn cover_copies(&self, seq: SequenceNumber) -> u8 {
+        self.send_wnd
+            .get(&seq)
+            .and_then(|p| p.as_ref())
+            .map_or(0, |p| p.cover_copies)
+    }
+
     /// Produce a tail-loss probe if it is time for one. The probe retransmits
     /// the current tail packet with a fresh timestamp and RTO without marking
     /// it as a loss event or clearing its congestion state. `packet_state`
@@ -1052,6 +1080,7 @@ impl PktSendSpace {
                 rto,
                 rto_from_tail_probe: true,
                 sacked_above: _,
+                cover_copies: _,
                 fast_loss_rtx_time: _,
                 fast_loss_confirm_until: _,
                 deferred_loss_baseline_deadline: _,
@@ -1114,6 +1143,7 @@ impl PktSendSpace {
             rto,
             rto_from_tail_probe: false,
             sacked_above: 0,
+            cover_copies: 0,
             fast_loss_rtx_time: None,
             fast_loss_confirm_until: None,
             deferred_loss_baseline_deadline: None,
@@ -1272,6 +1302,7 @@ impl PktSendSpace {
                     rto: fresh_rto,
                     rto_from_tail_probe: false,
                     sacked_above: _,
+                    cover_copies: _,
                     fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
                     fast_loss_confirm_until: None,
                     deferred_loss_baseline_deadline: baseline_deadline_opt,
@@ -1733,6 +1764,12 @@ struct InFlightPkt {
     /// [`FAST_LOSS_SACK_THRESHOLD`], the packet is declared lost without
     /// waiting for the time-based reorder window to expire.
     pub sacked_above: u32,
+    /// Number of retransmission-armour duplicate copies this packet's
+    /// original transmission carried, recorded by the transmission layer when
+    /// the packet went out.  A repair of an interactive single-symbol tail
+    /// re-sends exactly this cover instead of a lone datagram: see
+    /// [`PktSendSpace::set_cover_copies`].
+    pub cover_copies: u8,
     /// The earliest instant the evidence-gated fast-loss declaration for this
     /// packet may fire: the SACK-evidence moment plus
     /// [`FAST_LOSS_CONFIRM_MS`].  Set when the packet first becomes
@@ -2156,6 +2193,59 @@ mod tests {
         ack_up_to(&mut space, 0, t0 + ms(1));
         assert!(!space.has_tail_probe(t0 + ms(900)));
         assert!(space.tail_probe(t0 + ms(900)).is_none());
+    }
+
+    /// A repair re-sends the armour cover the packet's *original* transmission
+    /// carried: the count is recorded per packet by the transmission layer and
+    /// must survive both repair paths (the tail-loss probe and the full-RTO
+    /// retransmission), so a probe of a packet whose cover was wiped re-emits
+    /// the same width instead of a lone datagram.  A packet that never carried
+    /// one (bulk/stock lanes, or an interactive tail the loss-adaptive ladder
+    /// had already stripped) reports zero — the repair then stays exactly as it
+    /// was.  The record dies with the packet.
+    #[test]
+    fn the_recorded_cover_survives_both_repair_paths_and_zero_means_no_cover() {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        settle_rtt_at(&mut space, t0);
+        send_packet(&mut space, t0);
+        assert_eq!(
+            space.cover_copies(sq(0)),
+            0,
+            "a packet with no recorded cover must report zero"
+        );
+
+        space.set_cover_copies(sq(0), 4);
+        assert_eq!(space.cover_copies(sq(0)), 4);
+
+        assert!(
+            space.tail_probe(t0 + ms(250)).is_some(),
+            "the probe must fire"
+        );
+        assert_eq!(
+            space.cover_copies(sq(0)),
+            4,
+            "a tail probe must not clear the cover record"
+        );
+
+        assert!(space.rtx(t0 + ms(2_000)).is_some(), "the RTO must fire");
+        assert_eq!(
+            space.cover_copies(sq(0)),
+            4,
+            "an RTO retransmission must not clear the cover record"
+        );
+
+        ack_up_to(&mut space, 0, t0 + ms(2_001));
+        assert_eq!(
+            space.cover_copies(sq(0)),
+            0,
+            "the record must die with the acked packet"
+        );
+        assert_eq!(
+            space.cover_copies(sq(7)),
+            0,
+            "a sequence outside the window must report zero"
+        );
     }
 
     #[test]
