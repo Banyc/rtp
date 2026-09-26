@@ -313,9 +313,23 @@ fn client_queues_nonce_bound_ready_after_confirmation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_handshake_leg_recovers_from_one_lost_datagram() {
-    for dropped in [Kind::Hello, Kind::HelloAck, Kind::Confirm, Kind::ConfirmAck] {
-        complete_over_channels(Some(dropped), false).await;
-    }
+    // One leg per dropped handshake kind, each over its own channel pair with
+    // its own nonce, and each recovering in one opening retry interval
+    // (250 ms + jitter) rather than in a fixed wait.  The legs are
+    // independent, so they are polled concurrently: four sequential ~300 ms
+    // episodes cost the tier a second that concurrency does not, and the
+    // cells are unchanged -- same drop filter, same assertions, and a leg
+    // that fails still fails the test.
+    let (c0, s0) = handshake_channel_pair(Some(Kind::Hello), false);
+    let (c1, s1) = handshake_channel_pair(Some(Kind::HelloAck), false);
+    let (c2, s2) = handshake_channel_pair(Some(Kind::Confirm), false);
+    let (c3, s3) = handshake_channel_pair(Some(Kind::ConfirmAck), false);
+    tokio::join!(
+        complete_over_pair(c0, s0, Some(Kind::Hello), false),
+        complete_over_pair(c1, s1, Some(Kind::HelloAck), false),
+        complete_over_pair(c2, s2, Some(Kind::Confirm), false),
+        complete_over_pair(c3, s3, Some(Kind::ConfirmAck), false),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -377,12 +391,15 @@ async fn server_first_handshake_does_not_wait_for_rtp_traffic() {
     .expect("opening handshake failed");
 }
 
-async fn complete_over_channels(dropped: Option<Kind>, duplicate: bool) {
+fn handshake_channel_pair(
+    dropped: Option<Kind>,
+    duplicate: bool,
+) -> (UnreliableLayer, UnreliableLayer) {
     let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
     let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
     let drop_client = dropped.filter(|kind| matches!(kind, Kind::Hello | Kind::Confirm));
     let drop_server = dropped.filter(|kind| matches!(kind, Kind::HelloAck | Kind::ConfirmAck));
-    let mut client = wrap_fec(
+    let client = wrap_fec(
         Box::new(ChannelRead(server_to_client_rx)),
         Box::new(ChannelWrite::new(
             client_to_server_tx,
@@ -391,7 +408,7 @@ async fn complete_over_channels(dropped: Option<Kind>, duplicate: bool) {
         )),
         false,
     );
-    let mut server = wrap_fec(
+    let server = wrap_fec(
         Box::new(ChannelRead(client_to_server_rx)),
         Box::new(ChannelWrite::new(
             server_to_client_tx,
@@ -400,6 +417,20 @@ async fn complete_over_channels(dropped: Option<Kind>, duplicate: bool) {
         )),
         false,
     );
+    (client, server)
+}
+
+async fn complete_over_channels(dropped: Option<Kind>, duplicate: bool) {
+    let (client, server) = handshake_channel_pair(dropped, duplicate);
+    complete_over_pair(client, server, dropped, duplicate).await;
+}
+
+async fn complete_over_pair(
+    mut client: UnreliableLayer,
+    mut server: UnreliableLayer,
+    dropped: Option<Kind>,
+    duplicate: bool,
+) {
     if dropped == Some(Kind::ConfirmAck) {
         let (_, server_socket) =
             tokio::time::timeout(OPENING_TIMEOUT + Duration::from_secs(1), async {
