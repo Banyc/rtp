@@ -650,12 +650,21 @@ async fn lost_ready_is_recovered_by_a_duplicate_confirmation() {
     .expect("opening handshake hung")
     .expect("opening handshake failed");
 
-    // Same wall-clock constraint as the retired-ready test: the +1s and
-    // +3s post-open retransmission slots are `std::time::Instant`
-    // scheduled, so they can only fire with real time. Waiting 3.2s also
-    // proves the server stopped retransmitting after +1s (a non-retired
-    // recovery would send again at +3s, tripping `confirmation_attempts`).
-    tokio::time::sleep(Duration::from_millis(3_200)).await;
+    // Same wall-clock constraint as the retired-ready test: the post-open
+    // retransmission slots are `std::time::Instant` scheduled, so they can
+    // only fire with real time. The slot this wait exists to cover is the
+    // +1s one, which is the server's duplicate confirmation: `1s +
+    // retry_delay` puts it 1.0368-1.3833 s after the opening in eight probed
+    // runs, and the client's retried Ready follows in the same millisecond,
+    // so 1.6 s bounds the worst case (`1s + 499 ms` jitter). The old 3.2s
+    // wait also reached past the +3s slot, but not deterministically -- the
+    // per-nonce jitter places that slot in [3.0, 3.5) s -- and there is
+    // nothing there to see: the retried Ready retires the recovery, so no
+    // further confirmation is sent at any slot, and eight probed runs found
+    // no event at all between 1.39 s and 4 s. The retirement is pinned
+    // exactly, at no wall clock, by
+    // `transmission::post_open_recovery::tests::retried_ready_retires_the_scheduled_retransmission_chain`.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
     assert_eq!(ready_attempts.load(Ordering::SeqCst), 2);
     assert_eq!(
         confirmation_attempts.load(Ordering::SeqCst),

@@ -76,3 +76,51 @@ impl PostOpenRecovery {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traffic_shaping::control::handshake::post_open::retry_delay;
+    use crate::traffic_shaping::control::handshake::wire::{Kind, Packet};
+
+    /// A lost `Ready` is answered by the server's +1 s retransmission, and the
+    /// client's retried `Ready` then retires the recovery: no later slot may
+    /// send. The schedule and the retirement are both `Instant`-based, and the
+    /// per-nonce jitter places the +3 s slot in `[3.0, 3.5)` s, so no fixed
+    /// sleep in an integration test observes the retirement deterministically.
+    /// Driving `now` by argument covers it exactly, at no wall clock.
+    #[test]
+    fn retried_ready_retires_the_scheduled_retransmission_chain() {
+        let nonce = 0x0123_4567_89ab_cdef;
+        let t0 = Instant::now();
+        let recovery = PostOpenRecovery::new(Some(PostOpenHandshake::server(nonce, t0)));
+        let ready = Packet {
+            kind: Kind::Ready,
+            nonce,
+        }
+        .encode();
+
+        let slot0 = t0 + retry_delay(nonce, 0);
+        assert_eq!(recovery.next_send_time(t0), Some(slot0));
+        assert!(
+            recovery.claim_response(slot0).is_some(),
+            "the +1 s slot must fire when the client's Ready is lost"
+        );
+
+        assert_eq!(recovery.observe(&ready, slot0), PostOpenVerdict::Complete);
+        let slot1 = t0 + retry_delay(nonce, 1);
+        assert!(
+            slot1 > slot0,
+            "the +3 s slot is scheduled after the +1 s one"
+        );
+        assert_eq!(
+            recovery.next_send_time(slot1),
+            None,
+            "a retired recovery must expose no further send time"
+        );
+        assert!(
+            recovery.claim_response(slot1).is_none(),
+            "the +3 s slot must not send after the retried Ready retires recovery"
+        );
+    }
+}
