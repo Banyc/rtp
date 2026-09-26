@@ -54,6 +54,7 @@ opt-in sets are recorded here and machine-checked:
   cargo test --release -p rtp --lib -- --ignored probe_fresh_tail_armor_latency
   cargo test --release -p rtp --lib -- --ignored probe_fresh_tail_burst_loss_latency
   cargo test --release -p rtp --lib -- --ignored probe_lone_tail_repair_deadline_latency
+  cargo test --release -p rtp --lib -- --ignored probe_lone_tail_repair_ladder
   cargo test --release -p rtp --lib -- --ignored probe_armor_copy_cell
   ```
 
@@ -245,6 +246,7 @@ src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = probe
 src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = probe
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = probe
 src/traffic_shaping/recovery/pkt_send_space.rs::applying_many_sacks_remains_linear_in_the_send_window = perf-lane
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = probe
 src/traffic_shaping/recovery/rtx_index.rs::deferred_loss_cancellation_does_not_rescan_the_pending_set = perf-lane
 tests/rtp_bufferbloat.rs::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 tests/rtp_burst_loss.rs::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
@@ -283,6 +285,7 @@ src/socket/stream.rs::probe_fresh_tail_armor_latency = 4
 src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = 7
 src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 7
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = 4
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = 6
 ```
 
 ## Scenario manifest

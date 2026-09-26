@@ -17,6 +17,16 @@ pub struct RtxTimer {
     first_measured: bool,
 }
 impl RtxTimer {
+    /// RFC 6298's 1 s minimum RTO floor, kept for the *general* RTO path.
+    ///
+    /// One scoped departure: once the tail-loss prober's budget for the
+    /// current tail episode is spent, the tail loss is corroborated by two
+    /// unanswered probes and the send-space retransmission deadline uses the
+    /// prober's tightened post-probe floor instead of this one
+    /// (`TailLossProber::TAIL_PROBED_MIN_RTO`, see
+    /// `PktSendSpace::repair_rto`).  The floor still governs every path with
+    /// no probe evidence, so an unmeasured or merely-idle connection is
+    /// unaffected.
     const MIN_RTO: Duration = Duration::from_secs(1);
     const K: f64 = 4.;
     const BETA: f64 = 1. / 4.;
@@ -146,8 +156,15 @@ mod tests {
 
     use super::RtxTimer;
 
+    /// The reorder window tracks variance with no `MIN_RTO` floor, and so does
+    /// the repair deadline once the tail prober's budget for an episode is
+    /// spent: on a stable low-RTT link the window is tight while `rto()` is
+    /// floored at 1 s, and on a jittered link whose raw RTO sits between
+    /// `TAIL_PROBED_MIN_RTO` and `MIN_RTO` the send space arms the full-RTO rung
+    /// at that raw RTO — the estimator, not the 1 s floor.  The general path
+    /// (no probe budget spent) keeps the floor.
     #[test]
-    fn reorder_window_tracks_variance_without_min_rto_floor() {
+    fn reorder_window_tracks_variance_and_the_corroborated_repair_deadline_tracks_the_raw_rto() {
         let mut rto = RtxTimer::new();
 
         // Steady 100 ms samples: variance collapses, so the reorder window is
@@ -173,6 +190,69 @@ mod tests {
         let rw = rto.reorder_window();
         assert!(rw > Duration::from_millis(900), "rw={rw:?}");
         assert!(rw <= rto.rto(), "rw={rw:?} rto={:?}", rto.rto());
+
+        // A jittered link whose raw RTO lands between the post-probe floor and
+        // the 1 s `MIN_RTO` floor. Fed the same sample sequence, the send
+        // space's repair ladder must step by exactly that raw RTO: the repair
+        // deadline is the corroborated estimator value, exempt from the 1 s
+        // floor, while `rto()` still reports the floored general RTO.
+        use std::time::Instant;
+
+        use crate::traffic_shaping::recovery::pkt_send_space::PktSendSpace;
+        use crate::traffic_shaping::recovery::tlp::TailLossProber;
+
+        let samples = |i: usize| Duration::from_millis(if i.is_multiple_of(2) { 100 } else { 250 });
+        let mut jittered = RtxTimer::new();
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        for i in 0..40 {
+            jittered.set(samples(i));
+            space.sample_rtt(samples(i), t0 + Duration::from_millis(i as u64));
+        }
+        assert!(
+            jittered.raw_rto() > TailLossProber::TAIL_PROBED_MIN_RTO,
+            "the fixture's raw RTO {:?} must sit above the post-probe floor, or the reparture is not observable",
+            jittered.raw_rto()
+        );
+        assert!(
+            jittered.raw_rto() < RtxTimer::MIN_RTO,
+            "the fixture's raw RTO {:?} must sit below the 1 s floor, or the departure is not observable",
+            jittered.raw_rto()
+        );
+        let send_t = t0 + Duration::from_secs(1);
+        let no_packets_in_flight = space.no_pkts_in_flight();
+        let mut connection_state = dre::ConnectionState::new(send_t);
+        space.send(
+            vec![0u8; 1],
+            connection_state.send_packet_2(send_t, no_packets_in_flight),
+            None,
+            send_t,
+        );
+        let mut rungs: Vec<u64> = Vec::new();
+        for step in 0..4_000u64 {
+            let now = send_t + Duration::from_millis(step);
+            if space.has_rtx(now) && space.rtx(now).is_some() {
+                rungs.push(step);
+            } else {
+                let _ = space.tail_probe(now);
+            }
+        }
+        assert!(
+            rungs.len() >= 3,
+            "the replay produced {} full-RTO rungs, too few to measure the steady spacing: rungs={rungs:?}",
+            rungs.len()
+        );
+        assert_eq!(
+            rungs[1] - rungs[0],
+            u64::try_from(jittered.raw_rto().as_nanos().div_ceil(1_000_000)).unwrap(),
+            "M1: with the probe budget spent the repair rung must step by the raw RTO ({:?}), not the 1 s `MIN_RTO` floor (rungs={rungs:?})",
+            jittered.raw_rto()
+        );
+        assert!(
+            space.rto_duration() >= RtxTimer::MIN_RTO,
+            "the general RTO path keeps the 1 s floor, got {:?}",
+            space.rto_duration()
+        );
     }
 
     #[test]

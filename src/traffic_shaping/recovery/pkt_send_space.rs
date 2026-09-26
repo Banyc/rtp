@@ -476,7 +476,7 @@ impl PktSendSpace {
                     seq,
                     rto_at: p.sent_time + p.rto,
                     sent_at: p.sent_time,
-                    apply_live_rto_floor: !p.rto_from_tail_probe,
+                    apply_live_rto_floor: !p.rto_is_exact(),
                     reorder_eligible: out_of_order,
                     fast_loss_eligible: false,
                     pre_outage_eligible: false,
@@ -578,7 +578,7 @@ impl PktSendSpace {
                 seq,
                 rto_at: p.sent_time + p.rto,
                 sent_at: p.sent_time,
-                apply_live_rto_floor: !p.rto_from_tail_probe,
+                apply_live_rto_floor: !p.rto_is_exact(),
                 reorder_eligible: out_of_order_seq_end.is_some_and(|end| lt(seq, end)),
                 fast_loss_eligible: fast_loss_armed && p.is_fast_loss(),
                 pre_outage_eligible: pre_outage,
@@ -678,7 +678,7 @@ impl PktSendSpace {
                     seq,
                     rto_at: p.sent_time + p.rto,
                     sent_at: p.sent_time,
-                    apply_live_rto_floor: !p.rto_from_tail_probe,
+                    apply_live_rto_floor: !p.rto_is_exact(),
                     reorder_eligible: out_of_order,
                     fast_loss_eligible: false,
                     pre_outage_eligible: false,
@@ -1079,6 +1079,7 @@ impl PktSendSpace {
                 frame_len: _,
                 rto,
                 rto_from_tail_probe: true,
+                rto_post_probe_floor: false,
                 sacked_above: _,
                 cover_copies: _,
                 fast_loss_rtx_time: _,
@@ -1130,7 +1131,7 @@ impl PktSendSpace {
 
         self.max_pipe_seq = Some(s);
 
-        let rto = self.rtt_stats.rto_duration();
+        let (rto, rto_post_probe_floor) = self.repair_rto();
         self.liveness.on_send(now, rto);
 
         let p = InFlightPkt {
@@ -1142,6 +1143,7 @@ impl PktSendSpace {
             frame_len,
             rto,
             rto_from_tail_probe: false,
+            rto_post_probe_floor,
             sacked_above: 0,
             cover_copies: 0,
             fast_loss_rtx_time: None,
@@ -1165,7 +1167,7 @@ impl PktSendSpace {
             seq: s,
             rto_at: now + rto,
             sent_at: now,
-            apply_live_rto_floor: true,
+            apply_live_rto_floor: !rto_post_probe_floor,
             reorder_eligible: out_of_order,
             fast_loss_eligible: false,
             pre_outage_eligible: false,
@@ -1201,6 +1203,10 @@ impl PktSendSpace {
         // re-arms fast loss on the next evidence sync.
         self.clear_expired_fast_loss_disable(now);
         let stock_window = self.rtt_stats.reorder_window();
+        // Armed before the packet borrow is taken: the post-probe floor decision
+        // reads the prober, and nothing between here and the re-arm below
+        // changes its budget.
+        let (fresh_rto, rto_post_probe_floor) = self.repair_rto();
         let rtx_window = if self.jitter_cap {
             self.rtt_stats.fast_reorder_window()
         } else {
@@ -1290,7 +1296,6 @@ impl PktSendSpace {
             false
         };
 
-        let fresh_rto = self.rtt_stats.rto_duration();
         self_assign::self_assign! {
                 p = InFlightPkt {
                     stats: _,
@@ -1301,6 +1306,7 @@ impl PktSendSpace {
                     frame_len: _,
                     rto: fresh_rto,
                     rto_from_tail_probe: false,
+                    rto_post_probe_floor,
                     sacked_above: _,
                     cover_copies: _,
                     fast_loss_rtx_time: if is_fast_loss_rtx { Some(now) } else { None },
@@ -1328,7 +1334,7 @@ impl PktSendSpace {
             seq: s,
             rto_at: now + fresh_rto,
             sent_at: now,
-            apply_live_rto_floor: true,
+            apply_live_rto_floor: !rto_post_probe_floor,
             reorder_eligible: out_of_order,
             fast_loss_eligible: false,
             pre_outage_eligible: false,
@@ -1469,6 +1475,34 @@ impl PktSendSpace {
 
     pub(crate) fn retransmission_counters(&self) -> RetransmissionCounters {
         self.retransmission_counters
+    }
+
+    /// The RTO a repair-bearing transmission arms on the packet, and whether
+    /// that deadline is *exact* (it must not be pushed back out by the live
+    /// estimator's floor).
+    ///
+    /// Before the tail-loss prober's budget for the current tail episode is
+    /// spent, the general 1 s `MIN_RTO` floor governs: estimator error is
+    /// uncorroborated, so a shorter deadline on a merely unmeasured path would
+    /// be a guess.  Once the budget is spent — two probes have gone unanswered
+    /// for the tail — the loss is corroborated, so the deadline uses the same
+    /// tightened post-probe floor the probe window already uses
+    /// ([`TailLossProber::rto`], `max(raw_rto, 300 ms)`), and it is exact: the
+    /// live `MIN_RTO` floor must not push a corroborated sub-second deadline
+    /// back out to 1 s, which is what made every rung of a lost tail's repair
+    /// ladder cost a full second.
+    ///
+    /// Scoped deliberately to the spent-budget path: the general RTO path (no
+    /// probe corroboration) keeps its 1 s floor unchanged, and the deadline's
+    /// exactness is carried by [`InFlightPkt::rto_post_probe_floor`] rather
+    /// than `rto_from_tail_probe`, so the retransmission this deadline fires is
+    /// still accounted as the genuine congestion loss event it is.
+    fn repair_rto(&self) -> (Duration, bool) {
+        if self.tlp.can_probe() {
+            (self.rtt_stats.rto_duration(), false)
+        } else {
+            (self.tlp.rto(&self.rtt_stats), true)
+        }
     }
 
     /// One send-window traversal computing the loss ratio, the pipe depth,
@@ -1759,6 +1793,13 @@ struct InFlightPkt {
     /// still fires, but it must not record a congestion loss event because the
     /// probe itself already signalled the tail episode.
     pub rto_from_tail_probe: bool,
+    /// True if this packet's RTO was armed at the tail prober's post-probe
+    /// floor because the prober's budget was already spent
+    /// ([`PktSendSpace::repair_rto`]).  The deadline is *exact* — the live
+    /// `MIN_RTO` floor must not push a corroborated sub-second deadline back
+    /// out to 1 s — but, unlike a probe-derived RTO, no probe was sent for this
+    /// packet, so its retransmission is still the genuine loss event it is.
+    pub rto_post_probe_floor: bool,
     /// Number of newer in-flight packets that have been SACKed past this
     /// packet.  Used by the evidence-gated fast-loss path: once this reaches
     /// [`FAST_LOSS_SACK_THRESHOLD`], the packet is declared lost without
@@ -1795,9 +1836,17 @@ struct InFlightPkt {
     pub deferred_loss_baseline_deadline: Option<Instant>,
 }
 impl InFlightPkt {
+    /// Whether this packet's own RTO offset is the *exact* deadline, exempt
+    /// from the live estimator's `MIN_RTO` floor: it was armed below that floor
+    /// with evidence — by a tail-loss probe, or at the post-probe floor once
+    /// the probe budget was spent.
+    pub fn rto_is_exact(&self) -> bool {
+        self.rto_from_tail_probe || self.rto_post_probe_floor
+    }
+
     pub fn hits_rto(&self, now: Instant, live_rto: Duration) -> bool {
         let sent_elapsed = now.duration_since(self.sent_time);
-        let effective_rto = if self.rto_from_tail_probe {
+        let effective_rto = if self.rto_is_exact() {
             self.rto
         } else {
             self.rto.max(live_rto)
@@ -5306,5 +5355,102 @@ mod tests {
             Some(probe_deadline),
             "an eligible overdue tail probe returns the real probe deadline"
         );
+    }
+
+    /// Deterministic repair-ladder probe for a lost lone tail.
+    ///
+    /// Replays the production shape — one tail packet, no reply, every
+    /// transmission lost, so no ACK ever refills the tail prober — against a
+    /// settled RTT estimator, and prints every repair event with its offset
+    /// from the packet's send. The rungs are the deadlines the send space arms:
+    /// the prober's two probe windows (`2 * sRTT`), then the full-RTO rungs
+    /// whose spacing is the RTO re-armed on each retransmission. Deterministic
+    /// and network-free, so the ladder's *spacing* — the quantity the field
+    /// stall is made of — is measurable without a load environment; the
+    /// socket-level `probe_lone_tail_repair_deadline_latency` measures the same
+    /// ladder end to end under a burst-loss impairment.
+    ///
+    /// Run with `--ignored --nocapture`.
+    ///
+    /// Self-validating report-only: asserts the *instrument's* integrity — each
+    /// arm settled its estimator to the RTT it names, fired both tail probes
+    /// and several full-RTO rungs, and its printed ladder agrees with its
+    /// counters — and no bound from this crate's GATE.md.
+    #[test]
+    #[ignore = "deterministic lone-tail repair-ladder probe; <1 s; run with --ignored --nocapture"]
+    fn probe_lone_tail_repair_ladder() {
+        for rtt_ms in [50u64, 190] {
+            let t0 = Instant::now();
+            let mut space = PktSendSpace::new();
+            for i in 0..40 {
+                space.sample_rtt(ms(rtt_ms), t0 + ms(i));
+            }
+            let send_t = t0 + ms(1_000);
+            send_packet(&mut space, send_t);
+            let mut ladder: Vec<(u64, &'static str)> = Vec::new();
+            for step in 0..6_000u64 {
+                let now = send_t + ms(step);
+                if space.has_rtx(now) && space.rtx(now).is_some() {
+                    ladder.push((step, "rtx"));
+                } else if space.tail_probe(now).is_some() {
+                    ladder.push((step, "probe"));
+                }
+            }
+            let counters = space.retransmission_counters();
+            let rtx_rungs: Vec<u64> = ladder
+                .iter()
+                .filter(|(_, arm)| *arm == "rtx")
+                .map(|(at, _)| *at)
+                .collect();
+            let steady_spacing = rtx_rungs
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .next_back()
+                .unwrap_or(0);
+            eprintln!(
+                "[probe ladder rtt={rtt_ms}ms] srtt={:?} raw_rto={:?} general_rto={:?} ladder={ladder:?} counters={counters:?} steady_rung_spacing_ms={steady_spacing}",
+                space.smooth_rtt(),
+                space.rtt_stats.raw_rto(),
+                space.rto_duration(),
+            );
+            // Instrument integrity, per arm: the estimator settled to the RTT
+            // the arm names, the tail prober fired both of its probes (so the
+            // ladder's first rungs really are the probe windows this arm
+            // claims), the ladder produced the full-RTO rungs it reports, and
+            // the printed ladder agrees with the counters. The general RTO
+            // staying at the 1 s floor is what makes this arm a measurement of
+            // the *repair deadline* departing from it, not of a different
+            // estimator.
+            assert_eq!(
+                space.smooth_rtt(),
+                ms(rtt_ms),
+                "[probe ladder rtt={rtt_ms}ms] the estimator did not settle to the arm's RTT: these rungs are not this path's"
+            );
+            assert_eq!(
+                space.rto_duration(),
+                Duration::from_secs(1),
+                "[probe ladder rtt={rtt_ms}ms] the general RTO is not the 1 s floor: the arm is not measuring the floor's departure"
+            );
+            assert_eq!(
+                counters.tail_probes, 2,
+                "[probe ladder rtt={rtt_ms}ms] the arm fired {} tail probes, not the budget of 2: its first rungs are not the probe windows it prints",
+                counters.tail_probes
+            );
+            assert!(
+                counters.rto_reason >= 3,
+                "[probe ladder rtt={rtt_ms}ms] the arm produced {} full-RTO rungs: too few to measure the steady spacing, so the ladder it prints is not the repair ladder",
+                counters.rto_reason
+            );
+            assert_eq!(
+                ladder.first().map(|(at, _)| *at),
+                Some(rtt_ms * 2),
+                "[probe ladder rtt={rtt_ms}ms] the first rung is not the probe window (2*sRTT): the arm did not measure an RTT-estimated lone tail"
+            );
+            assert_eq!(
+                counters.rto_reason as usize,
+                rtx_rungs.len(),
+                "[probe ladder rtt={rtt_ms}ms] the printed ladder's full-RTO rungs and the rto_reason counter disagree: the classification is not this arm's"
+            );
+        }
     }
 }

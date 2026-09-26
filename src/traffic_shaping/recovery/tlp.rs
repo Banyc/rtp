@@ -29,7 +29,12 @@ impl TailLossProber {
     /// The first timeout signal keeps the 1 s `MIN_RTO` floor to absorb
     /// estimator error; once a tail probe has been sent the timeout is
     /// corroborated and can safely be tightened to 300 ms.
-    const TAIL_PROBED_MIN_RTO: Duration = Duration::from_millis(300);
+    ///
+    /// It governs two things: the probe window's cap, and — once the budget is
+    /// spent — the send-space retransmission deadline itself (`PktSendSpace::repair_rto`).  Before the budget is spent the deadline
+    /// keeps the general `MIN_RTO` floor, so the tightening is scoped to a
+    /// tail episode whose loss the probes have already corroborated.
+    pub(crate) const TAIL_PROBED_MIN_RTO: Duration = Duration::from_millis(300);
 
     pub fn new() -> Self {
         Self { probes_sent: 0 }
@@ -175,12 +180,65 @@ mod tests {
         stats
     }
 
+    /// The pre-probe RTO keeps the general 1 s `MIN_RTO` floor; once the prober's
+    /// budget for a tail episode is spent, the *send space* arms the repair
+    /// deadline at the tightened post-probe floor instead
+    /// (`PktSendSpace::repair_rto`) — the departure `TAIL_PROBED_MIN_RTO`
+    /// documents.  The prober's own `rto()` is the same number the general path
+    /// reports before any probe, so the scoping has to be asserted where the
+    /// deadline is armed: the full-RTO rung spacing of a lost lone tail's repair
+    /// ladder, replayed deterministically against a settled 50 ms estimator, is
+    /// `TAIL_PROBED_MIN_RTO` rather than the 1 s floor the general estimator RTO
+    /// still reports.
     #[test]
     fn pre_probe_rto_uses_1s_floor() {
+        use std::time::Instant;
+
+        use crate::traffic_shaping::recovery::pkt_send_space::PktSendSpace;
+
         let rtt_stats = settled_rtt_stats();
         let tlp = TailLossProber::new();
         let r = tlp.rto(&rtt_stats);
         assert!(r >= Duration::from_secs(1), "r={r:?}");
+
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        for i in 0..40 {
+            space.sample_rtt(ms(50), t0 + ms(i));
+        }
+        let send_t = t0 + Duration::from_secs(1);
+        let no_packets_in_flight = space.no_pkts_in_flight();
+        let mut connection_state = dre::ConnectionState::new(send_t);
+        space.send(
+            vec![0u8; 1],
+            connection_state.send_packet_2(send_t, no_packets_in_flight),
+            None,
+            send_t,
+        );
+        let mut rungs: Vec<u64> = Vec::new();
+        for step in 0..4_000u64 {
+            let now = send_t + ms(step);
+            if space.has_rtx(now) && space.rtx(now).is_some() {
+                rungs.push(step);
+            } else {
+                let _ = space.tail_probe(now);
+            }
+        }
+        assert!(
+            rungs.len() >= 3,
+            "the replay produced {} full-RTO rungs, too few to measure the steady spacing: rungs={rungs:?}",
+            rungs.len()
+        );
+        assert_eq!(
+            rungs[1] - rungs[0],
+            u64::try_from(TailLossProber::TAIL_PROBED_MIN_RTO.as_millis()).unwrap(),
+            "M1: once the probe budget is spent, every full-RTO rung of a lost tail's repair ladder must sit `TAIL_PROBED_MIN_RTO` apart; the 1 s `MIN_RTO` floor must not delay repair. rungs={rungs:?}"
+        );
+        assert_eq!(
+            space.rto_duration(),
+            Duration::from_secs(1),
+            "the general RTO path keeps the 1 s `MIN_RTO` floor; the departure is scoped to the repair deadline"
+        );
     }
 
     #[test]
