@@ -600,8 +600,16 @@ async fn nonce_bound_ready_retires_post_open_retransmissions() {
     // `std::time::Instant` (see `claim_post_open_response`), so only real
     // wall-clock time can let the established+1s slot fire. `advance()`
     // moves the tokio clock, not `std::time::Instant`, so a paused
-    // runtime cannot fast-forward this window.
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // runtime cannot fast-forward this window. The assertion forbids an
+    // event, so the wait must outlast the slot it forbids: the slot is
+    // `1s + retry_delay`, whose per-nonce jitter places it in [1.0, 1.5) s,
+    // and the nonce is drawn per connection from `SysRng`
+    // (`client_opening_handshake`), so the worst case is 1.499 s and a
+    // 1.6 s wait leaves the write driver's wake ~100 ms of margin. With the
+    // retirement withheld in `PostOpenRecovery::observe`, the test still
+    // passed 9 of 10 runs on a 1.1 s wait -- only the runs whose jitter was
+    // at most 100 ms reached the slot -- and failed all 6 runs on 1.6 s.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
     assert_eq!(
         confirmation_attempts.load(Ordering::SeqCst),
         1,
