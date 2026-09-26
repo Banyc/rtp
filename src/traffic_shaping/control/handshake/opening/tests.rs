@@ -63,26 +63,61 @@ impl UnreliableRead for RecordingRead {
     }
 }
 
-/// The handshake retransmission schedule must fit the opening deadline:
-/// a jittered retry (`RETRY_INTERVAL + RETRY_JITTER_MS`, clamped to the
-/// deadline) must be able to fire while the opening is still live, and the
-/// pre-handshake burst delay must not exceed the deadline either. These are
-/// relations between the constants — asserted without racing wall-clock —
-/// so shrinking `OPENING_TIMEOUT` below the max retry offset (or growing
-/// the jitter past the timeout) is caught deterministically, exactly the
-/// class the end-to-end lost-leg recovery test enforces through real time.
+/// The operator's path, as measured on the deployed client: a 190 ms minimum
+/// round trip with maxima of 1063 ms and 3205 ms.  It is a measurement, not
+/// a protocol value — this transport is not RFC-compliant and follows TCP as
+/// a baseline best practice — and it is the input the opening's leg budget
+/// is derived from.
+const FIELD_WORST_RTT: Duration = Duration::from_millis(3_205);
+
+/// The handshake retransmission schedule must fit a *leg* budget: a jittered
+/// retry (`RETRY_INTERVAL + RETRY_JITTER_MS`, clamped to the leg's deadline)
+/// must be able to fire while that leg is still live, and the pre-handshake
+/// burst delay must not exhaust a leg's budget either. These are relations
+/// between the constants — asserted without racing wall-clock — so shrinking
+/// the leg budget below the max retry offset (or growing the jitter past it)
+/// is caught deterministically, exactly the class the end-to-end lost-leg
+/// recovery test enforces through real time.
 #[test]
-fn the_retry_schedule_fits_inside_the_opening_timeout() {
+fn the_retry_schedule_fits_inside_an_opening_leg() {
     let max_retry_offset = RETRY_INTERVAL + Duration::from_millis(RETRY_JITTER_MS);
     assert!(
-        max_retry_offset < OPENING_TIMEOUT,
+        max_retry_offset < OPENING_LEG_TIMEOUT,
         "a jittered retransmission ({max_retry_offset:?}) must be able to fire before the \
-         opening deadline ({OPENING_TIMEOUT:?})"
+         leg's deadline ({OPENING_LEG_TIMEOUT:?})"
     );
     assert!(
-        Duration::from_millis(OPENING_JITTER_MS) < OPENING_TIMEOUT,
-        "the pre-handshake burst delay ({OPENING_JITTER_MS} ms) must not exhaust the \
-         opening deadline ({OPENING_TIMEOUT:?})"
+        Duration::from_millis(OPENING_JITTER_MS) < OPENING_LEG_TIMEOUT,
+        "the pre-handshake burst delay ({OPENING_JITTER_MS} ms) must not exhaust a leg's \
+         deadline ({OPENING_LEG_TIMEOUT:?})"
+    );
+}
+
+/// A leg's budget must outlast the path's worst measured round trip, because
+/// a leg *is* one round trip: a budget shorter than the path's round trip
+/// expires before the peer's answer can arrive and the opening fails on a
+/// live path.
+///
+/// The measured boundary this replaced is in `GATE.md`'s "The opening
+/// handshake's time budget": on the real `rtp`-over-`NetemPair` sweep the old
+/// whole-opening budget completed every leg up to 1500 ms of round trip and
+/// failed from 1600 ms up, always with `TimedOut`, while the field's path
+/// reaches 3205 ms.  This pin is a relation to that measured field value
+/// rather than to a value of the test's own choosing, so raising the leg
+/// budget without raising it past the field's worst round trip stays red.
+#[test]
+fn an_opening_leg_outlasts_the_fields_worst_round_trip() {
+    assert!(
+        OPENING_LEG_TIMEOUT >= FIELD_WORST_RTT,
+        "a handshake leg is one round trip on the path, so its budget ({OPENING_LEG_TIMEOUT:?}) \
+         must outlast the field's worst measured round trip ({FIELD_WORST_RTT:?}); the opening \
+         is then bounded by two legs, not by one"
+    );
+    let whole_opening = OPENING_LEG_TIMEOUT + OPENING_LEG_TIMEOUT;
+    assert!(
+        whole_opening >= FIELD_WORST_RTT + FIELD_WORST_RTT,
+        "the opening is two round trips, so its worst case ({whole_opening:?}) must cover both \
+         of the field's worst, not one"
     );
 }
 
@@ -100,6 +135,128 @@ fn a_blocked_send_gets_a_retry_within_its_budget() {
         "a jittered retry ({max_retry_offset:?}) must fit inside the send budget \
          ({SEND_RETRY_BUDGET:?})"
     );
+}
+
+/// The opening must complete on a path whose round trip is the field's worst
+/// measured spike.  The legs are real wall clock (the handshake's deadlines
+/// are `std::time::Instant`s, which a paused runtime clock does not drive),
+/// so the row costs roughly two of the field's round trips — the price of
+/// covering the one regime no other row reaches.
+///
+/// This pins the *shape* as well as the value: a slow first leg no longer
+/// spends the second leg's budget, so the pair of 3204 ms legs completes in
+/// ~6.4 s, which a single 4 s whole-opening budget could not.  Reverting
+/// either the value (to 3 s) or the shape (one shared deadline) fails it with
+/// `TimedOut`; the relation test above stays green under the shape revert,
+/// so the two pins guard different properties.  The before/after sweep it is
+/// drawn from is tabulated in `GATE.md`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_opening_completes_at_the_fields_worst_round_trip() {
+    // Half the field's worst round trip, so a hop's delay is that one-way
+    // time and a round trip is the whole 3204 ms.
+    let one_way = FIELD_WORST_RTT / 2;
+    let (client, server, mut relays) = delayed_handshake_channel_pair(one_way);
+    let mut client = client;
+    let mut server = server;
+    let started = Instant::now();
+    tokio::time::timeout(
+        OPENING_LEG_TIMEOUT + OPENING_LEG_TIMEOUT + Duration::from_secs(1),
+        async {
+            tokio::try_join!(
+                client_opening_handshake(&mut client),
+                server_opening_handshake(&mut server),
+            )
+        },
+    )
+    .await
+    .expect("the opening did not fit two leg budgets")
+    .expect("the opening failed on the field's worst round trip");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= FIELD_WORST_RTT + FIELD_WORST_RTT,
+        "the opening is two round trips, so completing in {elapsed:?} would not have crossed \
+         the field's worst round trip twice; the delayed pair is not applying the delay"
+    );
+    // Both legs outlasted the 250 ms retry interval, so neither peer may
+    // report a sample: a sample is valid only when the request succeeded on
+    // its first transmission, and a delayed leg is ambiguous.  That the
+    // opening completed anyway is the point — the route crossed the slow leg
+    // twice and still finished inside the two leg budgets.
+    assert!(
+        client.initial_rtt.is_none(),
+        "the client's Confirm→ConfirmAck leg crossed the field's worst round trip, so it was \
+         retransmitted and its sample ({:?}) must be withheld",
+        client.initial_rtt
+    );
+    assert!(
+        server.initial_rtt.is_none(),
+        "the server's HelloAck→Confirm leg crossed the field's worst round trip, so it was \
+         retransmitted and its sample ({:?}) must be withheld",
+        server.initial_rtt
+    );
+    relays.shutdown().await;
+}
+
+/// A handshake channel pair whose every hop is delayed by `one_way`, so a
+/// round trip between the peers is `2 * one_way`.  The delay is a relay in
+/// front of each read channel, not a sleep inside `send`: the write must
+/// return immediately, because a real path's delay is on the wire after the
+/// socket accepted the datagram, while the handshake's send budget bounds
+/// only the write itself.  Each datagram is relayed by its own child task so
+/// the relay cannot serialise a retransmission burst into a growing queue.
+/// The relays live in the caller's [`tokio::task::JoinSet`], because this
+/// crate forbids a detached `tokio::spawn`: dropping the owner must abort its
+/// children.
+fn delayed_handshake_channel_pair(
+    one_way: Duration,
+) -> (UnreliableLayer, UnreliableLayer, tokio::task::JoinSet<()>) {
+    // Each direction is a write channel, a relay that holds each datagram for
+    // `one_way`, and the read channel the peer's double reads from.
+    let (client_to_server_tx, client_to_server_wire) = mpsc::channel(32);
+    let (client_to_server_delayed_tx, client_to_server_rx) = mpsc::channel(32);
+    let (server_to_client_tx, server_to_client_wire) = mpsc::channel(32);
+    let (server_to_client_delayed_tx, server_to_client_rx) = mpsc::channel(32);
+    let mut relays = tokio::task::JoinSet::new();
+    relays.spawn(delayed_relay(
+        client_to_server_wire,
+        client_to_server_delayed_tx,
+        one_way,
+    ));
+    relays.spawn(delayed_relay(
+        server_to_client_wire,
+        server_to_client_delayed_tx,
+        one_way,
+    ));
+    let client = wrap_fec(
+        Box::new(ChannelRead(server_to_client_rx)),
+        Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
+        false,
+    );
+    let server = wrap_fec(
+        Box::new(ChannelRead(client_to_server_rx)),
+        Box::new(ChannelWrite::new(server_to_client_tx, None, false)),
+        false,
+    );
+    (client, server, relays)
+}
+
+/// Forward every datagram arriving on `from` to `tx` `one_way` after it
+/// arrived there, one child task per datagram so the delays overlap.
+async fn delayed_relay(
+    mut from: mpsc::Receiver<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
+    one_way: Duration,
+) {
+    let mut inflight = tokio::task::JoinSet::new();
+    while let Some(datagram) = from.recv().await {
+        let tx = tx.clone();
+        inflight.spawn(async move {
+            tokio::time::sleep(one_way).await;
+            let _ = tx.send(datagram).await;
+        });
+        while inflight.try_join_next().is_some() {}
+    }
+    inflight.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -432,8 +589,9 @@ async fn complete_over_pair(
     duplicate: bool,
 ) {
     if dropped == Some(Kind::ConfirmAck) {
-        let (_, server_socket) =
-            tokio::time::timeout(OPENING_TIMEOUT + Duration::from_secs(1), async {
+        let (_, server_socket) = tokio::time::timeout(
+            OPENING_LEG_TIMEOUT + OPENING_LEG_TIMEOUT + Duration::from_secs(1),
+            async {
                 tokio::try_join!(
                     async { client_opening_handshake(&mut client).await },
                     async {
@@ -441,10 +599,11 @@ async fn complete_over_pair(
                         Ok::<_, io::Error>(socket(server, None))
                     },
                 )
-            })
-            .await
-            .expect("post-open confirmation recovery hung")
-            .expect("post-open confirmation recovery failed");
+            },
+        )
+        .await
+        .expect("post-open confirmation recovery hung")
+        .expect("post-open confirmation recovery failed");
         assert!(
             client.initial_rtt.is_none(),
             "client must not sample after retransmitting Confirm because ConfirmAck was lost"
@@ -454,20 +613,23 @@ async fn complete_over_pair(
     }
 
     let next_protocol = b"first RTP datagram";
-    tokio::time::timeout(OPENING_TIMEOUT + Duration::from_secs(1), async {
-        tokio::try_join!(
-            async {
-                client_opening_handshake(&mut client).await?;
-                client
-                    .utp_write
-                    .send(next_protocol)
-                    .await
-                    .map_err(io::Error::from)?;
-                Ok::<_, io::Error>(())
-            },
-            server_opening_handshake(&mut server),
-        )
-    })
+    tokio::time::timeout(
+        OPENING_LEG_TIMEOUT + OPENING_LEG_TIMEOUT + Duration::from_secs(1),
+        async {
+            tokio::try_join!(
+                async {
+                    client_opening_handshake(&mut client).await?;
+                    client
+                        .utp_write
+                        .send(next_protocol)
+                        .await
+                        .map_err(io::Error::from)?;
+                    Ok::<_, io::Error>(())
+                },
+                server_opening_handshake(&mut server),
+            )
+        },
+    )
     .await
     .expect("opening handshake hung")
     .expect("opening handshake failed");

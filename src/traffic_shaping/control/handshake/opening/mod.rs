@@ -10,7 +10,28 @@ use super::wire::{Kind, Packet, SEND_RETRY_INTERVAL};
 use crate::sequence::{InitialSequences, SequenceNumber};
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
-const OPENING_TIMEOUT: Duration = Duration::from_secs(3);
+/// The budget for **one** handshake leg, not for the opening as a whole.
+///
+/// Each leg is one round trip on the path (Hello→HelloAck, then
+/// Confirm→ConfirmAck), so a leg's budget must outlast the path's *round
+/// trip* or the leg expires before the peer's answer can arrive — and a
+/// shared opening budget let a slow first leg spend the second leg's share,
+/// so a first leg near the top of the field's range left a second leg with
+/// almost none of it.
+///
+/// The value is a **measurement**: the operator's path measures a 190 ms
+/// minimum round trip with maxima of 1063 ms and 3205 ms, and a leg that
+/// cannot outlast the worst of those fails a connection opened during the
+/// spike — the case where a rebirth is worse than the spike it was born in.
+/// 4 s is the smallest whole second above the field's worst sample (a 25 %
+/// margin over 3205 ms).  It cannot be derived from the handshake's own RTT
+/// sample: the opening is lockstep, so both peers bound the *same* leg by a
+/// deadline armed before that leg's sample exists, and a one-sided budget
+/// longer than the peer's would only retry into an abandoned handshake.
+///
+/// A dead path pays one leg (4 s) rather than the whole opening, because a
+/// leg that never answers never reaches the second.
+const OPENING_LEG_TIMEOUT: Duration = Duration::from_secs(4);
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SEND_RETRY_BUDGET: Duration = Duration::from_millis(500);
 /// Random pre-handshake delay so connection opens do not all start with an
@@ -80,14 +101,16 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
         .try_fill_bytes(&mut nonce_bytes)
         .expect("operating-system randomness unavailable");
     let nonce = u64::from_be_bytes(nonce_bytes);
-    let deadline = Instant::now() + OPENING_TIMEOUT;
     let mss = unreliable.mss;
+    // Each leg is armed with its own budget, at the instant it starts: the
+    // leg's deadline bounds that leg's retry rounds, and a slow leg cannot
+    // spend the next leg's share.
     client_phase(
         unreliable,
         nonce,
         Kind::Hello,
         Kind::HelloAck,
-        deadline,
+        Instant::now() + OPENING_LEG_TIMEOUT,
         mss,
     )
     .await?;
@@ -98,7 +121,7 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
         nonce,
         Kind::Confirm,
         Kind::ConfirmAck,
-        deadline,
+        Instant::now() + OPENING_LEG_TIMEOUT,
         mss,
     )
     .await?;
@@ -111,18 +134,32 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
 }
 
 pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::Result<()> {
-    let deadline = Instant::now() + OPENING_TIMEOUT;
     let mss = unreliable.mss;
+    // One budget for the wait for the Hello (armed once, so a stream of
+    // unrelated datagrams cannot slide it), then one per leg after it.
+    let hello_deadline = Instant::now() + OPENING_LEG_TIMEOUT;
     let hello = loop {
-        match receive_until(&mut unreliable.utp_read, deadline, mss).await? {
+        match receive_until(&mut unreliable.utp_read, hello_deadline, mss).await? {
             Received::Handshake(packet) if packet.kind == Kind::Hello => break packet,
             Received::Deadline => return Err(timeout()),
             Received::Handshake(_) | Received::NextProtocol => {}
         }
     };
-    let initial_rtt = server_wait_for_confirm(unreliable, hello.nonce, deadline, mss).await?;
+    let initial_rtt = server_wait_for_confirm(
+        unreliable,
+        hello.nonce,
+        Instant::now() + OPENING_LEG_TIMEOUT,
+        mss,
+    )
+    .await?;
     unreliable.initial_rtt = initial_rtt;
-    server_confirm(unreliable, hello.nonce, deadline, mss).await?;
+    server_confirm(
+        unreliable,
+        hello.nonce,
+        Instant::now() + OPENING_LEG_TIMEOUT,
+        mss,
+    )
+    .await?;
     unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, Instant::now()));
     unreliable.session_tag = Some(session_tag(hello.nonce));
     let (client_to_server, server_to_client) = directional_initial_sequences(hello.nonce);
