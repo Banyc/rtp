@@ -214,6 +214,19 @@ async fn rtp_bulk_bounded_buffer_goodput_and_queue_bound() {
                 samples.push(latency_ms);
             }
             let received = samples.len() as u64;
+            // The bound below is only a measurement if the arm observed a
+            // latency at all. Both halves are true invariants of a correct run:
+            // the sender offers 128 pings at a 500 ms cadence across the 15 s
+            // window, and the link this arm configures drops nothing. An empty
+            // observation must therefore fail here rather than skip the bound.
+            assert!(
+                ping_sent > 0,
+                "the sparse-ping sender offered no message in the measurement window"
+            );
+            assert!(
+                received > 0,
+                "the latency sink delivered no sample of the {ping_sent} pings offered"
+            );
             if received > 0 {
                 samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 let p50 = percentile(&samples, 0.50);
