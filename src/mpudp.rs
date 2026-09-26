@@ -440,8 +440,17 @@ mod tests {
         let narrow_addr = narrow.local_addrs().next().unwrap();
         declare_two_paths(narrow_addr, 11, 2).await;
         assert!(
+            // The deadline bounds a wait for an admission that must never come,
+            // so it only has to exceed how long the wrong outcome takes. With
+            // the cap discarded at `Listener::bind` — the defect the doc comment
+            // above names — the over-wide session is admitted and `accept_with`
+            // resolves in 0.67-1.46 ms (57 runs: 5 serialized, then 12 and 40
+            // concurrent, at load average 3.3-3.8 on 10 cores; the accepted
+            // `wide` path below takes the same 0.73-1.33 ms), so 100 ms keeps a
+            // ~70x margin over it while taking 2.9 s out of every run of the
+            // always-run tier.
             tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_millis(100),
                 narrow.accept_with(AcceptConfig::default()),
             )
             .await
