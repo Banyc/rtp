@@ -386,7 +386,7 @@ rtp_mss::rtp_tiny_mss_survives_mild_loss = default | 0.65 | composite(impairment
 fuzz_codec::a_hostile_datagram_never_yields_a_range_outside_it = default | 5.50 | composite(impairment,layer,metric,scale) | codec-fuzz@impairment=hostile-datagram+metric=range-safety+layer=codec+scale=400k-rounds
 rtp_padding_bench::padded_wire_sizes_converge_to_one_peak = default | 0.16 | baseline@padding | padding-wire@padding=profile+impairment=clean+metric=size-distribution+scale=256KiB+layer=rtp
 rtp_padding_bench::unpadded_wire_sizes_stay_multimodal = default | 0.19 | orthogonal@padding | padding-wire@padding=none+impairment=clean+metric=size-distribution+scale=256KiB+layer=rtp
-rtp_padding_bench::ack_padding_hides_ack_packets_among_data = default | 7.53 | composite(padding,metric)@padding | padding-wire@padding=ack-mimics-data+impairment=clean+metric=ack-obscurity+scale=256KiB+layer=rtp
+rtp_padding_bench::ack_padding_hides_ack_packets_among_data = default | 5.60 | composite(padding,metric)@padding | padding-wire@padding=ack-mimics-data+impairment=clean+metric=ack-obscurity+scale=256KiB+layer=rtp
 shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase = default | 0.71 | baseline@contested | contested-instrument@impairment=none+metric=sample-retention+layer=shared-bottleneck+scale=unit
 shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = default | 0.01 | orthogonal@contested | contested-instrument@impairment=none+metric=starvation-floor+layer=shared-bottleneck+scale=unit
 rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
@@ -418,6 +418,23 @@ unguarded path) and `probe` (the six report-only repair-latency instruments).
 The bulk of the declared rows are `composite` because the arms genuinely vary
 several dimensions at once — labelling them orthogonal would be the confound
 the mandate exists to prevent.
+
+The `padding` family's fitted-ACK arm is the one row whose cost fell without a
+retune: its 24 trials x 2 arms x 256 KiB are now pooled with two transfers in
+flight, which is the same units, the same bytes and the same datagrams, at
+5.60 s instead of 7.53 s (median of five runs at load average 4-6, against a
+matched 7.14-9.90 s serial control in the same window). The overlap stops at
+two because the arm counts a scheduling-sensitive leak — an ACK sent before the
+sampler has `MIN_SAMPLES` observations goes out unpadded — so contention is
+visible in the measured statistic: the pooled fitted/baseline small ratio (the
+unchanged `< 0.5` bound) measured 0.140-0.190 serial and 0.158-0.192 at two in
+flight, the same envelope, while four in flight reached 0.328 at load average
+15 and wider overlap inflated the work as well. No cell, threshold, round count
+or tier changed. The always-run ceiling is a bound on the tier's declared
+total, not on one test: that total is now 28.67 s of 60 s, and `default = 60`
+is left as declared. The headroom over the 21-25 s the tier actually measures
+is deliberate, and tightening a ceiling is a policy decision rather than a
+consequence of one arm's cost.
 
 ```gate-budgets
 default = 60

@@ -291,9 +291,26 @@ async fn unpadded_wire_sizes_stay_multimodal() {
 /// concentrated the ratio enough that 0/60 experiments in the same harness
 /// exceeded the < 0.5 bound under load average ~10, while the neutralized
 /// policy (`AckMimicsData` -> `None`) failed 8/8 — so the bound still
-/// separates fitted from unpadded. The 256 KiB transfer keeps the added
-/// default-tier cost near two seconds.
+/// separates fitted from unpadded.
 const ACK_PADDING_TRIALS: usize = 24;
+
+/// The pooled trials are independent connections, each pacing at the
+/// delivery rate it measures; overlapping two of them shortens the pool
+/// without changing a unit of work — still 24 trials x 2 arms x 256 KiB, the
+/// same bytes and the same datagrams.
+///
+/// Two is the widest overlap that leaves the measured ratio untouched, and
+/// that is the binding constraint rather than the wall clock: the leak this
+/// arm counts is scheduling-sensitive (an ACK sent before the sampler has
+/// `MIN_SAMPLES` observations goes out unpadded), so contention lifts the
+/// pooled fitted/baseline small ratio. Five runs each on an
+/// unloaded-to-moderately-loaded host put serial at 0.140-0.190 and two-way
+/// overlap at 0.158-0.192 — the same envelope — while four-way overlap
+/// reached 0.174-0.328 and wider overlap inflated the work as well (each
+/// connection's measured delivery rate falls under contention, and at
+/// sixteen in flight the pool is slower than serial). The < 0.5 bound is
+/// unchanged; two is the overlap that preserves its margin.
+const ACK_PADDING_TRANSFERS_IN_FLIGHT: usize = 2;
 
 /// Runs in the default tier: the property is deterministic (fitted ACKs
 /// mimic the data envelope) and the 24-trial pool both fits the default
@@ -314,18 +331,42 @@ async fn ack_padding_hides_ack_packets_among_data() {
     let mut fitted_small = 0usize;
     let mut baseline_large = 0usize;
     let mut fitted_large = 0usize;
+    let mut tally = |policy: rtp::udp::HarmfulPaddingPolicy,
+                     histogram: &std::collections::HashMap<usize, usize>| {
+        if policy == rtp::udp::HarmfulPaddingPolicy::None {
+            baseline_small += small(histogram);
+            baseline_large += large(histogram);
+        } else {
+            fitted_small += small(histogram);
+            fitted_large += large(histogram);
+        }
+    };
+    // The unit set itself is the admission gate: a spawn waits for one
+    // completed unit once `ACK_PADDING_TRANSFERS_IN_FLIGHT` are live, so the
+    // pool holds exactly that many transfers and every unit is reaped.
+    let mut units = tokio::task::JoinSet::new();
     for _ in 0..ACK_PADDING_TRIALS {
-        let (baseline, _) =
-            run_transfer(rtp::udp::HarmfulPaddingPolicy::None, transfer_bytes).await;
-        let (fitted, _) = run_transfer(
+        for policy in [
+            rtp::udp::HarmfulPaddingPolicy::None,
             rtp::udp::HarmfulPaddingPolicy::AckMimicsData,
-            transfer_bytes,
-        )
-        .await;
-        baseline_small += small(&baseline);
-        fitted_small += small(&fitted);
-        baseline_large += large(&baseline);
-        fitted_large += large(&fitted);
+        ] {
+            if units.len() >= ACK_PADDING_TRANSFERS_IN_FLIGHT {
+                let (policy, histogram) = units
+                    .join_next()
+                    .await
+                    .expect("a transfer unit is in flight")
+                    .expect("a transfer unit does not panic");
+                tally(policy, &histogram);
+            }
+            units.spawn(async move {
+                let (histogram, _) = run_transfer(policy, transfer_bytes).await;
+                (policy, histogram)
+            });
+        }
+    }
+    while let Some(unit) = units.join_next().await {
+        let (policy, histogram) = unit.expect("a transfer unit does not panic");
+        tally(policy, &histogram);
     }
     println!(
         "ack_padding: trials={ACK_PADDING_TRIALS} baseline_small={baseline_small} fitted_small={fitted_small} baseline_large={baseline_large} fitted_large={fitted_large}"
