@@ -456,8 +456,39 @@ mod tests {
             .expect("successful FIN ACK did not release graceful reaping");
     }
 
-    async fn wait_for_rtx_window() {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+    /// Wait until the in-flight tail packet is due for a **tail-loss probe**, so
+    /// the next `send_pkts` pass is what puts the recovery datagram on the wire
+    /// rather than a fresh send.
+    ///
+    /// This is a predicate, not a duration, because the duration a fixed sleep
+    /// would have to guess is not one number: the probe window is
+    /// `max(2 * sRTT, MIN_TOL)` capped at the RTO, so on this harness's settled
+    /// 1 ms RTT it is the 10 ms `MIN_TOL` floor -- an order of magnitude below
+    /// the 1 s `MIN_RTO` a *full-RTO* retransmission needs.  A fixed wait that
+    /// reached one of those two would silently not reach the other; polling
+    /// `has_tail_probe` keeps the premise true whatever RTT a caller settles.
+    ///
+    /// The 2 s ceiling is not a schedule: it only bounds a premise that has
+    /// already broken (it is 200x the window this harness installs, and the
+    /// loop asserts rather than sleeps through it).
+    async fn wait_for_rtx_window(tl: &TransmissionLayer) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let probe_due = {
+                let rl = tl.shared_for_test().reliable_layer_for_test();
+                let rl = rl.lock().unwrap();
+                rl.pkt_send_space().has_tail_probe(Instant::now())
+            };
+            if probe_due {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the in-flight tail never became due for a tail-loss probe within 2 s; the \
+                 retransmission premise of every test using this wait has broken"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
     fn harness(fec: bool, enabled: bool) -> (TransmissionLayer, Arc<Mutex<RecordingWrite>>) {
         harness_with_tuning(
@@ -827,7 +858,7 @@ mod tests {
         let (mut tl, recorder) = harness(false, true);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
-        wait_for_rtx_window().await;
+        wait_for_rtx_window(&tl).await;
         tl.shared_for_test()
             .reliable_layer_for_test()
             .lock()
@@ -846,7 +877,7 @@ mod tests {
         let (mut tl, recorder) = harness(true, true);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
-        wait_for_rtx_window().await;
+        wait_for_rtx_window(&tl).await;
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
         let dg = recorder.lock().unwrap().datagrams();
@@ -1110,7 +1141,7 @@ mod tests {
         // the 1 ms settled RTT) so the *tail probe* — not a data packet — is
         // the next recovery send.  The regular RTO stays far off (MIN_RTO
         // floor), so a regular retransmit cannot preempt it.
-        wait_for_rtx_window().await;
+        wait_for_rtx_window(&tl).await;
         // Drain the ordinary pacer: no token is available for the armor
         // duplicate-copy gate.
         let drained = tl.drain_rate_limiter_for_test(usize::MAX, Instant::now());
@@ -1154,7 +1185,7 @@ mod tests {
 
         // Wait out the tail-loss-probe window (PTO = max(2*srtt, 10 ms) at the
         // 1 ms settled RTT); the regular RTO is still far off.
-        wait_for_rtx_window().await;
+        wait_for_rtx_window(&tl).await;
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
         let repair = recorder.lock().unwrap().count();
@@ -1169,7 +1200,7 @@ mod tests {
         let (mut tl, recorder) = harness(false, false);
         settle_rtt(&tl, Duration::from_millis(1), 5);
         let _seq = send_one_packet(&tl, Instant::now());
-        wait_for_rtx_window().await;
+        wait_for_rtx_window(&tl).await;
         let mut bufs = SendBufs::new();
         let _ = tl.send_pkts(&mut bufs).await;
         let datagrams = recorder.lock().unwrap().datagrams();
@@ -1884,8 +1915,10 @@ mod tests {
         use crate::transmission::ack_feedback::ReceivedAckWork;
         let (mut transmission, recorder) = harness(true, false);
         settle_rtt(&transmission, Duration::from_millis(1), 5);
-        // Send a full-size packet so it is in flight; after the RTO it
-        // becomes a full-size retransmission.
+        // Send a full-size packet so it is in flight; once it is overdue for a
+        // tail-loss probe (the wait's premise -- *not* the 1 s `MIN_RTO`
+        // full-RTO rung, which is still far off) it becomes a full-size
+        // retransmission.
         let mss = crate::udp::NO_FEC_MSS;
         {
             let rl = transmission.shared_for_test().reliable_layer_for_test();
@@ -1897,7 +1930,7 @@ mod tests {
         let mut send_bufs = SendBufs::new();
         transmission.send_pkts(&mut send_bufs).await.unwrap();
         recorder.lock().unwrap().clear();
-        wait_for_rtx_window().await;
+        wait_for_rtx_window(&transmission).await;
         // A pending ACK makes the piggyback claim due, but the retransmitted
         // packet is full-size: the claim must be released and the data go out
         // alone (no oversized datagram, no stuck claim).
