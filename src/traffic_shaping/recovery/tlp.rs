@@ -28,7 +28,12 @@ impl TailLossProber {
     ///
     /// The first timeout signal keeps the 1 s `MIN_RTO` floor to absorb
     /// estimator error; once a tail probe has been sent the timeout is
-    /// corroborated and can safely be tightened to 300 ms.
+    /// corroborated and can safely be tightened to 300 ms.  On a path whose
+    /// own estimator is *already* above 300 ms the binding term is instead the
+    /// corroborated variance margin ([`RttStats::corroborated_repair_rto`]),
+    /// which replaces RFC 6298's `K * rttvar` with the path's measured reorder
+    /// tolerance — the regime the 1 s-floor fix alone could not reach (see
+    /// [`Self::rto`]).
     ///
     /// It governs two things: the probe window's cap, and — once the budget is
     /// spent — the send-space retransmission deadline itself (`PktSendSpace::repair_rto`).  Before the budget is spent the deadline
@@ -54,12 +59,19 @@ impl TailLossProber {
     ///
     /// Before any tail-loss probe has been sent, uses the standard `MIN_RTO`
     /// floor (1 s). After a probe has been sent, tightens to
-    /// `TAIL_PROBED_MIN_RTO` (300 ms) so subsequent recovery is faster.
+    /// `max(corroborated_repair_rto, TAIL_PROBED_MIN_RTO)` (300 ms): the
+    /// probe's corroboration replaces RFC 6298's `K * rttvar` variance margin
+    /// with the path's measured reorder tolerance, so a jittered path whose
+    /// `raw_rto` sits below the 1 s floor is tightened to that margin rather
+    /// than left at `raw_rto`.  On a quiet path the corroborated margin is the
+    /// general RTO itself, so this is exactly the 300 ms floor as before.
     pub fn rto(&self, rtt_stats: &RttStats) -> Duration {
         if self.probes_sent == 0 {
             return rtt_stats.rto_duration();
         }
-        rtt_stats.raw_rto().max(Self::TAIL_PROBED_MIN_RTO)
+        rtt_stats
+            .corroborated_repair_rto()
+            .max(Self::TAIL_PROBED_MIN_RTO)
     }
 
     /// Time between consecutive tail-loss probes for the current tail episode.
@@ -253,20 +265,43 @@ mod tests {
         );
     }
 
+    /// On a jitter-dominated link the general RTO is `srtt + K * rttvar`
+    /// behind the 1 s `MIN_RTO` floor, and the probe's corroboration tightens
+    /// it to the path's measured reorder tolerance — floored at the post-probe
+    /// floor and never below the measured sRTT, and never *later* than the
+    /// general RTO it replaces.  The tightening is the point of the change:
+    /// the raw RTO is exactly what the 300 ms floor cannot reach when the
+    /// variance term dominates.
     #[test]
-    fn post_probe_rto_unchanged_on_jittery_link() {
+    fn post_probe_rto_tightens_to_the_corroborated_margin_on_a_jittery_link() {
         let mut stats = RttStats::new();
         for _ in 0..10 {
             stats.record_rtt(ms(100));
             stats.record_rtt(ms(900));
         }
         let mut tlp = TailLossProber::new();
-        let first = tlp.rto(&stats);
+        let general = tlp.rto(&stats);
+        assert_eq!(
+            general,
+            stats.rto_duration(),
+            "before any probe the prober's RTO must be the general estimator's"
+        );
+        assert!(general >= Duration::from_secs(1), "general={general:?}");
         tlp.sent();
         let post = tlp.rto(&stats);
         assert_eq!(
-            first, post,
-            "jitter-dominated RTO must not change after tail probe"
+            post,
+            stats.corroborated_repair_rto().max(ms(300)),
+            "M1: the corroborated RTO must be the reorder margin, not the raw RTO"
+        );
+        assert!(
+            post < general,
+            "M1: on a jitter-dominated link the probe's corroboration must tighten the RTO (post={post:?} general={general:?})"
+        );
+        assert!(
+            post >= stats.smooth_rtt(),
+            "the corroborated RTO {post:?} must never fall below the measured sRTT {:?}",
+            stats.smooth_rtt()
         );
     }
 

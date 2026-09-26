@@ -259,8 +259,17 @@ impl RttStats {
         self.rto.rto()
     }
 
+    /// The estimator's raw (unfloored) RTO; test-only, see
+    /// [`RtxTimer::raw_rto`].
+    #[cfg(test)]
     pub(crate) fn raw_rto(&self) -> Duration {
         self.rto.raw_rto()
+    }
+
+    /// The corroborated tail-repair deadline's pre-floor value (see
+    /// [`RtxTimer::corroborated_repair_rto`]).
+    pub(crate) fn corroborated_repair_rto(&self) -> Duration {
+        self.rto.corroborated_repair_rto()
     }
 
     pub(crate) fn reorder_window(&self) -> Duration {

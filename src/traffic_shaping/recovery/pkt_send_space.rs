@@ -1486,11 +1486,11 @@ impl PktSendSpace {
     /// uncorroborated, so a shorter deadline on a merely unmeasured path would
     /// be a guess.  Once the budget is spent — two probes have gone unanswered
     /// for the tail — the loss is corroborated, so the deadline uses the same
-    /// tightened post-probe floor the probe window already uses
-    /// ([`TailLossProber::rto`], `max(raw_rto, 300 ms)`), and it is exact: the
-    /// live `MIN_RTO` floor must not push a corroborated sub-second deadline
-    /// back out to 1 s, which is what made every rung of a lost tail's repair
-    /// ladder cost a full second.
+    /// tightened post-probe RTO the probe window already uses
+    /// ([`TailLossProber::rto`]: the corroborated variance margin, floored at
+    /// 300 ms), and it is exact: the live `MIN_RTO` floor must not push a
+    /// corroborated sub-second deadline back out to 1 s, which is what made
+    /// every rung of a lost tail's repair ladder cost a full second.
     ///
     /// Scoped deliberately to the spent-budget path: the general RTO path (no
     /// probe corroboration) keeps its 1 s floor unchanged, and the deadline's
@@ -1902,6 +1902,7 @@ mod tests {
         LOSS_RATE_MIN_SAMPLES, MAX_ACK_BLOCKS, OUTAGE_RECOVERY_CWND, PktSendSpace,
     };
     use crate::sequence::SequenceNumber;
+    use crate::traffic_shaping::recovery::tlp::TailLossProber;
     use primitive::ops::float::{PosR, UnitR};
 
     fn sq(n: u64) -> SequenceNumber {
@@ -5372,6 +5373,14 @@ mod tests {
     ///
     /// Run with `--ignored --nocapture`.
     ///
+    /// Two constant-RTT arms (50 ms and 190 ms) pin the floor and its
+    /// departure; two jittered arms (the `sch_netem` delay-jitter draw, whose
+    /// round trip is triangular and whose variance term therefore dominates
+    /// `raw_rto`) pin the regime where the post-probe floor stops binding —
+    /// the field's 190 ms RTT / 100 ms-jitter path.  Each arm prints
+    /// `smooth_rtt`, `rttvar`, `raw_rto`, the post-probe RTO in force, the
+    /// general RTO, its ladder and its `steady_rung_spacing_ms`.
+    ///
     /// Self-validating report-only: asserts the *instrument's* integrity — each
     /// arm settled its estimator to the RTT it names, fired both tail probes
     /// and several full-RTO rungs, and its printed ladder agrees with its
@@ -5450,6 +5459,118 @@ mod tests {
                 counters.rto_reason as usize,
                 rtx_rungs.len(),
                 "[probe ladder rtt={rtt_ms}ms] the printed ladder's full-RTO rungs and the rto_reason counter disagree: the classification is not this arm's"
+            );
+        }
+
+        // The jittered regimes the constant-RTT arms above cannot reach.  On a
+        // jittered path `raw_rto = sRTT + K * rttvar` (K = 4, RFC 6298) is
+        // dominated by the variance term, so the post-probe rung is the
+        // estimator's `raw_rto` and not the 300 ms `TAIL_PROBED_MIN_RTO`
+        // floor — the regime the field's 190 ms RTT / 100 ms-jitter path
+        // runs in, where the 300 ms floor stops being the binding term.
+        //
+        // The sample sequence is the *netem* one: `sch_netem`'s `delay TIME
+        // JITTER` draws each direction's one-way delay uniformly over
+        // `TIME ± JITTER`, so a round trip is `2 * owd + U1 + U2` — triangular,
+        // with the arm's `owd` as its mean and its full width at `2 * jitter`.
+        // The draws are enumerated as a 16x16 digital net (every one of the
+        // two directions' 16 levels paired with every other exactly once per
+        // 256-sample period, walked by an odd stride), so the arm's mean round
+        // trip is exactly `2 * owd`, its jitter is reproducible and
+        // load-independent, and there is no PRNG to seed.  `owd_ms` and
+        // `one_way_jitter_ms` are the arm's names for the impairment's two
+        // knobs; the second arm is the field's own `delay 95ms 100ms` at
+        // ~190 ms RTT.
+        for (label, owd_ms, one_way_jitter_ms, jitter_dominated) in [
+            ("50ms_rtt/jitter25_1way", 25u64, 25u64, false),
+            ("190ms_rtt/jitter100_1way", 95u64, 100u64, true),
+        ] {
+            let t0 = Instant::now();
+            let mean_ms = owd_ms * 2;
+            let mut space = PktSendSpace::new();
+            // Seed the filters at the arm's mean RTT before the jittered draw:
+            // the sample-growth clamp is relative to the live estimate, so
+            // starting from the 1 s `MIN_RTO` seed (or from a first draw at
+            // the net's low corner) would make the arm's settled state a
+            // function of the ordering instead of of the distribution.
+            for i in 0..16u64 {
+                space.sample_rtt(ms(mean_ms), t0 + ms(i));
+            }
+            for i in 0..1_024u64 {
+                let k = (i % 256) * 73 % 256;
+                let levels = |nibble: u64| (nibble * 2) as i64 - 15;
+                let delta = (levels(k % 16) + levels(k / 16)) * one_way_jitter_ms as i64 / 15;
+                space.sample_rtt(ms((mean_ms as i64 + delta) as u64), t0 + ms(16 + i));
+            }
+            let send_t = t0 + ms(1_000);
+            send_packet(&mut space, send_t);
+            let mut ladder: Vec<(u64, &'static str)> = Vec::new();
+            for step in 0..12_000u64 {
+                let now = send_t + ms(step);
+                if space.has_rtx(now) && space.rtx(now).is_some() {
+                    ladder.push((step, "rtx"));
+                } else if space.tail_probe(now).is_some() {
+                    ladder.push((step, "probe"));
+                }
+            }
+            let counters = space.retransmission_counters();
+            let rtx_rungs: Vec<u64> = ladder
+                .iter()
+                .filter(|(_, arm)| *arm == "rtx")
+                .map(|(at, _)| *at)
+                .collect();
+            let steady_spacing = rtx_rungs
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .next_back()
+                .unwrap_or(0);
+            eprintln!(
+                "[probe ladder {label}] srtt={:?} rttvar={:?} raw_rto={:?} post_probe_rto={:?} general_rto={:?} ladder={ladder:?} counters={counters:?} steady_rung_spacing_ms={steady_spacing}",
+                space.smooth_rtt(),
+                space.smooth_rtt_var(),
+                space.rtt_stats.raw_rto(),
+                space.tlp.rto(&space.rtt_stats),
+                space.rto_duration(),
+            );
+            // Instrument integrity, per jittered arm: the estimator settled
+            // to the arm's mean RTT, and the arm reaches the regime its label
+            // declares — `raw_rto` above the post-probe floor for the field
+            // arm (so its rungs are the estimator's variance bound, not the
+            // floor the constant arms already measure) and at or below it for
+            // the low-RTT arm (so the floor still masks its jitter).  Both
+            // probes fired, the ladder produced the full-RTO rungs it reports,
+            // and the general RTO stays at the 1 s floor.
+            let srtt = space.smooth_rtt();
+            assert!(
+                srtt >= ms(mean_ms * 4 / 5) && srtt <= ms(mean_ms * 6 / 5),
+                "[probe ladder {label}] the estimator settled at {srtt:?}, not the arm's {mean_ms} ms mean: these rungs are not this path's"
+            );
+            assert_eq!(
+                space.rtt_stats.raw_rto() > TailLossProber::TAIL_PROBED_MIN_RTO,
+                jitter_dominated,
+                "[probe ladder {label}] raw RTO {:?} against the post-probe floor {:?}: the arm's rungs are not the ones its declared regime names",
+                space.rtt_stats.raw_rto(),
+                TailLossProber::TAIL_PROBED_MIN_RTO
+            );
+            assert_eq!(
+                space.rto_duration(),
+                Duration::from_secs(1),
+                "[probe ladder {label}] the general RTO is not the 1 s floor: the arm is not measuring the floor's departure"
+            );
+            assert_eq!(
+                counters.tail_probes, 2,
+                "[probe ladder {label}] the arm fired {} tail probes, not the budget of 2: its first rungs are not the probe windows it prints",
+                counters.tail_probes
+            );
+            assert!(
+                counters.rto_reason >= 3,
+                "[probe ladder {label}] the arm produced {} full-RTO rungs: too few to measure the steady spacing, so the ladder it prints is not the repair ladder",
+                counters.rto_reason
+            );
+            assert_eq!(
+                counters.rto_reason as usize,
+                rtx_rungs.len(),
+                "[probe ladder {label}] the printed ladder's full-RTO rungs and the rto_reason counter disagree: the classification is not this arm's"
             );
         }
     }

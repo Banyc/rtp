@@ -151,16 +151,24 @@ not a magic constant; the harness never restates one.
    `probe_fresh_tail_burst_loss_latency`, whose handshake-less construction
    makes its cold start a pre-first-RTT-sample tail) and sweeps a burst that
    is exactly the six-datagram fresh-tail cover versus one that also eats the
-   first tail-loss probe.  The two arms bracket the deadline: the first
-   repairs at the first PTO (`2*srtt + RTT`); the second loses that PTO too,
-   and repairs once the burst being crossed has taken its remaining datagrams
-   — one or two rungs, not the multi-second ladder the field reported before
-   the two departures below.  No bound is asserted here: the bars above are
-   the mandate's, and this probe attributes which of them a regression moves.
+   first tail-loss probe.  The first two arms bracket the deadline on a
+   clean-delay 100 ms one-way path: the first repairs at the first PTO
+   (`2*srtt + RTT`); the second loses that PTO too, and repairs once the burst
+   being crossed has taken its remaining datagrams — one or two rungs, not the
+   multi-second ladder the field reported before the three departures below.
+   No bound is asserted here: the bars above are the mandate's, and
+   this probe attributes which of them a regression moves.
+   The *ladder* itself — the rung spacing the field stall is made of — is
+   measured deterministically and load-independently by
+   `probe_lone_tail_repair_ladder`, whose four arms are two constant-RTT
+   scales (50 ms, 190 ms) and two of the `sch_netem` `delay TIME JITTER`
+   draw (25 ms one-way ± 25 ms, and the field's own 95 ms ± 100 ms at
+   ~190 ms RTT), because the jitter-dominated regime is where the post-probe
+   floor stops binding.
 
-   This transport's tail-recovery timing departs from RFC 8985 in two places.
-   Both are recorded here because the latency floors above are built on them,
-   and both were chosen from measurement rather than from taste:
+   This transport's tail-recovery timing departs from RFC 8985 in three
+   places.  All are recorded here because the latency floors above are built
+   on them, and all were chosen from measurement rather than from taste:
 
    - **The pre-first-RTT-sample probe window is `TAIL_PROBED_MIN_RTO`
      (300 ms), not §7.2's `PTO = 1 s` (nor §7.3's skip).**  With no sample the
@@ -190,7 +198,31 @@ not a magic constant; the harness never restates one.
      Measured on `probe_lone_tail_repair_deadline_latency`'s burst-8 arm: max
      1611 ms → 919 ms, p99 1523 ms → 917 ms, p90 921 ms → 615 ms, with
      `rto_reason` 33 → 3 and `tail_probes` 46 → 26.
-2. **Reasonable goodput of the interactive lane** — the lane delivers what it
+   - **A corroborated tail repair is not armed at RFC 6298's RTO.**  Two
+     departures, both scoped to the prober's spent-budget path so that no
+     unmeasured or merely-idle connection is affected: the deadline drops the
+     1 s `MIN_RTO` floor (the two unanswered probes have already corroborated
+     the loss that floor exists to wait out), and it takes the path's measured
+     reorder margin `max(rttvar, srtt / 4)` in place of RFC 6298's
+     `K * rttvar` (K = 4).  The floor alone still left the field's regime
+     un-reached: at 190 ms RTT with `sch_netem`'s ±100 ms per-direction delay
+     jitter `raw_rto = srtt + 4 * rttvar` is ~507 ms, so the 300 ms floor
+     never binds and the rung stays the estimator's own variance bound — the
+     case where the corroboration buys nothing where it is worth most.  The
+     margin is never later than the general RTO, so a long-RTT low-jitter path
+     (where the `srtt / 4` floor dominates and would otherwise *loosen* every
+     rung) is unchanged, and it is never earlier than the measured sRTT.  The
+     probe window's cap uses the same number, so the probe cadence tightens
+     with the deadline.  Measured on `probe_lone_tail_repair_ladder`: rung
+     spacing 507 ms → 300 ms on the 190 ms RTT / ±100 ms one-way-jitter arm,
+     with the two constant-RTT arms unchanged at 300 ms and the low-RTT
+     jittered arm unchanged at 300 ms (`raw_rto` there is 128 ms, below the
+     floor).  The two pins that encoded the superseded behaviour are rewritten
+     to name the new one —
+     `rto::tests::reorder_window_tracks_variance_and_the_corroborated_repair_deadline_tracks_the_reorder_margin`
+     and `tlp::tests::post_probe_rto_tightens_to_the_corroborated_margin_on_a_jittery_link`
+     — and each goes red when the corroborated margin is reverted.
+
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,
    asserted in the **default tier**: `rtp_clean` (clean link, small and
@@ -285,7 +317,7 @@ src/socket/stream.rs::probe_fresh_tail_armor_latency = 4
 src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = 7
 src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 7
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = 4
-src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = 6
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = 12
 ```
 
 ## Scenario manifest
