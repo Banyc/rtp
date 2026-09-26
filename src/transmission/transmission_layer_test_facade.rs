@@ -2310,7 +2310,16 @@ mod tests {
         }
         let mut bufs = SendBufs::new();
         assert!(tl.send_pkts(&mut bufs).await.is_ok());
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // The watchdog deadline is `clamp(rto * rto_multiplier, floor,
+        // max_timeout)` and is armed by the send pass above. With the settled
+        // 1 ms RTT the estimator RTO sits on the 1 s `MIN_RTO` floor and this
+        // test's multiplier is 1, so the deadline is 1.00005 s after that pass
+        // (probed at 50 us resolution, five runs) and the 2 s `max_timeout`
+        // does not bind. The wait is a cadence, not the asserted property: the
+        // assertions below need the watchdog to have fired when the next send
+        // pass evaluates it, so 1.2x the measured deadline suffices where
+        // waiting the tuning's own 2 s upper bound paid twice it on every run.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
         let shared = Arc::clone(tl.shared_for_test());
         let mut send_tasks = tokio::task::JoinSet::new();
         // The parked KILL delivery is cancelled through a watch inside the
