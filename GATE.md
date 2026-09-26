@@ -375,9 +375,17 @@ whole of what a cheaper per-round equivalent could take. The rounds are not
 independent besides — the `SplitMix64` stream is sequential and the decoder
 carries group state across packets — so overlapping them would hand round *n*
 different bytes than the serial pass feeds it, which is a coverage change and
-not a shortening. Both rows keep their declared costs: those are the max of
-three streamed reps in the heavier load window above, and a lighter window is
-not a substitute for them.
+not a shortening. Both rows' declared costs above are **measured isolated in debug** — the mode the
+always-run gate runs (`cargo test -p rtp --lib -- --exact --test-threads=1`, 1.88 s
+and 1.87 s) — not read from a streamed per-test report. That distinction is not
+cosmetic here: the streamed numbers previously recorded for these two rows
+(**6.17 s** and **8.49 s**) are artefacts of bracketing completions in a shared
+output stream while the harness runs tests concurrently, and they were provably
+wrong before anyone measured them properly — **their sum, 14.66 s, exceeds the
+entire 718-test lib target, which is 8.12 s in debug**. The two rows are real
+costs and significant ones (~3.75 s of that 8.12 s), but they are 3–4× smaller
+than the report claimed, and a tier budget computed from the report would have
+been wrong by that much.
 
 Both fuzzes were re-shown to fail when the property each guards is broken.
 Making the decoder return a payload one byte longer than its packet — the
@@ -431,8 +439,8 @@ shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = 
 rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard | 5 | composite(impairment,metric,scale)@liveness | transport-liveness@impairment=permanent-mtu-hole+metric=connection-liveness+layer=rtp+scale=short-watchdog
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard | 65 | composite(fresh-sacks,impairment,metric)@liveness | transport-liveness@impairment=permanent-mtu-hole+fresh-sacks=on+metric=connection-liveness+layer=rtp
-lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder = default | 6.17 | baseline@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
-lib::traffic_shaping::redundancy::fec::tests::a_guarded_hostile_datagram_never_panics_the_fec_decoder = default | 8.49 | re-measurement(direct-decoder-path-bypasses-catch-unwind-so-a-panicking-hostile-datagram-fails-the-test-instead-of-being-counted-malformed)@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
+lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder = default | 1.88 | baseline@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
+lib::traffic_shaping::redundancy::fec::tests::a_guarded_hostile_datagram_never_panics_the_fec_decoder = default | 1.87 | re-measurement(direct-decoder-path-bypasses-catch-unwind-so-a-panicking-hostile-datagram-fails-the-test-instead-of-being-counted-malformed)@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
 lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder = perf | 1 | baseline@probe | probe-ladder@impairment=jitter+metric=rung-spacing+layer=rtp+scale=4-arms
 lib::socket::stream::tests::probe_fresh_tail_armor_latency = perf | 25 | composite(impairment,metric)@probe | probe-armor@impairment=clean+metric=armour-latency+layer=rtp
 lib::socket::stream::tests::probe_fresh_tail_burst_loss_latency = perf | 145 | composite(handshake,impairment,metric)@probe | probe-armor@impairment=burst-loss+metric=armour-latency+layer=rtp+handshake=none
