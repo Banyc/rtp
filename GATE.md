@@ -348,6 +348,45 @@ presented as the other. Second, the in-crate opt-in battery is **not** "about
 four minutes" — the six probes' own `#[ignore]` reasons sum to ~388 s — and
 neither figure has been measured, which is recorded as a gap below.
 
+**Neither FEC decoder-fuzz row is a single-test target, and neither cost is
+recoverable by shortening.** Both rows are two of the 718 tests in the `--lib`
+target, which libtest runs at its own parallelism — 10 threads here, and
+47.92 / 26.63 / 15.13 / 9.25 / 6.28 s at `--test-threads=1/2/4/8/16` on the same
+revision — so no core sits idle for them and there is no spare thread for an
+in-test overlap to take. Deleting both outright, which is the ceiling on any
+shortening, is not even resolvable above the target's own run-to-run variance:
+at load average 2.8-3.4 the `--lib` wall clock measures 8.01-9.86 s with both
+rows present and 7.39-7.68 s with both skipped, and in release — where the two
+rows cost 0.06 s each, 0.12 s of CPU in total — the same A/B measures 8.03 s
+against 7.17 s, a spread larger than the whole of the work removed. What does
+hold is the bound. The target is gated by its multi-second sleeping tests
+rather than by CPU — it is 8.0-9.9 s in debug and 7.2-8.0 s in release, while
+the two rows' own cost falls from 1.85 s to 0.06 s — so their entire debug
+cost, ~3.7 s of CPU across 50,000 rounds each, is absorbed, and 0.37 s is the
+most it could ever buy even packed perfectly across the 10 threads the target
+runs on. The remainder of the cost is not recoverable either. A
+three-rep phase probe inside the rounds (load average 4.0-4.1) puts each fuzz
+at 0.49 s generating the hostile datagram stream, 1.35 s inside the decoder
+under test, 0.008 s building the per-round wire packet and 0.001 s draining
+recoveries; the guards the production path adds per round (`catch_unwind`, the
+thread-local flag, the cached panic hook) calibrate at 0.0018 s for the same
+50,000 rounds. `wire_pkt`'s per-round buffer, at 0.45 %, is therefore the
+whole of what a cheaper per-round equivalent could take. The rounds are not
+independent besides — the `SplitMix64` stream is sequential and the decoder
+carries group state across packets — so overlapping them would hand round *n*
+different bytes than the serial pass feeds it, which is a coverage change and
+not a shortening. Both rows keep their declared costs: those are the max of
+three streamed reps in the heavier load window above, and a lighter window is
+not a substitute for them.
+
+Both fuzzes were re-shown to fail when the property each guards is broken.
+Making the decoder return a payload one byte longer than its packet — the
+range the first fuzz exists to forbid — fails it at round 4 with "a 1423-byte
+packet yielded 1424 payload bytes". Removing the `encodable_wire_pkt`
+precondition so unguarded hostile input reaches the direct decoder call fails
+the second with a third-party `TooManyShards` panic propagated out of
+`fec::de`, which is the panic its docs say must not be swallowed.
+
 ### Cost provenance
 
 No cost below is invented; each is one of two things.
