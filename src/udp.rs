@@ -2496,7 +2496,13 @@ mod tests {
         over.connect(addr).await.unwrap();
         over.send(b"over").await.unwrap();
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), dispatched.recv())
+            // Bounds a wait for an admission that must never come, so it only
+            // has to exceed how long the wrong outcome takes. With the cap
+            // comparison loosened to equality the over-cap datagram is
+            // classified and handed out, resolving this `recv` in 23-57 ms, so
+            // 500 ms keeps a ~10x margin over it while taking 4.5 s out of every
+            // run of the always-run tier.
+            tokio::time::timeout(std::time::Duration::from_millis(500), dispatched.recv())
                 .await
                 .is_err(),
             "an unknown source past the cap must be refused, not admitted once the ledger overshoots"

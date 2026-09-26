@@ -91,9 +91,9 @@ comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
 
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp` runs it.
   Every scenario here is seeded (deterministic impairment). This is the gate
-  that runs on every `cargo test`: measured on this checkout it is 16.8-18.6 s
-  end to end, of which the `lib` target is 8.07-9.35 s, `fuzz_codec`
-  2.58-2.68 s and `rtp_padding_bench` 3.46-3.71 s (see the perf declaration
+  that runs on every `cargo test`: measured on this checkout it is 12.9-18.1 s
+  end to end, of which the `lib` target is 4.08-9.25 s, `fuzz_codec`
+  2.57-2.60 s and `rtp_padding_bench` 3.53-4.09 s (see the perf declaration
   below for the method, the load and the per-row costs).
 - **standard** — `#[ignore]`d, runs in well under a minute per target and
   asserts a correctness or transport-floor property. Run the target
@@ -311,17 +311,17 @@ three reps per binary, reading the harness's own `finished in` figure:
 
 | binary | run | wall clock (3 reps) |
 | --- | --- | --- |
-| `lib` | 718 (+10 ignored) | 9.35 / 8.14 / 8.07 s |
-| `fuzz_codec` | 1 | 2.67 / 2.68 / 2.58 s |
-| `rtp_padding_bench` | 3 (+6 ignored) | 3.71 / 3.46 / 3.50 s |
+| `lib` | 718 (+10 ignored) | 4.10 / 9.25 / 4.08 s |
+| `fuzz_codec` | 1 | 2.59 / 2.57 / 2.60 s |
+| `rtp_padding_bench` | 3 (+6 ignored) | 3.53 / 3.71 / 4.09 s |
 | `shared_bottleneck` | 2 (+7 ignored) | 0.71 / 0.71 / 0.71 s |
-| `rtp_mss` | 3 | 0.69 / 0.63 / 0.66 s |
-| `rtp_loss` | 1 | 0.56 / 0.43 / 0.49 s |
-| `rtp_fec` | 1 (+1 ignored) | 0.33 / 0.28 / 0.34 s |
-| `rtp_clean` | 3 | 0.14 / 0.13 / 0.13 s |
+| `rtp_mss` | 3 | 0.56 / 0.66 / 0.67 s |
+| `rtp_loss` | 1 | 0.50 / 0.48 / 0.50 s |
+| `rtp_fec` | 1 (+1 ignored) | 0.43 / 0.29 / 0.31 s |
+| `rtp_clean` | 3 | 0.13 / 0.13 / 0.13 s |
 | `rtp_liveness` | 1 (+2 ignored) | 0.00 / 0.00 / 0.00 s |
 | `hol_verify4`, `rtp_bufferbloat`, `rtp_burst_loss`, `rtp_gentle` | 0 (every test `#[ignore]`d) | 0.00 s |
-| **`cargo test -p rtp` end to end** | **733** | **18.60 / 16.77 / 16.80 s** |
+| **`cargo test -p rtp` end to end** | **733** | **12.85 / 18.11 / 13.39 s** |
 
 **How it was measured.** The per-binary and end-to-end figures are wall clock
 around the cargo invocation, read from the harness's own `finished in` line. A
@@ -337,11 +337,11 @@ default 10-thread parallelism (the mode the gate runs) and three times at
 `--test-threads=1`, which takes the other tests' contention out of a row's own
 cost and makes the **fit check** exact: *the per-test costs of a target must fit
 that target's total.* They do, in every serialized rep: `--lib` sums
-46.95 / 47.08 / 47.04 s of per-test time against 46.97 / 47.09 / 47.05 s
-reported, `fuzz_codec` 2.59 / 2.59 / 3.16 s exactly, `rtp_padding_bench`
-4.44 / 4.72 / 4.12 s exactly, `rtp_mss` 0.66 / 0.65 / 0.83 s exactly. Under the
-default parallelism the `--lib` per-test sum is 43.12 / 43.97 / 51.57 s against
-an 8.16-8.28 s wall clock — the expected shape for ten tests at a time, several
+38.40 / 34.34 / 37.79 s of per-test time against 38.41 / 34.35 / 37.80 s
+reported, `fuzz_codec` 2.62 / 2.60 / 2.60 s exactly, `rtp_padding_bench`
+3.89 / 3.98 / 3.95 s exactly, `rtp_mss` 0.57 / 0.70 / 0.67 s exactly. Under the
+default parallelism the `--lib` per-test sum is 31.89 / 35.70 / 38.47 s against
+a 3.74-9.14 s wall clock — the expected shape for ten tests at a time, several
 of them sleeping rather than burning CPU. Both figures are stated because both
 are true and they are not the same quantity: the serialized one is what a row
 costs, the parallel one is what it has to compete with.
@@ -364,10 +364,14 @@ again.
 3.1-5.0 and 15-minute 6.7-9.1 on 10 cores. These are costs measured *under
 load*, not properties of the tests, and the rep-to-rep spread says how much of
 each number is the machine: inside the tier's own three
-invocations the `lib` target is 8.07-9.35 s (±8 %), `rtp_padding_bench`
-3.46-3.71 s (±4 %) and `fuzz_codec` 2.58-2.68 s (±4 %); run standalone the same
-binaries spread wider — `lib` 8.16-8.29 s, `rtp_padding_bench` 3.44-4.39 s,
-`fuzz_codec` 2.81-3.16 s. Every declared cost is the **max of its three reps**,
+invocations `rtp_padding_bench` is 3.53-4.09 s (±7 %) and `fuzz_codec`
+2.57-2.60 s (±1 %), while the `lib` target is bimodal at 4.08-4.10 s or 9.25 s —
+not machine speed but one test: `socket::stream::tests::test_fec_recovers_under_loss`
+measures 2.80 / 5.01 / 9.03 s in the parallel reps of those same three runs, a
+spread of whole 1 s `MIN_RTO` waits, so the `lib` target's wall clock is
+quantised by whether its unlucky losses land before a probe can repair them.
+Run standalone the same binaries spread wider — `rtp_padding_bench` 3.44-4.39 s,
+`fuzz_codec` 2.57-3.16 s. Every declared cost is the **max of its three reps**,
 so a later run is compared against a deliberately conservative figure rather
 than a lucky one. Where the two modes disagree materially the row is a
 timing-cadence-sensitive one (the two padding-shape rows: 0.26 s and 0.18 s
@@ -376,14 +380,15 @@ because it is the one that fits the target's total.
 
 Two consequences stated rather than left implicit. First, the 17 declared
 `default` rows are rows, not the tier: they sum to 14.30 s of serialized
-per-test cost, the whole `--lib` target sums to 47.5 s measured the same way,
-and the tier's wall clock is 16.8-18.6 s at its own parallelism — three
+per-test cost, the whole `--lib` target sums to 34.3-38.4 s measured the same
+way, and the tier's wall clock is 12.9-18.1 s at its own parallelism — three
 different quantities, and none is presented as another. The block's largest
 single costs are not the two fuzzes but
-`socket::stream::tests::test_fec_recovers_under_loss` (9.22 s serialized,
-7.39 s contended), then `udp::tests::the_session_cap_re_binds_after_a_soft_overshoot`
-(5.06 s), then `keyed_udp::tests::an_overshot_keyed_ledger_still_refuses_unknown_keys`
-(5.01 s); the two decoder fuzzes are next at 1.92 s and 1.93 s. Second, the in-crate opt-in battery is **not** "about
+`socket::stream::tests::test_fec_recovers_under_loss` (9.44 s serialized,
+2.80-9.03 s contended), then
+`traffic_shaping::control::handshake::opening::tests::lost_ready_is_recovered_by_a_duplicate_confirmation`
+(3.25 s) and `mpudp::tests::a_session_wider_than_the_cap_is_refused` (3.11 s);
+the two decoder fuzzes are next at 1.84 s and 1.85 s. Second, the in-crate opt-in battery is **not** "about
 four minutes" — the six probes' own `#[ignore]` reasons sum to ~388 s — and
 neither figure has been measured, which is recorded as a gap below.
 
@@ -571,7 +576,7 @@ attribution@baseline-family=fec-diversity = rtp_fec::rtp_max_diversity_fec_cover
 attribution@baseline-family=padding-perf = the six perf-tier rtp_padding_bench rows are report-only A/B measurements (bulk throughput and small-echo latency across three presets) whose `#[ignore]` reasons state no wall clock, and whose cells are the A/B preset axis rather than the declared `padding-wire` axis. The repair is one streamed run per row plus a `padding-ab` cell name and a reference row of its own.
 attribution@baseline-family=hol-verify4 = hol_verify4::v4_clean_rawbulk and v4_ge5_rawbulk are one dimension apart (impairment) and internally coherent, so only their costs are missing: neither `#[ignore]` reason states a wall clock and no document does either. One streamed release run per row declares the family with no cell change.
 attribution@baseline-family=perf-lane = the four in-crate perf-lane tests are asserting gates, but this grammar resolves an `#[ignore]`d lib row's tier to `perf`, which this crate's own tier vocabulary reserves for report-only measurement; declaring an asserting perf lane as `perf` would file a gate under the tier that must contain no assertion. The repair is a tier the grammar can name for an in-crate asserting opt-in test, or reading the perf lanes' tier from the `ignored-manifest` classification the crate already keeps.
-cost@metric=wall-clock = the remaining 716 default-tier lib tests have no per-test cost in any document. Their suite cost is measured (8.07-9.35 s parallel, 46.95-47.09 s serialized) but a row names one test, so the repair is to declare the expensive ones with cells of their own from the harness-native per-test map (libtest `--report-time`, max of three serialized reps, with the contended figure at the default 10-thread parallelism in brackets; every cost below is well under its target's total, and the two decoder fuzzes already declared are omitted): socket::stream::tests::test_fec_recovers_under_loss 9.22 s [7.39], udp::tests::the_session_cap_re_binds_after_a_soft_overshoot 5.06 s [5.06], keyed_udp::tests::an_overshot_keyed_ledger_still_refuses_unknown_keys 5.01 s [5.01], traffic_shaping::control::handshake::opening::tests::lost_ready_is_recovered_by_a_duplicate_confirmation 3.23 s [3.23], mpudp::tests::a_session_wider_than_the_cap_is_refused 3.11 s [3.12], socket::session::tests::a_stuck_underlay_still_resolves_the_session_handle 3.00 s [3.00], socket::session::tests::the_post_terminal_kill_tail_is_bounded 3.00 s [3.00], transmission::transmission_layer_test_facade::tests::proactive_watchdog_aborts_locally_before_best_effort_kill_completes 2.00 s [2.01], socket::stream::tests::test_fec_recovers_under_loss_with_mss_8192 0.68 s [1.77], traffic_shaping::control::handshake::opening::tests::post_open_timer_recovers_without_another_client_confirmation 1.26 s [1.50], traffic_shaping::control::handshake::opening::tests::every_handshake_leg_recovers_from_one_lost_datagram 1.27 s [1.29], traffic_shaping::control::handshake::opening::tests::nonce_bound_ready_retires_post_open_retransmissions 1.16 s [1.15], socket::session::tests::read_drop_keeps_session_alive_until_recv_window_saturates 0.44 s [0.94], socket::stream::tests::a_bulk_transfer_survives_loss_reorder_and_duplication 0.57 s [0.90] and traffic_shaping::control::handshake::opening::tests::post_open_guard_recovers_after_three_lost_confirmations 0.87 s [0.90]; nothing else in the target reaches 0.9 s in either mode, and the 7.32 / 5.02 / 5.00 s set this gap previously named was read from the streamed instrument and is superseded above.
+cost@metric=wall-clock = the remaining 716 default-tier lib tests have no per-test cost in any document. Their suite cost is measured (4.08-9.25 s parallel, 34.34-38.40 s serialized) but a row names one test, so the repair is to declare the expensive ones with cells of their own from the harness-native per-test map (libtest `--report-time`, max of three serialized reps, with the contended figure at the default 10-thread parallelism in brackets; every cost below is well under its target's total, and the two decoder fuzzes already declared are omitted): socket::stream::tests::test_fec_recovers_under_loss 9.44 s [9.03], traffic_shaping::control::handshake::opening::tests::lost_ready_is_recovered_by_a_duplicate_confirmation 3.25 s [3.25], mpudp::tests::a_session_wider_than_the_cap_is_refused 3.11 s [3.11], socket::session::tests::a_stuck_underlay_still_resolves_the_session_handle 3.00 s [3.00], socket::session::tests::the_post_terminal_kill_tail_is_bounded 3.00 s [3.00], transmission::transmission_layer_test_facade::tests::proactive_watchdog_aborts_locally_before_best_effort_kill_completes 2.00 s [2.00], socket::stream::tests::test_fec_recovers_under_loss_with_mss_8192 0.96 s [1.54], traffic_shaping::control::handshake::opening::tests::post_open_timer_recovers_without_another_client_confirmation 1.51 s [1.52], traffic_shaping::control::handshake::opening::tests::every_handshake_leg_recovers_from_one_lost_datagram 1.22 s [1.22], traffic_shaping::control::handshake::opening::tests::nonce_bound_ready_retires_post_open_retransmissions 1.15 s [1.14], traffic_shaping::control::handshake::opening::tests::post_open_guard_recovers_after_three_lost_confirmations 0.89 s [0.86], socket::session::tests::read_drop_keeps_session_alive_until_recv_window_saturates 0.66 s [0.85] and socket::stream::tests::a_bulk_transfer_survives_loss_reorder_and_duplication 0.55 s [0.58]; nothing else in the target reaches 0.9 s in either mode. Two rows this gap listed at 5.06 s and 5.01 s are gone from it: each waited out a 5 s refusal deadline against a refused admission measured at 5-34 ms, so each now waits 500 ms and costs 0.50-0.55 s. The 7.32 / 5.02 / 5.00 s set this gap originally named was read from the streamed instrument and is superseded above.
 transport-delivery@impairment=correlated-loss = no default-tier row drops four-state Gilbert-Elliot loss at the transport layer: the always-run impaired delivery rows use the harness's 5 % iid mild-loss preset and the 3 % iid FEC preset, and GE loss is exercised only by the opt-in burst-loss arms. An always-run GE arm is what closes this, and it is a new arm rather than a retune of a frozen one.
 transport-delivery@metric=goodput-fraction = no default-tier row measures goodput as a fraction of the configured link rate: the capacity-relative floors are opt-in (bufferbloat `standard`, burst-loss `full`). The cell is knowingly empty in the always-run tier because the arm it needs is a multi-second rate-shaped run, which the 60 s budget's headroom over the measured 16.8-18.6 s does not currently buy; the deliberate answer is to measure the opt-in arm rather than to move a floor into a tier that cannot pay for it.
 transport-latency@impairment=burst-loss = the always-run tier's only latency assertion is the 60 ms one-way delay observability check. The sparse-message tail under GE burst loss is opt-in (`full`), and an always-run tail arm would need a window short enough for the default budget and long enough to carry one recovery episode — a new arm, not a shortened probe.

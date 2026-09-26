@@ -1404,9 +1404,15 @@ mod tests {
 
         let unknown = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         unknown.send_to(&[1, 0, 0, 0], addr).await.unwrap();
+        // The deadline bounds a wait for an admission that must never come, so
+        // it only has to exceed how long the wrong outcome takes. Loosening the
+        // ledger comparison above to equality — the regression the assertion
+        // below names — admits the datagram and resolves `accept_with` in 5 ms,
+        // so 500 ms keeps a hundredfold margin over it while taking 4.5 s out of
+        // every run of the always-run tier.
         assert!(
             tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_millis(500),
                 server.accept_with(AcceptConfig::default()),
             )
             .await
