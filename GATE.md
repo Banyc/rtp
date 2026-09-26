@@ -139,14 +139,47 @@ not a magic constant; the harness never restates one.
    `probe_lone_tail_repair_deadline_latency`, which seeds the RTT estimate
    from the handshake (the production shape, unlike
    `probe_fresh_tail_burst_loss_latency`, whose handshake-less construction
-   makes its one ~1 s echo the initial `MIN_RTO`) and sweeps a burst that is
-   exactly the six-datagram fresh-tail cover versus one that also eats the
+   makes its cold start a pre-first-RTT-sample tail) and sweeps a burst that
+   is exactly the six-datagram fresh-tail cover versus one that also eats the
    first tail-loss probe.  The two arms bracket the deadline: the first
-   repairs at the first PTO (`2*srtt + RTT`), the second at the second
-   (`4*srtt + RTT`) and, once the cover is gone, at every subsequent
-   `TAIL_PROBED_MIN_RTO` rung — the multi-rung episode the field reports as
-   one to three seconds.  No bound is asserted here: the bars above are the
-   mandate's, and this probe attributes which of them a regression moves.
+   repairs at the first PTO (`2*srtt + RTT`); the second loses that PTO too,
+   and repairs once the burst being crossed has taken its remaining datagrams
+   — one or two rungs, not the multi-second ladder the field reported before
+   the two departures below.  No bound is asserted here: the bars above are
+   the mandate's, and this probe attributes which of them a regression moves.
+
+   This transport's tail-recovery timing departs from RFC 8985 in two places.
+   Both are recorded here because the latency floors above are built on them,
+   and both were chosen from measurement rather than from taste:
+
+   - **The pre-first-RTT-sample probe window is `TAIL_PROBED_MIN_RTO`
+     (300 ms), not §7.2's `PTO = 1 s` (nor §7.3's skip).**  With no sample the
+     estimator's sRTT *is* the `MIN_RTO` floor, so §7.2's formula degenerates
+     to a full second of silence before the first probe of an unmeasured
+     path.  The rule buys no safety in this protocol: a probe is a duplicate
+     of an already-sent, unacked packet, which the receiver de-duplicates by
+     sequence number, so an early probe costs one datagram while the §7.2
+     wait costs the *entire* recovery of a tail lost before the first sample.
+     Measured as the ~1 s cold-start echo in
+     `probe_fresh_tail_burst_loss_latency`'s burst arm (max 1049 ms → 351 ms
+     with the cap).  Nothing else moves: the general RTO path — and so every
+     retransmission and non-tail timer — keeps the 1 s `MIN_RTO` floor, and
+     the window still abstains entirely when every packet is acked.
+   - **A repair re-sends the tail's own armour cover.**  A probe or
+     window-expiry retransmission of an interactive single-symbol tail fires
+     only after that packet's whole original transmission — primary plus its
+     cover — was lost, so the link has just demonstrated it drops that many
+     consecutive datagrams.  A lone repair datagram is then *known* to be
+     dropped while the burst is still pending, and the episode climbs one
+     rung per dropped datagram; re-sending the recorded cover spends the
+     burst's remaining drop budget inside one rung.  The count is the
+     packet's own recorded cover, so a repair never sends more than the
+     original did, and the episode ends when the tail is acked — its datagram
+     count is bounded by the burst being crossed, not by the number of rungs.
+     Bulk/stock repairs record no cover and are byte-for-byte unchanged.
+     Measured on `probe_lone_tail_repair_deadline_latency`'s burst-8 arm: max
+     1611 ms → 919 ms, p99 1523 ms → 917 ms, p90 921 ms → 615 ms, with
+     `rto_reason` 33 → 3 and `tail_probes` 46 → 26.
 2. **Reasonable goodput of the interactive lane** — the lane delivers what it
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,

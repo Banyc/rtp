@@ -2178,19 +2178,36 @@ mod tests {
         assert_eq!(space.tail_probe(t3).unwrap().seq, sq(1));
     }
 
+    /// RFC 8985 §7.2/§7.3 pin the pre-sample probe window at a full `PTO = 1 s`
+    /// (the estimator's sRTT is the 1 s `MIN_RTO` floor itself, so the PTO
+    /// formula degenerates to one second of silence).  This protocol follows
+    /// TCP as a baseline and deliberately departs here: a probe is a duplicate
+    /// of an already-sent, unacked packet that the receiver de-duplicates by
+    /// sequence number, so firing one before any sample costs one datagram and
+    /// saves the *entire* recovery of a tail lost before the first sample.  The
+    /// window is capped at the post-probe floor until a real sample exists, so
+    /// the probe fires at `TAIL_PROBED_MIN_RTO` and the budget is spent on the
+    /// tail instead of on waiting.  The general RTO path keeps `MIN_RTO`, and
+    /// an all-acked window still has no tail to probe.
     #[test]
-    fn tail_probe_abstains_when_all_acked_or_before_first_rtt_sample() {
+    fn tail_probe_fires_at_the_pre_sample_floor_and_abstains_when_all_acked() {
         let t0 = Instant::now();
         let mut space = PktSendSpace::new();
 
-        // Without any RTT sample the RTO defaults to 1 s, so the PTO (capped at
-        // RTO) does not fire at 900 ms.
         send_packet(&mut space, t0);
-        assert!(!space.has_tail_probe(t0 + ms(900)));
-        assert!(space.tail_probe(t0 + ms(900)).is_none());
+        assert!(
+            !space.has_tail_probe(t0 + ms(299)),
+            "M1: the probe must not fire before the pre-sample floor"
+        );
+        assert!(space.tail_probe(t0 + ms(299)).is_none());
+        let probe = space
+            .tail_probe(t0 + ms(300))
+            .expect("M1: the probe must fire at the pre-sample floor, not after 1 s");
+        assert_eq!(probe.seq, sq(0));
+        assert_eq!(space.retransmission_counters.tail_probes, 1);
 
         // After all packets are acked there is no tail and no probe.
-        ack_up_to(&mut space, 0, t0 + ms(1));
+        ack_up_to(&mut space, 0, t0 + ms(300));
         assert!(!space.has_tail_probe(t0 + ms(900)));
         assert!(space.tail_probe(t0 + ms(900)).is_none());
     }

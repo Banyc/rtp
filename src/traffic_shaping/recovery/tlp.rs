@@ -59,8 +59,10 @@ impl TailLossProber {
 
     /// Time between consecutive tail-loss probes for the current tail episode.
     /// The PTO formula: `max(2*srtt, 2*min_rtt)` with a 10 ms floor, capped at
-    /// the RTO currently in use.  The doubled terms use checked multiplication
-    /// so a sub-nanosecond RTT cannot round the doubling away.
+    /// the RTO currently in use — except before the first RTT sample, where the
+    /// cap is the post-probe floor (see [`Self::probe_window_with_srtt`]).  The
+    /// doubled terms use checked multiplication so a sub-nanosecond RTT cannot
+    /// round the doubling away.
     pub fn probe_window(&self, rtt_stats: &RttStats) -> Duration {
         let srtt = rtt_stats.smooth_rtt();
         self.probe_window_with_srtt(rtt_stats, srtt)
@@ -74,7 +76,23 @@ impl TailLossProber {
         let doubled_srtt = srtt
             .checked_mul(2)
             .expect("smoothed RTT must fit when doubled for the probe window");
-        let cap = self.rto(rtt_stats);
+        // RFC 8985 §7.2/§7.3 waits a full `PTO = 1 s` before the first probe of
+        // an unmeasured path and requires skipping the probe until an RTT
+        // sample exists.  This protocol follows TCP as a baseline, not as
+        // compliance, and the pre-sample rule buys no safety here: a probe is a
+        // duplicate of an already-sent, unacked packet that the receiver
+        // de-duplicates by sequence number, so the only cost of an early probe
+        // is one datagram, while the rule's cost is the *entire* recovery of a
+        // tail lost before the first sample (the estimator's sRTT is the 1 s
+        // `MIN_RTO` floor itself, so `2 * sRTT` capped at the RTO idles for a
+        // full second).  The probe window is therefore capped at the
+        // post-probe floor until a real sample exists; the general RTO path
+        // keeps `MIN_RTO`, so no unmeasured retransmission is pulled in.
+        let cap = if rtt_stats.min_rtt().is_none() {
+            Self::TAIL_PROBED_MIN_RTO
+        } else {
+            self.rto(rtt_stats)
+        };
         doubled_srtt.max(Self::MIN_TOL).min(cap)
     }
 
@@ -90,11 +108,13 @@ impl TailLossProber {
     }
 
     /// Merge the next probe time into an already-known wake deadline.
-    /// A probe cannot precede `sent_time + MIN_TOL`. When another source is
-    /// already due by that lower bound, keep it without calculating the RTT-
-    /// derived probe window.  An overdue probe that is temporarily ineligible
-    /// is deferred to a bounded `INELIGIBLE_RETRY` cadence instead of
-    /// returning the same past deadline.
+    /// No probe can precede `sent_time + MIN_TOL` — every probe-window cap is
+    /// at least `TAIL_PROBED_MIN_RTO`, which is above the tolerance floor.  When
+    /// another source is already due by that lower bound, keep it without
+    /// calculating the RTT-derived probe window: the probe cannot be earlier,
+    /// so the merge would return the same deadline.  An overdue probe that is
+    /// temporarily ineligible is deferred to a bounded `INELIGIBLE_RETRY`
+    /// cadence instead of returning the same past deadline.
     pub fn merge_next_probe_time(
         &self,
         now: Instant,
@@ -106,16 +126,17 @@ impl TailLossProber {
         if !self.can_probe() {
             return current;
         }
-        let srtt = rtt_stats.smooth_rtt();
-        // Both RTO caps are at least sRTT, while the uncapped probe window is
-        // at least max(sRTT, MIN_TOL). Therefore no probe can precede this
-        // lower bound. If another wake already wins, avoid the doubled-sRTT
-        // and RTO-cap calculation entirely.
-        let earliest_probe = sent_time + srtt.max(Self::MIN_TOL);
+        // The lower bound must be the true one.  Bounding it by sRTT instead
+        // (as a pre-sample PTO of `2 * sRTT` once implied) would let this
+        // early-out swallow a probe whose capped window is *shorter* than sRTT
+        // — exactly the pre-sample case, where the window is the post-probe
+        // floor while sRTT is still the 1 s `MIN_RTO` — and defer the probe to
+        // whatever competing deadline happened to be earlier.
+        let earliest_probe = sent_time + Self::MIN_TOL;
         if current.is_some_and(|deadline| deadline <= earliest_probe) {
             return current;
         }
-        let mut probe = sent_time + self.probe_window_with_srtt(rtt_stats, srtt);
+        let mut probe = sent_time + self.probe_window_with_srtt(rtt_stats, rtt_stats.smooth_rtt());
         if !eligible && probe <= now {
             probe = now + Self::INELIGIBLE_RETRY;
         }
@@ -191,6 +212,68 @@ mod tests {
         );
     }
 
+    /// The pre-first-RTT-sample probe window is the post-probe floor, not the
+    /// RFC 8985 §7.2 `PTO = 1 s`.  The estimator seeds sRTT at the 1 s
+    /// `MIN_RTO` floor, so an uncapped `2 * sRTT` capped at the RTO would idle
+    /// a full second before the first probe of an unmeasured path.  A probe is
+    /// a duplicate of an already-sent, unacked packet, so the early fire costs
+    /// one datagram and saves the whole tail recovery; the general RTO path is
+    /// untouched and still floors at `MIN_RTO`.
+    #[test]
+    fn pre_sample_probe_window_is_the_post_probe_floor_not_the_pre_sample_pto() {
+        let rtt_stats = RttStats::new();
+        assert!(
+            rtt_stats.min_rtt().is_none(),
+            "the fixture must have no RTT sample"
+        );
+        let tlp = TailLossProber::new();
+        assert_eq!(
+            tlp.probe_window(&rtt_stats),
+            TailLossProber::TAIL_PROBED_MIN_RTO,
+            "M1: the pre-sample probe window must be the post-probe floor"
+        );
+        assert_eq!(
+            tlp.rto(&rtt_stats),
+            Duration::from_secs(1),
+            "the pre-probe RTO must keep the 1 s MIN_RTO floor"
+        );
+        let sent = Instant::now();
+        assert!(
+            !tlp.is_due(sent, &rtt_stats, sent + ms(299)),
+            "M1: a pre-sample probe must not fire before the floor"
+        );
+        assert!(
+            tlp.is_due(sent, &rtt_stats, sent + ms(300)),
+            "M1: a pre-sample probe must fire at the floor"
+        );
+    }
+
+    /// A competing wake that is *earlier than sRTT but later than the probe
+    /// window* must not swallow the probe.  Before the first RTT sample sRTT is
+    /// the 1 s `MIN_RTO` floor while the probe window is the 300 ms post-probe
+    /// floor, so bounding the merge's early-out by sRTT would defer the probe
+    /// to a wake up to 700 ms later and defeat the pre-sample cap entirely.
+    /// The early-out's bound is therefore the true floor a probe can never
+    /// precede, `MIN_TOL`.
+    #[test]
+    fn a_competing_wake_inside_the_pre_sample_srtt_does_not_swallow_the_probe() {
+        let tlp = TailLossProber::new();
+        let sent = Instant::now();
+        let rtt_stats = RttStats::new();
+        let window = tlp.probe_window(&rtt_stats);
+        assert_eq!(window, TailLossProber::TAIL_PROBED_MIN_RTO);
+        let current = sent + window + ms(200);
+        assert!(
+            current < sent + rtt_stats.smooth_rtt(),
+            "the competing wake must sit inside sRTT for this to be a guard"
+        );
+        assert_eq!(
+            tlp.merge_next_probe_time(sent, sent, &rtt_stats, true, Some(current)),
+            Some(sent + window),
+            "M1: a competing wake inside the pre-sample sRTT must not defer the probe"
+        );
+    }
+
     #[test]
     fn probe_window_fires_between_2srtt_and_rto() {
         let rtt_stats = settled_rtt_stats();
@@ -260,12 +343,16 @@ mod tests {
         );
     }
 
+    /// A competing wake that is due at or before the probe's lower bound
+    /// (`sent_time + MIN_TOL`, the shortest any probe window can be) wins the
+    /// merge without changing it: the merge is a plain minimum, and the
+    /// early-out only skips recomputing a deadline that cannot be earlier.
     #[test]
     fn earlier_deadline_at_probe_lower_bound_wins_without_changing_it() {
         let tlp = TailLossProber::new();
         let sent = Instant::now();
         let rtt_stats = settled_rtt_stats();
-        let current = sent + rtt_stats.smooth_rtt();
+        let current = sent + TailLossProber::MIN_TOL;
         assert!(current < sent + tlp.probe_window(&rtt_stats));
         assert_eq!(
             tlp.merge_next_probe_time(sent, sent, &rtt_stats, true, Some(current)),
