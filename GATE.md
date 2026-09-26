@@ -37,11 +37,17 @@ opt-in sets are recorded here and machine-checked:
   assertion there would be a flake source, not a signal. The checker keeps
   them honest — a perf lane whose body loses its assertion token, or whose
   reason stops documenting the run command, is an error.
-- **probe** — a *report-only* in-process measurement probe: it prints the
-  sender parity/gate counters, echo-latency percentiles, or repair-path
-  classification, and asserts nothing. Run them explicitly when the property
-  they observe is in scope (each names its wall-clock cost in the `#[ignore]`
-  reason):
+- **probe** — a *self-validating, report-only* in-process measurement probe:
+  it prints the sender parity/gate counters, echo-latency percentiles, or
+  repair-path classification, and asserts **its own measurement's integrity** —
+  that the arm ran its whole load, that no echo missed its deadline, that the
+  counters it prints were actually delivered and agree with the arm's label —
+  and nothing about the product: no bound from this file's *Performance*
+  section appears in a probe. A broken instrument (zero samples, a counter that
+  never arrived, a "clean" arm that dropped datagrams) fails the test instead
+  of printing a table of zeros that a reader can mistake for a measurement.
+  Run them explicitly when the property they observe is in scope (each names
+  its wall-clock cost in the `#[ignore]` reason):
 
   ```sh
   cargo test --release -p rtp --lib -- --ignored probe_single_symbol_interactive_fec_repair
@@ -52,9 +58,12 @@ opt-in sets are recorded here and machine-checked:
   ```
 
   They cannot be mistaken for a gate: the names start with `probe_`, the docs
-  describe the measurement, and the checker refuses an assertion token in a
-  probe body — a check silently added under the ignore flag is the exact hole
-  this inventory exists to close.
+  describe the measurement, and the assertion token each probe validates its
+  measurement with is recorded in the `gate-probe-selfchecks` block below.
+  `tools/check-ignored.py` fails when a probe's body reaches no assertion (a
+  probe that stopped validating its measurement), when its recorded count and
+  its body disagree (a check added, removed or moved under the ignore flag is
+  visible in this file), and when the block names a test that is not a probe.
 
 The whole in-crate opt-in battery is `cargo test --release -p rtp --lib --
 --ignored` (about four minutes; the probes dominate).
@@ -260,6 +269,20 @@ tests/shared_bottleneck.rs::shared_bneck_reorder_tolerant_fairness = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_10mbps = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_2mbps = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_dedicated_bulk_10mbps = full
+```
+
+The probe inventory of what each probe validates: the count of assertion tokens
+in the probe's own body. A probe's measurement-integrity checks are part of the
+instrument, so they are recorded the same way the netem_test gate records the
+asserting helpers a report-only `perf` scenario may reach — a change to them is
+a change to this file.
+
+```gate-probe-selfchecks
+src/socket/stream.rs::probe_armor_copy_cell = 6
+src/socket/stream.rs::probe_fresh_tail_armor_latency = 4
+src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = 7
+src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 7
+src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = 4
 ```
 
 ## Scenario manifest

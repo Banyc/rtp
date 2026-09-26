@@ -949,7 +949,13 @@ mod tests {
     /// Prints the sender parity/gate counters and the receiver recovered
     /// count so the repair path is observable without the netem oracle.
     ///
-    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
+    /// Self-validating report-only: prints the measurements and asserts the
+    /// *instrument's* integrity (the arm ran its whole load, the far side
+    /// observed it, and the counters it prints actually arrived) so a dead
+    /// instrument fails instead of printing a table of zeros.  It asserts no
+    /// bound from this crate's GATE.md.  The parity/recovery columns are
+    /// reported rather than asserted: the iid loss stream's position depends on
+    /// the sender's datagram count, so a correct run can show them as zero.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process FEC-repair measurement probe; ~45 s; run with --ignored --nocapture"]
     async fn probe_single_symbol_interactive_fec_repair() {
@@ -1042,6 +1048,33 @@ mod tests {
                 delivered,
                 recovered,
             );
+            // Measurement integrity: the arm's load ran to completion, the far
+            // side observed it, and the counters this probe exists to report
+            // were actually delivered.  These assert the instrument, never the
+            // transport: no bound from GATE.md appears here.
+            let sent = sent_ok.load(AtomicOrdering::Relaxed);
+            assert_eq!(
+                sent, n as u64,
+                "[probe {label}] only {sent} of the arm's {n} sends completed: the printed table is not the arm's load"
+            );
+            assert!(
+                delivered > 0,
+                "[probe {label}] the receiver observed 0 of the {sent} messages sent: nothing was measured"
+            );
+            assert!(
+                counters.is_some(),
+                "[probe {label}] no FEC-counter observation reached the probe: the counters the probe reports are missing, not zero"
+            );
+            assert!(
+                recovered.is_some(),
+                "[probe {label}] the receiver reports no FEC state (`recovered=None`): the repair path this arm measures is unobservable"
+            );
+            // No mechanism assertion is sound here: the two arms' iid loss is
+            // drawn from a stream whose position depends on how many datagrams
+            // the sender wrote, so whether the parity gate opens varies between
+            // runs (a run has measured depth3 with `parity_sent` 771 and with
+            // 0).  `parity_sent`/`recovered` may therefore legitimately be 0 on
+            // either arm and the printed table is read as-is.
         }
     }
 
@@ -1053,7 +1086,11 @@ mod tests {
     /// tail-loss-probe wait, so the p99 echo latency is the interactive
     /// repair tail.  Run with `--ignored --nocapture` to print the summary.
     ///
-    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
+    /// Self-validating report-only: prints the measurements and asserts the
+    /// *instrument's* integrity (the arm ran its whole load, no echo missed its
+    /// deadline, the counters it prints actually arrived and agree with the
+    /// arm's label) so a dead instrument fails instead of printing a table of
+    /// zeros.  It asserts no bound from this crate's GATE.md.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process interactive repair-latency probe; ~25 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_armor_latency() {
@@ -1158,6 +1195,28 @@ mod tests {
             latencies.last().copied().unwrap_or_default(),
             armor_duplicates.load(AtomicOrdering::Relaxed),
         );
+        // Measurement integrity: every one of the arm's `n` sends was awaited to
+        // its own echo inside the 500 ms deadline, the fresh-tail armour this
+        // probe is named for fired, the FEC counters arrived, and a real clock
+        // measured the echoes.  Facts about the instrument's run, not bounds.
+        assert_eq!(
+            latencies.len(),
+            n,
+            "[probe fresh-armor] only {} of the arm's {n} messages produced a measured echo: a missing sample is an instrument failure, not a latency",
+            latencies.len()
+        );
+        assert!(
+            armor_duplicates.load(AtomicOrdering::Relaxed) > 0,
+            "[probe fresh-armor] the sender re-sent no fresh-tail armour cover: the sub-millisecond echoes this probe attributes to armour were not armour"
+        );
+        assert!(
+            counters.is_some(),
+            "[probe fresh-armor] no FEC-counter observation reached the probe: the counters the probe reports are missing, not zero"
+        );
+        assert!(
+            latencies.last().copied().unwrap_or_default() > Duration::ZERO,
+            "[probe fresh-armor] every measured echo took zero time: the clock, not the link, produced these samples"
+        );
     }
 
     /// Burst-loss companion to `probe_fresh_tail_armor_latency`: the same
@@ -1186,7 +1245,11 @@ mod tests {
     /// smoothed RTTs plus a round trip) instead of being read as one opaque
     /// maximum.
     ///
-    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
+    /// Self-validating report-only: prints the measurements and asserts the
+    /// *instrument's* integrity (the arm ran its whole load, no echo missed its
+    /// deadline, the counters it prints actually arrived and agree with the
+    /// arm's label) so a dead instrument fails instead of printing a table of
+    /// zeros.  It asserts no bound from this crate's GATE.md.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process burst-loss interactive repair probe; ~145 s; run with --ignored --nocapture"]
     async fn probe_fresh_tail_burst_loss_latency() {
@@ -1352,6 +1415,49 @@ mod tests {
                 loss_sink.dropped(),
                 recovered.load(AtomicOrdering::Relaxed),
             );
+            // Measurement integrity, per arm: the whole load was measured, no
+            // echo missed its 2 s deadline, the counters arrived, the fresh-tail
+            // armour fired, the impairment instrument agrees with the arm's
+            // label, and the matched echoes are real round trips (a fixed `owd`
+            // per direction makes `2*owd` the RTT floor).  No GATE.md bound is
+            // asserted; `recovered` may legitimately be 0 on any burst arm.
+            assert_eq!(
+                latencies.len(),
+                n,
+                "[probe burst {label}] only {} of the arm's {n} messages produced a measured echo",
+                latencies.len()
+            );
+            assert_eq!(
+                timeouts, 0,
+                "[probe burst {label}] {timeouts} echoes missed their 2 s deadline: the arm did not measure the {n} it claims"
+            );
+            assert!(
+                counters.is_some(),
+                "[probe burst {label}] no FEC-counter observation reached the probe: the counters the probe reports are missing, not zero"
+            );
+            assert!(
+                armor_duplicates.load(AtomicOrdering::Relaxed) > 0,
+                "[probe burst {label}] the sender re-sent no fresh-tail armour cover: the armour path this probe measures never fired"
+            );
+            if burst == 0 {
+                assert_eq!(
+                    loss_sink.dropped(),
+                    0,
+                    "[probe burst {label}] the `burst=0` clean arm dropped {} datagrams: its link is not the clean link its label claims",
+                    loss_sink.dropped()
+                );
+            } else {
+                assert!(
+                    loss_sink.dropped() > 0,
+                    "[probe burst {label}] the burst-{burst} arm dropped nothing: the impairment the arm is named for did not fire"
+                );
+            }
+            assert!(
+                pick(0.50) >= owd * 2,
+                "[probe burst {label}] p50 {:?} is below the link's two-way floor {:?}: these samples are not round trips of this link",
+                pick(0.50),
+                owd * 2
+            );
         }
     }
 
@@ -1384,7 +1490,11 @@ mod tests {
     /// the arm-to-arm max delta is the first PTO, so the second PTO follows.
     /// Run with `--ignored --nocapture`.
     ///
-    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
+    /// Self-validating report-only: prints the measurements and asserts the
+    /// *instrument's* integrity (the arm ran its whole load, no echo missed its
+    /// deadline, the counters it prints actually arrived and agree with the
+    /// arm's label) so a dead instrument fails instead of printing a table of
+    /// zeros.  It asserts no bound from this crate's GATE.md.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process lone-tail repair-deadline probe; ~45 s; run with --ignored --nocapture"]
     async fn probe_lone_tail_repair_deadline_latency() {
@@ -1538,6 +1648,45 @@ mod tests {
                 armor_duplicates.load(AtomicOrdering::Relaxed),
                 loss_sink.dropped(),
             );
+            // Measurement integrity, per arm: the whole load was measured, no
+            // echo missed its 3 s deadline, the impairment fired, the fresh-tail
+            // armour fired, the retransmission counters arrived, the repair this
+            // arm attributes to the tail-loss probe really was a tail probe, and
+            // the matched echoes clear the link's two-way floor.  No GATE.md
+            // bound is asserted; `rto_reason` may legitimately be nonzero.
+            assert_eq!(
+                latencies.len(),
+                n,
+                "[probe lone-tail {label}] only {} of the arm's {n} messages produced a measured echo",
+                latencies.len()
+            );
+            assert_eq!(
+                timeouts, 0,
+                "[probe lone-tail {label}] {timeouts} echoes missed their 3 s deadline: the arm did not measure the {n} it claims"
+            );
+            let counters = counters.unwrap_or_else(|| {
+                panic!(
+                    "[probe lone-tail {label}] no retransmission-counter observation reached the probe: the tail_probes/rto_reason attribution the probe prints is missing, not zero"
+                )
+            });
+            assert!(
+                counters.tail_probes > 0,
+                "[probe lone-tail {label}] the sender issued no tail-loss probe: the repair this arm attributes to the {label} deadline was not a tail probe; counters={counters:?}"
+            );
+            assert!(
+                loss_sink.dropped() > 0,
+                "[probe lone-tail {label}] the burst-{burst} arm dropped nothing: the impairment the arm is named for did not fire"
+            );
+            assert!(
+                armor_duplicates.load(AtomicOrdering::Relaxed) > 0,
+                "[probe lone-tail {label}] the sender re-sent no fresh-tail armour cover: the armour path this probe measures never fired"
+            );
+            assert!(
+                pick(0.50) >= owd * 2,
+                "[probe lone-tail {label}] p50 {:?} is below the link's two-way floor {:?}: these samples are not round trips of this link",
+                pick(0.50),
+                owd * 2
+            );
         }
         eprintln!(
             "[probe lone-tail BURST_TRIANGLE] burst6 (cover wiped, first PTO survives) vs burst8 \
@@ -1561,7 +1710,11 @@ mod tests {
     /// fixed quiet gap, burst 0 = off), `ARMOR_N`, `ARMOR_SEED`.  Run with
     /// `--ignored --nocapture`.
     ///
-    /// Report-only: prints the measurements and asserts nothing (see GATE.md).
+    /// Self-validating report-only: prints the measurements and asserts the
+    /// *instrument's* integrity (the cell collected samples, ran its whole
+    /// load, and its wire and metrics counters reported) so a dead instrument
+    /// fails instead of printing a table of zeros.  It asserts no bound from
+    /// this crate's GATE.md.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "in-process armor-frontier cell; ~10 s per cell; run with --ignored --nocapture"]
     async fn probe_armor_copy_cell() {
@@ -1763,6 +1916,39 @@ mod tests {
             rate,
             tokens,
             cwnd,
+        );
+        // Measurement integrity: the cell produced samples, its whole load
+        // completed, the wire counter and the metrics observer both reported,
+        // and an echoed round trip cannot beat the link's two-way floor.  None
+        // of these is an obligation bound; they assert only that the printed
+        // cell is a measurement at all.  `armor_copies` is deliberately not
+        // asserted: `ARMOR_COPIES=0` is a legitimate swept cell.
+        assert!(
+            !latencies.is_empty(),
+            "ARMOR_CELL copies={copies_label} bps={bps} burst={burst} gap={gap} n={n}: no echo was measured, so every percentile above is a placeholder zero"
+        );
+        assert_eq!(
+            send_failures, 0,
+            "ARMOR_CELL copies={copies_label} bps={bps} burst={burst} gap={gap} n={n}: {send_failures} sends missed their 2 s deadline, so the cell did not run the load it claims"
+        );
+        assert!(
+            dgrams > 0 && bytes > 0,
+            "ARMOR_CELL copies={copies_label} bps={bps} burst={burst} gap={gap} n={n}: the wire counter observed {dgrams} datagrams / {bytes} bytes: dgrams_per_msg is a dead counter, not zero traffic"
+        );
+        assert!(
+            dgrams >= latencies.len() as u64,
+            "ARMOR_CELL copies={copies_label} bps={bps} burst={burst} gap={gap} n={n}: {} messages were delivered through only {dgrams} written datagrams: the two counters disagree",
+            latencies.len()
+        );
+        assert!(
+            cwnd > 0,
+            "ARMOR_CELL copies={copies_label} bps={bps} burst={burst} gap={gap} n={n}: no metrics snapshot reached the probe (send_rate/tokens/cwnd all zero): those columns are missing, not measured"
+        );
+        let two_way_floor_ms = 2.0 * owd.as_secs_f64() * 1000.0;
+        assert!(
+            pick(0.99) >= two_way_floor_ms,
+            "ARMOR_CELL copies={copies_label} bps={bps} burst={burst} gap={gap} n={n}: p99 {:.2} ms is below the link's two-way floor {two_way_floor_ms:.2} ms: these samples are not round trips of this link",
+            pick(0.99)
         );
     }
 

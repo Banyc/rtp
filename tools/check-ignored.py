@@ -17,11 +17,17 @@ The in-crate (`src/`) inventory has one of two honest classifications:
   run command, and the checker requires (a) the reason to still say `perf lane`
   and (b) the test body to still contain an assertion token. A perf lane that
   loses its assertion has silently stopped being a gate and is an error.
-- `probe` — a *report-only* measurement probe: it prints counters or latency
-  summaries and asserts nothing. The checker requires no assertion token to be
-  reachable from its body — in the body itself or through a helper defined in
-  the same file — so a probe cannot silently grow a check under the ignore flag
-  (the same class of hole the netem_test gate closes for its `perf` tier).
+- `probe` — a *self-validating, report-only* measurement probe: it prints
+  counters or latency summaries, and asserts its own measurement's integrity
+  (the arm ran its whole load, no echo missed its deadline, the counters it
+  prints actually arrived and agree with the arm's label) — never a bound the
+  product must meet. The checker requires the probe's own body to contain at
+  least one assertion token and the `gate-probe-selfchecks` block to record the
+  exact token count, so the validation cannot silently appear, disappear, or
+  change under the ignore flag (the same class of hole the netem_test gate
+  closes for its `perf` tier). A probe that asserts nothing is a dead
+  instrument: it prints a table of zeros and exits 0, and a reader can take
+  those zeros for a measurement.
 
 The relocated scenario targets (`tests/`) keep the harness tier vocabulary:
 
@@ -109,6 +115,38 @@ def manifest_entries() -> dict[str, str]:
         if name in entries:
             sys.exit(f"{MANIFEST}: duplicate entry {name}")
         entries[name] = classification
+    return entries
+
+
+def probe_selfchecks() -> dict[str, int]:
+    """`RELATIVE_PATH::fn -> own-body assertion-token count` from GATE.md.
+
+    A probe is report-only about the product but must validate its own
+    measurement, so its assertion tokens are recorded here.  The count is what
+    makes the validation auditable under the ignore flag: a check added or
+    removed silently leaves the recorded count stale and is an error, exactly
+    as an unrecorded asserting helper is for the netem_test gate's `perf` tier.
+    The count is over the probe's own body (not same-file helpers): the probe
+    states its measurement's invariants where the reader of the table looks.
+    """
+    block = manifest_block("gate-probe-selfchecks")
+    if block is None:
+        sys.exit(f"{MANIFEST}: no ```gate-probe-selfchecks block found")
+    entries: dict[str, int] = {}
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, _, count = line.partition(" = ")
+        name, count = name.strip(), count.strip()
+        if name in entries:
+            sys.exit(f"{MANIFEST}: duplicate gate-probe-selfchecks entry {name}")
+        try:
+            entries[name] = int(count)
+        except ValueError:
+            sys.exit(
+                f"{MANIFEST}: {name} has non-integer gate-probe-selfchecks count {count!r}"
+            )
     return entries
 
 
@@ -247,6 +285,7 @@ def ignored_tests() -> tuple[dict[str, tuple[str, str]], dict[str, dict[str, str
 
 def main() -> int:
     manifest = manifest_entries()
+    selfchecks = probe_selfchecks()
     actual, functions = ignored_tests()
 
     bad = False
@@ -293,14 +332,28 @@ def main() -> int:
                 )
                 bad = True
         elif classification == "probe":
-            rel = name.rsplit("::", 1)[0]
-            reached = reached_assertions(body, functions.get(rel, {}))
-            if reached:
+            recorded = selfchecks.get(name)
+            if recorded is None:
                 print(
-                    f"probe {name} reaches assertion token(s) "
-                    f"({', '.join(sorted(reached))}): a report-only probe must "
-                    f"assert nothing, in its body or through a same-file helper "
-                    f"(reclassify as perf-lane or remove the assertion)"
+                    f"probe {name} has no gate-probe-selfchecks entry: a probe must "
+                    f"validate its own measurement, and the token count that says so "
+                    f"must be recorded in GATE.md"
+                )
+                bad = True
+            elif recorded < 1:
+                print(
+                    f"probe {name} records {recorded} selfcheck assertion(s): a probe "
+                    f"that asserts nothing is a dead instrument (it prints zeros and "
+                    f"exits 0); assert the arm's sample count, its timeouts, or its "
+                    f"counters instead"
+                )
+                bad = True
+            elif recorded != len(tokens):
+                print(
+                    f"probe {name} selfcheck count changed: GATE.md records {recorded}, "
+                    f"the body has {len(tokens)} assertion token(s) "
+                    f"({', '.join(sorted(set(tokens)))}): a check added, removed or "
+                    f"moved under the ignore flag must be recorded here"
                 )
                 bad = True
         elif classification in ("standard", "full"):
@@ -321,6 +374,14 @@ def main() -> int:
                 )
                 bad = True
 
+    recorded_probes = {name for name, c in manifest.items() if c == "probe"}
+    for name in sorted(set(selfchecks) - recorded_probes):
+        print(
+            f"STALE gate-probe-selfchecks entry (not a `probe` in the "
+            f"ignored-manifest): {name}"
+        )
+        bad = True
+
     if bad:
         print(
             f"\nmanifest has {len(manifest)} entries, source reports "
@@ -333,6 +394,11 @@ def main() -> int:
     for classification in sorted(CLASSIFICATIONS):
         count = sum(1 for c in manifest.values() if c == classification)
         print(f"  {classification}: {count}")
+    probes = sum(1 for c in manifest.values() if c == "probe")
+    print(
+        f"  probe selfchecks: {sum(1 for name in manifest if name in selfchecks)} of "
+        f"{probes} probe(s) record an assertion-token count"
+    )
     return 0
 
 
