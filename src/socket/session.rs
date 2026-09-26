@@ -685,7 +685,17 @@ mod tests {
     /// best-effort KILL datagram.  That tail must be bounded: an underlay that
     /// never completes the KILL (the writer is alive but stuck, so the reaper
     /// genuinely waits for it) must not park the session supervisor forever.
-    #[tokio::test]
+    ///
+    /// The bound is a duration, so the assertion is about wall clock; both are
+    /// spent by the same `tokio::time::timeout`, so the clock is driven instead
+    /// of waited on.  With time paused the runtime jumps to the earlier of the
+    /// two deadlines: the KILL can never complete here (no driver claims it),
+    /// so the *only* resolution is `reaper_ready`'s `DRIVER_JOIN_TIMEOUT` arm,
+    /// and the elapsed reading is that deadline exactly rather than a sleep
+    /// that outlasts it.  A tail that stops being bounded resolves through the
+    /// 10 s gate instead and fails on the elapsed assertion; a bound widened
+    /// past that gate fails the gate.
+    #[tokio::test(start_paused = true)]
     async fn the_post_terminal_kill_tail_is_bounded() {
         use crate::transmission::test_doubles::{BlockingWrite, PendingRead};
         // The write half lives inside the layer, so its termination writer is
@@ -696,9 +706,16 @@ mod tests {
         let reaper = transmission.termination_reaper_for_test().clone();
         shared.request_kill_and_abort(MetricsTerminationCause::LocalAbort);
         let mut ready = Box::pin(reaper_ready(&reaper, &shared));
+        let waiting_since = tokio::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(10), &mut ready)
             .await
             .expect("the post-terminal KILL tail is unbounded and stalled the session reap");
+        assert_eq!(
+            waiting_since.elapsed(),
+            DRIVER_JOIN_TIMEOUT,
+            "the post-terminal KILL tail must be cut off by DRIVER_JOIN_TIMEOUT, \
+             not by the 10 s gate and not by the KILL completing"
+        );
     }
 
     /// A driver parked inside the underlay's send cannot observe the stop
@@ -707,7 +724,14 @@ mod tests {
     /// never emits.  Both waits must be bounded so the session handle still
     /// resolves: hanging the caller is not a permissible outcome of a stuck
     /// underlay.
-    #[tokio::test]
+    ///
+    /// The bound is `join_drivers`' `DRIVER_JOIN_TIMEOUT` around its stuck
+    /// children, so the clock is driven rather than slept through: with time
+    /// paused the supervisor's next deadline is that join bound, and the
+    /// measured elapsed is the deadline itself.  An unbounded join never
+    /// resolves and trips the 20 s gate; a bound widened past it trips the
+    /// gate the same way.
+    #[tokio::test(start_paused = true)]
     async fn a_stuck_underlay_still_resolves_the_session_handle() {
         use crate::transmission::test_doubles::BlockingWrite;
         let started = Arc::new(tokio::sync::Notify::new());
@@ -731,11 +755,20 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
             .expect("the writer never reached the stuck underlay send");
+        // The KILL is claimed and both children are parked, so from here the
+        // only way the handle resolves is the join bound.
+        let joining_since = tokio::time::Instant::now();
         let joined = tokio::time::timeout(Duration::from_secs(20), owner_tasks.join_next())
             .await
             .expect("a stuck underlay hung the session handle instead of resolving it")
             .expect("the supervisor JoinSet was empty");
         joined.expect("the supervisor task failed");
+        assert_eq!(
+            joining_since.elapsed(),
+            DRIVER_JOIN_TIMEOUT,
+            "the stuck drivers must be aborted by DRIVER_JOIN_TIMEOUT, \
+             not by the 20 s gate"
+        );
     }
 
     #[tokio::test]
