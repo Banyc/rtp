@@ -619,7 +619,17 @@ impl WriteHalf {
 
     #[cfg(test)]
     pub async fn send_pkts(&mut self, bufs: &mut SendBufs) -> Result<bool, IoErr> {
-        Ok(self.send_pkts_inner(bufs, Instant::now()).await?.0)
+        self.send_pkts_at(bufs, Instant::now()).await
+    }
+
+    /// A send pass evaluated at a caller-supplied decision time.  A test that
+    /// must cross a wall-clock deadline drives the instant instead of
+    /// sleeping to it: the watchdog predicate, the deadline arithmetic and
+    /// the wire timestamp all read this fixed `now`, exactly as production's
+    /// `send_pass` fixes its own at entry.  Production never calls this.
+    #[cfg(test)]
+    pub async fn send_pkts_at(&mut self, bufs: &mut SendBufs, now: Instant) -> Result<bool, IoErr> {
+        Ok(self.send_pkts_inner(bufs, now).await?.0)
     }
 
     pub(crate) async fn send_pass(&mut self, bufs: &mut SendBufs) -> Result<SendLoopResult, IoErr> {
