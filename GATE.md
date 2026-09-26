@@ -67,7 +67,10 @@ opt-in sets are recorded here and machine-checked:
   visible in this file), and when the block names a test that is not a probe.
 
 The whole in-crate opt-in battery is `cargo test --release -p rtp --lib --
---ignored` (about four minutes; the probes dominate).
+--ignored`; the six probes' own `#[ignore]` reasons sum to ~388 s (~6.5
+minutes), plus a few seconds for the four perf lanes. Neither that sum nor any
+single probe has been measured: the perf declaration below cites those reasons
+and records the measurement itself as a gap.
 
 ## Scenario gate tiers
 
@@ -87,8 +90,11 @@ comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
 `BottleneckShaper`).
 
 - **default** — not `#[ignore]`d, so a plain `cargo test -p rtp` runs it.
-  Every scenario here is seeded (deterministic impairment) and finishes in a
-  few seconds. This is the gate that runs on every `cargo test`.
+  Every scenario here is seeded (deterministic impairment). This is the gate
+  that runs on every `cargo test`: measured on this checkout it is 21.2-24.6 s
+  end to end, of which the `lib` target is 8.11-8.44 s, `fuzz_codec`
+  4.14-6.48 s and `rtp_padding_bench` 6.12-7.17 s (see the perf declaration
+  below for the method, the load and the per-row costs).
 - **standard** — `#[ignore]`d, runs in well under a minute per target and
   asserts a correctness or transport-floor property. Run the target
   explicitly, e.g. `cargo test --release -p rtp --test rtp_bufferbloat --
@@ -284,6 +290,177 @@ not a magic constant; the harness never restates one.
 
 The asserting tests are named in `gate-asserting`; each has been vacuity-checked
 in its new home (break the guard → the failure names the guard).
+
+## Perf declaration — declared time, declared coverage
+
+The dual mandate (`AGENTS.md`, "The perf-test dual mandate — time and
+coverage") requires every perf test to name its tier, its cost and the
+coverage cells it provides, so the trade between the two is visible and
+checkable rather than assumed. The three blocks below are rtp's declaration;
+`python3 ../netem_test/tools/check-gate.py --crate . rtp tests GATE.md`
+enforces it. Each row's relation to its family's baseline is re-derived from
+the row's own cells, so a row that varies several dimensions must be labelled a
+`composite` and a row that varies none must say why it repeats the point.
+
+### The always-run tier, measured
+
+The tier that runs on every `cargo test` is `cargo test -p rtp`: the 728-test
+`--lib` target, the 14 `gate-default-required` scenarios, and `fuzz_codec`.
+Measured on this checkout in **debug** (the mode the default gate runs in),
+three reps per binary, reading the harness's own `finished in` figure:
+
+| binary | run | wall clock (3 reps) |
+| --- | --- | --- |
+| `lib` | 718 (+10 ignored) | 8.11 / 8.21 / 8.44 s |
+| `fuzz_codec` | 1 | 6.48 / 4.16 / 4.14 s |
+| `rtp_padding_bench` | 3 (+6 ignored) | 7.17 / 6.12 / 7.02 s |
+| `shared_bottleneck` | 2 (+7 ignored) | 0.71 / 0.71 / 0.70 s |
+| `rtp_mss` | 3 | 0.59 / 0.50 / 0.62 s |
+| `rtp_loss` | 1 | 0.49 / 0.57 / 0.52 s |
+| `rtp_fec` | 1 (+1 ignored) | 0.36 / 0.31 / 0.29 s |
+| `rtp_clean` | 3 | 0.13 / 0.13 / 0.13 s |
+| `rtp_liveness` | 1 (+2 ignored) | 0.13 / 0.13 / 0.13 s |
+| `hol_verify4`, `rtp_bufferbloat`, `rtp_burst_loss`, `rtp_gentle` | 0 (every test `#[ignore]`d) | 0.00 s |
+| **`cargo test -p rtp` end to end** | **733** | **24.64 / 21.15 / 22.35 s** |
+
+**How it was measured.** The per-binary and end-to-end figures are wall clock
+around the cargo invocation. The per-row costs in the block below come from
+the mandate-runner's own idea: each test binary is run directly with
+`--test-threads=1` and every arriving `test <name> ... ok` line is timestamped,
+so the delta between consecutive lines is that test's own cost with no build
+time in it. The same streamed pass over the `--lib` target attributes 59.98 s
+of serialized wall clock, where the parallel default run takes 8.2 s; its two largest single costs are the hostile-datagram
+FEC decoder fuzzes at 8.49 s and 6.17 s.
+
+**Load.** The host is shared and loaded throughout: 1-minute load average
+6.8-10.7 and 15-minute 13-16.5 on 10 cores. These are costs measured *under
+load*, not properties of the tests, and the rep-to-rep spread says how much of
+each number is the machine — the `lib` target ±2 % (8.11-8.44 s),
+`rtp_padding_bench` ±8 % (6.12-7.17 s), `fuzz_codec` ±22 % (4.14-6.48 s).
+Every declared cost is the **max of its three reps**, so a later run is
+compared against a deliberately conservative figure rather than a lucky one.
+
+Two consequences stated rather than left implicit. First, the declared
+`default` rows sum to 30.60 s while the tier's measured wall clock is
+21.2-24.6 s: the rows are serialized per-test costs and the tier runs its
+`lib` target in parallel, so the two are different quantities and neither is
+presented as the other. Second, the in-crate opt-in battery is **not** "about
+four minutes" — the six probes' own `#[ignore]` reasons sum to ~388 s — and
+neither figure has been measured, which is recorded as a gap below.
+
+### Cost provenance
+
+No cost below is invented; each is one of two things.
+
+- **measured** — a default-tier row's cost is the max of the three streamed
+  reps above. A test the streaming timer resolves below its 10 ms grain is
+  recorded as `0.01`, the grain, not as zero: a zero cost makes the checker's
+  drift test divide by zero.
+- **cited** — an opt-in row's cost is the wall clock its own `#[ignore]`
+  reason states: `probe_single_symbol_interactive_fec_repair` ~45 s,
+  `probe_fresh_tail_armor_latency` ~25 s,
+  `probe_fresh_tail_burst_loss_latency` ~145 s,
+  `probe_lone_tail_repair_deadline_latency` ~2.7 min (162 s),
+  `probe_armor_copy_cell` ~10 s for its one cell,
+  `probe_lone_tail_repair_ladder` <1 s (1 s), and the two standard-tier
+  liveness arms 65 s and 5 s.
+
+A row whose wall clock appears in no document *and* was not measured is not
+given a number: it is recorded as a gap below, so an unmeasured cost is
+visibly pending instead of plausibly guessed.
+
+The declared sums are `default` 30.60 s of a 60 s budget, `standard` 70 s of
+300 s, `perf` 388 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
+declared so a later row cannot be added without one — `full` is the tier the
+~90-minute `shared_bneck_fairness_longrun` lives in.
+
+```gate-perf-design
+rtp_clean::rtp_over_netem_clean_link_delivers_data = default | 0.01 | baseline | transport-delivery@impairment=clean+mss=default+scale=small+metric=byte-exact+shape=bulk+layer=rtp
+rtp_clean::rtp_over_netem_clean_link_delivers_400kib = default | 0.08 | orthogonal | transport-delivery@impairment=clean+mss=default+scale=400KiB+metric=byte-exact+shape=bulk+layer=rtp
+rtp_clean::rtp_over_netem_latency_is_observable = default | 0.14 | composite(impairment,metric) | transport-latency@impairment=delayed-60ms+mss=default+scale=small+metric=latency-floor+shape=bulk+layer=rtp
+rtp_fec::rtp_with_fec_recovers_under_netem_loss = default | 0.38 | composite(fec,impairment,scale) | transport-delivery@impairment=loss-3pct+mss=default+scale=1MiB+metric=byte-exact+shape=bulk+layer=rtp+fec=on
+rtp_loss::rtp_over_netem_survives_mild_loss_400kib = default | 0.50 | composite(impairment,scale) | transport-delivery@impairment=mild-loss-5pct+mss=default+scale=400KiB+metric=byte-exact+shape=bulk+layer=rtp
+rtp_mss::rtp_small_mss_clean_link_delivers_data = default | 0.01 | orthogonal | transport-delivery@impairment=clean+mss=512+scale=small+metric=byte-exact+shape=bulk+layer=rtp
+rtp_mss::rtp_custom_mss_clean_link_delivers_200kib = default | 0.06 | composite(mss,scale) | transport-delivery@impairment=clean+mss=1024+scale=200KiB+metric=byte-exact+shape=bulk+layer=rtp
+rtp_mss::rtp_tiny_mss_survives_mild_loss = default | 0.65 | composite(impairment,mss,scale) | transport-delivery@impairment=mild-loss-5pct+mss=256+scale=100KiB+metric=byte-exact+shape=bulk+layer=rtp
+fuzz_codec::a_hostile_datagram_never_yields_a_range_outside_it = default | 5.50 | composite(impairment,layer,metric,scale) | codec-fuzz@impairment=hostile-datagram+metric=range-safety+layer=codec+scale=400k-rounds
+rtp_padding_bench::padded_wire_sizes_converge_to_one_peak = default | 0.16 | baseline@padding | padding-wire@padding=profile+impairment=clean+metric=size-distribution+scale=256KiB+layer=rtp
+rtp_padding_bench::unpadded_wire_sizes_stay_multimodal = default | 0.19 | orthogonal@padding | padding-wire@padding=none+impairment=clean+metric=size-distribution+scale=256KiB+layer=rtp
+rtp_padding_bench::ack_padding_hides_ack_packets_among_data = default | 7.53 | composite(padding,metric)@padding | padding-wire@padding=ack-mimics-data+impairment=clean+metric=ack-obscurity+scale=256KiB+layer=rtp
+shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase = default | 0.71 | baseline@contested | contested-instrument@impairment=none+metric=sample-retention+layer=shared-bottleneck+scale=unit
+shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = default | 0.01 | orthogonal@contested | contested-instrument@impairment=none+metric=starvation-floor+layer=shared-bottleneck+scale=unit
+rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
+rtp_liveness::rtp_permanent_hole_liveness_smoke = standard | 5 | composite(impairment,metric,scale)@liveness | transport-liveness@impairment=permanent-mtu-hole+metric=connection-liveness+layer=rtp+scale=short-watchdog
+rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard | 65 | composite(fresh-sacks,impairment,metric)@liveness | transport-liveness@impairment=permanent-mtu-hole+fresh-sacks=on+metric=connection-liveness+layer=rtp
+lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder = default | 6.17 | baseline@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
+lib::traffic_shaping::redundancy::fec::tests::a_guarded_hostile_datagram_never_panics_the_fec_decoder = default | 8.49 | re-measurement(direct-decoder-path-bypasses-catch-unwind-so-a-panicking-hostile-datagram-fails-the-test-instead-of-being-counted-malformed)@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
+lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder = perf | 1 | baseline@probe | probe-ladder@impairment=jitter+metric=rung-spacing+layer=rtp+scale=4-arms
+lib::socket::stream::tests::probe_fresh_tail_armor_latency = perf | 25 | composite(impairment,metric)@probe | probe-armor@impairment=clean+metric=armour-latency+layer=rtp
+lib::socket::stream::tests::probe_fresh_tail_burst_loss_latency = perf | 145 | composite(handshake,impairment,metric)@probe | probe-armor@impairment=burst-loss+metric=armour-latency+layer=rtp+handshake=none
+lib::socket::stream::tests::probe_single_symbol_interactive_fec_repair = perf | 45 | composite(fec,impairment,metric)@probe | probe-fec@impairment=loss+metric=repair-latency+layer=rtp+fec=on
+lib::socket::stream::tests::probe_lone_tail_repair_deadline_latency = perf | 162 | composite(handshake,impairment,metric)@probe | probe-deadline@impairment=burst-loss+metric=repair-deadline+layer=rtp+handshake=seeded
+lib::socket::stream::tests::probe_armor_copy_cell = perf | 10 | composite(impairment,metric,scale)@probe | probe-armor@impairment=clean+metric=armour-copy+layer=rtp+scale=cell
+```
+
+### The families
+
+Six references cover the declared subset. The **residual** (default) family is
+the always-run transport floors, stated against the clean-link byte-exact
+delivery point; two of its rows are one dimension away from it (`scale`, and
+`mss`) and the rest are labelled with the dimensions they actually move, which
+is the honest reading of pre-existing arms that were never built as a
+one-axis set. The five named families each carry their own reference:
+`padding` (wire-shape at one 256 KiB transfer), `contested` (the
+shared-bottleneck instrument's own sanity pair, one dimension apart),
+`liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
+hostile-datagram FEC decoder fuzz pair, a deliberate repeat through the
+unguarded path) and `probe` (the six report-only repair-latency instruments).
+The bulk of the declared rows are `composite` because the arms genuinely vary
+several dimensions at once — labelling them orthogonal would be the confound
+the mandate exists to prevent.
+
+```gate-budgets
+default = 60
+standard = 300
+full = 6000
+perf = 450
+baseline = rtp_clean::rtp_over_netem_clean_link_delivers_data
+baseline.padding = rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
+baseline.contested = shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
+baseline.liveness = rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets
+baseline.decoder-fuzz = lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder
+baseline.probe = lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder
+members.padding = padding-wire
+members.contested = contested-instrument
+members.liveness = transport-liveness
+members.decoder-fuzz = decoder-fuzz
+members.probe = probe-*
+drift = 0.5
+drift_floor_s = 2.0
+```
+
+The rest is **not** declared. The granularity is the family, not the row: a
+family whose rows share one blocker is one gap naming the blocker and the
+repair, because recording its rows individually would hide the blocker behind
+noise. Two blockers account for every undeclared family — no wall clock in any
+document, and a cell name whose property is foreign to the family it would
+have to join. A **new arm closes neither**, so no family below is closed by
+adding one.
+
+```gate-coverage-gaps
+attribution@baseline-family=burst-loss = the three full-tier rtp_burst_loss arms (rtp_sparse_message_tail_latency_under_burst_loss and the two bulk-goodput arms) are internally coherent — the tail arm is one impairment away from the shared rate+queue+loss topology the goodput pair already varies — but no document records their wall clock: GATE.md's only figure is "~180-316 s by report", a range and an unattributed report rather than a cost. One streamed release run of the target per row declares the family with no cell change.
+attribution@baseline-family=shared-bottleneck-full = the seven full-tier shared_bottleneck arms share the contested instrument with the two default rows declared above, but their `#[ignore]` reasons state no wall clock; only fairness_longrun has one (~90 minutes). The repair is one streamed run per arm; the family then needs its own reference row because it separates from the declared `contested` family by impairment (bulk-contended rather than unit), which is a second cell name and not a retune of the first.
+attribution@baseline-family=bufferbloat = rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound is a single standard-tier row whose `#[ignore]` reason says only "slow". A one-row family has no member to state a relation against and no citable cost, so both halves are missing: one streamed run plus a `bufferbloat@...` cell name and a reference decides it.
+attribution@baseline-family=gentle = rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains is a single standard-tier row, blocked the same way as bufferbloat, with the extra problem that its two-phase gate-open shape has no second arm in any tier to vary one dimension against — so it is a one-row family until a second arm exists, not merely an uncosted one.
+attribution@baseline-family=fec-diversity = rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss measures a different property from the declared default-tier FEC row (max-diversity cover of single-packet messages versus whole-stream recovery) and is two declared dimensions away from it (fec-mode, metric). The repair is either a max-diversity arm one dimension from the declared FEC row or a composite label naming both, plus the row's cost.
+attribution@baseline-family=padding-perf = the six perf-tier rtp_padding_bench rows are report-only A/B measurements (bulk throughput and small-echo latency across three presets) whose `#[ignore]` reasons state no wall clock, and whose cells are the A/B preset axis rather than the declared `padding-wire` axis. The repair is one streamed run per row plus a `padding-ab` cell name and a reference row of its own.
+attribution@baseline-family=hol-verify4 = hol_verify4::v4_clean_rawbulk and v4_ge5_rawbulk are one dimension apart (impairment) and internally coherent, so only their costs are missing: neither `#[ignore]` reason states a wall clock and no document does either. One streamed release run per row declares the family with no cell change.
+attribution@baseline-family=perf-lane = the four in-crate perf-lane tests are asserting gates, but this grammar resolves an `#[ignore]`d lib row's tier to `perf`, which this crate's own tier vocabulary reserves for report-only measurement; declaring an asserting perf lane as `perf` would file a gate under the tier that must contain no assertion. The repair is a tier the grammar can name for an in-crate asserting opt-in test, or reading the perf lanes' tier from the `ignored-manifest` classification the crate already keeps.
+cost@metric=wall-clock = the remaining 716 default-tier lib tests have no per-test cost in any document. Their suite cost is measured (8.11-8.44 s parallel, 59.98 s serialized) but a row names one test, so the repair is to declare the streamed per-test cost of the expensive ones with cells of their own: test_fec_recovers_under_loss 7.32 s, the_session_cap_re_binds_after_a_soft_overshoot 5.02 s, an_overshot_keyed_ledger_still_refuses_unknown_keys 5.00 s, opening::tests::lost_ready_is_recovered_by_a_duplicate_confirmation 3.22 s, mpudp::tests::a_session_wider_than_the_cap_is_refused 3.11 s, socket::session::tests::a_stuck_underlay_still_resolves_the_session_handle 3.00 s, socket::session::tests::the_post_terminal_kill_tail_is_bounded 3.00 s.
+transport-delivery@impairment=correlated-loss = no default-tier row drops four-state Gilbert-Elliot loss at the transport layer: the always-run impaired delivery rows use the harness's 5 % iid mild-loss preset and the 3 % iid FEC preset, and GE loss is exercised only by the opt-in burst-loss arms. An always-run GE arm is what closes this, and it is a new arm rather than a retune of a frozen one.
+transport-delivery@metric=goodput-fraction = no default-tier row measures goodput as a fraction of the configured link rate: the capacity-relative floors are opt-in (bufferbloat `standard`, burst-loss `full`). The cell is knowingly empty in the always-run tier because the arm it needs is a multi-second rate-shaped run, which the 60 s budget's headroom over the measured 24.6 s does not currently buy; the deliberate answer is to measure the opt-in arm rather than to move a floor into a tier that cannot pay for it.
+transport-latency@impairment=burst-loss = the always-run tier's only latency assertion is the 60 ms one-way delay observability check. The sparse-message tail under GE burst loss is opt-in (`full`), and an always-run tail arm would need a window short enough for the default budget and long enough to carry one recovery episode — a new arm, not a shortened probe.
+```
 
 ## Ignored-test manifest
 
