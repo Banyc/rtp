@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod ack;
+mod clock;
 mod codec;
 mod debug;
 mod delivery;

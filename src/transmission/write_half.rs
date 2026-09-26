@@ -1527,6 +1527,7 @@ mod tests {
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
             fresh_tail_armor_copies_override: None,
+            clock: crate::clock::ClockRef::system(),
         };
         let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let (shared, write_half, _read_half, _reaper) =
@@ -1706,6 +1707,7 @@ mod tests {
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
             fresh_tail_armor_copies_override: None,
+            clock: crate::clock::ClockRef::system(),
         };
         let watchdog = WatchdogTuning::new(1, Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let (shared, write_half, _read_half, _reaper) =

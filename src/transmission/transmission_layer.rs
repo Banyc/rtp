@@ -133,6 +133,11 @@ pub struct UnreliableLayer {
     /// [`crate::traffic_shaping::redundancy::retransmission_armor::fresh_tail::fresh_tail_armor_copies`] decides,
     /// and only the interactive lane (`fec_instream_flush`) consults it.
     pub(crate) fresh_tail_armor_copies_override: Option<usize>,
+    /// The monotonic clock the opening handshake arms its leg deadlines and
+    /// re-anchors its retries from. Production carries the system clock; a
+    /// test installs a controlled one so a multi-second deadline can be
+    /// driven instead of slept through (see [`crate::clock`]).
+    pub(crate) clock: crate::clock::ClockRef,
 }
 
 #[derive(Debug, Clone)]

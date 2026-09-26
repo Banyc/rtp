@@ -3,6 +3,7 @@ use super::super::wire::SEND_RETRY_INTERVAL;
 use super::*;
 use crate::{
     ack::{AckHistory, EncodeAck, MAX_ACK_BLOCKS},
+    clock::{ClockRef, test_support::VirtualClock},
     codec,
     io_err::IoErr,
     sequence::InitialSequences,
@@ -138,10 +139,14 @@ fn a_blocked_send_gets_a_retry_within_its_budget() {
 }
 
 /// The opening must complete on a path whose round trip is the field's worst
-/// measured spike.  The legs are real wall clock (the handshake's deadlines
-/// are `std::time::Instant`s, which a paused runtime clock does not drive),
-/// so the row costs roughly two of the field's round trips — the price of
-/// covering the one regime no other row reaches.
+/// measured spike.
+///
+/// The pair's delay relays are tokio sleeps and the handshake's leg
+/// deadlines and retries are read from the connection's [`ClockRef`], so the
+/// runtime clock is *driven* rather than merely observed: under
+/// `#[tokio::test(start_paused = true)]` the two field round trips are
+/// crossed at no wall-clock cost, while the row still covers the one regime
+/// no other row reaches.
 ///
 /// This pins the *shape* as well as the value: a slow first leg no longer
 /// spends the second leg's budget, so the pair of 3204 ms legs completes in
@@ -150,7 +155,7 @@ fn a_blocked_send_gets_a_retry_within_its_budget() {
 /// `TimedOut`; the relation test above stays green under the shape revert,
 /// so the two pins guard different properties.  The before/after sweep it is
 /// drawn from is tabulated in `GATE.md`.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn the_opening_completes_at_the_fields_worst_round_trip() {
     // Half the field's worst round trip, so a hop's delay is that one-way
     // time and a round trip is the whole 3204 ms.
@@ -158,7 +163,12 @@ async fn the_opening_completes_at_the_fields_worst_round_trip() {
     let (client, server, mut relays) = delayed_handshake_channel_pair(one_way);
     let mut client = client;
     let mut server = server;
-    let started = Instant::now();
+    // One clock for both peers, so their deadlines share the runtime's
+    // virtual epoch.
+    let clock = ClockRef::fixed(VirtualClock::new());
+    client.clock = clock.clone();
+    server.clock = clock.clone();
+    let started = tokio::time::Instant::now();
     tokio::time::timeout(
         OPENING_LEG_TIMEOUT + OPENING_LEG_TIMEOUT + Duration::from_secs(1),
         async {
@@ -1055,6 +1065,7 @@ async fn client_cannot_succeed_without_a_delivered_confirmation() {
     let mss = client.mss;
     let result = client_phase(
         &mut client,
+        &ClockRef::system(),
         0x1234,
         Kind::Confirm,
         Kind::ConfirmAck,
@@ -1283,7 +1294,7 @@ async fn send_times_out_on_sustained_would_block() {
     let mut writer: Box<dyn UnreliableWrite> = Box::new(AlwaysWouldBlock(Arc::clone(&attempts)));
     let deadline = Instant::now() + Duration::from_millis(5);
     let started = Instant::now();
-    let result = send(&mut writer, b"x", deadline).await;
+    let result = send(&mut writer, &ClockRef::system(), b"x", deadline).await;
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert!(started.elapsed() >= Duration::from_millis(5));
@@ -1309,10 +1320,13 @@ async fn send_completes_on_late_writability() {
     }
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut writer: Box<dyn UnreliableWrite> = Box::new(LateWritable { attempts: 3 });
-    tokio::time::timeout(Duration::from_secs(5), send(&mut writer, b"x", deadline))
-        .await
-        .expect("send hung")
-        .expect("send missed late writability");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        send(&mut writer, &ClockRef::system(), b"x", deadline),
+    )
+    .await
+    .expect("send hung")
+    .expect("send missed late writability");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1331,7 +1345,13 @@ async fn send_does_not_cancel_pending_write_at_retry_deadline() {
                 release,
                 cancelled,
             });
-            send(&mut writer, b"x", Instant::now() + Duration::from_millis(5)).await
+            send(
+                &mut writer,
+                &ClockRef::system(),
+                b"x",
+                Instant::now() + Duration::from_millis(5),
+            )
+            .await
         }
     });
     started.notified().await;

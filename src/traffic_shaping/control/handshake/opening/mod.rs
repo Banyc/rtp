@@ -7,6 +7,7 @@ use rand::TryRng;
 use super::padding::pad_handshake;
 use super::post_open::PostOpenHandshake;
 use super::wire::{Kind, Packet, SEND_RETRY_INTERVAL};
+use crate::clock::ClockRef;
 use crate::sequence::{InitialSequences, SequenceNumber};
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
@@ -102,15 +103,20 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
         .expect("operating-system randomness unavailable");
     let nonce = u64::from_be_bytes(nonce_bytes);
     let mss = unreliable.mss;
+    // The deadline is armed and every retry re-anchored from the connection's
+    // clock, so a driven runtime reaches the field's round trip without
+    // sleeping through it.
+    let clock = unreliable.clock.clone();
     // Each leg is armed with its own budget, at the instant it starts: the
     // leg's deadline bounds that leg's retry rounds, and a slow leg cannot
     // spend the next leg's share.
     client_phase(
         unreliable,
+        &clock,
         nonce,
         Kind::Hello,
         Kind::HelloAck,
-        Instant::now() + OPENING_LEG_TIMEOUT,
+        clock.now() + OPENING_LEG_TIMEOUT,
         mss,
     )
     .await?;
@@ -118,15 +124,16 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     // RTP traffic; the Hello→HelloAck leg is deliberately not sampled.
     let initial_rtt = client_phase(
         unreliable,
+        &clock,
         nonce,
         Kind::Confirm,
         Kind::ConfirmAck,
-        Instant::now() + OPENING_LEG_TIMEOUT,
+        clock.now() + OPENING_LEG_TIMEOUT,
         mss,
     )
     .await?;
     unreliable.initial_rtt = initial_rtt;
-    unreliable.post_open_handshake = Some(PostOpenHandshake::client(nonce, Instant::now()));
+    unreliable.post_open_handshake = Some(PostOpenHandshake::client(nonce, clock.now()));
     unreliable.session_tag = Some(session_tag(nonce));
     let (client_to_server, server_to_client) = directional_initial_sequences(nonce);
     unreliable.initial_sequences = InitialSequences::client(client_to_server, server_to_client);
@@ -135,11 +142,12 @@ pub async fn client_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
 
 pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::Result<()> {
     let mss = unreliable.mss;
+    let clock = unreliable.clock.clone();
     // One budget for the wait for the Hello (armed once, so a stream of
     // unrelated datagrams cannot slide it), then one per leg after it.
-    let hello_deadline = Instant::now() + OPENING_LEG_TIMEOUT;
+    let hello_deadline = clock.now() + OPENING_LEG_TIMEOUT;
     let hello = loop {
-        match receive_until(&mut unreliable.utp_read, hello_deadline, mss).await? {
+        match receive_until(&mut unreliable.utp_read, &clock, hello_deadline, mss).await? {
             Received::Handshake(packet) if packet.kind == Kind::Hello => break packet,
             Received::Deadline => return Err(timeout()),
             Received::Handshake(_) | Received::NextProtocol => {}
@@ -147,20 +155,22 @@ pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
     };
     let initial_rtt = server_wait_for_confirm(
         unreliable,
+        &clock,
         hello.nonce,
-        Instant::now() + OPENING_LEG_TIMEOUT,
+        clock.now() + OPENING_LEG_TIMEOUT,
         mss,
     )
     .await?;
     unreliable.initial_rtt = initial_rtt;
     server_confirm(
         unreliable,
+        &clock,
         hello.nonce,
-        Instant::now() + OPENING_LEG_TIMEOUT,
+        clock.now() + OPENING_LEG_TIMEOUT,
         mss,
     )
     .await?;
-    unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, Instant::now()));
+    unreliable.post_open_handshake = Some(PostOpenHandshake::server(hello.nonce, clock.now()));
     unreliable.session_tag = Some(session_tag(hello.nonce));
     let (client_to_server, server_to_client) = directional_initial_sequences(hello.nonce);
     unreliable.initial_sequences = InitialSequences::server(client_to_server, server_to_client);
@@ -169,6 +179,7 @@ pub async fn server_opening_handshake(unreliable: &mut UnreliableLayer) -> io::R
 
 async fn client_phase(
     unreliable: &mut UnreliableLayer,
+    clock: &ClockRef,
     nonce: u64,
     request: Kind,
     response: Kind,
@@ -182,20 +193,20 @@ async fn client_phase(
     .encode();
     let mut attempts = 0usize;
     loop {
-        if Instant::now() >= deadline {
+        if clock.now() >= deadline {
             return Err(timeout());
         }
-        send_padded(&mut unreliable.utp_write, &request, deadline, mss).await?;
+        send_padded(&mut unreliable.utp_write, clock, &request, deadline, mss).await?;
         attempts += 1;
-        let sent_at = Instant::now();
-        let retry_at = retry_at(deadline);
+        let sent_at = clock.now();
+        let retry_at = retry_at(clock, deadline);
         loop {
-            match receive_until(&mut unreliable.utp_read, retry_at, mss).await? {
+            match receive_until(&mut unreliable.utp_read, clock, retry_at, mss).await? {
                 Received::Handshake(packet) if packet.nonce == nonce && packet.kind == response => {
                     // A sample is valid only when the request succeeded on its
                     // first transmission; after a retry the response is
                     // ambiguous, so report `None`.
-                    return Ok((attempts == 1).then(|| Instant::now().duration_since(sent_at)));
+                    return Ok((attempts == 1).then(|| clock.now().duration_since(sent_at)));
                 }
                 Received::Deadline => break,
                 Received::Handshake(_) | Received::NextProtocol => {}
@@ -206,6 +217,7 @@ async fn client_phase(
 
 async fn server_wait_for_confirm(
     unreliable: &mut UnreliableLayer,
+    clock: &ClockRef,
     nonce: u64,
     deadline: Instant,
     mss: crate::mss::Mss,
@@ -217,22 +229,22 @@ async fn server_wait_for_confirm(
     .encode();
     let mut attempts = 0usize;
     loop {
-        if Instant::now() >= deadline {
+        if clock.now() >= deadline {
             return Err(timeout());
         }
-        send_padded(&mut unreliable.utp_write, &hello_ack, deadline, mss).await?;
+        send_padded(&mut unreliable.utp_write, clock, &hello_ack, deadline, mss).await?;
         attempts += 1;
-        let sent_at = Instant::now();
-        let retry_at = retry_at(deadline);
+        let sent_at = clock.now();
+        let retry_at = retry_at(clock, deadline);
         loop {
-            match receive_until(&mut unreliable.utp_read, retry_at, mss).await? {
+            match receive_until(&mut unreliable.utp_read, clock, retry_at, mss).await? {
                 Received::Handshake(packet)
                     if packet.nonce == nonce && packet.kind == Kind::Confirm =>
                 {
                     // A sample is valid only when the HelloAck succeeded on
                     // its first transmission; after a retry the Confirm is
                     // ambiguous, so report `None`.
-                    return Ok((attempts == 1).then(|| Instant::now().duration_since(sent_at)));
+                    return Ok((attempts == 1).then(|| clock.now().duration_since(sent_at)));
                 }
                 Received::Handshake(packet)
                     if packet.nonce == nonce && packet.kind == Kind::Hello =>
@@ -248,6 +260,7 @@ async fn server_wait_for_confirm(
 
 async fn server_confirm(
     unreliable: &mut UnreliableLayer,
+    clock: &ClockRef,
     nonce: u64,
     deadline: Instant,
     mss: crate::mss::Mss,
@@ -257,12 +270,20 @@ async fn server_confirm(
         nonce,
     }
     .encode();
-    send_padded(&mut unreliable.utp_write, &confirm_ack, deadline, mss).await
+    send_padded(
+        &mut unreliable.utp_write,
+        clock,
+        &confirm_ack,
+        deadline,
+        mss,
+    )
+    .await
 }
 
-fn retry_at(deadline: Instant) -> Instant {
+fn retry_at(clock: &ClockRef, deadline: Instant) -> Instant {
     let jitter = Duration::from_millis(rand::random_range(0..=RETRY_JITTER_MS));
-    Instant::now()
+    clock
+        .now()
         .checked_add(RETRY_INTERVAL + jitter)
         .map(|instant| instant.min(deadline))
         .unwrap_or(deadline)
@@ -270,10 +291,11 @@ fn retry_at(deadline: Instant) -> Instant {
 
 async fn receive_until(
     read: &mut Box<dyn UnreliableRead>,
+    clock: &ClockRef,
     deadline: Instant,
     mss: crate::mss::Mss,
 ) -> io::Result<Received> {
-    if Instant::now() >= deadline {
+    if clock.now() >= deadline {
         return Ok(Received::Deadline);
     }
     // Sized to the connection's MSS-derived maximum padded handshake packet
@@ -294,12 +316,13 @@ async fn receive_until(
 
 async fn send(
     write: &mut Box<dyn UnreliableWrite>,
+    clock: &ClockRef,
     bytes: &[u8],
     deadline: Instant,
 ) -> io::Result<()> {
-    let send_deadline = deadline.min(Instant::now() + SEND_RETRY_BUDGET);
+    let send_deadline = deadline.min(clock.now() + SEND_RETRY_BUDGET);
     loop {
-        if Instant::now() >= send_deadline {
+        if clock.now() >= send_deadline {
             return Err(timeout());
         }
         match write.send(bytes).await {
@@ -308,10 +331,11 @@ async fn send(
             Err(error) if error == io::ErrorKind::WouldBlock => {}
             Err(kind) => return Err(io::Error::from(kind)),
         }
-        if Instant::now() >= send_deadline {
+        if clock.now() >= send_deadline {
             return Err(timeout());
         }
-        let retry_at = Instant::now()
+        let retry_at = clock
+            .now()
             .checked_add(
                 SEND_RETRY_INTERVAL
                     + Duration::from_millis(rand::random_range(0..=SEND_RETRY_JITTER_MS)),
@@ -328,13 +352,14 @@ async fn send(
 /// MSS; the padding bound is derived from it in the padding module.
 async fn send_padded(
     write: &mut Box<dyn UnreliableWrite>,
+    clock: &ClockRef,
     core: &[u8],
     deadline: Instant,
     mss: crate::mss::Mss,
 ) -> io::Result<()> {
     let mut padded = vec![0u8; mss.get()];
     let n = pad_handshake(core, &mut padded, mss);
-    send(write, &padded[..n], deadline).await
+    send(write, clock, &padded[..n], deadline).await
 }
 
 fn timeout() -> io::Error {

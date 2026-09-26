@@ -1003,6 +1003,7 @@ mod tests {
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,
             fresh_tail_armor_copies_override: None,
+            clock: crate::clock::ClockRef::system(),
         }
     }
 
