@@ -529,6 +529,7 @@ async fn complete_over_pair(
 async fn post_open_guard_recovers_after_three_lost_confirmations() {
     let (client_to_server_tx, client_to_server_rx) = mpsc::channel(32);
     let (server_to_client_tx, server_to_client_rx) = mpsc::channel(32);
+    let confirmations_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut client = wrap_fec(
         Box::new(ChannelRead(server_to_client_rx)),
         Box::new(ChannelWrite::new(client_to_server_tx, None, false)),
@@ -539,6 +540,7 @@ async fn post_open_guard_recovers_after_three_lost_confirmations() {
         Box::new(DropFirstConfirmationsWrite {
             tx: server_to_client_tx,
             remaining: 3,
+            dropped: Arc::clone(&confirmations_dropped),
         }),
         true,
     );
@@ -554,6 +556,18 @@ async fn post_open_guard_recovers_after_three_lost_confirmations() {
     .await
     .expect("post-open duplicate confirmation recovery hung")
     .expect("post-open duplicate confirmation recovery failed");
+    // The premise the completion proves is that every one of the three
+    // confirmations was lost, so the recovery cannot be the opening
+    // confirmation arriving normally.  The second and third are the server's
+    // answers to the client's 250 ms-jittered opening retransmissions, so this
+    // counter only moves once that cadence has fired twice; a filter that
+    // stops matching leaves the row green while it exercises nothing.
+    assert_eq!(
+        confirmations_dropped.load(Ordering::SeqCst),
+        3,
+        "the premise is three lost ConfirmAcks, so the completion must come from the guard \
+         recovery rather than from the opening confirmation arriving on its first attempt"
+    );
     drop(server_socket);
 }
 
@@ -569,11 +583,13 @@ async fn post_open_timer_recovers_without_another_client_confirmation() {
         }),
         false,
     );
+    let confirmations_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut server = wrap_fec(
         Box::new(ChannelRead(client_to_server_rx)),
         Box::new(DropFirstConfirmationsWrite {
             tx: server_to_client_tx,
             remaining: 1,
+            dropped: Arc::clone(&confirmations_dropped),
         }),
         false,
     );
@@ -589,6 +605,16 @@ async fn post_open_timer_recovers_without_another_client_confirmation() {
     .await
     .expect("post-open scheduled confirmation recovery hung")
     .expect("post-open scheduled confirmation recovery failed");
+    // The row claims the *scheduled* slot recovered the opening, and that claim
+    // rests on the opening confirmation having been lost: with the filter
+    // matching nothing the client completes on the first confirmation in ~300
+    // ms and this row passes in the same wall clock while proving nothing.
+    assert_eq!(
+        confirmations_dropped.load(Ordering::SeqCst),
+        1,
+        "the premise is one lost ConfirmAck; without it the client completes on the opening leg \
+         and the +1 s scheduled slot is never needed"
+    );
     drop(server_socket);
 }
 
@@ -725,11 +751,13 @@ async fn stale_rtp_datagram_cannot_retire_nonce_bound_recovery() {
         }),
         false,
     );
+    let confirmations_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut server = wrap_fec(
         Box::new(ChannelRead(client_to_server_rx)),
         Box::new(DropFirstConfirmationsWrite {
             tx: server_to_client_tx,
             remaining: 1,
+            dropped: Arc::clone(&confirmations_dropped),
         }),
         false,
     );
@@ -745,6 +773,15 @@ async fn stale_rtp_datagram_cannot_retire_nonce_bound_recovery() {
     .await
     .expect("stale RTP traffic retired opening recovery")
     .expect("nonce-bound recovery failed after stale RTP traffic");
+    // The row claims a stale RTP datagram cannot retire the recovery, and that
+    // claim rests on the recovery still being *live* when the stale datagram
+    // lands: the lost first confirmation is what keeps it live.
+    assert_eq!(
+        confirmations_dropped.load(Ordering::SeqCst),
+        1,
+        "the premise is one lost ConfirmAck, so the recovery is still pending when the stale \
+         RTP datagram arrives"
+    );
     drop(server_socket);
 }
 
@@ -948,6 +985,13 @@ impl UnreliableWrite for CountingChannelWrite {
 struct DropFirstConfirmationsWrite {
     tx: mpsc::Sender<Vec<u8>>,
     remaining: usize,
+    /// How many ConfirmAcks this filter actually discarded.  Every test that
+    /// uses it claims a recovery *because* those confirmations were lost, so
+    /// the count is asserted: with the filter matching nothing the handshake
+    /// completes on the first confirmation and the recovery the row names is
+    /// never exercised, which the row's completion assertion alone cannot
+    /// tell apart from a working recovery.
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait]
@@ -957,6 +1001,7 @@ impl UnreliableWrite for DropFirstConfirmationsWrite {
             && Packet::decode(buf).is_some_and(|packet| packet.kind == Kind::ConfirmAck)
         {
             self.remaining -= 1;
+            self.dropped.fetch_add(1, Ordering::SeqCst);
             return Ok(buf.len());
         }
         self.tx
