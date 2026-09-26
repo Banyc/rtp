@@ -218,6 +218,18 @@ mod tests {
         for i in 0..40 {
             space.sample_rtt(ms(50), t0 + ms(i));
         }
+        // Vacuity: the arm only measures the floor if the floor is what binds.
+        // On this settled 50 ms fixture the path's corroborated reorder margin
+        // sits *below* `TAIL_PROBED_MIN_RTO`, so an arm that stepped by the
+        // margin instead of the floor would be distinguishable from this one;
+        // on a path whose margin is above the floor the two coincide and the
+        // spacing assertion below would pass without measuring anything.
+        let corroborated = space.corroborated_repair_rto();
+        assert!(
+            corroborated < TailLossProber::TAIL_PROBED_MIN_RTO,
+            "the fixture's corroborated margin {corroborated:?} must sit below {:?}, or the arm cannot tell the floor from the margin it guards",
+            TailLossProber::TAIL_PROBED_MIN_RTO
+        );
         let send_t = t0 + Duration::from_secs(1);
         let no_packets_in_flight = space.no_pkts_in_flight();
         let mut connection_state = dre::ConnectionState::new(send_t);
@@ -250,6 +262,31 @@ mod tests {
             space.rto_duration(),
             Duration::from_secs(1),
             "the general RTO path keeps the 1 s `MIN_RTO` floor; the departure is scoped to the repair deadline"
+        );
+        // And the probe *cadence* keeps the same floor: on a path whose
+        // `2 * sRTT` exceeds it while the corroborated margin does not, the
+        // prober still waits 300 ms between the probes that corroborate the
+        // loss — the tightened repair deadline does not shorten the cadence.
+        let mut long = RttStats::new();
+        for i in 0..40 {
+            long.record_rtt(ms(190 + i));
+        }
+        assert!(
+            long.corroborated_repair_rto() <= TailLossProber::TAIL_PROBED_MIN_RTO,
+            "vacuity: the fixture's corroborated margin {:?} must not exceed the probe floor {:?}",
+            long.corroborated_repair_rto(),
+            TailLossProber::TAIL_PROBED_MIN_RTO
+        );
+        assert!(
+            long.smooth_rtt().checked_mul(2).unwrap() > TailLossProber::TAIL_PROBED_MIN_RTO,
+            "vacuity: the fixture's 2*sRTT must exceed the probe floor, or the floor is not the binding term"
+        );
+        let mut prober = TailLossProber::new();
+        prober.sent();
+        assert_eq!(
+            prober.probe_window(&long),
+            TailLossProber::TAIL_PROBED_MIN_RTO,
+            "the probe cadence's cap must keep the post-probe floor"
         );
     }
 

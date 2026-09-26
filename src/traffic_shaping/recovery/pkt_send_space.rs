@@ -1505,6 +1505,14 @@ impl PktSendSpace {
         }
     }
 
+    /// The path's corroborated repair margin, exposed so the pins that measure
+    /// which term binds a repair rung can show the bound is observable on
+    /// their own fixture instead of restating it.
+    #[cfg(test)]
+    pub(crate) fn corroborated_repair_rto(&self) -> Duration {
+        self.rtt_stats.corroborated_repair_rto()
+    }
+
     /// One send-window traversal computing the loss ratio, the pipe depth,
     /// the retransmission count, the oldest pipe-packet age, and the maximum
     /// RTO overdue for the metrics snapshot.  Mirrors the semantics of

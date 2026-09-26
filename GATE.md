@@ -174,7 +174,40 @@ not a magic constant; the harness never restates one.
    scales (50 ms, 190 ms) and two of the `sch_netem` `delay TIME JITTER`
    draw (25 ms one-way ± 25 ms, and the field's own 95 ms ± 100 ms at
    ~190 ms RTT), because the jitter-dominated regime is where the post-probe
-   floor stops binding.
+   floor stops binding.  The ladder's **height** — what one loss event costs
+   — is measured by `probe_lone_tail_finite_loss_ladder`, which drops a run
+   of consecutive datagrams on the request direction and reports the rungs
+   the send space fires and the wait to first delivery.  Its accounting, read
+   off the code: a lone-tail lane is the only source on its direction, so a
+   burst is consumed one datagram per datagram of our own traffic; every tail
+   transmission emits `1 + cover` datagrams (the primary plus the armour
+   copies a repair re-sends it, `PktSendSpace::cover_copies`), and
+   transmission `j` — `0` the original — covers datagrams
+   `m*j ..= m*j + m - 1` and is delivered iff `m*j + m > burst`.  The burst
+   therefore costs exactly `floor(burst / m)` rungs, and the wait is the
+   delivered rung's offset plus one RTT.  **The rung *count* is the burst's
+   length in our datagrams divided by what one transmission offers; it is not
+   a property of the ladder's cadence, and only the wall clock is the count
+   times the step.**  Measured, at the two constant-RTT scales, for `m = 1`
+   (no cover) and `m = 6` (the interactive single-symbol tail at the
+   burst-cover tier: primary + four armour copies + the message-sized parity,
+   or primary + five copies with the FEC parity gate closed — which is also
+   why the smoke arm's `lone_wire_x` reads ≈ 6.1):
+
+   | arm | 1 datagram | 2 | 3 | 5 | 6 | 12 | 18 |
+   |---|---|---|---|---|---|---|---|
+   | 50 ms, m=1 | 1 rung, 150 ms | 2, 250 | 3, 550 | 5, 1150 | 6, 1450 | 12, 3250 | 18, 5050 |
+   | 50 ms, m=6 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 1, 150 | 2, 250 | 3, 550 |
+   | 190 ms, m=1 | 1, 570 | 2, 870 | 3, 1170 | 5, 1770 | 6, 2070 | 12, 3870 | 18, 5670 |
+   | 190 ms, m=6 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 1, 570 | 2, 870 | 3, 1170 |
+
+   Two consequences the smoke arms already carry.  A burst of five datagrams —
+   exactly the cover the interactive tail's armour exists to absorb — costs
+   the interactive lane **no rung at all**, so a lone-tail excursion cannot be
+   a short burst: the arm's observed maxima are `floor(burst / 6)` for a burst
+   of 6–18+ datagrams.  And the first two rungs are the prober's two
+   `2 * sRTT` windows rather than the floor, so only the rungs after them are
+   floor-shaped.
 
    This transport's tail-recovery timing departs from RFC 8985 in three
    places.  All are recorded here because the latency floors above are built
@@ -251,7 +284,29 @@ not a magic constant; the harness never restates one.
      mechanism-correct, structurally bounded change whose end-to-end payoff at
      the field's jitter level is **not demonstrated** by any arm here; it is
      provable only on the deterministic ladder, where the rung is the binding
-     term.
+     term.  **A rung *below* `TAIL_PROBED_MIN_RTO` was then tried and is
+     rejected on measurement.**  The variant let the corroborated margin also
+     govern the deadline and the probe's own armed RTO, so the ladder stepped
+     by the margin from its third rung (`probe_lone_tail_finite_loss_ladder`:
+     50 ms RTT, `m = 1` — rungs at 100, 200, 251, 302, 353 ms instead of 100,
+     200, 500, 800, 1100; 190 ms RTT — 380, 680, 871, 1062 instead of 380,
+     680, 980, 1280 — and the 18-datagram burst's wait 5050 → 1066 ms and
+     5670 → 3926 ms).  On the `rtp_mux` mandate smoke set, three reverted and
+     three landed runs: the lone-tail maximum moved from 325 / 733 / 628 ms
+     (median 628) to 798 / 875 / **2299** ms (median 875) — disjoint — with
+     `> 250 ms` samples 2 / 4 / 2 → 4 / 3 / 4; the lane's own wire multiple
+     rose on **both** impaired arms — lone 6.09 / 6.17 / 6.10 → 6.49 / 6.24 /
+     6.23 (disjoint, and `lone_wire_x ≈ 6` *is* the six-datagram per-message
+     budget, so any increase there is a repair datagram) and hostile 3.97 /
+     4.24 / 4.63 → 4.83 / 4.85 / 4.63 (median 4.24 → 4.83).  A rung that fires
+     before the previous transmission's ACK is back is a duplicate, and on
+     these arms it also made the tail **worse**, so the floor stays and the
+     step is treated as settled.  The clean arm — M1's asserting arm and M2's
+     real budget — was unmoved: `clean_p99` 91.3 / 86.3 / 90.9 → 90.9 / 90.4 /
+     91.2 ms with zero samples `> 250 ms` on both sides, and `clean_wire_x`
+     2.11 / 2.34 / 2.09 → 2.24 / 2.16 / 2.21 against the 6× budget.  M3 read
+     0.958 → 0.958 and M4 was unchanged and PASS, so no mandate moved in
+     either direction except the lone tail's guards.
 2. **Reasonable goodput of the interactive lane** — the lane delivers what it
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,
@@ -801,3 +856,20 @@ passing a function by name, through a trait object, or through a macro alias
 Nothing here substitutes for running the perf lanes when the property they
 assert is in scope — the manifests guarantee the classification and the set,
 not the measurements.
+
+### The M1 lone-tail residual is the ladder's height, and it is inherent
+
+The step is settled: at the field's ~190 ms round trip with `±100 ms`
+per-direction jitter the corroborated reorder margin is ~270 ms against the
+300 ms `TAIL_PROBED_MIN_RTO`, so the floor is worth ~10 % there and a rung
+below it was measured to *raise* the tail and the wire (the negative recorded
+above).  The count is settled too: `n = floor(burst / m)` with `m` already at
+the largest per-transmission datagram count the wire budget is written for —
+six datagrams a message (`FRESH_INTERACTIVE_TAIL_ARMOR_COPIES_BURST_*` plus
+the message-sized parity), which `lone_wire_x ≈ 6.1` confirms is what the lane
+actually sends.  So the residual is `floor(burst / 6) × ~300 ms`: a 0.33–2.4 s
+lone maximum is a burst of 6–15+ consecutive datagrams and the field's 3.2 s
+climb is ~12 rungs of the same arithmetic.  The lever that would reduce it is
+a larger `m`, and that is the interactive lane's own wire, which M2 exists to
+bound.  Recorded as inherent, with the instrument that measures it
+(`probe_lone_tail_finite_loss_ladder`) rather than as an open lever.
