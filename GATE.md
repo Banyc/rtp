@@ -385,6 +385,7 @@ netem_test/netem-test/src/kit/task_scope.rs::run = 1
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task = 2
 netem_test/netem-test/src/kit/task_scope.rs::submit_test_task_required = 1
 rtp/src/testkit/rtp.rs::spawn_rtp_byte_sink_server_core = 1
+tests/hol_verify4.rs::assert_bulk_delivered = 1
 tests/rtp_padding_bench.rs::run_transfer = 1
 tests/rtp_padding_bench.rs::run_transfer_preset = 1
 ```

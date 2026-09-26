@@ -70,6 +70,7 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
         })
         .await;
 
+    assert_bulk_delivered(label, total);
     let mibps = total as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
     let mibps_window =
         delivered_at_window as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64().max(f64::EPSILON);
@@ -81,6 +82,21 @@ async fn run_rawbulk(label: &str, c2s: NetemConfig, s2c: NetemConfig) -> u64 {
 }
 
 // ────────────────────────────── report-only probes ───────────────────────────
+
+/// The raw bulk arms' measurement-integrity guard: the delivered byte total is
+/// the only quantity these probes report, and a correct run over either link
+/// (clean 50 ms RTT, or 5 % burst loss with a 3 s recovery horizon) always
+/// delivers bytes, so a zero total means the sink counted nothing and the arm
+/// measured no transport at all. Both arms are `perf`-tier — report-only, so no
+/// assertion may sit in their own bodies — hence the guard lives here, is
+/// reached through [`run_rawbulk`], and is declared in this crate's `GATE.md`
+/// under `gate-perf-guard-helpers`.
+fn assert_bulk_delivered(label: &str, total: u64) {
+    assert!(
+        total > 0,
+        "the {label} sink delivered no byte over {BULK_WINDOW:?}: nothing was measured"
+    );
+}
 
 /// Raw `rtp` bulk lane over Gilbert-Elliott 5% burst loss (c2s seed 33, s2c
 /// seed 44) — the raw half of the A/B comparison with the mux crate's
