@@ -5574,4 +5574,155 @@ mod tests {
             );
         }
     }
+
+    /// Deterministic **finite-burst** repair-ladder probe: what one loss
+    /// event costs, not how fast an unbounded ladder steps.
+    ///
+    /// `probe_lone_tail_repair_ladder` holds the path lossy forever, so it
+    /// measures the *spacing* of a ladder that never ends.  The field's
+    /// staircase is the other quantity: a finite burst swallows some number
+    /// of repair transmissions, and each swallowed transmission is a whole
+    /// rung of wait.  This probe replays the production lone-tail shape (one
+    /// tail packet, every transmission lost until the burst ends, no other
+    /// traffic on that direction) against a settled estimator, and drops a
+    /// run of `burst` **datagrams** — the shape the four-state GE model's
+    /// burst draws (a geometric run of drops terminated by the first
+    /// delivered packet).
+    ///
+    /// The accounting it measures.  A lone-tail lane is the only source on
+    /// its direction, so the burst is consumed one datagram per datagram of
+    /// our own traffic; every tail transmission emits `1 + cover` datagrams
+    /// (the primary plus the armour copies a repair re-sends, see
+    /// `PktSendSpace::cover_copies`), and transmission `j` (0 = the original)
+    /// covers datagrams `m*j ..= m*j + m - 1`.  It is delivered iff
+    /// `m*j + m > burst`, so the number of transmissions the burst swallows
+    /// is `n = floor(burst / m)` — **`n` is the burst's length in our
+    /// datagrams divided by what one transmission offers, and is independent
+    /// of the ladder's cadence; only the wall clock is `n * step`.**  That is
+    /// why the armour cover's re-send (m = 6 instead of 1) is what bounds the
+    /// rung count and why a shorter step bounds only the wait.
+    ///
+    /// Run with `--ignored --nocapture`.
+    ///
+    /// Self-validating report-only: asserts the instrument's integrity — the
+    /// estimator settled to the arm's RTT, the general RTO stayed at the 1 s
+    /// floor, and the measured fresh-delivery transmission index and wait
+    /// equal the model's `floor(burst / m)` and `t_n + RTT`.  The model
+    /// assertion is the vacuity: a send space that fired two datagrams per
+    /// rung, collapsed a rung, or re-sent no cover would move the measured
+    /// index away from `floor(burst / m)` and fail the arm.
+    #[test]
+    #[ignore = "deterministic finite-burst lone-tail repair-ladder probe; <1 s; run with --ignored --nocapture"]
+    fn probe_lone_tail_finite_loss_ladder() {
+        // `1` is a lane whose per-transmission datagram count is the primary
+        // alone (stock/bulk, or the interactive tail after the loss-adaptive
+        // ladder withdrew the cover at hostile loss); `6` is the interactive
+        // single-symbol tail at the low-loss burst-cover tier the production
+        // smoke arms run (primary + four armour copies + the message-sized
+        // parity, or primary + five copies with the FEC parity gate closed).
+        for rtt_ms in [50u64, 190] {
+            for per_tx in [1usize, 6] {
+                for burst in [1usize, 2, 3, 5, 6, 8, 12, 18] {
+                    let t0 = Instant::now();
+                    let mut space = PktSendSpace::new();
+                    for i in 0..40 {
+                        space.sample_rtt(ms(rtt_ms), t0 + ms(i));
+                    }
+                    let send_t = t0 + ms(1_000);
+                    let seq = send_packet(&mut space, send_t);
+                    let cover = u8::try_from(per_tx - 1).unwrap();
+                    space.set_cover_copies(seq, cover);
+
+                    // The original transmission is transmission 0 and covers
+                    // datagrams `0..per_tx`; it is dropped iff the burst covers
+                    // all of them. Every later transmission covers the next
+                    // `per_tx` datagrams, and the first one that leaves the
+                    // burst behind is the one that delivers the tail.
+                    let original_lost = per_tx <= burst;
+                    let mut ladder: Vec<(u64, &'static str)> = Vec::new();
+                    let mut wait_ms: u64 = 0;
+                    if original_lost {
+                        let mut dropped = per_tx;
+                        let mut delivered = false;
+                        for step in 0..20_000u64 {
+                            let now = send_t + ms(step);
+                            let kind = if space.has_rtx(now) && space.rtx(now).is_some() {
+                                "rtx"
+                            } else if space.tail_probe(now).is_some() {
+                                "probe"
+                            } else {
+                                continue;
+                            };
+                            ladder.push((step, kind));
+                            if dropped + per_tx > burst {
+                                delivered = true;
+                                wait_ms = step + rtt_ms;
+                                break;
+                            }
+                            dropped += per_tx;
+                        }
+                        assert!(
+                            delivered,
+                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the replay never delivered the tail: the ladder is not a bounded-repair instrument"
+                        );
+                    }
+                    let n = ladder.len();
+                    let ladder_times: Vec<u64> = ladder.iter().map(|(at, _)| *at).collect();
+                    eprintln!(
+                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] rungs={n} wait_ms={wait_ms} ladder={ladder:?} srtt={:?} post_probe_rto={:?}",
+                        space.smooth_rtt(),
+                        space.tlp.rto(&space.rtt_stats),
+                    );
+                    // Instrument integrity, per arm. The estimator settled to
+                    // the RTT the arm names and the general RTO is still the
+                    // 1 s floor, so these rungs are this path's repair
+                    // deadline and not a different estimator.
+                    assert_eq!(
+                        space.smooth_rtt(),
+                        ms(rtt_ms),
+                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the estimator did not settle to the arm's RTT: these rungs are not this path's"
+                    );
+                    assert_eq!(
+                        space.rto_duration(),
+                        Duration::from_secs(1),
+                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the general RTO is not the 1 s floor: the arm is not measuring the corroborated repair deadline"
+                    );
+                    // The model: a burst costs exactly `floor(burst / m)`
+                    // repair transmissions — no more, no fewer. This is the
+                    // arm's vacuity: it fails if a transmission emits more
+                    // datagrams than its own recorded cover, if a rung
+                    // disappears, or if the original transmission's cover
+                    // stops absorbing the short bursts it exists for.
+                    assert_eq!(
+                        n,
+                        burst / per_tx,
+                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the burst cost {n} rung(s), not floor(burst/m)={}: the per-transmission datagram count is not {per_tx}. ladder={ladder:?}",
+                        burst / per_tx
+                    );
+                    if n == 0 {
+                        // A burst the original transmission's own cover
+                        // absorbs costs no rung at all: nothing may fire and
+                        // the request never waits.
+                        assert!(
+                            !original_lost,
+                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the original transmission was lost yet the arm fired no rung: a lost tail that is never repaired"
+                        );
+                        assert_eq!(
+                            wait_ms, 0,
+                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] a repair-free arm must report no wait, got {wait_ms} ms"
+                        );
+                    } else {
+                        // The delivered rung is the last one fired and the
+                        // wait is its offset plus one round trip: the recovery
+                        // is that rung's `sent_time` plus the path's own RTT.
+                        assert_eq!(
+                            wait_ms,
+                            ladder_times[n - 1] + rtt_ms,
+                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the arm's wait is not the delivered rung's offset plus one RTT. ladder={ladder:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
