@@ -12,6 +12,33 @@ use super::rtt_stats::RttStats;
 #[derive(Debug)]
 pub struct TailLossProber {
     probes_sent: u8,
+    /// The `(floor, budget)` pair in force for this prober.
+    ///
+    /// Production is `(TAIL_PROBED_MIN_RTO, MAX_PROBES)`.  The pair is a field
+    /// rather than a direct reference to the constants so the ladder's two
+    /// nudgeable parameters can be *swept* by measurement instead of edited by
+    /// hand and recompiled (`PktSendSpace::set_repair_ladder`).  It exists only
+    /// in test builds, so the shipped binary reads the constants.
+    #[cfg(test)]
+    ladder: LadderSweep,
+}
+
+/// The repair ladder's nudgeable parameters, when a measurement sweeps them.
+///
+/// Production never constructs one: the fields it carries are the constants
+/// `TailLossProber::new` reads, so a swept run and a default run differ only in
+/// the values a test injected.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct LadderSweep {
+    repair_floor: Duration,
+    probe_budget: u8,
+    /// Caps the **first** probe window — the one armed before any probe of the
+    /// episode has been sent, and so the height of the shortest, most common
+    /// excursion.  `None` keeps today's `min(2 * sRTT, RTO)`, whose cap is the
+    /// general RTO rather than the repair floor; `Some(t)` lowers that cap to
+    /// `t` (never above the RTO it replaces).
+    first_probe_cap: Option<Duration>,
 }
 
 impl TailLossProber {
@@ -42,7 +69,70 @@ impl TailLossProber {
     pub(crate) const TAIL_PROBED_MIN_RTO: Duration = Duration::from_millis(300);
 
     pub fn new() -> Self {
-        Self { probes_sent: 0 }
+        Self {
+            probes_sent: 0,
+            #[cfg(test)]
+            ladder: LadderSweep {
+                repair_floor: Self::TAIL_PROBED_MIN_RTO,
+                probe_budget: Self::MAX_PROBES,
+                first_probe_cap: None,
+            },
+        }
+    }
+
+    /// Sweep the ladder's post-probe repair floor and probe budget.  Test-only:
+    /// the shipped binary has no way to reach it, so production's floor and
+    /// budget remain the constants above.
+    #[cfg(test)]
+    pub(crate) fn set_ladder(&mut self, min_rto: Duration, max_probes: u8) {
+        self.ladder.repair_floor = min_rto;
+        self.ladder.probe_budget = max_probes;
+    }
+
+    /// Sweep the first probe window's cap — the head rung's spacing.  Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_first_probe_cap(&mut self, cap: Option<Duration>) {
+        self.ladder.first_probe_cap = cap;
+    }
+
+    /// The cap in force for the first probe window of an episode on a path that
+    /// already has an RTT sample: the live RTO, lowered to a swept cap when one
+    /// was injected.
+    fn first_probe_cap(&self, live_rto: Duration) -> Duration {
+        #[cfg(test)]
+        {
+            self.ladder
+                .first_probe_cap
+                .map_or(live_rto, |cap| cap.min(live_rto))
+        }
+        #[cfg(not(test))]
+        {
+            live_rto
+        }
+    }
+
+    /// The repair floor in force (the constants, unless a test swept it).
+    fn repair_floor(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.ladder.repair_floor
+        }
+        #[cfg(not(test))]
+        {
+            Self::TAIL_PROBED_MIN_RTO
+        }
+    }
+
+    /// The probe budget in force (the constants, unless a test swept it).
+    fn probe_budget(&self) -> u8 {
+        #[cfg(test)]
+        {
+            self.ladder.probe_budget
+        }
+        #[cfg(not(test))]
+        {
+            Self::MAX_PROBES
+        }
     }
 
     /// Reset the probe budget (called on ACK progress or new packet push).
@@ -52,7 +142,7 @@ impl TailLossProber {
 
     /// Whether the probe budget still has room.
     pub fn can_probe(&self) -> bool {
-        self.probes_sent < Self::MAX_PROBES
+        self.probes_sent < self.probe_budget()
     }
 
     /// RTO for the current tail episode.
@@ -69,9 +159,7 @@ impl TailLossProber {
         if self.probes_sent == 0 {
             return rtt_stats.rto_duration();
         }
-        rtt_stats
-            .corroborated_repair_rto()
-            .max(Self::TAIL_PROBED_MIN_RTO)
+        rtt_stats.corroborated_repair_rto().max(self.repair_floor())
     }
 
     /// Time between consecutive tail-loss probes for the current tail episode.
@@ -106,7 +194,9 @@ impl TailLossProber {
         // post-probe floor until a real sample exists; the general RTO path
         // keeps `MIN_RTO`, so no unmeasured retransmission is pulled in.
         let cap = if rtt_stats.min_rtt().is_none() {
-            Self::TAIL_PROBED_MIN_RTO
+            self.repair_floor()
+        } else if self.probes_sent == 0 {
+            self.first_probe_cap(self.rto(rtt_stats))
         } else {
             self.rto(rtt_stats)
         };

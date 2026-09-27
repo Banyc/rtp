@@ -1032,6 +1032,24 @@ impl PktSendSpace {
         }
     }
 
+    /// Sweep the repair ladder's two nudgeable parameters — the post-probe
+    /// repair floor and the tail-loss-probe budget — on this send space.
+    /// Test-only, and it defaults to the production constants, so a measurement
+    /// can put the ladder's spacing and height side by side instead of editing
+    /// `TailLossProber`'s constants and recompiling.
+    #[cfg(test)]
+    pub(crate) fn set_repair_ladder(&mut self, min_rto: Duration, max_probes: u8) {
+        self.tlp.set_ladder(min_rto, max_probes);
+    }
+
+    /// Sweep the first probe window's cap — the head rung's spacing — on this
+    /// send space.  Test-only and `None` by default, so a measurement can ask
+    /// what capping the head rung at the repair floor would buy.
+    #[cfg(test)]
+    pub(crate) fn set_first_probe_cap(&mut self, cap: Option<Duration>) {
+        self.tlp.set_first_probe_cap(cap);
+    }
+
     /// The armour cover [`Self::set_cover_copies`] recorded for `seq`, or `0`
     /// when the packet never had one (bulk/stock lanes, or an interactive
     /// tail sent while the loss-adaptive ladder had withdrawn the cover).
@@ -5583,150 +5601,507 @@ mod tests {
         }
     }
 
-    /// Deterministic **finite-burst** repair-ladder probe: what one loss
-    /// event costs, not how fast an unbounded ladder steps.
+    /// One observed firing of a lone-tail repair ladder.
+    #[derive(Debug, Clone, Copy)]
+    struct LadderRung {
+        /// Milliseconds from the original transmission.
+        at_ms: u64,
+        /// Datagrams this transmission put on the wire (the primary plus the
+        /// cover the repair re-sent, read from the send space itself).
+        datagrams: u64,
+        /// Whether the send space's own retransmission counters attribute the
+        /// firing to the tail-loss prober rather than to a full-RTO deadline.
+        is_probe: bool,
+    }
+
+    /// What one ACK-driven lone-tail burst replay measured.
+    #[derive(Debug)]
+    struct LadderOutcome {
+        rungs: Vec<LadderRung>,
+        /// `(transmission index, ms)`, `0` being the original transmission, of
+        /// the first transmission whose datagrams cleared the burst.
+        delivering: Option<(u64, u64)>,
+        /// Milliseconds from the original transmission to the ACK that retired
+        /// the episode.
+        ack_ms: Option<u64>,
+        /// Every datagram the episode put on the wire, the original included.
+        datagrams: u64,
+    }
+
+    impl LadderOutcome {
+        fn rung_times(&self) -> Vec<u64> {
+            self.rungs.iter().map(|rung| rung.at_ms).collect()
+        }
+    }
+
+    /// Replay one lone-tail loss burst against the **wire**, and read the
+    /// repair ladder off the send space's own firings.
     ///
-    /// `probe_lone_tail_repair_ladder` holds the path lossy forever, so it
-    /// measures the *spacing* of a ladder that never ends.  The field's
-    /// staircase is the other quantity: a finite burst swallows some number
-    /// of repair transmissions, and each swallowed transmission is a whole
-    /// rung of wait.  This probe replays the production lone-tail shape (one
-    /// tail packet, every transmission lost until the burst ends, no other
-    /// traffic on that direction) against a settled estimator, and drops a
-    /// run of `burst` **datagrams** — the shape the four-state GE model's
-    /// burst draws (a geometric run of drops terminated by the first
-    /// delivered packet).
+    /// The predecessor of this helper let the replay's own arithmetic decide
+    /// when the burst was crossed (`if dropped + per_tx > burst { break }`),
+    /// which made its rung count the loop's exit condition: the assertion
+    /// `rungs == burst / m` could not fail whatever the send space did.  Here
+    /// the drop window is the wire's — datagram `i` (0-based, the original
+    /// transmission's first) is dropped while `i < burst` — a transmission is
+    /// delivered iff at least one of its datagrams lands past the window, the
+    /// ACK returns one round trip later, and the **ACK** is what ends the
+    /// episode.  The rung count is therefore the number of firings the send
+    /// space chose before the ACK arrived, which a collapsed rung, a doubled
+    /// rung or a lost cover moves; and because the episode is not cut short at
+    /// delivery, the replay also measures the rungs a short spacing fires
+    /// *blind* — after the tail has already been delivered but before its ACK
+    /// is back.
     ///
-    /// The accounting it measures.  A lone-tail lane is the only source on
-    /// its direction, so the burst is consumed one datagram per datagram of
-    /// our own traffic; every tail transmission emits `1 + cover` datagrams
-    /// (the primary plus the armour copies a repair re-sends, see
-    /// `PktSendSpace::cover_copies`), and transmission `j` (0 = the original)
-    /// covers datagrams `m*j ..= m*j + m - 1`.  It is delivered iff
-    /// `m*j + m > burst`, so the number of transmissions the burst swallows
-    /// is `n = floor(burst / m)` — **`n` is the burst's length in our
-    /// datagrams divided by what one transmission offers, and is independent
-    /// of the ladder's cadence; only the wall clock is `n * step`.**  That is
-    /// why the armour cover's re-send (m = 6 instead of 1) is what bounds the
-    /// rung count and why a shorter step bounds only the wait.
+    /// `1` datagram per transmission is a lane whose repair is the primary
+    /// alone (stock/bulk, or the interactive tail after the loss-adaptive
+    /// ladder withdrew the cover at hostile loss); `6` is the interactive
+    /// single-symbol tail at the low-loss burst-cover tier the production
+    /// smoke arms run (primary + four armour copies + the message-sized parity,
+    /// or primary + five copies with the FEC parity gate closed).
+    ///
+    /// `ladder` sweeps the two nudgeable parameters — the post-probe repair
+    /// floor and the tail-loss-probe budget — through
+    /// `PktSendSpace::set_repair_ladder`; `None` measures the production
+    /// constants.  `rtt_ms` is what the estimator settles to; `ack_delay_ms` is
+    /// what one round trip actually takes on this episode.  They are separate
+    /// because a jittered path's *minimum* round trip is its one-way delay while
+    /// an episode's ACK can take several times that: a rung shorter than the
+    /// ACK's own delay fires after the tail is delivered and before its ACK is
+    /// back.
+    fn replay_lone_tail_burst(
+        rtt_ms: u64,
+        ack_delay_ms: u64,
+        per_tx: u64,
+        burst: u64,
+        ladder: Option<(Duration, u8)>,
+        first_probe_cap: Option<Duration>,
+    ) -> LadderOutcome {
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        if let Some((floor, max_probes)) = ladder {
+            space.set_repair_ladder(floor, max_probes);
+        }
+        if first_probe_cap.is_some() {
+            space.set_first_probe_cap(first_probe_cap);
+        }
+        for i in 0..40 {
+            space.sample_rtt(ms(rtt_ms), t0 + ms(i));
+        }
+        let send_t = t0 + ms(1_000);
+        let seq = send_packet(&mut space, send_t);
+        space.set_cover_copies(seq, u8::try_from(per_tx - 1).unwrap());
+
+        let mut emitted = per_tx;
+        let mut delivering = (per_tx > burst).then_some((0u64, 0u64));
+        let mut pending_ack = delivering.map(|(_, at)| at + ack_delay_ms);
+        let mut outcome = LadderOutcome {
+            rungs: Vec::new(),
+            delivering,
+            ack_ms: None,
+            datagrams: 0,
+        };
+        // The production poll order (`ReliableLayer::send_data_pkt_bounded`):
+        // a due full-RTO deadline first, the tail-loss probe only when none is.
+        for step in 0..60_000u64 {
+            let now = send_t + ms(step);
+            if pending_ack.is_some_and(|at| step >= at) {
+                ack_one(&mut space, seq.to_wire(), now);
+                outcome.ack_ms = pending_ack;
+                break;
+            }
+            let before = space.retransmission_counters();
+            let fired = if space.has_rtx(now) {
+                space.rtx(now).is_some()
+            } else {
+                space.tail_probe(now).is_some()
+            };
+            if !fired {
+                continue;
+            }
+            let after = space.retransmission_counters();
+            let datagrams = u64::from(space.cover_copies(seq)) + 1;
+            let index = outcome.rungs.len() as u64 + 1;
+            outcome.rungs.push(LadderRung {
+                at_ms: step,
+                datagrams,
+                is_probe: after.tail_probes > before.tail_probes,
+            });
+            emitted += datagrams;
+            if pending_ack.is_none() && emitted > burst {
+                delivering = Some((index, step));
+                pending_ack = Some(step + ack_delay_ms);
+            }
+        }
+        outcome.delivering = delivering;
+        outcome.datagrams = emitted;
+        outcome
+    }
+
+    /// The ladder's *height* and *step*, measured from the wire: a finite burst
+    /// costs `floor(burst / m)` rungs, each a `1 + cover`-datagram transmission,
+    /// and the rungs are one probe window apart at the head and one repair floor
+    /// apart thereafter.
+    ///
+    /// This is the always-run guard on the two quantities the field's 3.2 s
+    /// maximum is made of.  It is deliberately *not* an `#[ignore]` probe:
+    /// the rung count and the inter-rung interval are read off the send space's
+    /// own firing sequence (timestamps and retransmission counters), so a
+    /// collapsed rung, a doubled rung, a lost cover or a retuned floor moves
+    /// them.  `probe_lone_tail_wire_ladder_sweep` is the corresponding sweep.
+    #[test]
+    fn the_lone_tail_ladder_is_measured_from_the_wire_and_steps_by_the_repair_floor() {
+        // 190 ms round trip, the interactive tail's `m = 6` cover, and a burst
+        // of 18 datagrams: the original plus two rungs are swallowed and the
+        // third rung's datagrams clear the burst.
+        let outcome = replay_lone_tail_burst(190, 190, 6, 18, None, None);
+        let times = outcome.rung_times();
+        let observed_steps: Vec<u64> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert_eq!(
+            times,
+            vec![380, 680, 980],
+            "the ladder's firings must be the pre-budget probe window (2*sRTT = 380 ms) followed by the post-probe floor: observed firings {times:?}, observed inter-rung spacings {observed_steps:?} ms"
+        );
+        assert_eq!(
+            outcome.delivering,
+            Some((3, 980)),
+            "the delivering transmission is the wire's, not the model's: observed {:?}",
+            outcome.delivering
+        );
+        assert_eq!(
+            outcome.ack_ms,
+            Some(1_170),
+            "the episode ends at the measured ACK instant (delivery + RTT), not a computed wait: observed {:?}",
+            outcome.ack_ms
+        );
+        // The rung count is the send space's own firing count.  The model's
+        // `floor(burst / m)` = 3 is what it must *agree with*, and it is only
+        // checked here because the replay no longer cuts the ladder short at
+        // delivery.
+        assert_eq!(
+            outcome.rungs.len(),
+            3,
+            "the burst of 18 datagrams at m = 6 must cost 3 rungs; the ladder fired {}: {:?}",
+            outcome.rungs.len(),
+            outcome.rungs
+        );
+        // The step itself: every rung after the head sits the production
+        // repair floor from the previous one.  This is the assertion a retuned
+        // `TAIL_PROBED_MIN_RTO` breaks.
+        let floor_ms = u64::try_from(TailLossProber::TAIL_PROBED_MIN_RTO.as_millis()).unwrap();
+        for pair in times.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                floor_ms,
+                "every rung of the repair ladder must sit `TAIL_PROBED_MIN_RTO` = {floor_ms} ms from the previous one; observed spacing {} ms in {times:?}",
+                pair[1] - pair[0]
+            );
+        }
+        // Wire cost: the original plus three rungs, each the primary and its
+        // five armour copies, summed from the cover each firing actually
+        // carried.
+        let rung_datagrams: u64 = outcome.rungs.iter().map(|rung| rung.datagrams).sum();
+        assert_eq!(
+            rung_datagrams + 6,
+            outcome.datagrams,
+            "the episode's wire is the original's cover plus every rung's; measured {}+6 against {}",
+            rung_datagrams,
+            outcome.datagrams
+        );
+        assert_eq!(outcome.datagrams, 4 * 6);
+        // The head rung is the pre-budget tail-loss probe, not an RTO rung:
+        // the attribution comes from the send space's own counters, not from
+        // the poll order the replay happens to use.
+        assert!(
+            outcome.rungs[0].is_probe,
+            "the ladder's head rung must be the tail-loss probe whose window is 2*sRTT; observed {}",
+            if outcome.rungs[0].is_probe {
+                "probe"
+            } else {
+                "full-RTO"
+            }
+        );
+
+        // The same burst with no cover (`m = 1`) costs one rung per datagram.
+        // The count is again the wire's: 18 datagrams, 18 transmissions.
+        let bare = replay_lone_tail_burst(190, 190, 1, 18, None, None);
+        assert_eq!(
+            bare.rungs.len(),
+            18,
+            "a burst of 18 datagrams at m = 1 must cost 18 rungs; the ladder fired {} (last at {} ms)",
+            bare.rungs.len(),
+            bare.rungs.last().map_or(0, |rung| rung.at_ms)
+        );
+        assert_eq!(bare.datagrams, 19, "18 rungs plus the original");
+
+        // A burst the original transmission's own cover absorbs costs no rung
+        // at all, and the ACK still retires the episode at one round trip.
+        let absorbed = replay_lone_tail_burst(190, 190, 6, 5, None, None);
+        assert!(
+            absorbed.rungs.is_empty(),
+            "a 5-datagram burst is absorbed by the 6-datagram cover; the ladder fired {:?}",
+            absorbed.rungs
+        );
+        assert_eq!(absorbed.delivering, Some((0, 0)));
+        assert_eq!(absorbed.ack_ms, Some(190));
+
+        // The sweep knob's default is the production pair: injecting it
+        // explicitly must reproduce the unchecked run byte for byte, which is
+        // what makes every swept row below comparable to production.
+        let injected = replay_lone_tail_burst(
+            190,
+            190,
+            6,
+            18,
+            Some((TailLossProber::TAIL_PROBED_MIN_RTO, 2)),
+            None,
+        );
+        assert_eq!(
+            injected.rung_times(),
+            outcome.rung_times(),
+            "injecting the production `(TAIL_PROBED_MIN_RTO, MAX_PROBES)` pair must reproduce the default ladder: injected {:?} against default {:?}",
+            injected.rung_times(),
+            outcome.rung_times()
+        );
+        assert_eq!(injected.datagrams, outcome.datagrams);
+        assert_eq!(injected.ack_ms, outcome.ack_ms);
+    }
+
+    /// Deterministic sweep of the repair ladder's two nudgeable parameters:
+    /// the post-probe repair floor (`TAIL_PROBED_MIN_RTO`, 300 ms today) and the
+    /// tail-loss-probe budget (`MAX_PROBES`, 2 today).
+    ///
+    /// For each configuration it replays a burst sweep and reports, over the
+    /// swept bursts, the recovery latency the ACK measured (p50 / p99 / max, in
+    /// ms) and the datagrams the ladder put on the wire.  The wire count is the
+    /// diagnosis: a rung that is *shorter* than the path's round trip fires after
+    /// the tail has already been delivered and before its ACK is back, so it is
+    /// a duplicate — it cannot move the ACK and it adds a transmission.
     ///
     /// Run with `--ignored --nocapture`.
     ///
     /// Self-validating report-only: asserts the instrument's integrity — the
     /// estimator settled to the arm's RTT, the general RTO stayed at the 1 s
-    /// floor, and the measured fresh-delivery transmission index and wait
-    /// equal the model's `floor(burst / m)` and `t_n + RTT`.  The model
-    /// assertion is the vacuity: a send space that fired two datagrams per
-    /// rung, collapsed a rung, or re-sent no cover would move the measured
-    /// index away from `floor(burst / m)` and fail the arm.
+    /// floor, and every burst was delivered and acked — and no bound from this
+    /// crate's GATE.md.
     #[test]
-    #[ignore = "deterministic finite-burst lone-tail repair-ladder probe; <1 s; run with --ignored --nocapture"]
-    fn probe_lone_tail_finite_loss_ladder() {
-        // `1` is a lane whose per-transmission datagram count is the primary
-        // alone (stock/bulk, or the interactive tail after the loss-adaptive
-        // ladder withdrew the cover at hostile loss); `6` is the interactive
-        // single-symbol tail at the low-loss burst-cover tier the production
-        // smoke arms run (primary + four armour copies + the message-sized
-        // parity, or primary + five copies with the FEC parity gate closed).
+    #[ignore = "deterministic repair-ladder spacing/budget sweep; <1 s; run with --ignored --nocapture"]
+    fn probe_lone_tail_wire_ladder_sweep() {
+        let floor = TailLossProber::TAIL_PROBED_MIN_RTO;
         for rtt_ms in [50u64, 190] {
-            for per_tx in [1usize, 6] {
-                for burst in [1usize, 2, 3, 5, 6, 8, 12, 18] {
-                    let t0 = Instant::now();
-                    let mut space = PktSendSpace::new();
-                    for i in 0..40 {
-                        space.sample_rtt(ms(rtt_ms), t0 + ms(i));
-                    }
-                    let send_t = t0 + ms(1_000);
-                    let seq = send_packet(&mut space, send_t);
-                    let cover = u8::try_from(per_tx - 1).unwrap();
-                    space.set_cover_copies(seq, cover);
-
-                    // The original transmission is transmission 0 and covers
-                    // datagrams `0..per_tx`; it is dropped iff the burst covers
-                    // all of them. Every later transmission covers the next
-                    // `per_tx` datagrams, and the first one that leaves the
-                    // burst behind is the one that delivers the tail.
-                    let original_lost = per_tx <= burst;
-                    let mut ladder: Vec<(u64, &'static str)> = Vec::new();
-                    let mut wait_ms: u64 = 0;
-                    if original_lost {
-                        let mut dropped = per_tx;
-                        let mut delivered = false;
-                        for step in 0..20_000u64 {
-                            let now = send_t + ms(step);
-                            let kind = if space.has_rtx(now) && space.rtx(now).is_some() {
-                                "rtx"
-                            } else if space.tail_probe(now).is_some() {
-                                "probe"
-                            } else {
-                                continue;
-                            };
-                            ladder.push((step, kind));
-                            if dropped + per_tx > burst {
-                                delivered = true;
-                                wait_ms = step + rtt_ms;
-                                break;
-                            }
-                            dropped += per_tx;
+            for per_tx in [1u64, 6] {
+                for (label, ladder) in [
+                    ("floor=300ms budget=2 (production)", None),
+                    (
+                        "floor=250ms budget=2",
+                        Some((Duration::from_millis(250), 2u8)),
+                    ),
+                    (
+                        "floor=200ms budget=2",
+                        Some((Duration::from_millis(200), 2u8)),
+                    ),
+                    (
+                        "floor=150ms budget=2",
+                        Some((Duration::from_millis(150), 2u8)),
+                    ),
+                    (
+                        "floor=100ms budget=2",
+                        Some((Duration::from_millis(100), 2u8)),
+                    ),
+                    (
+                        "floor=50ms budget=2",
+                        Some((Duration::from_millis(50), 2u8)),
+                    ),
+                    ("floor=300ms budget=4 (raised probes)", Some((floor, 4u8))),
+                    ("floor=300ms budget=1 (lowered probes)", Some((floor, 1u8))),
+                ] {
+                    let mut waits: Vec<u64> = Vec::new();
+                    let mut datagrams: u64 = 0;
+                    let mut first_step = String::new();
+                    let mut steady_step: Vec<u64> = Vec::new();
+                    for burst in 1..=48u64 {
+                        let outcome =
+                            replay_lone_tail_burst(rtt_ms, rtt_ms, per_tx, burst, ladder, None);
+                        assert!(
+                            outcome.delivering.is_some(),
+                            "[{label} rtt={rtt_ms}ms m={per_tx} burst={burst}] the wire never delivered the tail"
+                        );
+                        let ack = outcome.ack_ms.unwrap_or_else(|| {
+                            panic!(
+                                "[{label} rtt={rtt_ms}ms m={per_tx} burst={burst}] the episode was never acked: the ladder is not a bounded-repair instrument"
+                            )
+                        });
+                        assert!(
+                            ack >= rtt_ms,
+                            "[{label} rtt={rtt_ms}ms m={per_tx} burst={burst}] an ack at {ack} ms is below the arm's round trip"
+                        );
+                        waits.push(ack);
+                        datagrams += outcome.datagrams;
+                        if burst == 48 {
+                            first_step = format!("{:?}", outcome.rung_times().first());
+                            steady_step = outcome
+                                .rung_times()
+                                .windows(2)
+                                .map(|pair| pair[1] - pair[0])
+                                .collect();
                         }
-                        assert!(
-                            delivered,
-                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the replay never delivered the tail: the ladder is not a bounded-repair instrument"
-                        );
                     }
-                    let n = ladder.len();
-                    let ladder_times: Vec<u64> = ladder.iter().map(|(at, _)| *at).collect();
+                    waits.sort_unstable();
+                    let pick = |q: f64| waits[((waits.len() - 1) as f64 * q).round() as usize];
                     eprintln!(
-                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] rungs={n} wait_ms={wait_ms} ladder={ladder:?} srtt={:?} post_probe_rto={:?}",
-                        space.smooth_rtt(),
-                        space.tlp.rto(&space.rtt_stats),
+                        "[ladder sweep rtt={rtt_ms}ms m={per_tx} {label}] first_rung_ms={first_step} steady_steps_ms={steady_step:?} wait_ms p50={} p99={} max={} wire_datagrams_over_48_bursts={datagrams}",
+                        pick(0.50),
+                        pick(0.99),
+                        waits.last().copied().unwrap_or_default(),
                     );
-                    // Instrument integrity, per arm. The estimator settled to
-                    // the RTT the arm names and the general RTO is still the
-                    // 1 s floor, so these rungs are this path's repair
-                    // deadline and not a different estimator.
-                    assert_eq!(
-                        space.smooth_rtt(),
-                        ms(rtt_ms),
-                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the estimator did not settle to the arm's RTT: these rungs are not this path's"
-                    );
-                    assert_eq!(
-                        space.rto_duration(),
-                        Duration::from_secs(1),
-                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the general RTO is not the 1 s floor: the arm is not measuring the corroborated repair deadline"
-                    );
-                    // The model: a burst costs exactly `floor(burst / m)`
-                    // repair transmissions — no more, no fewer. This is the
-                    // arm's vacuity: it fails if a transmission emits more
-                    // datagrams than its own recorded cover, if a rung
-                    // disappears, or if the original transmission's cover
-                    // stops absorbing the short bursts it exists for.
-                    assert_eq!(
-                        n,
-                        burst / per_tx,
-                        "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the burst cost {n} rung(s), not floor(burst/m)={}: the per-transmission datagram count is not {per_tx}. ladder={ladder:?}",
-                        burst / per_tx
-                    );
-                    if n == 0 {
-                        // A burst the original transmission's own cover
-                        // absorbs costs no rung at all: nothing may fire and
-                        // the request never waits.
+                }
+            }
+        }
+    }
+
+    /// The same sweep on an **episode whose ACK takes a jittered round trip** —
+    /// the regime the field runs in, and the one the constant-RTT sweep above
+    /// cannot see.
+    ///
+    /// `sch_netem`'s `delay TIME JITTER` draws each direction's one-way delay as
+    /// `max(0, TIME + U)`, `U` uniform over `±JITTER`, clamping at zero; an
+    /// episode's ACK therefore takes the sum of two such draws, whose minimum is
+    /// zero and whose mean is `2 * TIME`.  The draws are enumerated as an 8x8 net
+    /// (every pair exactly once) so the arm is reproducible and load-independent.
+    ///
+    /// This is where a rung shorter than the ACK's own delay shows up: it fires
+    /// after the tail was already delivered and before its ACK is back, so it is
+    /// a duplicate.  The reported wire amplification is the ladder's spent
+    /// datagrams divided by what the delivering transmission itself needed —
+    /// `1.0` means no rung was wasted.
+    ///
+    /// Two arms of the same sweep are deliberately different in kind.  Lowering
+    /// the **repair floor** compresses the rungs, which is what creates extra
+    /// blind rungs; lowering the **first probe window's cap** only translates the
+    /// ladder earlier, leaving every inter-rung interval — and so the blind-rung
+    /// pattern — unchanged.  The two levers' amplifications are read side by side
+    /// for exactly that reason.
+    ///
+    /// Run with `--ignored --nocapture`.
+    ///
+    /// Self-validating report-only: asserts the instrument's integrity (every
+    /// episode delivered and acked, no ack below the nominal one-way floor) and
+    /// no bound from this crate's GATE.md.
+    #[test]
+    #[ignore = "deterministic repair-ladder spacing sweep under delay jitter; <1 s; run with --ignored --nocapture"]
+    fn probe_lone_tail_wire_ladder_under_jitter() {
+        let floor = TailLossProber::TAIL_PROBED_MIN_RTO;
+        // `k` over 0..8 gives `u` over `-JITTER ..= +JITTER` in 8 levels.
+        let levels: Vec<i64> = (0..8).map(|k| (k * 2 - 7) * 100 / 7).collect();
+        for (label, owd, jitter, rtt_ms) in [
+            ("field owd95 jitter100", 95i64, 100i64, 190u64),
+            ("owd25 jitter25", 25, 25, 50),
+        ] {
+            let mut delays: Vec<u64> = Vec::new();
+            for &u1 in &levels {
+                for &u2 in &levels {
+                    let d1 = (owd + u1 * jitter / 100).max(0);
+                    let d2 = (owd + u2 * jitter / 100).max(0);
+                    delays.push(u64::try_from(d1 + d2).unwrap());
+                }
+            }
+            let nominal_min = u64::try_from(owd + owd).unwrap();
+            {
+                let over = |t: u64| delays.iter().filter(|delay| **delay > t).count();
+                let first_rung = rtt_ms * 2;
+                eprintln!(
+                    "[ladder jitter {label}] ack_delay_ms min={} mean={:.1} max={} of {} draws; over 2*sRTT({first_rung}ms)={} over 300ms={} over 250ms={} over 200ms={}",
+                    delays.iter().copied().min().unwrap_or_default(),
+                    delays.iter().sum::<u64>() as f64 / delays.len() as f64,
+                    delays.iter().copied().max().unwrap_or_default(),
+                    delays.len(),
+                    over(first_rung),
+                    over(300),
+                    over(250),
+                    over(200),
+                );
+            }
+            for per_tx in [1u64, 6] {
+                for (config, ladder, first_cap) in [
+                    ("floor=300ms budget=2 (production)", None, None),
+                    (
+                        "floor=250ms budget=2",
+                        Some((Duration::from_millis(250), 2u8)),
+                        None,
+                    ),
+                    (
+                        "floor=200ms budget=2",
+                        Some((Duration::from_millis(200), 2u8)),
+                        None,
+                    ),
+                    (
+                        "floor=150ms budget=2",
+                        Some((Duration::from_millis(150), 2u8)),
+                        None,
+                    ),
+                    (
+                        "floor=100ms budget=2",
+                        Some((Duration::from_millis(100), 2u8)),
+                        None,
+                    ),
+                    ("floor=300ms budget=4", Some((floor, 4u8)), None),
+                    (
+                        "production floor + head cap=300ms",
+                        None,
+                        Some(Duration::from_millis(300)),
+                    ),
+                    (
+                        "production floor + head cap=250ms",
+                        None,
+                        Some(Duration::from_millis(250)),
+                    ),
+                    (
+                        "production floor + head cap=200ms",
+                        None,
+                        Some(Duration::from_millis(200)),
+                    ),
+                ] {
+                    for burst in [6u64, 18, 48] {
+                        let mut waits: Vec<u64> = Vec::new();
+                        let mut spent: u64 = 0;
+                        let mut needed: u64 = 0;
+                        let mut blind: u64 = 0;
+                        for &ack_delay in &delays {
+                            let outcome = replay_lone_tail_burst(
+                                rtt_ms, ack_delay, per_tx, burst, ladder, first_cap,
+                            );
+                            let (delivered_index, _) = outcome.delivering.unwrap_or_else(|| {
+                                panic!(
+                                    "[{label} rtt={rtt_ms}ms m={per_tx} burst={burst} ack={ack_delay}ms {config}] the wire never delivered the tail"
+                                )
+                            });
+                            let ack = outcome.ack_ms.unwrap_or_else(|| {
+                                panic!(
+                                    "[{label} rtt={rtt_ms}ms m={per_tx} burst={burst} ack={ack_delay}ms {config}] the episode was never acked"
+                                )
+                            });
+                            assert!(
+                                ack >= ack_delay,
+                                "[{label} {config}] an ack at {ack} ms is below the episode's own round trip {ack_delay} ms"
+                            );
+                            waits.push(ack);
+                            spent += outcome.datagrams;
+                            needed += (delivered_index + 1) * per_tx;
+                            blind += outcome.rungs.len() as u64 - delivered_index;
+                        }
+                        waits.sort_unstable();
+                        let pick = |q: f64| waits[((waits.len() - 1) as f64 * q).round() as usize];
+                        eprintln!(
+                            "[ladder jitter {label} rtt={rtt_ms}ms m={per_tx} burst={burst} {config}] ack_ms p50={} p99={} max={} wire_spent={spent} wire_needed={needed} amplification={:.3} blind_rungs_total={blind} episodes={}",
+                            pick(0.50),
+                            pick(0.99),
+                            waits.last().copied().unwrap_or_default(),
+                            spent as f64 / needed as f64,
+                            delays.len(),
+                        );
                         assert!(
-                            !original_lost,
-                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the original transmission was lost yet the arm fired no rung: a lost tail that is never repaired"
-                        );
-                        assert_eq!(
-                            wait_ms, 0,
-                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] a repair-free arm must report no wait, got {wait_ms} ms"
-                        );
-                    } else {
-                        // The delivered rung is the last one fired and the
-                        // wait is its offset plus one round trip: the recovery
-                        // is that rung's `sent_time` plus the path's own RTT.
-                        assert_eq!(
-                            wait_ms,
-                            ladder_times[n - 1] + rtt_ms,
-                            "[finite ladder rtt={rtt_ms}ms m={per_tx} burst={burst}] the arm's wait is not the delivered rung's offset plus one RTT. ladder={ladder:?}"
+                            nominal_min <= waits[0],
+                            "[{label} {config}] the fastest ack {} ms is below the nominal two-way delay {nominal_min} ms",
+                            waits[0]
                         );
                     }
                 }
