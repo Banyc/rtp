@@ -827,10 +827,10 @@ transport-latency@impairment=burst-loss = the always-run tier's only latency ass
 `shared_bottleneck::shared_bneck_fairness_longrun` is `#[ignore]`d, so the
 blocks above see one row — and that row's *load shape* is not fixed by the
 ignore set at all: it is scaled by environment variables the arm reads
-in-process (`tests/shared_bottleneck.rs:1119-1122`). That is the surface
-`gate-env-tier` exists for, and its runner field is the scriptless marker `-`:
-no script of this crate sets any of the four, and the marker is refused if one
-did.
+in-process (`tests/shared_bottleneck.rs:1119-1122`, and the selector at
+`:1133`). That is the surface `gate-env-tier` exists for, and its runner field
+is the scriptless marker `-`: no script of this crate sets any of the five, and
+the marker is refused if one did.
 
 What the arm measures is the windowed fairness of two bulk flows sharing one
 serialization bottleneck, not a soak:
@@ -848,13 +848,16 @@ serialization bottleneck, not a soak:
 - `RTP_FAIR_SKIP_SECS` (`:1122`, default 10) sets the post-join ramp that is
   skipped before a window is judged: `start_bin = (run.join + skip) / bin_ms`.
 
-`RTP_FAIR_CONFIGS` (`:1133`, no default — unset means all six) filters the
-configuration list by exact label. It is recorded here in prose rather than in
-the variable list below because the shared checker resolves an env name only
-through a crate-local helper that forwards it to `env::var` (the transitive
-closure `_rust_env_read_names` builds), and this one is read by a direct
-`std::env::var("RTP_FAIR_CONFIGS")` literal; naming it in the block trips that
-checker's stale-declaration half. The repair belongs in the checker.
+- `RTP_FAIR_CONFIGS` (`:1133`, no default — unset means all six) is a
+  **selector, not a size**: it filters the six-configuration list by exact
+  label (`filter.split(',').any(|name| name.trim() == *label)`), so it chooses
+  which configurations the arm runs without scaling any per-rep cost. It is
+  read by a direct `std::env::var("RTP_FAIR_CONFIGS")` literal, so it is named
+  in the surface's variable list below rather than left in prose: the checker
+  now resolves a distinct literal as well as a crate-local helper, and a
+  scriptless read is the half no script can show. Because its value is a label
+  list rather than a count, it is the surface's one variable the `total`
+  expression cannot name, and that total is the all-six default.
 
 The quantity a cell claims is the **windowed Jain index of the two flows'
 goodput bands and the slower flow's minimum share**, per configuration and rep —
@@ -901,8 +904,47 @@ the tail horizon (`tail_start_bin = bins·3/4`) is empty — the six
 `tail_worst_jain=inf` — where the declared default judges 14 windows per rep, 3
 of them in the tail horizon.
 
+### The other in-process opt-in surfaces
+
+Four more rows in the same block record surfaces the `#[ignore]` set cannot
+see, each classified by what its variable does rather than by what the checker
+can read:
+
+- **Reliability-path defaults** (`reliability-path-defaults`). The
+  connect/accept config `Default`s each read one environment variable, once per
+  process and cached, so every connection built from a default config shares
+  the value: FEC in-stream parity, the receiver's frame-delivery mode, the
+  jitter-tolerant fast-retransmit window, and the FEC diversity preset. They
+  are tuning knobs of reliability paths — a behaviour an explicit
+  per-connection argument overrides — and none of them sizes a measurement, so
+  the row carries no load.
+- **The armour-frontier probe's cell** (`armor-frontier-cell`).
+  `probe_armor_copy_cell` forces the fresh-tail armour copy count through a
+  test-only override so a shell loop can sweep one cell without recompiling.
+  The knob selects the cell's armour count; the probe's own cost is its
+  `ARMOR_N` message count, not this switch, and the probe's sibling `ARMOR_*`
+  knobs are read through a local closure rather than a bare `env::var` literal,
+  so they are invisible to the checker and no load is honest here either.
+- **The performance-trace capture** (`perf-trace-capture`). `PerfTrace::from_env`
+  turns the probes' 50 ms client and accepted-peer capture on by naming an
+  output directory, and a second variable drops the RTP rows for an
+  observer-free control run. These choose a diagnostic artifact; the captured
+  rows-per-second is a fixed constant regardless of lane speed, so neither
+  sizes a cost.
+- **The debug-send toggle** (`debug-send-toggle`). `debug_send()` caches one
+  process-wide flag that gates the per-packet debug traces. It is a diagnostic
+  control — not a fault injection and not a load knob — so its row records the
+  two states it selects and declines a load.
+
+None of the four is set by a script of this crate, so each row's runner is the
+scriptless marker `-`.
+
 ```gate-env-tier
-fair-longrun = RTP_FAIR_LONGRUN_REPS,RTP_FAIR_LONGRUN_SECS,RTP_FAIR_SKIP_SECS,RTP_FAIR_WINDOW_SECS | - | the windowed Jain fairness index and the slower flow's minimum share of two bulk flows' goodput converging on one 10 Mbit/s / 128 KiB shared serialization bottleneck, sampled in 250 ms bins over each sliding RTP_FAIR_WINDOW_SECS-second window after the RTP_FAIR_SKIP_SECS post-join ramp is skipped, for RTP_FAIR_LONGRUN_REPS reps of RTP_FAIR_LONGRUN_SECS measured seconds across six RTT-symmetry and arrival configurations (RTP_FAIR_CONFIGS filters that set; it is read directly, unset means all six) | contested-instrument@impairment=none+metric=jain-window+layer=shared-bottleneck+scale=long-run, contested-instrument@impairment=none+metric=share-min+layer=shared-bottleneck+scale=long-run | RTP_FAIR_LONGRUN_REPS=1,RTP_FAIR_LONGRUN_SECS=60,RTP_FAIR_SKIP_SECS=10,RTP_FAIR_WINDOW_SECS=20,total=6*RTP_FAIR_LONGRUN_REPS*RTP_FAIR_LONGRUN_SECS,wall=364s
+fair-longrun = RTP_FAIR_LONGRUN_REPS,RTP_FAIR_LONGRUN_SECS,RTP_FAIR_SKIP_SECS,RTP_FAIR_WINDOW_SECS,RTP_FAIR_CONFIGS | - | the windowed Jain fairness index and the slower flow's minimum share of two bulk flows' goodput converging on one 10 Mbit/s / 128 KiB shared serialization bottleneck, sampled in 250 ms bins over each sliding RTP_FAIR_WINDOW_SECS-second window after the RTP_FAIR_SKIP_SECS post-join ramp is skipped, for RTP_FAIR_LONGRUN_REPS reps of RTP_FAIR_LONGRUN_SECS measured seconds across six RTT-symmetry and arrival configurations (RTP_FAIR_CONFIGS selects which of the six run — unset means all six — and is a selector rather than a size, so it is the surface's one variable the load total does not factor) | contested-instrument@impairment=none+metric=jain-window+layer=shared-bottleneck+scale=long-run, contested-instrument@impairment=none+metric=share-min+layer=shared-bottleneck+scale=long-run | RTP_FAIR_LONGRUN_REPS=1,RTP_FAIR_LONGRUN_SECS=60,RTP_FAIR_SKIP_SECS=10,RTP_FAIR_WINDOW_SECS=20,total=6*RTP_FAIR_LONGRUN_REPS*RTP_FAIR_LONGRUN_SECS,wall=364s
+reliability-path-defaults = RTP_INSTREAM_GROUP_FEC,RTP_FRAME_DELIVERY,RTP_JITTER_CAP,RTP_MAX_DIVERSITY,RTP_MINDIV | - | the per-process `Default`s of the connect/accept config, each sampled once and cached so a config built later cannot observe a mid-run environment mutation: `RTP_INSTREAM_GROUP_FEC` selects in-stream group FEC parity (`src/traffic_shaping/redundancy/mod.rs:14`), `RTP_FRAME_DELIVERY` selects the receiver's frame-delivery mode (`src/delivery/frame/mode.rs:75`), `RTP_JITTER_CAP` selects the jitter-tolerant fast-retransmit reorder window and is default ON, only an explicit 0/false turning it off (`src/traffic_shaping/recovery/pkt_send_space.rs:121`), and `RTP_MAX_DIVERSITY`, with `RTP_MINDIV` as the legacy alias it falls back to, selects the maximum-diversity FEC preset (`src/traffic_shaping/redundancy/fec/gate/tuning.rs:124`); each selects a behaviour an explicit per-connection argument overrides, and none sizes a measurement | transport-delivery@knob=RTP_INSTREAM_GROUP_FEC+mode=instream-parity, transport-delivery@knob=RTP_FRAME_DELIVERY+mode=frame-delivery, transport-latency@knob=RTP_JITTER_CAP+window=jitter-margin, transport-delivery@knob=RTP_MAX_DIVERSITY+preset=max-diversity, transport-delivery@knob=RTP_MINDIV+preset=legacy-alias
+armor-frontier-cell = ARMOR_COPIES | - | the fresh-tail armour copy count `probe_armor_copy_cell` forces through the test-only `fresh_tail_armor_copies_override` so one efficiency-frontier cell is swept independently of the loss-adaptive ladder, `-1` keeping the production ladder (`src/socket/stream.rs:1834`); the cell's own cost is its `ARMOR_N` message count and its sibling sweep knobs are read by a local closure, so neither this switch nor they size the measurement | armor-frontier@knob=ARMOR_COPIES+mode=forced-count, armor-frontier@knob=ARMOR_COPIES+mode=production-ladder
+perf-trace-capture = NETEM_PERF_TRACE_DIR,NETEM_PERF_TRACE_RTP | - | opt-in performance-probe capture rather than a load knob: `NETEM_PERF_TRACE_DIR` names an output directory and enables the 50 ms client and accepted-peer RTP capture plus the netem and application-progress samples, and `NETEM_PERF_TRACE_RTP=0` retains only the netem and progress samples for an observer-free control run with the same artifacts (`src/testkit/perf_trace.rs:1061-1062`); both select a diagnostic output, and the capture's rows-per-second is a fixed constant regardless of lane speed | perf-trace@knob=NETEM_PERF_TRACE_DIR+artifact=capture-dir, perf-trace@knob=NETEM_PERF_TRACE_RTP+mode=netem-only-control
+debug-send-toggle = RTP_DEBUG_SEND | - | the process-wide debug-trace toggle on the per-packet send and receive paths (`src/debug.rs:28`): set prints the debug lines and unset is silent, and it is read once into a `OnceLock` so a busy sender pays no per-packet `getenv`; it is a diagnostic control, not a fault injection, and selects no measurement | debug-trace@knob=RTP_DEBUG_SEND+toggle=set, debug-trace@knob=RTP_DEBUG_SEND+toggle=unset
 ```
 
 ## Ignored-test manifest
