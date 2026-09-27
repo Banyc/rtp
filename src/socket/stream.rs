@@ -1504,7 +1504,10 @@ mod tests {
             let sink = Arc::clone(&observed);
             a_layer.metrics_observer =
                 Some(crate::metrics::MetricsObserver::new(move |observation| {
-                    if let Some(rtt) = observation.snapshot.and_then(|snapshot| snapshot.minimum_rtt) {
+                    if let Some(rtt) = observation
+                        .snapshot
+                        .and_then(|snapshot| snapshot.minimum_rtt)
+                    {
                         *sink.lock().unwrap() = Some(rtt);
                     }
                 }));
@@ -1518,7 +1521,8 @@ mod tests {
             );
             let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
             let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
-            let echo = tokio::spawn(async move {
+            let mut echo_tasks = tokio::task::JoinSet::new();
+            echo_tasks.spawn(async move {
                 let mut buf = vec![0u8; MSG];
                 loop {
                     match tokio::time::timeout(Duration::from_secs(2), b_r.recv(&mut buf)).await {
@@ -1539,7 +1543,8 @@ mod tests {
                 let started = Instant::now();
                 let _ = a_w.send(&msg).await;
                 let mut buf = vec![0u8; MSG];
-                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), a_r.recv(&mut buf)).await
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(2), a_r.recv(&mut buf)).await
                     && n >= 4
                     && buf[..4] == msg[..4]
                 {
@@ -1550,7 +1555,7 @@ mod tests {
             }
             drop(a_w);
             drop(a_r);
-            let _ = tokio::time::timeout(Duration::from_secs(3), echo).await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), echo_tasks.join_next()).await;
             let reported = *observed.lock().unwrap();
             let expected = owd * 2;
             eprintln!(
