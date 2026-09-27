@@ -64,7 +64,35 @@ const _: () = assert!(MAX_FRAME_LEN == MAX_SEND_DATA_BUF_LEN);
 const STAGE_WINDOW_SECS: f64 = 0.005;
 const SMOOTH_SEND_RATE_ALPHA: f64 = 0.4;
 const MIN_SEND_RATE: f64 = 1.;
-pub(crate) const INIT_SEND_RATE: f64 = 128.;
+/// The send rate a fresh connection seeds its pacer with, and therefore the
+/// rate the congestion window is *derived* from
+/// (`cwnd = rate × rtt × CWND_SEND_RATE_SCALE`,
+/// `traffic_shaping/recovery/pkt_send_space.rs:1397`).  It is the floor of the
+/// start-up ramp, so it is what decides whether the first seconds of a session
+/// are served from a standing sender-side backlog: a lane offered more
+/// packets/s than this seeds *below* its own offered load and pays a pacing
+/// queue until the ramp overtakes the offer.
+///
+/// It is `1024` because `128` was measured to be below the offered load of the
+/// deployed shape.  The `rtp_mux` mandate arms offer 256 B every 5 ms = ~200
+/// msg/s on the interactive lane (and four such flows on the production
+/// one-session shape), so a 128 pkt/s seed put the first ~3.5 s of every
+/// session in a backlog: the clean arm's p99 was **87.3 ms** against a 25 ms
+/// one-way floor, while the pacer-suppressed to ~1.3 of the declared armour
+/// copies.  At `1024` the seed is above the offered load and the same arm
+/// measures p99 **26.2 ms**, p999 28.7, max 30.0.  This is not an RFC 5681
+/// initial-window derivation — this transport is governed by measured delivery
+/// and loss rate, and follows TCP as a baseline best practice rather than as a
+/// conformance target — and the parameter is nudged only with that measurement
+/// beside it.  The cost is on the wire: the same arms' clean own-wire multiple
+/// moves 2.08x → 5.80x against the 6x budget M2 asserts, because the higher
+/// rate is also what stops the send pacer silently suppressing the declared
+/// fresh-tail armour cover, so the six datagrams a message declares now reach
+/// the wire.  Cutting the cover to buy that margin back was swept and refused:
+/// see `GATE.md` for the frontier (the two settings that fit the wire better
+/// each break a safeguard — the ladder's monotone-non-increasing copy count,
+/// or the hostile arm's window-adequacy gate).
+pub(crate) const INIT_SEND_RATE: f64 = 1024.;
 
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
 /// Pacing interval for a healthy huge-data-loss scan. A negative result is

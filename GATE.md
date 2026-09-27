@@ -1214,3 +1214,53 @@ and a 4.5× clean-lane p50 regression is exactly the failure M2 exists to
 prevent.  Recorded as inherent, with the instrument that measures it
 (`probe_lone_tail_finite_loss_ladder`) and the frontier that refuses it
 (`probe_armor_cover_frontier`) rather than as an open lever.
+### What `INIT_SEND_RATE` was bought with, and why the cover could not pay for it
+
+`INIT_SEND_RATE` is `1024`, raised from `128`.  The measurement and the reason
+are on the constant (`src/reliable/reliable_layer.rs`); what belongs here is
+what the *cover sweep* found, because the obvious way to pay for a rate is not
+available.
+
+The two constants are coupled: at `128` the send pacer was the binding term, so
+the declared six-datagram fresh-tail budget was **not** what reached the wire —
+measured, cutting the declared cover to one changed neither the wire (2.08× →
+2.07×) nor the p99 (87.3 → 82.8 ms), which is what a pacer-limited tier looks
+like.  At `1024` the pacer is no longer binding, the whole declared budget
+reaches the wire, and the same clean arm moves from 2.08× to **5.80×** against
+the 6× budget `rtp_mux`'s M2 asserts.  Reducing the burst-cover budget is
+therefore the natural second half of the change, and it was swept as a frontier
+on `rtp_mux`'s mandate arms (no arm retuned; `mandate_smoke` M1/M2/M4 and
+`rtp_mux_jitter::jitter_duallane_constitution_gate`, the M2 owner):
+
+| budget `m` (closed / open gate copies) | one-flow clean p99 | clean own-wire | four-flow clean p99 | hostile p99 | verdict |
+|---|---|---|---|---|---|
+| 6 (5 / 4) — the shipped tier, rate 1024 | 26.2 ms | 5.80× | 176.1 ms | 125.6 ms | at 97 % of the M2 budget |
+| 4 (3 / 2) | 27.7 ms | 4.53× | 137.2 ms | 218.7 ms | **refused**: window-adequacy gate |
+| 2 (1 / 4) | 29.7 ms | 2.27× | 130.4 ms | 163.1 ms | **refused**: monotonicity invariant |
+| 1 (0 / —) | 87.0 ms | 3.40× | 104.7 ms | 314.9 ms | worse on both axes |
+
+Two refusals, each by a safeguard rather than by taste.  At `m = 2` the
+closed-gate tier would spend two datagrams where the open-gate tier spends six,
+so a link whose loss crossed the FEC gate's enable threshold would *gain*
+redundancy — the copy ladder's monotone-non-increasing invariant, which is the
+ladder's stated reason for holding the two gate states equal, and it is not
+loosened to fit a wire measurement.  At `m = 4` the ladder's rung count rises
+1.5× (`floor(burst / m)`), and `mandate_smoke::m1_latency_window_censoring`
+— an existing default-tier gate — fails by name: the hostile arm's own
+mean-8-datagram burst can now build **7 rungs**, `7 × 300 ms + 50 ms = 2150 ms`
+against the arm's **2000 ms** room, so the hostile tail that arm asserts on
+would be **censored**, its reported p99 a lower bound.  The window is a frozen
+perf-test setting, so the honest reading is that `m = 4` is not observable at
+the arm's field scale, not that the gate is wrong.  `m = 1` needs no safeguard
+to refuse it: with the 2 % iid loss uncovered the p99 returns to the `128`
+baseline's 87.0 ms *and* the wire rises to 3.40×, because the retransmissions
+cost more than the copies saved.
+
+So the rate lands alone, at the tier whose budget the wire already declares
+(`m = 6`), and the cover stays where the frontier recorded it.  What this
+leaves open is the wire margin (5.80× of 6×) and the four-flow clean tail
+(176.1 ms, essentially unmoved from 180.8 ms), and the lever for both is the
+same one this section refuses: a shorter observation window would admit
+`m = 5` (rungs 5, `5 × 300 + 50 = 1550 ms` ≤ 2000 ms) if a *new* hostile arm
+with a longer window were added alongside, and that is a coverage change for
+`rtp_mux`'s declaration, not for this crate's transport.
