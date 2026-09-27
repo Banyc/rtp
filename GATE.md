@@ -822,6 +822,89 @@ transport-delivery@metric=goodput-fraction = no default-tier row measures goodpu
 transport-latency@impairment=burst-loss = the always-run tier's only latency assertion is the 60 ms one-way delay observability check. The sparse-message tail under GE burst loss is opt-in (`full`), and an always-run tail arm would need a window short enough for the default budget and long enough to carry one recovery episode — a new arm, not a shortened probe.
 ```
 
+### The long-run fairness surface: `RTP_FAIR_*`, in `gate-env-tier`
+
+`shared_bottleneck::shared_bneck_fairness_longrun` is `#[ignore]`d, so the
+blocks above see one row — and that row's *load shape* is not fixed by the
+ignore set at all: it is scaled by environment variables the arm reads
+in-process (`tests/shared_bottleneck.rs:1119-1122`). That is the surface
+`gate-env-tier` exists for, and its runner field is the scriptless marker `-`:
+no script of this crate sets any of the four, and the marker is refused if one
+did.
+
+What the arm measures is the windowed fairness of two bulk flows sharing one
+serialization bottleneck, not a soak:
+
+- `RTP_FAIR_LONGRUN_SECS` (`:1119`, default 300) sets each rep's measured
+  window: `let total_run = Duration::from_secs(env_u64("RTP_FAIR_LONGRUN_SECS", 300));`
+  is the `run_for` both flows are pumped for through one shared
+  `BottleneckShaper` (`FAIRNESS_RATE_BPS = 10_000_000`, 128 KiB limit), each
+  flow's propagation delay being its configuration's `owd_a_ms`/`owd_b_ms`.
+- `RTP_FAIR_LONGRUN_REPS` (`:1120`, default 3) sets how many reps each of the
+  six configurations gets.
+- `RTP_FAIR_WINDOW_SECS` (`:1121`, default 20, floored at 1) sets the judging
+  window: per-flow goodput is sampled in 250 ms bins and the Jain index is
+  computed over rolling `window_bins = RTP_FAIR_WINDOW_SECS / 250 ms` windows.
+- `RTP_FAIR_SKIP_SECS` (`:1122`, default 10) sets the post-join ramp that is
+  skipped before a window is judged: `start_bin = (run.join + skip) / bin_ms`.
+
+`RTP_FAIR_CONFIGS` (`:1133`, no default — unset means all six) filters the
+configuration list by exact label. It is recorded here in prose rather than in
+the variable list below because the shared checker resolves an env name only
+through a crate-local helper that forwards it to `env::var` (the transitive
+closure `_rust_env_read_names` builds), and this one is read by a direct
+`std::env::var("RTP_FAIR_CONFIGS")` literal; naming it in the block trips that
+checker's stale-declaration half. The repair belongs in the checker.
+
+The quantity a cell claims is the **windowed Jain index of the two flows'
+goodput bands and the slower flow's minimum share**, per configuration and rep —
+what the arm prints as `[fair-longrun] … a=… b=… jain=… share_min=…` — over a
+clean path with no `sch_netem` impairment and one shared serialization
+bottleneck. Two things the declaration must not overstate. The long-run arm's
+own assertion is **delivery only** — `assert!(run.bins_a.iter().sum::<u64>() > 0
+&& run.bins_b.iter().sum::<u64>() > 0, "{label} rep={rep}: both flows must
+deliver over the long run")` (`:1208-1210`) — so its fairness output is
+report-only. The fairness *floors* are asserted by its short siblings over the
+same `two_flow_goodput` substrate: `*jain >= jain_floor` (`:1013-1016`, and the
+reorder-lane variant at `:1098-1103`), plus the independent absolute slower-flow
+floor `mean_slow >= floor` (`:930-933`), whose whole point is that a two-flow
+Jain index is scale-invariant and so cannot see a combined collapse; that floor
+is shown non-vacuous by
+`absolute_starvation_floor_fires_on_a_jain_perfect_collapse` (`:958`). What
+makes the arm a fairness measurement rather than a throughput soak is the
+statistic itself: `jain_index(a, b) = (a + b)^2 / (2 (a^2 + b^2))` (`:827-833`).
+
+**Cost: measured at the sized shape, derived for the defaults.** The default
+shape is `6 × RTP_FAIR_LONGRUN_REPS × RTP_FAIR_LONGRUN_SECS` = 6 × 3 × 300 =
+**5400 rep-seconds** — the ~90 minutes the arm's own `#[ignore]` reason states,
+and *not* executed here. What was executed is the load field below: all six
+configurations, one rep each, `RTP_FAIR_LONGRUN_SECS=60` at the declared
+`RTP_FAIR_WINDOW_SECS=20` and `RTP_FAIR_SKIP_SECS=10`, i.e. `6 × 1 × 60 = 360`
+rep-seconds of contended measurement, **360 rep-seconds in 364 s wall** (libtest
+`finished in 363.38s`, exit 0, all six `[fair-longrun-summary]` lines present,
+1-minute load average 2.2-2.4 on 10 cores). The loop is wall-clock-driven (`while
+run_start.elapsed() < total_run` over 250 ms bins), so the shape's cost is its
+own second-budget plus a per-rep setup and drain: 4 s over six reps, ~0.7 s
+each. The default's wall therefore follows by the same arithmetic — 18 reps of
+300 s plus 18 × ~0.7 s ≈ **5412 s (~90 min)** — a *derived* figure, labelled as
+derived rather than measured a second time. The `total` is that second-budget
+because the judged-window count is a quotient of the variables
+(`(4·SECS − 4·(join+SKIP)) / (4·WINDOW)`) that the load grammar — sum and
+product over the variables and integer literals — cannot express. No `bound=` is
+recorded: the arm claims no per-run detection rate (its only assertion is
+delivery), and the smallest excursion it reports is one whole
+`RTP_FAIR_WINDOW_SECS` window, which is a resolution rather than a bound.
+Finally, the scaled shape is *thinner* than the default in a way that is named
+rather than hidden: at `RTP_FAIR_LONGRUN_SECS=60` each rep judges 2 windows and
+the tail horizon (`tail_start_bin = bins·3/4`) is empty — the six
+`[fair-longrun-summary]` lines all read `tail_below_0.90=0/0` and
+`tail_worst_jain=inf` — where the declared default judges 14 windows per rep, 3
+of them in the tail horizon.
+
+```gate-env-tier
+fair-longrun = RTP_FAIR_LONGRUN_REPS,RTP_FAIR_LONGRUN_SECS,RTP_FAIR_SKIP_SECS,RTP_FAIR_WINDOW_SECS | - | the windowed Jain fairness index and the slower flow's minimum share of two bulk flows' goodput converging on one 10 Mbit/s / 128 KiB shared serialization bottleneck, sampled in 250 ms bins over each sliding RTP_FAIR_WINDOW_SECS-second window after the RTP_FAIR_SKIP_SECS post-join ramp is skipped, for RTP_FAIR_LONGRUN_REPS reps of RTP_FAIR_LONGRUN_SECS measured seconds across six RTT-symmetry and arrival configurations (RTP_FAIR_CONFIGS filters that set; it is read directly, unset means all six) | contested-instrument@impairment=none+metric=jain-window+layer=shared-bottleneck+scale=long-run, contested-instrument@impairment=none+metric=share-min+layer=shared-bottleneck+scale=long-run | RTP_FAIR_LONGRUN_REPS=1,RTP_FAIR_LONGRUN_SECS=60,RTP_FAIR_SKIP_SECS=10,RTP_FAIR_WINDOW_SECS=20,total=6*RTP_FAIR_LONGRUN_REPS*RTP_FAIR_LONGRUN_SECS,wall=364s
+```
+
 ## Ignored-test manifest
 
 Each line is `RELATIVE_PATH::fn = classification`. The set must equal the
