@@ -1264,3 +1264,30 @@ same one this section refuses: a shorter observation window would admit
 `m = 5` (rungs 5, `5 × 300 + 50 = 1550 ms` ≤ 2000 ms) if a *new* hostile arm
 with a longer window were added alongside, and that is a coverage change for
 `rtp_mux`'s declaration, not for this crate's transport.
+
+### The seed is not an M2 lever either: the third dimension, measured
+
+The section above leaves one setting named and unswept — the seed itself.  The
+seed is an *offer*, not a rate floor (its ordering against `MIN_SEND_RATE` is
+pinned by this crate's own unit tests), and the M2 breach that the wire margin
+above turns into is a function of how much of the declared cover the pacer
+admits.  So the seed was swept at the deployed cover (`m = 6`), one dimension
+per arm, through `rtp_mux`'s own mandate arms and its M2 owner gate; the table,
+the run counts and the bounds each arm was judged against are in
+`rtp_mux/GATE.md` ("The deployed baseline the impaired tail must not regress
+past"), which is where the mandate bounds live.  What belongs here is the
+transport reading: **the owner gate is a step function of the seed rather than
+a slope**, because its 40 msg/s arm offers 40 × 6 = 240 pkt/s, so every seed at
+or above `240` admits the whole declared cover (6.82–6.85× on the gate) while
+`208` truncates it to 5.95× and `128` to 3.68×; and **every seed that clears
+the gate pays for it with the clean arm**, `p99` 26.5 ms → 84.4 ms at `208` and
+87.6 ms at `128`, because the pacer that stops admitting the armour also stops
+admitting the offer.  The impaired tail is not bought back by any of them
+(`hostile p99` 241.8 ms at `208`, 202.1 ms at `128`, against the deployed
+distribution's 152.3–218.4 ms).  The seed is therefore **refused as an M2
+lever**: the deployed `1024` is the point M1 selects, the 6× breach stands on
+the deployed owner gate, and the lever that would cut the wire without
+deepening the ladder — armouring only an actually unacked tail, since the owner
+gate's 40 msg/s cadence on a 50 ms round trip pipelines its messages and so
+most of its fresh tails are not lone — is a change to `is_fresh_interactive_tail`
+with its own M1 measurement, named here and not attempted.
