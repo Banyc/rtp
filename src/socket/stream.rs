@@ -2811,4 +2811,308 @@ mod tests {
         let (_, _, duplicated) = rate_a.applied();
         assert!(duplicated > 0, "no packet was actually duplicated");
     }
+
+    /// One efficiency-frontier cell of the **fresh-tail armour cover**: what
+    /// the forced cover costs on the wire, and whether forcing a larger cover
+    /// raises the cover the lane actually sends.
+    ///
+    /// `probe_armor_copy_cell` sweeps the same test-only
+    /// `fresh_tail_armor_copies_override` at its declared 25 ms cadence, where
+    /// the send pacer grants only ~3.2 datagrams per message: a forced cover
+    /// above ~2.4 copies is never admitted, so that arm's `ARMOR_COPIES` sweep
+    /// is inert *upward* and the
+    /// `armor-frontier@knob=ARMOR_COPIES+mode=forced-count` cell it is declared
+    /// under cannot sweep the cover that cell names.  This arm measures the
+    /// regime that cell cannot reach — a cadence at which the pacer is not the
+    /// binding term — and asserts the property that makes it a measurement of
+    /// the cover rather than of the pacer: raising the forced cover must raise
+    /// the armour the lane actually sends (`armor_per_msg`) and the bytes that
+    /// carry it.  An override that stopped being consulted, or an admission
+    /// control that admitted no more cover at the larger forced value, fails
+    /// here while every latency column still looks healthy.
+    ///
+    /// It asserts no product bound.  Its `wall` is
+    /// `2 * COVER_SWEEP_N * COVER_SWEEP_CADENCE_MS` plus the consumer's idle
+    /// drain, and it reads its own eight-variable surface
+    /// (`cover-frontier-cell`).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "in-process armour cover-frontier cell; ~34 s for both forced covers; run with --ignored --nocapture"]
+    async fn probe_armor_cover_frontier() {
+        struct FrontierCell {
+            label: String,
+            samples: usize,
+            send_failures: usize,
+            datagrams: u64,
+            armor_per_msg: f64,
+            bytes_per_msg: f64,
+            p99_ms: f64,
+            max_ms: f64,
+        }
+
+        /// The load a frontier cell runs under, minus the two values that
+        /// define the sweep itself (`copies` and `label`).
+        struct CellSpec {
+            n: usize,
+            cadence_ms: usize,
+            bps: usize,
+            burst: usize,
+            gap: usize,
+            seed: u64,
+            msg_len: usize,
+            owd: std::time::Duration,
+        }
+
+        // The probe's own body carries every assertion; this helper only
+        // reports, so the recorded `gate-probe-selfchecks` count stays the
+        // body's own.
+        async fn run_frontier_cell(label: String, copies: usize, spec: &CellSpec) -> FrontierCell {
+            let CellSpec {
+                n,
+                cadence_ms,
+                bps,
+                burst,
+                gap,
+                seed,
+                msg_len,
+                owd,
+            } = *spec;
+            use crate::udp::testing::{
+                BasisPoints, BurstLoss, wrap_fec_burst_delayed_with_mss_and_fec_tuning,
+                wrap_fec_delayed_with_mss_and_fec_tuning,
+                wrap_fec_iid_delayed_with_mss_and_fec_tuning,
+            };
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let mss = 8192usize;
+            let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+
+            let (counting, datagrams, wire_bytes) = CountingWrite::new(a.clone());
+            let tuning =
+                crate::traffic_shaping::redundancy::fec::gate::FecTuning::interactive_prompt();
+            let mut a_layer = if burst > 0 {
+                wrap_fec_burst_delayed_with_mss_and_fec_tuning(
+                    a.clone(),
+                    counting,
+                    true,
+                    mss,
+                    tuning,
+                    BurstLoss::new(burst, gap, gap, seed),
+                    owd,
+                )
+            } else {
+                wrap_fec_iid_delayed_with_mss_and_fec_tuning(
+                    a.clone(),
+                    counting,
+                    true,
+                    mss,
+                    tuning,
+                    BasisPoints::new(bps),
+                    owd,
+                )
+            };
+            a_layer.fresh_tail_armor_copies_override = Some(copies);
+            let armor_copies = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            {
+                let armor = Arc::clone(&armor_copies);
+                a_layer.metrics_observer =
+                    Some(crate::metrics::MetricsObserver::new(move |observation| {
+                        if observation.event
+                            == crate::metrics::MetricsEvent::RetransmissionArmorDuplicate
+                        {
+                            armor.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    }));
+            }
+            let b_layer =
+                wrap_fec_delayed_with_mss_and_fec_tuning(b.clone(), b, true, mss, tuning, owd);
+            let (mut a_r, mut a_w, _a_supervisor) = crate::socket::socket(a_layer, None);
+            let (mut b_r, mut b_w, _b_supervisor) = crate::socket::socket(b_layer, None);
+            let mut echo_tasks = tokio::task::JoinSet::new();
+            echo_tasks.spawn(async move {
+                let mut buf = vec![0u8; msg_len];
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(2000),
+                        b_r.recv(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(len)) => {
+                            let _ = b_w.send(&buf[..len]).await;
+                        }
+                    }
+                }
+            });
+            let send_times: Arc<
+                std::sync::Mutex<std::collections::HashMap<u32, std::time::Instant>>,
+            > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let latencies = Arc::new(std::sync::Mutex::new(Vec::with_capacity(n)));
+            let mut consumer_tasks = tokio::task::JoinSet::new();
+            {
+                let send_times = Arc::clone(&send_times);
+                let latencies = Arc::clone(&latencies);
+                consumer_tasks.spawn(async move {
+                    let mut buf = vec![0u8; msg_len];
+                    loop {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            a_r.recv(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(len)) if len >= 4 => {
+                                let id = u32::from_le_bytes(buf[..4].try_into().unwrap());
+                                if let Some(start) = send_times.lock().unwrap().remove(&id) {
+                                    latencies.lock().unwrap().push(start.elapsed());
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                });
+            }
+            let mut send_failures = 0usize;
+            for i in 0..n {
+                let mut msg = vec![(i % 251) as u8; msg_len];
+                msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                send_times
+                    .lock()
+                    .unwrap()
+                    .insert(i as u32, std::time::Instant::now());
+                if !tokio::time::timeout(std::time::Duration::from_secs(2), a_w.send(&msg))
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+                {
+                    send_failures += 1;
+                    send_times.lock().unwrap().remove(&(i as u32));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(cadence_ms as u64)).await;
+            }
+            drop(a_w);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while consumer_tasks.join_next().await.is_some() {}
+            })
+            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), echo_tasks.join_next())
+                .await;
+
+            let mut lat = latencies.lock().unwrap().clone();
+            lat.sort_unstable();
+            let pick = |q: f64| -> f64 {
+                if lat.is_empty() {
+                    return 0.0;
+                }
+                lat[(((lat.len() - 1) as f64) * q).round() as usize].as_secs_f64() * 1000.0
+            };
+            FrontierCell {
+                label,
+                samples: lat.len(),
+                send_failures,
+                datagrams: datagrams.load(AtomicOrdering::Relaxed),
+                armor_per_msg: armor_copies.load(AtomicOrdering::Relaxed) as f64 / n as f64,
+                bytes_per_msg: wire_bytes.load(AtomicOrdering::Relaxed) as f64 / n as f64,
+                p99_ms: pick(0.99),
+                max_ms: lat.last().map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0),
+            }
+        }
+
+        let env_usize = |key: &str, default: usize| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let n = env_usize("COVER_SWEEP_N", 150);
+        let cadence_ms = env_usize("COVER_SWEEP_CADENCE_MS", 100);
+        let low = env_usize("COVER_SWEEP_LOW", 4);
+        let high = env_usize("COVER_SWEEP_HIGH", 8);
+        let bps = env_usize("COVER_SWEEP_BPS", 0);
+        let burst = env_usize("COVER_SWEEP_BURST", 0);
+        let gap = env_usize("COVER_SWEEP_GAP", 0);
+        let seed = env_usize("COVER_SWEEP_SEED", 0x1234_5678) as u64;
+        let spec = CellSpec {
+            n,
+            cadence_ms,
+            bps,
+            burst,
+            gap,
+            seed,
+            msg_len: 256usize,
+            owd: std::time::Duration::from_millis(20),
+        };
+
+        let lo = run_frontier_cell(format!("cover={low}"), low, &spec).await;
+        let hi = run_frontier_cell(format!("cover={high}"), high, &spec).await;
+
+        for cell in [&lo, &hi] {
+            eprintln!(
+                "COVER_FRONTIER cell={} bps={} burst={} gap={} n={} cadence_ms={} samples={} send_failures={} p99_ms={:.2} max_ms={:.2} armor_per_msg={:.3} dgrams={} bytes_per_msg={:.1}",
+                cell.label,
+                bps,
+                burst,
+                gap,
+                n,
+                cadence_ms,
+                cell.samples,
+                cell.send_failures,
+                cell.p99_ms,
+                cell.max_ms,
+                cell.armor_per_msg,
+                cell.datagrams,
+                cell.bytes_per_msg,
+            );
+        }
+
+        // Measurement integrity: both cells produced samples and ran the whole
+        // load, the wire counter fired on both, and an echoed round trip cannot
+        // beat the link's two-way floor.  None of these is a product bound.
+        assert!(
+            lo.samples > 0 && hi.samples > 0,
+            "COVER_FRONTIER bps={bps} burst={burst} gap={gap} n={n}: a cell measured no echo ({} / {} samples), so its percentile columns are placeholders and its wire columns describe no round trip",
+            lo.samples,
+            hi.samples,
+        );
+        assert_eq!(
+            lo.send_failures, 0,
+            "COVER_FRONTIER cover={low} bps={bps} burst={burst} gap={gap} n={n}: {} sends missed their 2 s deadline, so the cell did not run the load it claims",
+            lo.send_failures,
+        );
+        assert_eq!(
+            hi.send_failures, 0,
+            "COVER_FRONTIER cover={high} bps={bps} burst={burst} gap={gap} n={n}: {} sends missed their 2 s deadline, so the cell did not run the load it claims",
+            hi.send_failures,
+        );
+        assert!(
+            lo.datagrams > 0 && hi.datagrams > 0,
+            "COVER_FRONTIER bps={bps} burst={burst} gap={gap} n={n}: the wire counter observed {} / {} datagrams, so bytes_per_msg is a dead counter rather than zero redundancy",
+            lo.datagrams,
+            hi.datagrams,
+        );
+        // The load-bearing assertion: this arm exists to measure the *cover*,
+        // so forcing a larger cover must raise the cover the lane actually
+        // admits.  This is the check the declared cell it sits beside cannot
+        // make, and the property that goes red when the override is inert.
+        assert!(
+            hi.armor_per_msg > lo.armor_per_msg,
+            "COVER_FRONTIER bps={bps} burst={burst} gap={gap} n={n} cadence_ms={cadence_ms}: forcing cover {high} admitted {:.3} armour copies per message against {:.3} at cover {low}: the forced cover did not raise the cover the lane sent, so this cell measures the admission control and not the cover",
+            hi.armor_per_msg,
+            lo.armor_per_msg,
+        );
+        assert!(
+            hi.bytes_per_msg > lo.bytes_per_msg,
+            "COVER_FRONTIER bps={bps} burst={burst} gap={gap} n={n}: the larger cover sent {:.1} bytes per message against {:.1}, so the wire did not follow the cover and the frontier has no cost column",
+            hi.bytes_per_msg,
+            lo.bytes_per_msg,
+        );
+        let two_way_floor_ms = 2.0 * spec.owd.as_secs_f64() * 1000.0;
+        assert!(
+            lo.p99_ms >= two_way_floor_ms && hi.p99_ms >= two_way_floor_ms,
+            "COVER_FRONTIER bps={bps} burst={burst} gap={gap} n={n}: p99 {:.2} / {:.2} ms is below the link's two-way floor {two_way_floor_ms:.2} ms, so these samples are not round trips of this link",
+            lo.p99_ms,
+            hi.p99_ms,
+        );
+    }
 }

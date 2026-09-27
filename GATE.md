@@ -89,9 +89,9 @@ opt-in sets are recorded here and machine-checked:
   visible in this file), and when the block names a test that is not a probe.
 
 The whole in-crate opt-in battery is `cargo test --release -p rtp --lib --
---ignored`; the seven probes' own `#[ignore]` reasons sum to ~389 s (~6.5
+--ignored`; the eight probes' own `#[ignore]` reasons sum to ~420 s (~7.0
 minutes), and the four perf lanes are declared in the perf block below with
-measured costs rather than cited ones. The 389 s is the sum of the probes'
+measured costs rather than cited ones. The 420 s is the sum of the probes'
 own `#[ignore]` reasons; the perf block cites each probe at the figure its
 reason states.
 
@@ -606,7 +606,7 @@ negative-control deadline against an admission measured at 0.67-1.46 ms, and
 100 ms now bounds it. The two session-bounds rows that stood at 3.00 s each in
 the list above now cost 0.01 s each: each wait was the bound it asserts, driven
 by a paused runtime clock. Second, the in-crate opt-in battery is **not** "about
-four minutes" — the seven probes' own `#[ignore]` reasons sum to ~389 s —
+four minutes" — the eight probes' own `#[ignore]` reasons sum to ~420 s —
 which is what the perf block cites for them, and that sum has not been measured
 as such. (The four perf lanes are not part of it: their rows' costs are
 measured, not cited, and are recorded in the `perf-lane` family below.)
@@ -702,7 +702,7 @@ given a number: it is recorded as a gap below, so an unmeasured cost is
 visibly pending instead of plausibly guessed.
 
 The declared sums are `default` 14.30 s of a 60 s budget, `standard` 70.18 s of
-300 s, `perf` 389 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
+300 s, `perf` 420 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
 declared so a later row cannot be added without one — `full` is the tier the
 ~90-minute `shared_bneck_fairness_longrun` lives in.
 
@@ -737,6 +737,7 @@ lib::socket::stream::tests::probe_fresh_tail_burst_loss_latency = perf | 145 | c
 lib::socket::stream::tests::probe_single_symbol_interactive_fec_repair = perf | 45 | composite(fec,impairment,metric)@probe | probe-fec@impairment=loss+metric=repair-latency+layer=rtp+fec=on
 lib::socket::stream::tests::probe_lone_tail_repair_deadline_latency = perf | 162 | composite(handshake,impairment,metric)@probe | probe-deadline@impairment=burst-loss+metric=repair-deadline+layer=rtp+handshake=seeded
 lib::socket::stream::tests::probe_armor_copy_cell = perf | 10 | composite(impairment,metric,scale)@probe | probe-armor@impairment=clean+metric=armour-copy+layer=rtp+scale=cell
+lib::socket::stream::tests::probe_armor_cover_frontier = perf | 31 | composite(impairment,metric,scale)@probe | probe-cover-frontier@impairment=clean+metric=realised-cover+layer=rtp+scale=two-forced-covers
 ```
 
 ### The families
@@ -751,7 +752,7 @@ one-axis set. The six named families each carry their own reference:
 shared-bottleneck instrument's own sanity pair, one dimension apart),
 `liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
 hostile-datagram FEC decoder fuzz pair, a deliberate repeat through the
-unguarded path), `probe` (the seven report-only repair-latency instruments) and
+unguarded path), `probe` (the eight report-only repair-latency instruments) and
 `perf-lane` (the four asserting in-crate scaling gates: one reference, the
 in-order receive-window advance, and the three rows that vary one or two
 dimensions from it). The bulk of the declared rows are `composite` because the
@@ -947,7 +948,8 @@ scriptless marker `-`.
 ```gate-env-tier
 fair-longrun = RTP_FAIR_LONGRUN_REPS,RTP_FAIR_LONGRUN_SECS,RTP_FAIR_SKIP_SECS,RTP_FAIR_WINDOW_SECS,RTP_FAIR_CONFIGS | - | the windowed Jain fairness index and the slower flow's minimum share of two bulk flows' goodput converging on one 10 Mbit/s / 128 KiB shared serialization bottleneck, sampled in 250 ms bins over each sliding RTP_FAIR_WINDOW_SECS-second window after the RTP_FAIR_SKIP_SECS post-join ramp is skipped, for RTP_FAIR_LONGRUN_REPS reps of RTP_FAIR_LONGRUN_SECS measured seconds across six RTT-symmetry and arrival configurations (RTP_FAIR_CONFIGS selects which of the six run — unset means all six — and is a selector rather than a size, so it is the surface's one variable the load total does not factor) | contested-instrument@impairment=none+metric=jain-window+layer=shared-bottleneck+scale=long-run, contested-instrument@impairment=none+metric=share-min+layer=shared-bottleneck+scale=long-run | RTP_FAIR_LONGRUN_REPS=1,RTP_FAIR_LONGRUN_SECS=60,RTP_FAIR_SKIP_SECS=10,RTP_FAIR_WINDOW_SECS=20,total=6*RTP_FAIR_LONGRUN_REPS*RTP_FAIR_LONGRUN_SECS,wall=364s
 reliability-path-defaults = RTP_INSTREAM_GROUP_FEC,RTP_FRAME_DELIVERY,RTP_JITTER_CAP,RTP_MAX_DIVERSITY,RTP_MINDIV,RTP_RTX_DUP | - | the per-process `Default`s of the connect/accept config, each sampled once and cached so a config built later cannot observe a mid-run environment mutation: `RTP_INSTREAM_GROUP_FEC` selects in-stream group FEC parity (`src/traffic_shaping/redundancy/mod.rs:14`), `RTP_FRAME_DELIVERY` selects the receiver's frame-delivery mode (`src/delivery/frame/mode.rs:75`), `RTP_JITTER_CAP` selects the jitter-tolerant fast-retransmit reorder window and is default ON, only an explicit 0/false turning it off (`src/traffic_shaping/recovery/pkt_send_space.rs:121`), `RTP_MAX_DIVERSITY`, with `RTP_MINDIV` as the legacy alias it falls back to, selects the maximum-diversity FEC preset (`src/traffic_shaping/redundancy/fec/gate/tuning.rs:124`), and `RTP_RTX_DUP` (`1`/`true` enables, anything else — including unset — disables) selects whether a recovery send gets a duplicate wire copy, sampled once through a `LazyLock` whose `const` string alias names it (`src/traffic_shaping/redundancy/retransmission_armor/config.rs:13,35`) and read by both config `Default`s (`src/udp.rs:492,549`); each selects a behaviour an explicit per-connection argument overrides, and none sizes a measurement | transport-delivery@knob=RTP_INSTREAM_GROUP_FEC+mode=instream-parity, transport-delivery@knob=RTP_FRAME_DELIVERY+mode=frame-delivery, transport-latency@knob=RTP_JITTER_CAP+window=jitter-margin, transport-delivery@knob=RTP_MAX_DIVERSITY+preset=max-diversity, transport-delivery@knob=RTP_MINDIV+preset=legacy-alias, transport-delivery@knob=RTP_RTX_DUP+mode=armor-dup, transport-delivery@knob=RTP_RTX_DUP+mode=armor-off
-armor-frontier-cell = ARMOR_COPIES,ARMOR_N,ARMOR_CADENCE_MS,ARMOR_BPS,ARMOR_BURST,ARMOR_GAP,ARMOR_SEED | - | the fresh-tail armour copy count `probe_armor_copy_cell` forces through the test-only `fresh_tail_armor_copies_override` so one efficiency-frontier cell is swept independently of the loss-adaptive ladder, `-1` keeping the production ladder (`src/socket/stream.rs:1834`); the probe's load is `ARMOR_N` stamped 256-byte messages sent one per `ARMOR_CADENCE_MS` (`:1833`, `:1844`), so those two size the cost — the measured `wall` below is their product plus the consumer's idle drain (10.57 s, 10.57 s and 10.58 s over three reps) — while `ARMOR_BPS` (iid loss basis points, 0 = off, `:1839`), `ARMOR_BURST` and `ARMOR_GAP` (burst length and fixed quiet gap, burst 0 = off, `:1840-1841`) and `ARMOR_SEED` (`:1842`) only select the injected-loss regime and its reproducible draw (`BurstLoss::new(burst, gap, gap, seed)`, `src/udp/testing.rs:168`); all seven are read by the local `env_usize` closure (`src/socket/stream.rs:1825-1831`), which forwards its `key` argument to `env::var` | armor-frontier@knob=ARMOR_COPIES+mode=forced-count, armor-frontier@knob=ARMOR_COPIES+mode=production-ladder, armor-frontier@impairment=iid-loss+knob=ARMOR_BPS, armor-frontier@impairment=burst-loss+knob=ARMOR_BURST | ARMOR_N=400,ARMOR_CADENCE_MS=25,total=ARMOR_N*ARMOR_CADENCE_MS,wall=10.58s
+armor-frontier-cell = ARMOR_COPIES,ARMOR_N,ARMOR_CADENCE_MS,ARMOR_BPS,ARMOR_BURST,ARMOR_GAP,ARMOR_SEED | - | the fresh-tail armour copy count `probe_armor_copy_cell` forces through the test-only `fresh_tail_armor_copies_override` so one efficiency-frontier cell is swept independently of the loss-adaptive ladder, `-1` keeping the production ladder (`src/socket/stream.rs:1834`); the probe's load is `ARMOR_N` stamped 256-byte messages sent one per `ARMOR_CADENCE_MS` (`:1833`, `:1844`), so those two size the cost — the measured `wall` below is their product plus the consumer's idle drain (10.57 s, 10.57 s and 10.58 s over three reps) — while `ARMOR_BPS` (iid loss basis points, 0 = off, `:1839`), `ARMOR_BURST` and `ARMOR_GAP` (burst length and fixed quiet gap, burst 0 = off, `:1840-1841`) and `ARMOR_SEED` (`:1842`) only select the injected-loss regime and its reproducible draw (`BurstLoss::new(burst, gap, gap, seed)`, `src/udp/testing.rs:168`); all seven are read by the local `env_usize` closure (`src/socket/stream.rs:1825-1831`), which forwards its `key` argument to `env::var`.  **This cell cannot sweep its knob upward, and must not be read as if it can:** at the 25 ms cadence its load declares, the send pacer grants ~3.2 datagrams per message and a forced cover above ~2.4 copies is never admitted, so `ARMOR_COPIES` 4, 5, 7, 9 and 11 all realise the same 2.393 armour copies and 977 B per message that `ARMOR_COPIES=2` nearly does (2.005 / 868 B).  The cover frontier is measured where the knob is live by `cover-frontier-cell` / `probe_armor_cover_frontier` below. | armor-frontier@knob=ARMOR_COPIES+mode=forced-count, armor-frontier@knob=ARMOR_COPIES+mode=production-ladder, armor-frontier@impairment=iid-loss+knob=ARMOR_BPS, armor-frontier@impairment=burst-loss+knob=ARMOR_BURST | ARMOR_N=400,ARMOR_CADENCE_MS=25,total=ARMOR_N*ARMOR_CADENCE_MS,wall=10.58s
+cover-frontier-cell = COVER_SWEEP_LOW,COVER_SWEEP_HIGH,COVER_SWEEP_N,COVER_SWEEP_CADENCE_MS,COVER_SWEEP_BPS,COVER_SWEEP_BURST,COVER_SWEEP_GAP,COVER_SWEEP_SEED | - | the two ends of the fresh-tail armour cover frontier `probe_armor_cover_frontier` sweeps, forcing each through the same test-only `fresh_tail_armor_copies_override` (`src/socket/stream.rs:2915`) that `probe_armor_copy_cell` forces; the surface exists because that override is only *realised* where the send pacer admits it, so a cover sweep has to name the cadence at which it claims the knob is live: `COVER_SWEEP_LOW` and `COVER_SWEEP_HIGH` are the two forced covers (`:3030-3031`), `COVER_SWEEP_N` the stamped 256-byte messages per cell at one per `COVER_SWEEP_CADENCE_MS` (`:3028-3029`), so those three size the cost (measured `wall` below is `2 * N * cadence` plus the consumer's idle drain, 30.45 s and 30.47 s over two reps), while `COVER_SWEEP_BPS` (iid loss basis points, 0 = off, `:3032`), `COVER_SWEEP_BURST` and `COVER_SWEEP_GAP` (burst length and fixed quiet gap, burst 0 = off, `:3033-3034`) and `COVER_SWEEP_SEED` (`:3035`) only select the injected-loss regime and its reproducible draw (`BurstLoss::new(burst, gap, gap, seed)`, `src/udp/testing.rs:168`); all eight are read by the probe's own `env_usize` closure (`src/socket/stream.rs:3022-3027`) | cover-frontier@knob=COVER_SWEEP_LOW+mode=forced-cover, cover-frontier@knob=COVER_SWEEP_HIGH+mode=forced-cover, cover-frontier@impairment=iid-loss+knob=COVER_SWEEP_BPS, cover-frontier@impairment=burst-loss+knob=COVER_SWEEP_BURST | COVER_SWEEP_LOW=4,COVER_SWEEP_HIGH=8,COVER_SWEEP_N=150,COVER_SWEEP_CADENCE_MS=100,total=2*COVER_SWEEP_N*COVER_SWEEP_CADENCE_MS,wall=31s
 perf-trace-capture = NETEM_PERF_TRACE_DIR,NETEM_PERF_TRACE_RTP | - | opt-in performance-probe capture rather than a load knob: `NETEM_PERF_TRACE_DIR` names an output directory and enables the 50 ms client and accepted-peer RTP capture plus the netem and application-progress samples, and `NETEM_PERF_TRACE_RTP=0` retains only the netem and progress samples for an observer-free control run with the same artifacts (`src/testkit/perf_trace.rs:1061-1062`); both select a diagnostic output, and the capture's rows-per-second is a fixed constant regardless of lane speed | perf-trace@knob=NETEM_PERF_TRACE_DIR+artifact=capture-dir, perf-trace@knob=NETEM_PERF_TRACE_RTP+mode=netem-only-control
 debug-send-toggle = RTP_DEBUG_SEND | - | the process-wide debug-trace toggle on the per-packet send and receive paths (`src/debug.rs:28`): set prints the debug lines and unset is silent, and it is read once into a `OnceLock` so a busy sender pays no per-packet `getenv`; it is a diagnostic control, not a fault injection, and selects no measurement | debug-trace@knob=RTP_DEBUG_SEND+toggle=set, debug-trace@knob=RTP_DEBUG_SEND+toggle=unset
 ```
@@ -972,13 +974,14 @@ compiled `--lib` target and owns the *tier*, whose vocabulary is the harness's
 therefore appears in both blocks under the two names that mean the same thing —
 `perf-lane` here, `standard` there — because the harness tier that may carry an
 assertion is `standard` and its `perf` tier is report-only by definition. The
-seven `probe`s appear here as `probe` and in the perf block as `perf`-tier rows,
+eight `probe`s appear here as `probe` and in the perf block as `perf`-tier rows,
 which is the same statement in each vocabulary.
 
 ```ignored-manifest
 src/recv_queue/pkt_recv_space.rs::advancing_the_receive_window_costs_no_more_per_packet = perf-lane
 src/recv_queue/pkt_recv_space.rs::withholding_frames_behind_a_hole_costs_no_more_per_pop = perf-lane
 src/socket/stream.rs::probe_armor_copy_cell = probe
+src/socket/stream.rs::probe_armor_cover_frontier = probe
 src/socket/stream.rs::probe_fresh_tail_armor_latency = probe
 src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = probe
 src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = probe
@@ -1020,6 +1023,7 @@ a change to this file.
 
 ```gate-probe-selfchecks
 src/socket/stream.rs::probe_armor_copy_cell = 6
+src/socket/stream.rs::probe_armor_cover_frontier = 7
 src/socket/stream.rs::probe_fresh_tail_armor_latency = 4
 src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = 7
 src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 8
@@ -1176,5 +1180,37 @@ actually sends.  So the residual is `floor(burst / 6) × ~300 ms`: a 0.33–2.4 
 lone maximum is a burst of 6–15+ consecutive datagrams and the field's 3.2 s
 climb is ~12 rungs of the same arithmetic.  The lever that would reduce it is
 a larger `m`, and that is the interactive lane's own wire, which M2 exists to
-bound.  Recorded as inherent, with the instrument that measures it
-(`probe_lone_tail_finite_loss_ladder`) rather than as an open lever.
+bound.  **That lever has now been swept rather than argued, and it is refused
+on measurement.**  `probe_armor_cover_frontier` (new, `perf` tier, 31 s) forces
+the `fresh_tail_armor_copies_override` at two covers on a cadence where the send
+pacer is *not* the binding term, and asserts the cover it forces is the cover
+the lane admits — an assertion the pre-existing `probe_armor_copy_cell` cannot
+make, because at its declared 25 ms cadence the pacer grants only ~3.2 datagrams
+per message and any forced cover above ~2.4 copies is never admitted, so that
+arm's `ARMOR_COPIES` sweep is inert *upward* (measured: `ARMOR_COPIES` 4, 5, 7,
+9 and 11 all realise `armor_per_msg` 2.393, `bytes_per_msg` 977 B, against 2.005
+/ 868 B at `ARMOR_COPIES=2`; the declared
+`armor-frontier@knob=ARMOR_COPIES+mode=forced-count` cell therefore cannot sweep
+the cover it names).  At a live cadence the override is realised exactly —
+`m = 2 + copies`, `armor_per_msg` 4.027 / 8.053 at covers 4 / 8, wire 5.59× /
+9.98× — so the frontier is measurable; what is not is a *benefit*.  At the
+field's own burst scale (a 72-datagram burst at 200 ms RTT, the burst the 3.2 s
+climb's ~12 rungs imply) the modest increase buys nothing reproducible: cover 4
+reads p99 1207.0 / 1206.9 / 1206.9 ms and max 1443.0 / 1440.6 / 1439.2 ms over
+three reps against cover 8's p99 1205.1 / 1203.9 / 1311.8 ms and max 1440.3 /
+1440.7 / 1598.1 ms, for wire 4.19× → 5.13×.  Only a cover the constitution
+cannot pay for moves it: cover 11 (`m = 13`) reads p99 439.3 ms and max 697.7 ms
+at 12.47× wire, more than twice the clean-lane budget.  The `rtp_mux` mandate
+arms say the same at the field's RTT — the field-RTT lone tail's p99 moves 314.8
+→ 292.4 ms (−7 %, three reps each, disjoint) while `lone_wire_x` moves 6.19× →
+8.35× and the hostile arm's 4.83× → 7.08× — and they add the cost this section
+could not see from inside `rtp`: on `mandate_smoke::m4_interactive_lane_fairness`
+(four interactive flows sharing the clean lane) the clean arm's slowest-flow p50
+moves 23.4–25.0 ms → 99.3–118.5 ms and its p99 max 177.4–183.7 ms → 253.4–265.0
+ms, six reps each and disjoint, while fairness itself is untouched (imbalance
+≤ 0.0029 against the 0.010 bound).  The deployed client multiplexes everything
+over one long-lived session, so the four-flow shape *is* the production shape,
+and a 4.5× clean-lane p50 regression is exactly the failure M2 exists to
+prevent.  Recorded as inherent, with the instrument that measures it
+(`probe_lone_tail_finite_loss_ladder`) and the frontier that refuses it
+(`probe_armor_cover_frontier`) rather than as an open lever.
