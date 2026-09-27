@@ -294,9 +294,11 @@ not a magic constant; the harness never restates one.
    exactly the cover the interactive tail's armour exists to absorb — costs
    the interactive lane **no rung at all**, so a lone-tail excursion cannot be
    a short burst: the arm's observed maxima are `floor(burst / 6)` for a burst
-   of 6–18+ datagrams.  And the first two rungs are the prober's two
-   `2 * sRTT` windows rather than the floor, so only the rungs after them are
-   floor-shaped.
+   of 6–18+ datagrams.  And the ladder's first rung is the prober's first probe
+   window — `2 * sRTT` capped at the corroborated repair deadline — so on a path
+   where that cap binds the head rung is deadline-shaped, and only the rungs
+   after it are floor-shaped.  The pre-cap table rows in the M1 section below are
+   superseded by the head-rung paragraph there.
 
    This transport's tail-recovery timing departs from RFC 8985 in three
    places.  All are recorded here because the latency floors above are built
@@ -404,9 +406,10 @@ not a magic constant; the harness never restates one.
      which drives the replay against the *wire* (datagram `i` is dropped while
      `i < burst`; the ACK ends the episode) rather than against its own
      arithmetic.  At the field's 190 ms round trip the interactive tail's
-     `m = 6` ladder fires at **380, 680, 980 ms** — the `2 * sRTT` head rung, then
+     `m = 6` ladder fires at **300, 600, 900 ms** — the head rung
+     `min(2 * sRTT, corroborated repair deadline)` = 300 ms, then
      `TAIL_PROBED_MIN_RTO` apart — delivers on the third rung, is acked at
-     **1170 ms** and spends **24 datagrams**; `m = 1` costs one rung per datagram
+     **1090 ms** and spends **24 datagrams**; `m = 1` costs one rung per datagram
      (18 rungs, 19 datagrams for an 18-datagram burst); and a burst the cover
      absorbs fires nothing and is acked at one round trip.  Setting
      `TAIL_PROBED_MIN_RTO` to 150 ms fails the guard naming the observed
@@ -423,23 +426,32 @@ not a magic constant; the harness never restates one.
 
      | floor | burst 6 p50/p99/max | burst 18 | burst 48 | wire amp 6 / 18 / 48 |
      |---|---|---|---|---|
-     | 300 (production) | 570 / 741 / 770 | 1170 / 1341 / 1370 | 2670 / 2841 / 2870 | 1.078 / 1.039 / 1.017 |
-     | 250 | 570 / 741 / 770 | 1070 / 1241 / 1270 | 2320 / 2491 / 2520 | 1.117 / 1.059 / 1.026 |
-     | 200 | 570 / 741 / 770 | 970 / 1141 / 1170 | 1970 / 2141 / 2170 | 1.219 / 1.109 / 1.049 |
-     | 150 | 570 / 741 / 770 | 952 / 1123 / 1152 | 1907 / 2078 / 2107 | 1.242 / 1.121 / 1.054 |
+     | 300 (production) | 490 / 661 / 690 | 1090 / 1261 / 1290 | 2590 / 2761 / 2790 | 1.078 / 1.039 / 1.017 |
+     | 250 | 440 / 611 / 640 | 940 / 1111 / 1140 | 2190 / 2361 / 2390 | 1.117 / 1.059 / 1.026 |
+     | 200 | 390 / 561 / 590 | 790 / 961 / 990 | 1790 / 1961 / 1990 | 1.219 / 1.109 / 1.049 |
+     | 150 | 381 / 552 / 581 | 763 / 934 / 963 | 1718 / 1889 / 1918 | 1.242 / 1.121 / 1.054 |
 
-     Two things this settles.  First, **below the floor the binding term is the
-     corroborated margin, not the floor**: at 190 ms the margin is 190 ms, so
-     150, 100 and 50 ms all step the same 191 ms and the floor has no effect there.
-     Second, **on the shallowest excursion — the one the interactive lane actually
-     takes, `m = 6` against a cover-sized burst — no floor from 300 down to 150 ms
-     moves M1 at all** (570 / 741 / 770 ms, identical), while the wire rises
-     1.078 → 1.242, because a burst the head rung already crosses never reaches a
-     floor-governed rung and only the rungs that fire *blind* — after the tail was
-     delivered and before its ACK was back — change.  Only the deep bursts gain
-     (burst 48: max 2870 → 2107 ms) and they pay 1.017 → 1.054 wire to do it, which is
-     the trade the end-to-end arms already measured as a **worse** tail.  The floor
-     therefore stays, now with the shallow-excursion half quantified.
+     Two things this settles.  First, **below the floor the steady rung's binding
+     term is the corroborated margin, not the floor**: on this low-variance 190 ms
+     fixture the margin is the clean-path `raw_rto` ≈ 191 ms (below the floor and
+     below `sRTT + sRTT / 4`, because `corroborated_repair_rto` is bounded above by
+     `raw_rto`), so 150, 100 and 50 ms all step the same 191 ms.  Second, **the
+     floor rows are now a composite**, because the head rung's cap is
+     `max(corroborated, floor)`: a floor below the corroborated deadline lowers the
+     head rung too, so a floor row varies two quantities at once.  The head cap
+     *alone* is isolated by the `production floor + head cap=` rows, which hold the
+     floor at 300 ms and move only the cap: at 190 ms, `m = 6`, cap 300 gives
+     490 / 661 / 690 ms, cap 250 gives 440 / 611 / 640 and cap 200 gives
+     390 / 561 / 590, **all at 1.078 wire amplification and 10 blind rungs at every
+     burst** — identical to production.  That is a *translation*, not a
+     compression: the head rung has no rung before it to be spaced away from, so
+     moving it shifts every rung equally and leaves the blind pattern invariant.
+     The floor rows do reach a lower deep-burst tail (burst 48: 2790 → 1918 ms at
+     floor 150), but they buy it by compressing the rungs *after* the head, and pay
+     wire for that compression (1.017 → 1.054), which is the trade the end-to-end
+     arms already measured as a **worse** tail.  The floor therefore stays at
+     300 ms — now the same number as the head cap, by construction rather than by
+     coincidence.
 
      **The probe budget does not bind at the field's round trip either**, and
      cannot: past the first probe the window's cap is `max(corroborated, floor)`,
@@ -454,18 +466,50 @@ not a magic constant; the harness never restates one.
      lowering it to 1 is strictly worse everywhere (50 ms, `m = 6`: p50 850 →
      1050 ms).
 
-     The sweep also isolated the lever the cover discussion never reached.  The
-     **head rung is `2 * sRTT`** (380 ms at the field), and it is capped by the
-     general RTO rather than by the repair floor, so no floor change touches it.
-     Capping it at the floor translates the whole ladder earlier without
-     compressing it, and the measured effect is a *free* latency cut: at 190 ms,
-     `m = 6`, burst 6 goes 570 / 741 / 770 → 490 / 661 / 690 ms at cap 300 and
-     390 / 561 / 590 ms at cap 200, with the wire amplification and the blind-rung
-     count **identical to production at every burst** (the head rung has no rung
-     before it to be spaced away from, so moving it shifts every rung equally and
-     leaves the blind pattern invariant).  That is a hypothesis, not a landing: no
-     end-to-end arm was run for it, so whether the shift survives the path's own
-     queueing is unmeasured.
+     The sweep also isolated the lever the cover discussion never reached, and it
+     has now been landed.  **The head rung is `min(2 * sRTT, corroborated repair
+     deadline)`** — RFC 8985 §7.2's `PTO = 2 * SRTT`, capped at the point the RTO
+     would fire (`TCP_RTO_expiration()`), which is exactly what the kernel does
+     (`net/ipv4/tcp_output.c:3129` `srtt_us >> 2` = 2 * RTT, capped by
+     `tcp_rto_delta_us` at `:3137-3141`).  The cap this protocol used was the
+     *general* RTO, which keeps RFC 6298's 1 s `MIN_RTO` floor — five times TCP's
+     own `TCP_RTO_MIN = HZ / 5` = 200 ms (`include/net/tcp.h:164`) — so at the
+     field's 190 ms round trip it left the head rung at the uncapped
+     2 * sRTT = 380 ms where TCP's own cap would already have fired at its floor.
+     The head rung is now capped at the **same corroborated repair deadline the
+     post-probe windows use**, which is never later than the general RTO and — the
+     deadline being `sRTT + max(rttvar, sRTT / 4)` bounded above by `raw_rto` —
+     never earlier than the measured sRTT.  The head rung is therefore confined to
+     `[sRTT, 2 * sRTT]` and can never be armed inside a round trip.
+
+     **That bound is the whole difference between this and a bare constant cap,
+     and at the field's round trip the two coincide.**  On a clean 190 ms path the
+     corroborated deadline is `raw_rto` ≈ 191 ms, so `max(corroborated, 300 ms)`
+     and a flat 300 ms give the *same* head rung, and no field-scale arm can tell
+     them apart — which is exactly why the constant form would have looked free.
+     `tlp::tests::the_head_rung_never_falls_below_one_round_trip` sweeps
+     10 / 50 / 100 / 190 / 400 / 1000 ms round trips and injects a constant 300 ms
+     cap through the same test-only override: production holds the head rung at or
+     above one round trip everywhere, and the injected constant arms below it at
+     400 and 1000 ms.  A flat cap is therefore **refused as a production form**: it
+     would have armed a probe inside a round trip on the field's own multi-second
+     excursions (the operator's observed 1063 ms and 3205 ms maxima).
+
+     **End-to-end status.**  On the deterministic replay the effect is a pure
+     translation: at 190 ms, `m = 6`, the head rung moves 380 → 300 ms and every
+     percentile at every burst drops by exactly that 80 ms — burst 6
+     570 / 741 / 770 → 490 / 661 / 690 ms, burst 18 1170 / 1341 / 1370 →
+     1090 / 1261 / 1290, burst 48 2670 / 2841 / 2870 → 2590 / 2761 / 2790 — with
+     the wire amplification and blind-rung count identical (1.078 / 1.039 / 1.017
+     and 10).  **What is not yet established is the end-to-end confirmation.**  No
+     `rtp_mux` mandate arm was run against this change (a peer iteration holds that
+     crate), so the mandate panels were not rendered and the interactive lane's own
+     wire multiple is unmeasured here; the socket-level
+     `probe_lone_tail_repair_deadline_latency` wall-clock arm is the transport's own
+     confirmation and must be re-run on a quiet host before this is treated as
+     shipped.  Until then this is a mechanism-correct, structurally bounded
+     translation whose deterministic effect is measured and whose end-to-end effect
+     is **not**.
 2. **Reasonable goodput of the interactive lane** — the lane delivers what it
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,

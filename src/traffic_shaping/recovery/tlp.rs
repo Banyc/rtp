@@ -33,11 +33,13 @@ pub struct TailLossProber {
 pub(crate) struct LadderSweep {
     repair_floor: Duration,
     probe_budget: u8,
-    /// Caps the **first** probe window — the one armed before any probe of the
-    /// episode has been sent, and so the height of the shortest, most common
-    /// excursion.  `None` keeps today's `min(2 * sRTT, RTO)`, whose cap is the
-    /// general RTO rather than the repair floor; `Some(t)` lowers that cap to
-    /// `t` (never above the RTO it replaces).
+    /// Lowers the **first** probe window's cap — the one armed before any
+    /// probe of the episode has been sent, and so the height of the shortest,
+    /// most common excursion.  `None` keeps the production cap (the
+    /// corroborated repair deadline, never above the general RTO); `Some(t)`
+    /// replaces it with `t` (never above the RTO it replaces), so a
+    /// measurement can put the production cap side by side with a stricter
+    /// constant one.
     first_probe_cap: Option<Duration>,
 }
 
@@ -96,18 +98,39 @@ impl TailLossProber {
     }
 
     /// The cap in force for the first probe window of an episode on a path that
-    /// already has an RTT sample: the live RTO, lowered to a swept cap when one
-    /// was injected.
-    fn first_probe_cap(&self, live_rto: Duration) -> Duration {
+    /// already has an RTT sample: the **same corroborated repair deadline the
+    /// post-probe windows are capped by** (see [`Self::rto`]), never above the
+    /// general RTO it replaces — lowered to a swept cap when one was injected.
+    ///
+    /// RFC 8985 §7.2 computes `PTO = 2 * SRTT` and caps it at the point the
+    /// RTO would fire (`TCP_RTO_expiration()`); the kernel does the same
+    /// (`net/ipv4/tcp_output.c:3129` `srtt_us >> 2` = 2 * RTT, capped by
+    /// `tcp_rto_delta_us` at `:3139-3141`).  The general RTO this protocol caps
+    /// with keeps RFC 6298's 1 s `MIN_RTO` floor, five times TCP's own
+    /// `TCP_RTO_MIN` = 200 ms (`include/net/tcp.h:164`), so on a 190 ms path the
+    /// cap is a full second and the head rung sits at 2 * sRTT where TCP would
+    /// already have fired at its floor.  The corroborated deadline is the same
+    /// number the later probes use, so the head rung now tightens with the
+    /// repair deadline it precedes.  It is never earlier than the measured sRTT
+    /// (the estimator's own reorder margin is added to it), so the head rung can
+    /// only be *translated* earlier — never below one round trip.  A bare
+    /// constant cap has no such bound: on a path whose round trip exceeds it the
+    /// probe would fire before the tail could possibly have been acked, which is
+    /// the spurious probe RFC 8985 §7.2 warns an `SRTT`-sized PTO into.
+    fn first_probe_cap(&self, rtt_stats: &RttStats, live_rto: Duration) -> Duration {
+        let corroborated = rtt_stats
+            .corroborated_repair_rto()
+            .max(self.repair_floor())
+            .min(live_rto);
         #[cfg(test)]
         {
             self.ladder
                 .first_probe_cap
-                .map_or(live_rto, |cap| cap.min(live_rto))
+                .map_or(corroborated, |cap| cap.min(live_rto))
         }
         #[cfg(not(test))]
         {
-            live_rto
+            corroborated
         }
     }
 
@@ -164,10 +187,12 @@ impl TailLossProber {
 
     /// Time between consecutive tail-loss probes for the current tail episode.
     /// The PTO formula: `max(2*srtt, 2*min_rtt)` with a 10 ms floor, capped at
-    /// the RTO currently in use — except before the first RTT sample, where the
-    /// cap is the post-probe floor (see [`Self::probe_window_with_srtt`]).  The
-    /// doubled terms use checked multiplication so a sub-nanosecond RTT cannot
-    /// round the doubling away.
+    /// the corroborated repair deadline once a probe has been sent — and, for
+    /// the first probe on a measured path, at that same deadline rather than at
+    /// the general RTO.  Before the first RTT sample the cap is the post-probe
+    /// floor (see [`Self::probe_window_with_srtt`]).  The doubled terms use
+    /// checked multiplication so a sub-nanosecond RTT cannot round the doubling
+    /// away.
     pub fn probe_window(&self, rtt_stats: &RttStats) -> Duration {
         let srtt = rtt_stats.smooth_rtt();
         self.probe_window_with_srtt(rtt_stats, srtt)
@@ -196,7 +221,7 @@ impl TailLossProber {
         let cap = if rtt_stats.min_rtt().is_none() {
             self.repair_floor()
         } else if self.probes_sent == 0 {
-            self.first_probe_cap(self.rto(rtt_stats))
+            self.first_probe_cap(rtt_stats, self.rto(rtt_stats))
         } else {
             self.rto(rtt_stats)
         };
@@ -501,8 +526,17 @@ mod tests {
         let sent = Instant::now();
         let window = tlp.probe_window(&rtt_stats);
 
-        // 2*srtt ~= 200ms, should be at least that.
-        assert!(window >= ms(10), "window={window:?}");
+        // The window is the uncapped `max(2*srtt, 2*min_rtt)` = 2*srtt here:
+        // the cap is the corroborated repair deadline, floored at
+        // `TAIL_PROBED_MIN_RTO`, and on this settled fixture (samples 100-119 ms,
+        // so sRTT is in that range and 2*sRTT <= 238 ms) the 300 ms floor sits
+        // above the doubled sRTT, so the cap does not bind the window.  Asserted
+        // exactly, so the claim cannot drift from the code.
+        let doubled_srtt = rtt_stats.smooth_rtt().checked_mul(2).unwrap();
+        assert_eq!(
+            window, doubled_srtt,
+            "the cap must not bind on this fixture: window={window:?} 2*srtt={doubled_srtt:?}"
+        );
         // Must not exceed the 1s RTO.
         assert!(window <= Duration::from_secs(1), "window={window:?}");
 
@@ -522,23 +556,102 @@ mod tests {
         assert_eq!(tlp.probe_window(&rtt_stats), rtt.checked_mul(2).unwrap());
     }
 
+    /// The window's uncapped term is `2 * sRTT`: `min_rtt` is the lifetime
+    /// minimum of the samples feeding `sRTT`, so `2 * min_rtt <= 2 * sRTT` and
+    /// only the dominant term is kept (checked here rather than doubled on
+    /// every poll).  That term is then capped at the corroborated repair
+    /// deadline — the same number the post-probe windows use, never above the
+    /// general RTO.  Both halves of the assertion are shown to bind, so the
+    /// test cannot pass with either half vacuous: the min-RTT term is strictly
+    /// below the sRTT term on at least one sample, and the cap is strictly
+    /// below the uncapped term on at least one.
     #[test]
     fn lifetime_minimum_is_dominated_across_varying_rtt_samples() {
         let mut rtt_stats = RttStats::new();
         let tlp = TailLossProber::new();
+        let mut min_rtt_was_strictly_smaller = false;
+        let mut cap_was_binding = false;
 
         for rtt in [ms(900), ms(100), ms(700), ms(250), ms(500)] {
             rtt_stats.record_rtt(rtt);
             let srtt = rtt_stats.smooth_rtt();
             let min_rtt = rtt_stats.min_rtt().unwrap();
             assert!(min_rtt <= srtt);
-            let old_formula = srtt
+            min_rtt_was_strictly_smaller |= min_rtt < srtt;
+            let uncapped = srtt
                 .checked_mul(2)
                 .unwrap()
                 .max(min_rtt.checked_mul(2).unwrap())
-                .max(TailLossProber::MIN_TOL)
+                .max(TailLossProber::MIN_TOL);
+            // The min-RTT term never changes the max: the simplification the
+            // probe window relies on, asserted directly against the term it
+            // drops.
+            assert_eq!(
+                uncapped,
+                srtt.checked_mul(2).unwrap().max(TailLossProber::MIN_TOL)
+            );
+            let cap = rtt_stats
+                .corroborated_repair_rto()
+                .max(TailLossProber::TAIL_PROBED_MIN_RTO)
                 .min(tlp.rto(&rtt_stats));
-            assert_eq!(tlp.probe_window(&rtt_stats), old_formula);
+            cap_was_binding |= cap < uncapped;
+            assert_eq!(
+                tlp.probe_window(&rtt_stats),
+                uncapped.min(cap),
+                "the window must be `max(2*sRTT, 2*min_rtt)` capped at the corroborated repair deadline"
+            );
+        }
+        assert!(
+            min_rtt_was_strictly_smaller,
+            "vacuity: every sample's min_rtt equalled its sRTT, so the min-RTT dominance is untested"
+        );
+        assert!(
+            cap_was_binding,
+            "vacuity: the corroborated cap never bound, so the capped half of the assertion is untested"
+        );
+    }
+
+    /// The head rung is never armed inside one round trip: its cap is the
+    /// corroborated repair deadline, which is `sRTT + max(rttvar, sRTT / 4)` and
+    /// so never earlier than the measured sRTT.  A bare constant cap has no
+    /// such bound — on a path whose round trip exceeds it the probe would fire
+    /// before the tail could possibly have been acked, the spurious probe
+    /// RFC 8985 §7.2 warns an `SRTT`-sized PTO into — so the vacuity half
+    /// injects that constant cap and shows the window falls below one round
+    /// trip.  That is the whole difference between the production cap and a
+    /// constant one, and the assertion is what keeps it.
+    #[test]
+    fn the_head_rung_never_falls_below_one_round_trip() {
+        for rtt_ms in [10u64, 50, 100, 190, 400, 1_000] {
+            let mut rtt_stats = RttStats::new();
+            for _ in 0..40 {
+                rtt_stats.record_rtt(ms(rtt_ms));
+            }
+            let tlp = TailLossProber::new();
+            let policy = rtt_stats.smooth_rtt().checked_mul(2).unwrap().min(
+                rtt_stats
+                    .corroborated_repair_rto()
+                    .max(TailLossProber::TAIL_PROBED_MIN_RTO),
+            );
+            assert_eq!(
+                tlp.probe_window(&rtt_stats),
+                policy,
+                "the head rung must be `min(2*sRTT, corroborated repair deadline)` at {rtt_ms} ms"
+            );
+            assert!(
+                tlp.probe_window(&rtt_stats) >= ms(rtt_ms),
+                "the head rung {:?} must never be armed before one round trip ({rtt_ms} ms): a probe inside the round trip is a guaranteed duplicate",
+                tlp.probe_window(&rtt_stats)
+            );
+            // Vacuity: a constant cap that ignores the path does arm inside it.
+            let mut capped = TailLossProber::new();
+            capped.set_first_probe_cap(Some(ms(300)));
+            if rtt_ms > 300 {
+                assert!(
+                    capped.probe_window(&rtt_stats) < ms(rtt_ms),
+                    "vacuity: a constant 300 ms cap must arm the head rung inside the {rtt_ms} ms round trip, or the bound above is a tautology"
+                );
+            }
         }
     }
 

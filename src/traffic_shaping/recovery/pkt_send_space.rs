@@ -1044,7 +1044,8 @@ impl PktSendSpace {
 
     /// Sweep the first probe window's cap — the head rung's spacing — on this
     /// send space.  Test-only and `None` by default, so a measurement can ask
-    /// what capping the head rung at the repair floor would buy.
+    /// what a stricter constant head cap would buy against the production one
+    /// (the corroborated repair deadline).
     #[cfg(test)]
     pub(crate) fn set_first_probe_cap(&mut self, cap: Option<Duration>) {
         self.tlp.set_first_probe_cap(cap);
@@ -5390,12 +5391,14 @@ mod tests {
     /// transmission lost, so no ACK ever refills the tail prober — against a
     /// settled RTT estimator, and prints every repair event with its offset
     /// from the packet's send. The rungs are the deadlines the send space arms:
-    /// the prober's two probe windows (`2 * sRTT`), then the full-RTO rungs
-    /// whose spacing is the RTO re-armed on each retransmission. Deterministic
-    /// and network-free, so the ladder's *spacing* — the quantity the field
-    /// stall is made of — is measurable without a load environment; the
-    /// socket-level `probe_lone_tail_repair_deadline_latency` measures the same
-    /// ladder end to end under a burst-loss impairment.
+    /// the prober's two probe windows (the first `min(2 * sRTT, corroborated
+    /// repair deadline)`, the second capped at that deadline once a probe has
+    /// been sent), then the full-RTO rungs whose spacing is the RTO re-armed on
+    /// each retransmission. Deterministic and network-free, so the ladder's
+    /// *spacing* — the quantity the field stall is made of — is measurable
+    /// without a load environment; the socket-level
+    /// `probe_lone_tail_repair_deadline_latency` measures the same ladder end
+    /// to end under a burst-loss impairment.
     ///
     /// Run with `--ignored --nocapture`.
     ///
@@ -5476,10 +5479,29 @@ mod tests {
                 "[probe ladder rtt={rtt_ms}ms] the arm produced {} full-RTO rungs: too few to measure the steady spacing, so the ladder it prints is not the repair ladder",
                 counters.rto_reason
             );
+            // The head rung is the probe window: `2 * sRTT` capped at the
+            // corroborated repair deadline (never above the general RTO).  On
+            // the 50 ms arm `2 * sRTT` = 100 ms is below the 300 ms floor, so
+            // the cap does not bind; on the 190 ms arm it does, and the head
+            // rung is the deadline.  Expected value derived from that policy,
+            // not from `probe_window` itself, so a revert to the general-RTO
+            // cap fails this assertion instead of moving both sides together.
+            let head_cap = space
+                .corroborated_repair_rto()
+                .max(TailLossProber::TAIL_PROBED_MIN_RTO);
+            let head_rung_ms = u64::try_from(
+                space
+                    .smooth_rtt()
+                    .checked_mul(2)
+                    .unwrap()
+                    .min(head_cap)
+                    .as_millis(),
+            )
+            .unwrap();
             assert_eq!(
                 ladder.first().map(|(at, _)| *at),
-                Some(rtt_ms * 2),
-                "[probe ladder rtt={rtt_ms}ms] the first rung is not the probe window (2*sRTT): the arm did not measure an RTT-estimated lone tail"
+                Some(head_rung_ms),
+                "[probe ladder rtt={rtt_ms}ms] the first rung is not the head rung `min(2*sRTT, corroborated repair deadline)`: the arm did not measure an RTT-estimated lone tail"
             );
             assert_eq!(
                 counters.rto_reason as usize,
@@ -5739,15 +5761,17 @@ mod tests {
 
     /// The ladder's *height* and *step*, measured from the wire: a finite burst
     /// costs `floor(burst / m)` rungs, each a `1 + cover`-datagram transmission,
-    /// and the rungs are one probe window apart at the head and one repair floor
-    /// apart thereafter.
+    /// and every rung sits one repair floor after the head, whose own height is
+    /// `min(2 * sRTT, corroborated repair deadline)` rather than the uncapped
+    /// `2 * sRTT`.
     ///
     /// This is the always-run guard on the two quantities the field's 3.2 s
     /// maximum is made of.  It is deliberately *not* an `#[ignore]` probe:
     /// the rung count and the inter-rung interval are read off the send space's
     /// own firing sequence (timestamps and retransmission counters), so a
-    /// collapsed rung, a doubled rung, a lost cover or a retuned floor moves
-    /// them.  `probe_lone_tail_wire_ladder_sweep` is the corresponding sweep.
+    /// collapsed rung, a doubled rung, a lost cover, a retuned floor or a head
+    /// rung uncapped from the repair deadline moves them.
+    /// `probe_lone_tail_wire_ladder_sweep` is the corresponding sweep.
     #[test]
     fn the_lone_tail_ladder_is_measured_from_the_wire_and_steps_by_the_repair_floor() {
         // 190 ms round trip, the interactive tail's `m = 6` cover, and a burst
@@ -5756,20 +5780,60 @@ mod tests {
         let outcome = replay_lone_tail_burst(190, 190, 6, 18, None, None);
         let times = outcome.rung_times();
         let observed_steps: Vec<u64> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        // The head rung's height is the probe window: RFC 8985 §7.2's
+        // `PTO = 2 * sRTT`, capped at the corroborated repair deadline (never
+        // above the general RTO).  The expected value is derived from that
+        // *policy* — the settled sRTT and the corroborated deadline — not from
+        // `probe_window` itself, so a revert to the general-RTO cap fails this
+        // assertion instead of moving both sides together.  On this settled
+        // 190 ms fixture `2 * sRTT` = 380 ms and the deadline is
+        // `TAIL_PROBED_MIN_RTO` = 300 ms, so the floor binds.
+        let t0 = Instant::now();
+        let mut settled = PktSendSpace::new();
+        for i in 0..40 {
+            settled.sample_rtt(ms(190), t0 + ms(i));
+        }
+        let head_cap = settled
+            .corroborated_repair_rto()
+            .max(TailLossProber::TAIL_PROBED_MIN_RTO);
+        assert_eq!(
+            settled.smooth_rtt(),
+            ms(190),
+            "the fixture must settle at 190 ms"
+        );
+        assert!(
+            settled.smooth_rtt().checked_mul(2).unwrap() > head_cap,
+            "vacuity: the head cap {head_cap:?} must sit below the uncapped 2*sRTT {:?}, or this assertion cannot tell a capped head rung from an uncapped one",
+            settled.smooth_rtt().checked_mul(2).unwrap()
+        );
+        let head_rung_ms = u64::try_from(
+            settled
+                .smooth_rtt()
+                .checked_mul(2)
+                .unwrap()
+                .min(head_cap)
+                .as_millis(),
+        )
+        .unwrap();
+        let floor_ms = u64::try_from(TailLossProber::TAIL_PROBED_MIN_RTO.as_millis()).unwrap();
         assert_eq!(
             times,
-            vec![380, 680, 980],
-            "the ladder's firings must be the pre-budget probe window (2*sRTT = 380 ms) followed by the post-probe floor: observed firings {times:?}, observed inter-rung spacings {observed_steps:?} ms"
+            vec![
+                head_rung_ms,
+                head_rung_ms + floor_ms,
+                head_rung_ms + 2 * floor_ms
+            ],
+            "the ladder's firings must be the head rung `min(2*sRTT, corroborated repair deadline)` = {head_rung_ms} ms followed by the post-probe floor: observed firings {times:?}, observed inter-rung spacings {observed_steps:?} ms"
         );
         assert_eq!(
             outcome.delivering,
-            Some((3, 980)),
+            Some((3, 900)),
             "the delivering transmission is the wire's, not the model's: observed {:?}",
             outcome.delivering
         );
         assert_eq!(
             outcome.ack_ms,
-            Some(1_170),
+            Some(1_090),
             "the episode ends at the measured ACK instant (delivery + RTT), not a computed wait: observed {:?}",
             outcome.ack_ms
         );
@@ -5787,7 +5851,6 @@ mod tests {
         // The step itself: every rung after the head sits the production
         // repair floor from the previous one.  This is the assertion a retuned
         // `TAIL_PROBED_MIN_RTO` breaks.
-        let floor_ms = u64::try_from(TailLossProber::TAIL_PROBED_MIN_RTO.as_millis()).unwrap();
         for pair in times.windows(2) {
             assert_eq!(
                 pair[1] - pair[0],
@@ -5974,12 +6037,15 @@ mod tests {
     /// datagrams divided by what the delivering transmission itself needed —
     /// `1.0` means no rung was wasted.
     ///
-    /// Two arms of the same sweep are deliberately different in kind.  Lowering
-    /// the **repair floor** compresses the rungs, which is what creates extra
-    /// blind rungs; lowering the **first probe window's cap** only translates the
-    /// ladder earlier, leaving every inter-rung interval — and so the blind-rung
-    /// pattern — unchanged.  The two levers' amplifications are read side by side
-    /// for exactly that reason.
+    /// Two arms of the same sweep are deliberately different in kind.  The
+    /// **repair floor** also caps the head rung (the head rung's cap is
+    /// `max(corroborated, floor)`), so a floor row both translates the head rung
+    /// and compresses the rungs after it — that compression is what creates extra
+    /// blind rungs.  The **first probe window's cap** rows hold the floor fixed and
+    /// move only the cap, so they *translate* the ladder earlier and leave every
+    /// inter-rung interval — and so the blind-rung pattern — unchanged.  The two
+    /// levers' amplifications are read side by side for exactly that reason: the
+    /// cap rows keep production's amplification and the floor rows pay for theirs.
     ///
     /// Run with `--ignored --nocapture`.
     ///
