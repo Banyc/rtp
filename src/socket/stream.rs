@@ -1461,6 +1461,134 @@ mod tests {
         }
     }
 
+    /// The transport's reported `min_rtt` must track the injected path delay.
+    ///
+    /// The decisive experiment for the `min_rtt`-floor hypothesis: `min_rtt` is
+    /// fed only from peer-echoed wire timestamps (the one production sample
+    /// source, `read_half`), the peer's echo rides the next ACK (`ACK_FLUSH_AGE`
+    /// = 3 ms of coalescing at most), and `TsEcho::rtt_from_echo` carries no
+    /// lower clamp — so a floor unrelated to the path would have to come from
+    /// somewhere else. This drives three jitter-free one-way delays and reads
+    /// back the smallest round trip each connection observed, and asserts the
+    /// reported floor *moves with the injected delay* rather than sitting on a
+    /// constant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reported_min_rtt_tracks_the_injected_path_delay() {
+        use crate::socket::socket;
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
+        use crate::udp::testing::wrap_fec_delayed_with_mss_and_fec_tuning;
+        use std::sync::{Arc, Mutex};
+        use std::time::Instant;
+
+        const N: usize = 40;
+        const MSG: usize = 256;
+        let mut rows = Vec::new();
+        for owd in [
+            Duration::from_millis(5),
+            Duration::from_millis(45),
+            Duration::from_millis(95),
+        ] {
+            let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            a.connect(b.local_addr().unwrap()).await.unwrap();
+            b.connect(a.local_addr().unwrap()).await.unwrap();
+            let mut a_layer = wrap_fec_delayed_with_mss_and_fec_tuning(
+                a.clone(),
+                a,
+                true,
+                8192,
+                FecTuning::interactive_prompt(),
+                owd,
+            );
+            let observed: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&observed);
+            a_layer.metrics_observer =
+                Some(crate::metrics::MetricsObserver::new(move |observation| {
+                    if let Some(rtt) = observation.snapshot.and_then(|snapshot| snapshot.minimum_rtt) {
+                        *sink.lock().unwrap() = Some(rtt);
+                    }
+                }));
+            let b_layer = wrap_fec_delayed_with_mss_and_fec_tuning(
+                b.clone(),
+                b,
+                true,
+                8192,
+                FecTuning::interactive_prompt(),
+                owd,
+            );
+            let (mut a_r, mut a_w, _a_supervisor) = socket(a_layer, None);
+            let (mut b_r, mut b_w, _b_supervisor) = socket(b_layer, None);
+            let echo = tokio::spawn(async move {
+                let mut buf = vec![0u8; MSG];
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(2), b_r.recv(&mut buf)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => {
+                            if b_w.send(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let mut echoes = 0usize;
+            let mut app_min = Duration::MAX;
+            for i in 0..N {
+                let mut msg = vec![(i % 251) as u8; MSG];
+                msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                let started = Instant::now();
+                let _ = a_w.send(&msg).await;
+                let mut buf = vec![0u8; MSG];
+                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), a_r.recv(&mut buf)).await
+                    && n >= 4
+                    && buf[..4] == msg[..4]
+                {
+                    echoes += 1;
+                    app_min = app_min.min(started.elapsed());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(a_w);
+            drop(a_r);
+            let _ = tokio::time::timeout(Duration::from_secs(3), echo).await;
+            let reported = *observed.lock().unwrap();
+            let expected = owd * 2;
+            eprintln!(
+                "[min-rtt-floor] owd={:>3}ms expected_rtt={:>3}ms reported_min_rtt={:?}ms app_min={:?}ms echoes={echoes}/{N}",
+                owd.as_millis(),
+                expected.as_millis(),
+                reported.map(|rtt| rtt.as_millis()),
+                app_min.as_millis(),
+            );
+            assert!(
+                echoes > 0,
+                "[min-rtt-floor] the {owd:?} arm completed no echo: the instrument measured nothing",
+            );
+            let reported = reported
+                .expect("the observer must have seen a metrics snapshot carrying an RTT sample");
+            // The reported floor must track the path: never below the injected
+            // round trip by more than scheduling slack, and never above it by
+            // more than the initial-flight settlement the arm pays.
+            assert!(
+                reported >= expected.saturating_sub(Duration::from_millis(5)),
+                "[min-rtt-floor] the {owd:?} arm reports min_rtt {reported:?} below its injected round trip {expected:?}: a floor below the path is impossible",
+            );
+            assert!(
+                reported <= expected + Duration::from_millis(40),
+                "[min-rtt-floor] the {owd:?} arm reports min_rtt {reported:?} far above its injected round trip {expected:?}: a floor unrelated to the path",
+            );
+            rows.push((owd, expected, reported));
+        }
+        assert!(
+            rows[2].2 >= rows[0].2 + Duration::from_millis(150),
+            "[min-rtt-floor] the reported floor did not move with the path: {:?} at {:?} against {:?} at {:?}",
+            rows[0].2,
+            rows[0].0,
+            rows[2].2,
+            rows[2].0,
+        );
+    }
+
     /// Lone-tail repair-deadline probe: the *production* request/response
     /// shape.
     ///

@@ -1265,6 +1265,48 @@ same one this section refuses: a shorter observation window would admit
 with a longer window were added alongside, and that is a coverage change for
 `rtp_mux`'s declaration, not for this crate's transport.
 
+### The reported `min_rtt` floor is the path's, not a sampling cadence
+
+The operator's client reports a ~190 ms **minimum** round trip, and that floor
+was the one shape with no account: the field's *maxima* are the repair ladder,
+but a floor is not a repair.  The hypothesis tested here was that `min_rtt` is
+fed only from peer-echoed wire timestamps, so the smallest round trip the
+transport can ever *observe* would be pinned by the cadence at which the peer
+echoes — a floor that would be invisible in this workspace, where the harness
+models no real path.
+
+**The code answer.** The one production sample source is the echo on an
+incoming datagram (`read_half`): the peer stores our packet's `send_ts`
+(`TsEcho::set`) and puts it on its next ACK, and we take
+`rtt = wire_ts(now) - echo_ts`.  The peer's echo delay is bounded by
+`ACK_FLUSH_AGE = 3 ms` (the ACK coalescing age,
+`src/transmission/ack_feedback/schedule.rs`), and `TsEcho::rtt_from_echo`
+carries **no lower clamp** — only an upper one (`MAX_ECHO_RTT = 60 s`) and a
+wrapping subtract.  The only other sample is the handshake's `initial_rtt`
+seed, which is itself a measured leg round trip.  So there is no clamp, no
+minimum-sample guard, and no periodic probe feeding `min_rtt`.
+
+**The measurement.** `socket::stream::tests::reported_min_rtt_tracks_the_injected_path_delay`
+(default tier) drives three jitter-free one-way delays through the in-crate
+delayed-link harness and reads back the smallest round trip each connection
+observed:
+
+| injected one-way | injected round trip | reported `min_rtt` | app-level minimum |
+| --- | --- | --- | --- |
+| 5 ms | 10 ms | **12 ms** | 12 ms |
+| 45 ms | 90 ms | **93 ms** | 93 ms |
+| 95 ms | 190 ms | **193 ms** | 193 ms |
+
+The offset is a constant **2-3 ms** (the harness's injected read delay plus
+scheduler slack), not a floor: the reported minimum moves with the path by
++181 ms across the sweep.  **The lead is closed.**  A 190 ms *minimum* on the
+deployed path is the path's own propagation, not a transport-added sampling
+floor — the transport reports 193 ms when the path is made 190 ms, and 12 ms
+when it is made 10 ms.  The test asserts both directions (never below the
+injected round trip by more than 5 ms of slack, never more than 40 ms above
+it) and that the floor moves by at least 150 ms across the sweep, so a
+constant-seed or clamped estimator fails it.
+
 ### The seed is not an M2 lever either: the third dimension, measured
 
 The section above leaves one setting named and unswept — the seed itself.  The
