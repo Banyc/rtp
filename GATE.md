@@ -396,6 +396,76 @@ not a magic constant; the harness never restates one.
      2.11 / 2.34 / 2.09 → 2.24 / 2.16 / 2.21 against the 6× budget.  M3 read
      0.958 → 0.958 and M4 was unchanged and PASS, so no mandate moved in
      either direction except the lone tail's guards.
+
+     **The ladder's spacing and budget are now arm-measured, and neither moves.**
+     Both quantities the field's maximum is made of — the rung count and the
+     inter-rung interval — are read off the send space's own firing sequence by
+     `pkt_send_space::tests::the_lone_tail_ladder_is_measured_from_the_wire_and_steps_by_the_repair_floor`,
+     which drives the replay against the *wire* (datagram `i` is dropped while
+     `i < burst`; the ACK ends the episode) rather than against its own
+     arithmetic.  At the field's 190 ms round trip the interactive tail's
+     `m = 6` ladder fires at **380, 680, 980 ms** — the `2 * sRTT` head rung, then
+     `TAIL_PROBED_MIN_RTO` apart — delivers on the third rung, is acked at
+     **1170 ms** and spends **24 datagrams**; `m = 1` costs one rung per datagram
+     (18 rungs, 19 datagrams for an 18-datagram burst); and a burst the cover
+     absorbs fires nothing and is acked at one round trip.  Setting
+     `TAIL_PROBED_MIN_RTO` to 150 ms fails the guard naming the observed
+     inter-rung spacings `[191, 191] ms`.
+
+     `pkt_send_space::probe_lone_tail_wire_ladder_sweep` (constant round trips)
+     and `pkt_send_space::probe_lone_tail_wire_ladder_under_jitter` (`sch_netem`'s
+     `delay TIME JITTER` enumerated as an 8x8 net, so the ACK takes the sum of two
+     `max(0, TIME + U)` draws) sweep the three parameters.  Reported per arm are
+     the ACK-measured recovery latency (p50 / p99 / max, ms) and the wire, as the
+     ladder's spent datagrams over what the delivering transmission alone needed.
+     At the field's arm (`owd 95 ms`, `±100 ms` per direction, 64 draws: ack delay
+     min 0 / mean 191.2 / max 390 ms) the interactive tail's `m = 6`:
+
+     | floor | burst 6 p50/p99/max | burst 18 | burst 48 | wire amp 6 / 18 / 48 |
+     |---|---|---|---|---|
+     | 300 (production) | 570 / 741 / 770 | 1170 / 1341 / 1370 | 2670 / 2841 / 2870 | 1.078 / 1.039 / 1.017 |
+     | 250 | 570 / 741 / 770 | 1070 / 1241 / 1270 | 2320 / 2491 / 2520 | 1.117 / 1.059 / 1.026 |
+     | 200 | 570 / 741 / 770 | 970 / 1141 / 1170 | 1970 / 2141 / 2170 | 1.219 / 1.109 / 1.049 |
+     | 150 | 570 / 741 / 770 | 952 / 1123 / 1152 | 1907 / 2078 / 2107 | 1.242 / 1.121 / 1.054 |
+
+     Two things this settles.  First, **below the floor the binding term is the
+     corroborated margin, not the floor**: at 190 ms the margin is 190 ms, so
+     150, 100 and 50 ms all step the same 191 ms and the floor has no effect there.
+     Second, **on the shallowest excursion — the one the interactive lane actually
+     takes, `m = 6` against a cover-sized burst — no floor from 300 down to 150 ms
+     moves M1 at all** (570 / 741 / 770 ms, identical), while the wire rises
+     1.078 → 1.242, because a burst the head rung already crosses never reaches a
+     floor-governed rung and only the rungs that fire *blind* — after the tail was
+     delivered and before its ACK was back — change.  Only the deep bursts gain
+     (burst 48: max 2870 → 2107 ms) and they pay 1.017 → 1.054 wire to do it, which is
+     the trade the end-to-end arms already measured as a **worse** tail.  The floor
+     therefore stays, now with the shallow-excursion half quantified.
+
+     **The probe budget does not bind at the field's round trip either**, and
+     cannot: past the first probe the window's cap is `max(corroborated, floor)`,
+     which *is* the full-RTO rung's own interval, so extra probes buy rungs at the
+     same 300 ms spacing.  Budget 1, 2 and 4 give byte-identical ladders at 190 ms
+     and `m = 1` (p50 7770 ms, wire 1224 datagrams over the 48-burst sweep).  It
+     does bind where `2 * sRTT` is genuinely cheaper than the floor — the 50 ms
+     round-trip arm, budget 2 → 4, `m = 6`, constant round trip: p50 850 → 450 ms
+     and p99 2050 → 1650 ms —
+     so the budget is a lever for short-RTT paths and not for the field's; it is
+     left at 2 rather than raised, since raising it is worthless at 190 ms and
+     lowering it to 1 is strictly worse everywhere (50 ms, `m = 6`: p50 850 →
+     1050 ms).
+
+     The sweep also isolated the lever the cover discussion never reached.  The
+     **head rung is `2 * sRTT`** (380 ms at the field), and it is capped by the
+     general RTO rather than by the repair floor, so no floor change touches it.
+     Capping it at the floor translates the whole ladder earlier without
+     compressing it, and the measured effect is a *free* latency cut: at 190 ms,
+     `m = 6`, burst 6 goes 570 / 741 / 770 → 490 / 661 / 690 ms at cap 300 and
+     390 / 561 / 590 ms at cap 200, with the wire amplification and the blind-rung
+     count **identical to production at every burst** (the head rung has no rung
+     before it to be spaced away from, so moving it shifts every rung equally and
+     leaves the blind pattern invariant).  That is a hypothesis, not a landing: no
+     end-to-end arm was run for it, so whether the shift survives the path's own
+     queueing is unmeasured.
 2. **Reasonable goodput of the interactive lane** — the lane delivers what it
    is offered (`delivery = 1.000`) without inflating its own wire. At the
    rtp layer `delivery = 1.000` is the offered payload arriving byte-exact,
@@ -731,7 +801,9 @@ lib::traffic_shaping::recovery::rtx_index::tests::deferred_loss_cancellation_doe
 lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder = default | 1.88 | baseline@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
 lib::traffic_shaping::redundancy::fec::tests::a_guarded_hostile_datagram_never_panics_the_fec_decoder = default | 1.87 | re-measurement(direct-decoder-path-bypasses-catch-unwind-so-a-panicking-hostile-datagram-fails-the-test-instead-of-being-counted-malformed)@decoder-fuzz | decoder-fuzz@impairment=hostile-datagram+metric=no-panic+layer=fec+scale=50k-rounds
 lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder = perf | 1 | baseline@probe | probe-ladder@impairment=jitter+metric=rung-spacing+layer=rtp+scale=4-arms
-lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_finite_loss_ladder = perf | 1 | composite(impairment,metric,scale)@probe | probe-ladder@impairment=burst-loss+metric=finite-burst-cost+layer=rtp+scale=2-rtt-2-cover-8-burst
+lib::traffic_shaping::recovery::pkt_send_space::tests::the_lone_tail_ladder_is_measured_from_the_wire_and_steps_by_the_repair_floor = default | 0.01 | composite(impairment,metric,scale)@probe | probe-ladder@impairment=none+metric=rung-spacing-count-and-wire+layer=rtp+scale=2-rtt-2-cover-3-bursts
+lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_wire_ladder_sweep = perf | 1 | composite(impairment,metric,scale)@probe | probe-ladder@impairment=none+metric=rung-spacing-sweep+layer=rtp+scale=6-spacings-2-budgets
+lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_wire_ladder_under_jitter = perf | 1 | composite(metric,scale)@probe | probe-ladder@impairment=jitter+metric=wire-amplification-and-head-rung+layer=rtp+scale=9-configs-2-rtts-3-bursts
 lib::socket::stream::tests::probe_fresh_tail_armor_latency = perf | 25 | composite(impairment,metric)@probe | probe-armor@impairment=clean+metric=armour-latency+layer=rtp
 lib::socket::stream::tests::probe_fresh_tail_burst_loss_latency = perf | 145 | composite(handshake,impairment,metric)@probe | probe-armor@impairment=burst-loss+metric=armour-latency+layer=rtp+handshake=none
 lib::socket::stream::tests::probe_single_symbol_interactive_fec_repair = perf | 45 | composite(fec,impairment,metric)@probe | probe-fec@impairment=loss+metric=repair-latency+layer=rtp+fec=on
@@ -752,7 +824,8 @@ one-axis set. The six named families each carry their own reference:
 shared-bottleneck instrument's own sanity pair, one dimension apart),
 `liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
 hostile-datagram FEC decoder fuzz pair, a deliberate repeat through the
-unguarded path), `probe` (the eight report-only repair-latency instruments) and
+unguarded path), `probe` (the nine report-only repair-latency instruments, plus the always-run
+wire-driven ladder guard) and
 `perf-lane` (the four asserting in-crate scaling gates: one reference, the
 in-order receive-window advance, and the three rows that vary one or two
 dimensions from it). The bulk of the declared rows are `composite` because the
@@ -988,7 +1061,8 @@ src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = probe
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = probe
 src/traffic_shaping/recovery/pkt_send_space.rs::applying_many_sacks_remains_linear_in_the_send_window = perf-lane
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = probe
-src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_finite_loss_ladder = probe
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_sweep = probe
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_under_jitter = probe
 src/traffic_shaping/recovery/rtx_index.rs::deferred_loss_cancellation_does_not_rescan_the_pending_set = perf-lane
 tests/rtp_bufferbloat.rs::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 tests/rtp_burst_loss.rs::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
@@ -1029,7 +1103,8 @@ src/socket/stream.rs::probe_fresh_tail_burst_loss_latency = 7
 src/socket/stream.rs::probe_lone_tail_repair_deadline_latency = 8
 src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = 4
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = 12
-src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_finite_loss_ladder = 7
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_sweep = 3
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_under_jitter = 4
 ```
 
 ## Scenario manifest
