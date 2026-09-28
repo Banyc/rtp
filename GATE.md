@@ -975,6 +975,20 @@ transport-latency@impairment=burst-loss = the always-run tier's only latency ass
 dispatcher-drop@attribution=per-flow = the counter is readable in aggregate only: `Listener::stats()` reports the listener's total `packets_dropped_dispatcher_full`, not which flow the dispatcher starved. The per-flow counterpart exists on udp_listener's dev line (`ConnStats::packets_dropped_dispatcher_full`, read through `Conn::stats()` / `ConnRead::stats()`) but is untagged there — the newest tag is v0.0.20 (`#7355b827`), which is what `rtp` pins and which has no per-connection record at all (`cargo check` on a `conn.stats()` accessor fails with `E0599: no method named stats found`). The repair is to advance `rtp`'s `udp_listener` pin to a tag carrying it and expose `Conn`/`ConnRead` stats beside `Listener::stats`; until then the per-flow cell is knowingly empty, not silently.
 ```
 
+**The harness's own lateness is now fixed, and it is not yet visible here.** The
+`netem-test` runner used to wait `min(remaining, RUNNER_IDLE_POLL = 5 ms)` before a
+queued deadline and install that as `SO_RCVTIMEO`; measured overrun is a fraction of
+the requested timeout (~1/8), so a scheduled datagram left up to ~1 ms late — p50
+0.58 ms, p99 12.5 ms, max 14.4 ms over the tail. `deadline_approach_wait`
+(`netem-test/src/lib.rs:1348`) now divides the remaining time in the final ≤10 ms
+(`min(remaining, 5 ms, max(remaining/2, 200 µs))`, O(log) extra sleeps rather than a
+spin), after which the tail's excess is p50 **0.056 ms**, max **0.166 ms**, and **0 of
+15 tail samples are the shaper's** against 1243 endpoint-side ones — so the rig's
+contribution is removed and the lane's maximum is `ceiling + endpoint`. **It is not
+visible from this crate yet**: `rtp` pins `netem-test` at git tag `v0.0.2`, so the
+arms below still measure the old wait until the harness is tagged and this pin is
+bumped — which is a queued release step, not a measurement that has been made here.
+
 **The `clean-tail` family, and what it settles.** The lane's tail above the
 link's own no-loss ceiling (`OWD + JITTER = 30 ms`) survives with the shaper's
 drop count at zero, and three cells shadow the baseline.  Measured at load
