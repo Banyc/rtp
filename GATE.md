@@ -809,7 +809,10 @@ No cost below is invented; each is one of two things.
   `probe_lone_tail_repair_deadline_latency` ~2.7 min (162 s),
   `probe_armor_copy_cell` ~10 s for its one cell,
   `probe_lone_tail_repair_ladder` <1 s (1 s),
-  `probe_lone_tail_finite_loss_ladder` <1 s (1 s), and the two standard-tier
+  `probe_lone_tail_finite_loss_ladder` <1 s (1 s),
+  `probe_midstream_single_loss_repair` <1 s (1 s, the same instrument class:
+  deterministic and network-free, so its cost is the replay and not a window),
+  and the two standard-tier
   liveness arms 65 s and 5 s.
 
 A row whose wall clock appears in no document *and* was not measured is not
@@ -817,7 +820,7 @@ given a number: it is recorded as a gap below, so an unmeasured cost is
 visibly pending instead of plausibly guessed.
 
 The declared sums are `default` 14.30 s of a 60 s budget, `standard` 70.18 s of
-300 s, `perf` 420 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
+300 s, `perf` 422.00 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
 declared so a later row cannot be added without one — `full` is the tier the
 ~90-minute `shared_bneck_fairness_longrun` lives in.
 
@@ -851,6 +854,7 @@ lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_la
 lib::traffic_shaping::recovery::pkt_send_space::tests::the_lone_tail_ladder_is_measured_from_the_wire_and_steps_by_the_repair_floor = default | 0.01 | composite(impairment,metric,scale)@probe | probe-ladder@impairment=none+metric=rung-spacing-count-and-wire+layer=rtp+scale=2-rtt-2-cover-3-bursts
 lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_wire_ladder_sweep = perf | 1 | composite(impairment,metric,scale)@probe | probe-ladder@impairment=none+metric=rung-spacing-sweep+layer=rtp+scale=6-spacings-2-budgets
 lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_wire_ladder_under_jitter = perf | 1 | composite(metric,scale)@probe | probe-ladder@impairment=jitter+metric=wire-amplification-and-head-rung+layer=rtp+scale=9-configs-2-rtts-3-bursts
+lib::traffic_shaping::recovery::pkt_send_space::tests::probe_midstream_single_loss_repair = perf | 1 | composite(impairment,metric,scale)@probe | probe-midstream@impairment=none+metric=repair-reason-and-offset+layer=rtp+scale=3-arms
 lib::socket::stream::tests::probe_fresh_tail_armor_latency = perf | 25 | composite(impairment,metric)@probe | probe-armor@impairment=clean+metric=armour-latency+layer=rtp
 lib::socket::stream::tests::probe_fresh_tail_burst_loss_latency = perf | 145 | composite(handshake,impairment,metric)@probe | probe-armor@impairment=burst-loss+metric=armour-latency+layer=rtp+handshake=none
 lib::socket::stream::tests::probe_single_symbol_interactive_fec_repair = perf | 45 | composite(fec,impairment,metric)@probe | probe-fec@impairment=loss+metric=repair-latency+layer=rtp+fec=on

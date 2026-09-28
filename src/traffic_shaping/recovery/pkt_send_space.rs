@@ -1927,6 +1927,7 @@ mod tests {
     use super::{
         CWND_SEND_RATE_SCALE, FAST_LOSS_CONFIRM_MS, FAST_LOSS_DISABLE_ROUND_TRIPS, INIT_CWND,
         LOSS_RATE_MIN_SAMPLES, MAX_ACK_BLOCKS, OUTAGE_RECOVERY_CWND, PktSendSpace,
+        RetransmissionCounters,
     };
     use crate::sequence::SequenceNumber;
     use crate::traffic_shaping::recovery::tlp::TailLossProber;
@@ -6172,6 +6173,139 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// What one mid-stream single-loss replay measured.
+    #[derive(Debug)]
+    struct MidStreamOutcome {
+        /// Offset, in ms from the dropped datagram's send, of the send space's
+        /// first repair firing.  `None` if nothing fired inside the horizon.
+        fire_ms: Option<u64>,
+        /// Which send-space reason armed that firing.
+        reason: Option<&'static str>,
+        /// The one-way latency the *message* on that lane therefore pays:
+        /// the firing offset plus one one-way delay for the repair to arrive.
+        one_way_ms: Option<u64>,
+        counters: RetransmissionCounters,
+    }
+
+    /// Replay a **single dropped datagram in the middle of a live cadence
+    /// lane** and read the repair off the send space's own firing sequence.
+    ///
+    /// The lone-tail replays above cover the packet that is the window's tail,
+    /// whose repair is the tail-loss prober's.  A cadence lane's loss is a
+    /// different regime: the dropped datagram has successors, so the peer keeps
+    /// SACKing past the hole, and the repair is whichever of the
+    /// evidence-gated fast-loss path, the RACK-style reorder window, or the
+    /// full-RTO deadline fires first.  This replay drives the send space with
+    /// the ACKs that shape actually produces and reports which one fired, at
+    /// what offset from the drop, and the one-way latency the message pays.
+    ///
+    /// The model is the deployed interactive lane's: one 256 B message per
+    /// datagram, `intersend_ms` between consecutive datagrams on the lane (four
+    /// flows at a 5 ms cadence interleave at 1.25 ms), and a round trip of
+    /// `rtt_ms`.  The dropped datagram is seq 0; successor `j` is sent at
+    /// `j * intersend_ms` and delivered one one-way delay later, so the ACK
+    /// carrying SACKs for successors `1..=j` — with the cumulative front still
+    /// at the hole — arrives at `j * intersend_ms + rtt_ms`.  Deterministic and
+    /// network-free, so the offset is load-independent.
+    fn replay_midstream_single_loss(rtt_ms: u64, intersend_ms: u64) -> MidStreamOutcome {
+        use crate::ack::{AckBlocks, AckInterval};
+
+        let t0 = Instant::now();
+        let mut space = PktSendSpace::new();
+        for i in 0..40 {
+            space.sample_rtt(ms(rtt_ms), t0 + ms(i));
+        }
+        let start = t0 + ms(1_000);
+        // The dropped datagram: sent, never delivered, so the cumulative front
+        // never advances past it.
+        let _hole = send_packet(&mut space, start);
+        let horizon = 4 * rtt_ms + 4_000;
+        let mut outcome = MidStreamOutcome {
+            fire_ms: None,
+            reason: None,
+            one_way_ms: None,
+            counters: space.retransmission_counters(),
+        };
+        for step in 0..=horizon {
+            let now = start + ms(step);
+            if step > 0 && step.is_multiple_of(intersend_ms) {
+                send_packet(&mut space, now);
+            }
+            if step >= rtt_ms && (step - rtt_ms).is_multiple_of(intersend_ms) {
+                let count = (step - rtt_ms) / intersend_ms;
+                if count >= 1 {
+                    let blocks = [AckInterval {
+                        start: sq(1),
+                        size: std::num::NonZeroU64::new(count).unwrap(),
+                    }];
+                    let mut acked = Vec::new();
+                    space.ack(AckBlocks::new(sq(0), &blocks), &mut acked, now);
+                }
+            }
+            if space.has_rtx(now) {
+                let before = space.retransmission_counters();
+                if space.rtx(now).is_some() {
+                    let after = space.retransmission_counters();
+                    outcome.fire_ms = Some(step);
+                    outcome.reason = Some(if after.fast_loss_reason > before.fast_loss_reason {
+                        "fast_loss"
+                    } else if after.reorder_reason > before.reorder_reason {
+                        "reorder"
+                    } else if after.rto_reason > before.rto_reason {
+                        "rto"
+                    } else {
+                        "unknown"
+                    });
+                    outcome.one_way_ms = Some(step + rtt_ms / 2);
+                    outcome.counters = after;
+                    break;
+                }
+            }
+        }
+        outcome
+    }
+
+    /// A cadence lane's single-datagram loss: which mechanism repairs it, at
+    /// what offset from the drop, and so what one-way latency the message
+    /// pays.
+    ///
+    /// The arms are the deployed interactive lane at the harness's own scales:
+    /// the clean link's 50 ms round trip and the field's 190 ms one, at the
+    /// four-flow 1.25 ms interleave and at a one-flow 5 ms one.  Reported per
+    /// arm: the firing offset, the reason the send space's own counters
+    /// attribute it to, and the message's one-way latency.  Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore = "deterministic mid-stream single-loss attribution probe; <1 s; run with --ignored --nocapture"]
+    fn probe_midstream_single_loss_repair() {
+        for (label, rtt_ms, intersend_ms) in [
+            ("rtt50_fourflow_inter1", 50u64, 1u64),
+            ("rtt50_oneflow_inter5", 50, 5),
+            ("rtt190_fourflow_inter1", 190, 1),
+        ] {
+            let out = replay_midstream_single_loss(rtt_ms, intersend_ms);
+            eprintln!(
+                "[midstream {label}] rtt={rtt_ms}ms intersend={intersend_ms}ms fire_ms={:?} reason={:?} one_way_ms={:?} counters={:?}",
+                out.fire_ms, out.reason, out.one_way_ms, out.counters
+            );
+            // Instrument sanity: the arm only attributes a repair if one fired,
+            // the counters named it, and it cannot have fired inside the first
+            // round trip (the evidence it acts on is an ACK's).
+            let fire = out.fire_ms.unwrap_or_else(|| {
+                panic!("[midstream {label}] no repair fired inside the horizon")
+            });
+            let reason = out.reason.expect("a firing must carry a reason");
+            assert_ne!(
+                reason, "unknown",
+                "[midstream {label}] a firing that moves no reason counter is not attributed"
+            );
+            assert!(
+                fire >= rtt_ms,
+                "[midstream {label}] the repair fired at {fire} ms, inside the {rtt_ms} ms round trip the evidence needs"
+            );
         }
     }
 }
