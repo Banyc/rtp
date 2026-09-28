@@ -45,6 +45,10 @@ pub use raw_send::{MaybeRawFd, maybe_raw_fd};
 pub(crate) use raw_send::{
     is_icmp_artifact, normalize_send_err, raw_sendto_fallback, should_wait_after_try_send,
 };
+/// The listener's dispatch/drop counters, re-exported so an `rtp` owner can
+/// name the type returned by [`Listener::stats`] without depending on
+/// `udp_listener` directly.
+pub use udp_listener::ListenerStats;
 
 mod layer;
 pub(crate) use layer::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery;
@@ -283,6 +287,21 @@ impl Listener {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Snapshot access to this listener's dispatch/drop counters (see
+    /// [`ListenerStats`]), including
+    /// [`packets_dropped_dispatcher_full`](ListenerStats::packets_dropped_dispatcher_full).
+    ///
+    /// The dispatcher never blocks: when a flow's receive channel is full it
+    /// drops the datagram rather than backpressuring the accept loop, and the
+    /// counter records that. Dropping is the right policy for a reliable
+    /// transport over UDP — `rtp` repairs the loss a round trip later — but the
+    /// drop is otherwise invisible from this crate, and a drop during overload
+    /// is a cause the transport must be able to attribute. Reading the counters
+    /// is a relaxed atomic load per field and takes no lock.
+    pub fn stats(&self) -> &ListenerStats {
+        self.listener.stats()
     }
 
     /// Accept the next connection, draining a connection already queued by an
@@ -2414,6 +2433,117 @@ mod tests {
             "the new session must reoccupy the freed slot"
         );
         drop(new_accepted);
+    }
+
+    /// A dispatcher overflow is readable through the listener's public stats.
+    ///
+    /// The dispatcher never blocks: when a flow's receive channel is full it
+    /// drops the datagram rather than backpressuring the accept loop, and
+    /// `Listener::stats()` reports that in `packets_dropped_dispatcher_full`.
+    /// Before the accessor existed the counter was reachable only from inside
+    /// this crate — the listener field is private and nothing re-exported its
+    /// statistics — so an `rtp` owner (the harness, in particular) could not see
+    /// an overload that drops datagrams at exactly the moment the path is most
+    /// degraded.
+    ///
+    /// The overflow is driven through the public accept API: a task keeps
+    /// calling `accept_with` and holds each returned, *unpolled* accept future,
+    /// so the flow's channel has an owner that never drains it, while a raw
+    /// source offers a burst larger than that channel. Every datagram past the
+    /// channel's capacity must be dropped at dispatch and visible in
+    /// `listener.stats()`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatcher_overflow_is_readable_through_the_listener_stats() {
+        let listener = Arc::new(
+            Listener::bind("127.0.0.1:0", ListenerConfig::default())
+                .await
+                .unwrap(),
+        );
+        let addr = listener.local_addr();
+
+        // Hold every accepted flow's future unpolled. The flow's reader lives
+        // inside that future and is never drained, so the channel fills and the
+        // dispatcher drops; the loop keeps driving `dispatch_next` while it
+        // waits for a flow that never comes.
+        let dispatcher_listener = Arc::clone(&listener);
+        let mut dispatcher = tokio::task::JoinSet::new();
+        dispatcher.spawn(async move {
+            let mut held = Vec::new();
+            while let Ok(accepted) = dispatcher_listener
+                .accept_with(AcceptConfig::default())
+                .await
+            {
+                held.push(accepted);
+            }
+        });
+
+        let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        source.connect(addr).await.unwrap();
+        let offered = DISPATCHER_BUF_SIZE + DISPATCHER_BUF_SIZE / 2;
+        for sent in 0..offered {
+            source.send(&[0u8; 64]).await.unwrap();
+            // Give the dispatcher a chance to drain the socket so the kernel
+            // receive buffer never overflows (which would drop datagrams
+            // before the dispatcher could account for them).
+            if sent % 128 == 127 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let stats = listener.stats();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let accounted = stats.packets_dispatched.load(Ordering::Relaxed)
+                    + stats
+                        .packets_dropped_dispatcher_full
+                        .load(Ordering::Relaxed)
+                    + stats.packets_dropped_rejected.load(Ordering::Relaxed)
+                    + stats.packets_dropped_existing_only.load(Ordering::Relaxed)
+                    + stats
+                        .packets_dropped_pkt_buf_overflow
+                        .load(Ordering::Relaxed);
+                if accounted >= offered as u64 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the offered burst was never fully accounted by the dispatcher");
+
+        let delivered = stats.packets_dispatched.load(Ordering::Relaxed);
+        let dropped = stats
+            .packets_dropped_dispatcher_full
+            .load(Ordering::Relaxed);
+        let rejected = stats.packets_dropped_rejected.load(Ordering::Relaxed);
+        let existing_only = stats.packets_dropped_existing_only.load(Ordering::Relaxed);
+        println!(
+            "DISPATCH_OVERFLOW_STATS offered={offered} received={} delivered={delivered} \
+             dropped_dispatcher_full={dropped} channel_capacity={DISPATCHER_BUF_SIZE} \
+             rejected={rejected} existing_only={existing_only}",
+            stats.packets_received.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            rejected + existing_only,
+            0,
+            "the offered datagrams must all be data: no dispatch rejected one (rejected \
+             {rejected}, existing-only {existing_only})"
+        );
+        assert_eq!(
+            delivered + dropped,
+            offered as u64,
+            "the read-through-`rtp` dispatcher accounting must be exhaustive: delivered \
+             {delivered} + dropped_dispatcher_full {dropped} != offered {offered}"
+        );
+        assert_eq!(
+            dropped,
+            (offered - DISPATCHER_BUF_SIZE) as u64,
+            "the dispatcher-drop count read through `Listener::stats()` is {dropped}, but a \
+             {offered}-datagram burst into a {DISPATCHER_BUF_SIZE}-slot channel must drop exactly \
+             {}",
+            offered - DISPATCHER_BUF_SIZE
+        );
+        dispatcher.abort_all();
     }
 
     /// The cap must re-bind from the state its own softness permits: the

@@ -873,6 +873,8 @@ lib::socket::stream::tests::probe_armor_copy_cell = perf | 10 | composite(impair
 lib::socket::stream::tests::probe_armor_cover_frontier = perf | 31 | composite(impairment,metric,scale)@probe | probe-cover-frontier@impairment=clean+metric=realised-cover+layer=rtp+scale=two-forced-covers
 rtp_clean_tail::clean_tail_shaper_vs_transport_matrix = standard | 20 | baseline@clean-tail | clean-tail@impairment=clean+jitter=5ms+stack=rtp+endpoints=tokio+rate=four-flow
 rtp_clean_tail::clean_tail_blocking_endpoint_control = standard | 10 | composite(endpoints,stack)@clean-tail | clean-tail@impairment=clean+jitter=5ms+stack=raw+endpoints=blocking+rate=four-flow
+lib::udp::tests::dispatcher_overflow_is_readable_through_the_listener_stats = default | 0.02 | composite(layer,metric,scale,shape,visibility) | dispatcher-drop@impairment=clean+mss=default+scale=over-capacity+metric=drop-count+shape=burst+layer=dispatch+visibility=in-crate
+dispatcher_drop_visibility::the_dispatcher_drop_count_is_readable_from_outside_rtp = default | 0.02 | composite(layer,metric,scale,shape,visibility) | dispatcher-drop@impairment=clean+mss=default+scale=over-capacity+metric=drop-count+shape=burst+layer=dispatch+visibility=cross-crate
 ```
 
 ### The families
@@ -882,8 +884,13 @@ the always-run transport floors, stated against the clean-link byte-exact
 delivery point; two of its rows are one dimension away from it (`scale`, and
 `mss`) and the rest are labelled with the dimensions they actually move, which
 is the honest reading of pre-existing arms that were never built as a
-one-axis set. The seven named families each carry their own reference:
-`padding` (wire-shape at one 256 KiB transfer), `contested` (the
+one-axis set. Its newest cell is `dispatcher-drop`: the two rows that read the
+listener's dispatcher-drop counter — one in-crate, one from another crate,
+because the second is what proves the harness (which talks to `rtp`, not to
+`udp_listener`) can name the type and call the accessor at all. They differ
+from each other by exactly the `visibility` dimension. The seven named families
+each carry their own reference: `padding` (wire-shape at one 256 KiB transfer),
+`contested` (the
 shared-bottleneck instrument's own sanity pair, one dimension apart),
 `liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
 hostile-datagram FEC decoder fuzz pair, a deliberate repeat through the
@@ -965,6 +972,7 @@ cost@metric=wall-clock = the remaining 719 default-tier lib tests have no per-te
 transport-delivery@impairment=correlated-loss = no default-tier row drops four-state Gilbert-Elliot loss at the transport layer: the always-run impaired delivery rows use the harness's 5 % iid mild-loss preset and the 3 % iid FEC preset, and GE loss is exercised only by the opt-in burst-loss arms. An always-run GE arm is what closes this, and it is a new arm rather than a retune of a frozen one.
 transport-delivery@metric=goodput-fraction = no default-tier row measures goodput as a fraction of the configured link rate: the capacity-relative floors are opt-in (bufferbloat `standard`, burst-loss `full`). The cell is knowingly empty in the always-run tier because the arm it needs is a multi-second rate-shaped run, which the 60 s budget's headroom over the measured 16.8-18.6 s does not currently buy; the deliberate answer is to measure the opt-in arm rather than to move a floor into a tier that cannot pay for it.
 transport-latency@impairment=burst-loss = the always-run tier's only latency assertion is the 60 ms one-way delay observability check. The sparse-message tail under GE burst loss is opt-in (`full`), and an always-run tail arm would need a window short enough for the default budget and long enough to carry one recovery episode — a new arm, not a shortened probe.
+dispatcher-drop@attribution=per-flow = the counter is readable in aggregate only: `Listener::stats()` reports the listener's total `packets_dropped_dispatcher_full`, not which flow the dispatcher starved. The per-flow counterpart exists on udp_listener's dev line (`ConnStats::packets_dropped_dispatcher_full`, read through `Conn::stats()` / `ConnRead::stats()`) but is untagged there — the newest tag is v0.0.20 (`#7355b827`), which is what `rtp` pins and which has no per-connection record at all (`cargo check` on a `conn.stats()` accessor fails with `E0599: no method named stats found`). The repair is to advance `rtp`'s `udp_listener` pin to a tag carrying it and expose `Conn`/`ConnRead` stats beside `Listener::stats`; until then the per-flow cell is knowingly empty, not silently.
 ```
 
 **The `clean-tail` family, and what it settles.** The lane's tail above the
