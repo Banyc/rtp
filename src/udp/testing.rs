@@ -476,6 +476,7 @@ fn fec_layer(
         session_tag: None,
         initial_sequences: crate::sequence::InitialSequences::ZERO,
         initial_rtt: None,
+        initial_send_rate: None,
         metrics_observer: None,
         mss,
         fec: fec_state,

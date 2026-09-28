@@ -98,6 +98,16 @@ pub struct UnreliableLayer {
     /// reliable sender's recovery timing via `ReliableLayer::sample_rtt` at
     /// connection construction.
     pub(crate) initial_rtt: Option<Duration>,
+    /// Optional pacer seed for this connection: when `Some(rate)` the
+    /// reliable sender starts its token bucket and send rate at `rate`
+    /// packets/second instead of the crate's `INIT_SEND_RATE`.  `None` — the
+    /// value every caller that does not opt in gets — keeps the stock seed.
+    /// A lane whose known offered rate is far above the stock seed opts in so
+    /// the connection is not served from a standing sender-side backlog while
+    /// its congestion ramp climbs past the offer; a lane with no declared
+    /// offer leaves it `None`, so the seed stays a per-connection policy and
+    /// not a property of the crate.
+    pub(crate) initial_send_rate: Option<f64>,
     /// Optional typed transport-observation callback installed by the caller.
     pub(crate) metrics_observer: Option<crate::metrics::MetricsObserver>,
     pub(crate) mss: crate::mss::Mss,

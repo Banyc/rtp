@@ -92,6 +92,16 @@ const MIN_SEND_RATE: f64 = 1.;
 /// see `GATE.md` for the frontier (the two settings that fit the wire better
 /// each break a safeguard — the ladder's monotone-non-increasing copy count,
 /// or the hostile arm's window-adequacy gate).
+///
+/// It is the **stock** seed: a connection whose owner has declared the lane's
+/// own offered rate opts in through the connect/accept config
+/// (`UnreliableLayer::initial_send_rate`), which calls [`ReliableLayer::seed_send_rate`]
+/// once at construction.  Measured on the four-flow production lane, the stock
+/// seed leaves the lane served from a standing sender-side backlog until its
+/// ramp crosses the offer, while a seed at the lane's own measured offer
+/// removes that transient; the seed is a lane's declaration and not the
+/// crate's, so every connection that declares no offer — a tiny-MSS transfer,
+/// a bare `rtp` socket, another lane — keeps this value.
 pub(crate) const INIT_SEND_RATE: f64 = 1024.;
 
 const MAX_DATA_LOSS_RATE: f64 = 0.9;
@@ -1426,6 +1436,18 @@ impl ReliableLayer {
     /// rate to settle at, so it degrades to the live rate instead of panicking
     /// the transport worker.  Every computed-rate site hands its raw `f64`
     /// here, so no call site can carry an unchecked `PosR::new(...).unwrap()`.
+    /// Install a connection's own pacer seed.
+    ///
+    /// The caller that has already resolved the seed (a lane's declared offer)
+    /// calls this once at construction, before any send; the crate's own
+    /// default is installed by the constructors.  It is deliberately a
+    /// per-connection install and not a global: a seed is a statement about the
+    /// traffic the connection's owner knows it will offer, and no other
+    /// connection on the host shares it.
+    pub(crate) fn seed_send_rate(&mut self, rate: f64, now: Instant) {
+        self.set_send_rate(rate, now);
+    }
+
     fn set_send_rate(&mut self, rate: f64, now: Instant) {
         // While an outage-recovery epoch is open every rate writer is clamped
         // to INIT_SEND_RATE until a fresh post-outage sample closes the

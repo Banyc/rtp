@@ -460,6 +460,10 @@ pub struct AcceptConfig {
     /// not declare an intent keep the stock behaviour.  A dedicated bulk pipe
     /// opts into [`CongestionLane::Dedicated`](crate::CongestionLane::Dedicated).
     pub congestion_lane: CongestionLane,
+    /// The accepting peer's own pacer seed; see [`ConnectConfig::initial_send_rate`].
+    /// Both peers configure it independently — the seed is a statement about
+    /// the traffic *this* end will offer — and `None` keeps the stock seed.
+    pub initial_send_rate: Option<f64>,
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub metrics_observer: Option<crate::metrics::MetricsObserver>,
@@ -489,6 +493,7 @@ impl Default for AcceptConfig {
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
             congestion_lane: CongestionLane::default(),
+            initial_send_rate: None,
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             metrics_observer: None,
@@ -516,6 +521,16 @@ pub struct ConnectConfig<'a> {
     /// [`CongestionLane::Shared`](crate::CongestionLane::Shared); see
     /// [`AcceptConfig::congestion_lane`].
     pub congestion_lane: CongestionLane,
+    /// The connection owner's optional **pacer seed**: when set, the reliable
+    /// sender starts its token bucket and send rate at this many packets per
+    /// second instead of the crate's stock seed (`INIT_SEND_RATE`).  A lane
+    /// whose known offered rate is far above the stock seed sets it, so the
+    /// connection is not served from a standing sender-side backlog while its
+    /// congestion ramp climbs past the offer.  `None` — the default, and what
+    /// every caller that does not opt in gets — keeps the stock behaviour
+    /// exactly, so a per-connection policy never becomes a property of the
+    /// crate.
+    pub initial_send_rate: Option<f64>,
     pub retransmission_armor: RetransmissionArmorConfig,
     pub instream_group_fec: bool,
     pub watchdog: Option<WatchdogTuning>,
@@ -546,6 +561,7 @@ impl<'a> Default for ConnectConfig<'a> {
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
             congestion_lane: CongestionLane::default(),
+            initial_send_rate: None,
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
             watchdog: None,
@@ -567,6 +583,7 @@ struct AcceptSetup {
     tuning: FecTuning,
     frame_delivery: FrameMode,
     congestion_lane: CongestionLane,
+    initial_send_rate: Option<f64>,
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
@@ -585,6 +602,7 @@ impl AcceptSetup {
             tuning: config.fec_tuning,
             frame_delivery: config.frame_delivery,
             congestion_lane: config.congestion_lane,
+            initial_send_rate: config.initial_send_rate,
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
@@ -643,6 +661,7 @@ async fn accept(
         tuning,
         frame_delivery,
         congestion_lane,
+        initial_send_rate,
         retransmission_armor,
         instream_group_fec,
         metrics_observer,
@@ -686,6 +705,7 @@ async fn accept(
         frame_delivery,
     )?;
     unreliable_layer.congestion_lane = congestion_lane;
+    unreliable_layer.initial_send_rate = initial_send_rate;
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
@@ -1036,6 +1056,7 @@ async fn connect_bound(
         fec_tuning,
         frame_delivery,
         congestion_lane,
+        initial_send_rate,
         retransmission_armor,
         instream_group_fec,
         watchdog,
@@ -1094,6 +1115,7 @@ async fn connect_bound(
         frame_delivery,
     )?;
     unreliable_layer.congestion_lane = congestion_lane;
+    unreliable_layer.initial_send_rate = initial_send_rate;
     unreliable_layer.retransmission_armor = retransmission_armor;
     unreliable_layer.instream_group_fec = instream_group_fec;
     unreliable_layer.metrics_observer = metrics_observer;
@@ -1719,6 +1741,7 @@ mod tests {
             tuning: FecTuning::default(),
             frame_delivery: crate::delivery::frame::mode::FrameMode::enabled_reordering(),
             congestion_lane: CongestionLane::default(),
+            initial_send_rate: None,
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: false,
             metrics_observer: None,

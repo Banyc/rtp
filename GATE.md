@@ -1402,6 +1402,41 @@ same one this section refuses: a shorter observation window would admit
 with a longer window were added alongside, and that is a coverage change for
 `rtp_mux`'s declaration, not for this crate's transport.
 
+### The pacer seed is a per-connection declaration, not a crate constant
+
+`INIT_SEND_RATE` (`src/reliable/reliable_layer.rs`) is unchanged at `1024`: it
+is the **stock** seed the constructors install.  What this revision adds is the
+mechanism for a connection's owner to declare its own seed, because the seed is
+a statement about the traffic that owner knows it will offer and no other
+connection on the host shares it.
+
+- `ReliableLayer::seed_send_rate(&mut self, rate, now)` installs one, and
+  `UnreliableLayer::initial_send_rate: Option<f64>` carries it from the
+  connect/accept config (`ConnectConfig::initial_send_rate`,
+  `AcceptConfig::initial_send_rate`) into `new_connection_inner`, which seeds
+  both the reliable layer's send rate and the token bucket's own rate before
+  the first send.  `None` — the default, and every caller that does not opt in —
+  installs the stock constant through the same constructor path as before.
+- The consumer that opts in is `rtp_mux`'s lane policy
+  (`lane_transport::initial_send_rate(LaneClass)`), which seeds the interactive
+  lane at the measured offer of the four-flow production shape and leaves every
+  other lane `None`.
+
+**Why it is not a global.** A global `4096` was measured and refuses itself on
+this crate's own default tier: the same tree, on a quiet host, fails
+`rtp::rtp_mss::rtp_tiny_mss_survives_mild_loss` — a 100 KiB echo at a 256 B MSS
+over a 5 % loss link — **3/30** runs at a global `4096` and **0/30** at `1024`,
+and seven unit-test ramp preambles assert against simulated links that saturate
+at `5955-7520 pkt/s` (`ramp_rate=7519.4`, `peak=7139.97`, `warm=5955.42`), so a
+2x or 4x multiple of a `4096` seed is unreachable by construction on those
+links.  With the seed declared per connection, all seven preambles and the
+tiny-MSS arm are **untouched** and the whole default tier is green
+(`cargo test --release -p rtp`).
+
+The seed's value and its measurement live with the policy that declares it
+(`rtp_mux/GATE.md`, "The interactive lane's pacer seed is a lane policy, not a
+crate constant"); this crate owns only the mechanism and the unchanged default.
+
 ### The reported `min_rtt` floor is the path's, not a sampling cadence
 
 The operator's client reports a ~190 ms **minimum** round trip, and that floor

@@ -185,6 +185,19 @@ fn new_connection_inner(
     if let Some(initial_rtt) = unreliable_layer.initial_rtt {
         reliable_layer.sample_rtt(initial_rtt, now);
     }
+    // The connection's optional pacer seed: install both the reliable layer's
+    // send rate and the token bucket's own rate, so the sender is not served
+    // from a standing backlog while its congestion ramp climbs to the lane's
+    // declared offer.  `None` leaves the crate's stock `INIT_SEND_RATE` in
+    // place; see `UnreliableLayer::initial_send_rate`.
+    if let Some(initial_send_rate) = unreliable_layer.initial_send_rate {
+        reliable_layer.seed_send_rate(initial_send_rate, now);
+        send_rate_limiter.set_rate(
+            primitive::ops::float::PosR::new(initial_send_rate)
+                .expect("a seeded send rate must be a positive, finite rate"),
+            now,
+        );
+    }
     let observability = ConnectionObservability::new(now, log_config, metrics_observer);
     reliable_layer.set_congestion_metrics_enabled(observability.enabled());
     let max_data_size_per_pkt = reliable_layer.max_data_size_per_pkt();
@@ -993,6 +1006,7 @@ mod tests {
             session_tag: None,
             initial_sequences: crate::sequence::InitialSequences::ZERO,
             initial_rtt: None,
+            initial_send_rate: None,
             metrics_observer: None,
             mss: crate::mss::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
             fec: None,
