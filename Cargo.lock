@@ -567,7 +567,7 @@ dependencies = [
 [[package]]
 name = "netem-test"
 version = "0.1.0"
-source = "git+https://github.com/Banyc/netem_test.git?tag=v0.0.2#4c315e8f60980c43ea692ca42b5f45e767010d46"
+source = "git+https://github.com/Banyc/netem_test.git?tag=v0.0.4#e423c41babc70f6e8bc1af1ebc2c1003b550ca48"
 dependencies = [
  "dfsql",
  "parking_lot 0.12.5",
