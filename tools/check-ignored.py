@@ -42,7 +42,8 @@ The relocated scenario targets (`tests/`) keep the harness tier vocabulary:
   requires its body to contain no assertion token, so a check cannot hide
   under the report-only tier. The helper reach of this tier is *not* left to
   this file's own-body scan: the shared scenario gate
-  (`netem_test/tools/check-gate.py`) follows the call graph from every `perf`
+  (`netem-tools check-gate`, the Rust port of the harness's gate checker, run
+  from `../netem_test`) follows the call graph from every `perf`
   scenario and requires each asserting helper it reaches to be declared in
   the crate's `gate-perf-guard-helpers` block.
 
@@ -54,7 +55,7 @@ vice versa) and escape the tier's rules.
 
 Files under `fuzz/`, `examples/`, and `local/` are not scanned (besides
 `tests/`, the opt-in inventory is the in-crate `src/` set). The
-assertion-token set matches netem_test's `tools/check-gate.py`, including the
+assertion-token set matches netem_test's `netem-tools check-gate`, including the
 debug-only forms; the brace counting is the same regex-level body extraction
 that harness uses, so both gates agree on what a function body is.
 
