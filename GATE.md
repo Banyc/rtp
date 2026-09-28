@@ -839,6 +839,8 @@ shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = 
 rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard | 5 | composite(impairment,metric,scale)@liveness | transport-liveness@impairment=permanent-mtu-hole+metric=connection-liveness+layer=rtp+scale=short-watchdog
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard | 65 | composite(fresh-sacks,impairment,metric)@liveness | transport-liveness@impairment=permanent-mtu-hole+fresh-sacks=on+metric=connection-liveness+layer=rtp
+lib::recv_budget_probe::probe_recv_budget_cliff = standard | 4 | composite(impairment,layer,metric,scale)@probe | probe-recv-budget@impairment=clean+metric=socket-hold-capacity+layer=udp+scale=3-budgets
+lib::recv_budget_probe::probe_recv_budget_transport = standard | 28 | composite(impairment,metric,scale)@probe | probe-recv-budget@impairment=stall+metric=wire-datagrams-per-mib+layer=rtp+scale=2-stalls-4-budgets
 lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet = standard | 0.01 | baseline@perf-lane | op-cost-scaling@layer=recv-window+metric=in-order-advance+scale=two-point
 lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_no_more_per_pop = standard | 0.01 | orthogonal@perf-lane | op-cost-scaling@layer=recv-window+metric=withheld-pop+scale=two-point
 lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window = standard | 0.11 | composite(layer,metric)@perf-lane | op-cost-scaling@layer=send-window+metric=sack-analysis+scale=two-point
@@ -869,8 +871,11 @@ one-axis set. The six named families each carry their own reference:
 shared-bottleneck instrument's own sanity pair, one dimension apart),
 `liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
 hostile-datagram FEC decoder fuzz pair, a deliberate repeat through the
-unguarded path), `probe` (the nine report-only repair-latency instruments, plus the always-run
-wire-driven ladder guard) and
+unguarded path), `probe` (the nine report-only repair-latency instruments, the
+always-run wire-driven ladder guard, and the two receive-budget instruments
+whose refusal is recorded under *Residual limitations* below: the socket's own
+hold capacity against a paced sender, and that budget's effect on the transport
+at the field's offer and delay) and
 `perf-lane` (the four asserting in-crate scaling gates: one reference, the
 in-order receive-window advance, and the three rows that vary one or two
 dimensions from it). The bulk of the declared rows are `composite` because the
@@ -1093,10 +1098,15 @@ the harness's
 therefore appears in both blocks under the two names that mean the same thing —
 `perf-lane` here, `standard` there — because the harness tier that may carry an
 assertion is `standard` and its `perf` tier is report-only by definition. The
-eight `probe`s appear here as `probe` and in the perf block as `perf`-tier rows,
-which is the same statement in each vocabulary.
+`probe`s appear here as `probe` and in the scenario gate's block as
+`standard`-tier rows, because `check-ignored.py` requires a probe to assert its
+own measurement and the harness's `perf` tier refuses a row that asserts in its
+own body; the two vocabularies say the same thing — *this opt-in asserts its
+instrument, not the product* — in the only tier each can carry it.
 
 ```ignored-manifest
+src/recv_budget_probe.rs::probe_recv_budget_cliff = probe
+src/recv_budget_probe.rs::probe_recv_budget_transport = probe
 src/recv_queue/pkt_recv_space.rs::advancing_the_receive_window_costs_no_more_per_packet = perf-lane
 src/recv_queue/pkt_recv_space.rs::withholding_frames_behind_a_hole_costs_no_more_per_pop = perf-lane
 src/socket/stream.rs::probe_armor_copy_cell = probe
@@ -1142,6 +1152,8 @@ asserting helpers a report-only `perf` scenario may reach — a change to them i
 a change to this file.
 
 ```gate-probe-selfchecks
+src/recv_budget_probe.rs::probe_recv_budget_cliff = 2
+src/recv_budget_probe.rs::probe_recv_budget_transport = 2
 src/socket/stream.rs::probe_armor_copy_cell = 6
 src/socket/stream.rs::probe_armor_cover_frontier = 7
 src/socket/stream.rs::probe_fresh_tail_armor_latency = 4
@@ -1168,6 +1180,8 @@ block's vocabulary.
 ```gate-manifest
 hol_verify4::v4_clean_rawbulk = perf
 hol_verify4::v4_ge5_rawbulk = perf
+lib::recv_budget_probe::probe_recv_budget_cliff = standard
+lib::recv_budget_probe::probe_recv_budget_transport = standard
 lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet = standard
 lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_no_more_per_pop = standard
 lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window = standard
@@ -1219,6 +1233,8 @@ rtp_padding_bench::unpadded_wire_sizes_stay_multimodal
 ```
 
 ```gate-asserting
+lib::recv_budget_probe::probe_recv_budget_cliff
+lib::recv_budget_probe::probe_recv_budget_transport
 lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet
 lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_no_more_per_pop
 lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window
@@ -1466,3 +1482,61 @@ only an actually unacked tail, since the owner gate's 40 msg/s cadence on a
 50 ms round trip pipelines its messages and so most of its fresh tails are not
 lone — is a change to `is_fresh_interactive_tail` with its own M1 measurement,
 named here and not attempted.
+
+### The receive-socket budget is refused as a path-sized lever, and the sweep is why
+
+`rtp` sizes nothing on the socket it owns.  `bind_udp` (`src/udp.rs:112-121`)
+calls `VectoredUdpSocket::bind`, and `connect_with_socket` (`src/udp.rs:1119`)
+`connect`s a caller-supplied one; no `SO_RCVBUF` is requested anywhere in the
+crate, so the budget is the kernel's default.  On the deployed Linux target that
+default is **212 992 B**: `SO_RCVBUF` clamps the request to `sysctl_rmem_max`
+(`net/core/sock.c:1375`, 4 MiB at `:286`) and `__sock_set_rcvbuf` then doubles it
+and floors it at `SOCK_MIN_RCVBUF` (`:987`, helper at `:967`), so `getsockopt`
+returns an *effective* value the caller never asked for; the default itself is
+`SK_RMEM_DEFAULT` = `SKB_TRUESIZE(256) * 256` = 832 x 256 (`include/net/sock.h:3058`),
+with `SKB_DATA_ALIGN` a 64-byte align (`include/linux/skbuff.h:256,273`) pinning
+`SKB_TRUESIZE`'s two structure terms to 256 and 320.  A full rtp datagram
+(`NO_FEC_MSS` 1424 plus its 48-byte header) therefore costs `SKB_TRUESIZE(1472)`
+= 2048, and the default holds **104** of them; `__udp_enqueue_schedule_skb`
+refuses when `rmem + skb->truesize > rcvbuf` (`net/ipv4/udp.c:1679`).
+
+`probe_recv_budget_cliff` measures the hold directly against a paced sender on
+this host: this host's own as-bound default (786 896 B) holds **541** of 738
+datagrams sent, an explicit 159 940 B holds **109**, and 398 458 B holds **274**
+— so the hold tracks the request 1:1 in *payload* bytes here, and the transport
+arm's emulated default (159 940 B, 104 by the truesize arithmetic above) is the
+deployed budget, not this host's.
+
+`probe_recv_budget_transport` then drives rtp's bulk lane at the product's offer
+(1 MiB/s) over the field's delay (95 ms each way) for a 4 MiB transfer whose
+stall lands 1 MiB in, and reports wire datagrams per MiB delivered (the only
+quantity that moved; the link dropped nothing in every arm, so the loss point is
+the receiver's socket):
+
+| stall | `tiny` 32 KB | `default` 153 KB | `path` 398 KB | `field` 3.37 MB |
+| --- | --- | --- | --- | --- |
+| 300 ms | — | 795 | **765** | — |
+| 3205 ms | 1979 | 1926 | 1911 | **1674** |
+
+End-to-end excess over the offer's own ideal moved by nothing: 169.3 / 167.7 ms
+at 300 ms, and 762.1 / 846.9 / 837.8 / 885.7 ms at 3205 ms — all within one
+arm-to-arm scatter, with the *largest* budget the worst at 3205 ms.
+
+One round trip of the offer is 199 229 B = 135 datagrams, so the deployed
+default (104) is below one bandwidth-delay product and a `rate x RTT` budget
+with 2x headroom is 398 458 B.  **It buys 3.8 % of wire at a one-round-trip
+stall and 0.8 % at the field's worst** (1911 against 1926), and no tail
+difference in any arm.  The quantity that does move the wire is the
+*stall duration*: covering the field's own 3205 ms at that offer needs 3.37 MB,
+22x the deployed default and 8.5x the path-sized budget, **per socket**, and it
+buys 13.1 % there — and
+that duration is not the path's round trip, so `rtp` cannot compute it.  Two
+further costs attend the change: the deliberate sizing API exists only in
+`tokio_udp`'s untagged `dev` (`a5f47f455275`), so a caller pinned to the
+published `v0.0.5` would reach it through `async_fd()` on unix only, with
+nothing on the fallback backend.  The lever is therefore **refused**: it does
+not pay at the product's offered rate, and what does pay is a deployment policy
+about stall durations rather than a path property the transport owns.  What is
+*unconfirmed* here is M1: no `rtp_mux` arm was run from `rtp`, so this says the
+budget does not move the transport's own wire or transfer time, not that some
+interactive percentile is unaffected.

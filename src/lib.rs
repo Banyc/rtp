@@ -10,6 +10,8 @@ pub mod keyed_udp;
 pub mod mpudp;
 mod mss;
 mod obfuscate;
+#[cfg(test)]
+mod recv_budget_probe;
 mod recv_queue;
 mod reliable;
 mod sequence;
