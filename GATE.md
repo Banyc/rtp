@@ -18,7 +18,7 @@ opt-in sets are recorded here and machine-checked:
   its `start_paused` runtime, and the watchdog row must keep its
   argument-supplied decision instant — so a wall-clock wait cannot return
   unnoticed.
-- `python3 ../netem_test/tools/check-gate.py --crate . rtp tests GATE.md`
+- `netem-tools check-gate --crate . rtp tests GATE.md`
   (from this checkout; the shared per-crate checker) enforces the scenario
   gate: the `gate-manifest`/`gate-asserting`/`gate-default-required`
   blocks below, plus the report-only perf tier's reach declared in
@@ -51,8 +51,9 @@ opt-in sets are recorded here and machine-checked:
   The four perf lanes are the in-crate asserting opt-in tests, so they are also
   rows of the perf declaration below, at the `standard` tier. `standard` is the
   harness's tier for an *asserting* opt-in test, and the block cannot be given
-  the crate's own tier name: `check-gate.py` resolves an `#[ignore]`d `lib`
-  row to `perf`, which this file reserves for report-only measurement, and it
+  the crate's own tier name: `netem-tools check-gate` resolves an `#[ignore]`d
+  `lib` row to `perf`, which this file reserves for report-only measurement,
+  and it
   body-scans a `perf` tier entry for assertion tokens — so tiering an asserting
   `lib` row `perf` would fail the gate rather than classify it. The mapping is
   `perf-lane` (this file's classification) = `standard` (the harness tier), and
@@ -132,8 +133,8 @@ comparison (`hol_verify4.rs`, the `rtp` half whose `mux` half lives in
   they do not assert a gate floor (the padding distribution/ACK-hiding floors
   they touch are asserted by the default-tier padding tests). A `perf`
   scenario must not contain an assertion in its own body, nor reach an
-  assertion through a helper: `check-gate.py --crate . rtp tests GATE.md`
-  fails with the scenario name, its file, and the token if it does.
+  assertion through a helper: `netem-tools check-gate` fails with the
+  scenario name, its file, and the token if it does.
 - **standard** / **full** asserting scenarios may keep their assertion in a
   helper defined in the same target file (the shared-bottleneck `full` arms
   assert inside `rr_under_bulk_ab`); `tools/check-ignored.py` follows those
@@ -555,7 +556,7 @@ The dual mandate (`AGENTS.md`, "The perf-test dual mandate — time and
 coverage") requires every perf test to name its tier, its cost and the
 coverage cells it provides, so the trade between the two is visible and
 checkable rather than assumed. The three blocks below are rtp's declaration;
-`python3 ../netem_test/tools/check-gate.py --crate . rtp tests GATE.md`
+`netem-tools check-gate --crate . rtp tests GATE.md`
 enforces it. Each row's relation to its family's baseline is re-derived from
 the row's own cells, so a row that varies several dimensions must be labelled a
 `composite` and a row that varies none must say why it repeats the point.
@@ -1085,8 +1086,9 @@ and they name the same in-crate tests differently. This one is the crate's own:
 `src/`-vs-`tests/` split, and holds each in-crate test to its own rule (a
 `perf-lane` must still assert; a `probe` must still assert its own measurement
 and match the count in `gate-probe-selfchecks`). The scenario gate is the
-harness's: `check-gate.py` resolves a `lib::<module>::<test>` entry against the
-compiled `--lib` target and owns the *tier*, whose vocabulary is the harness's
+harness's: `netem-tools check-gate` resolves a `lib::<module>::<test>` entry
+against the compiled `--lib` target and owns the *tier*, whose vocabulary is
+the harness's
 (`standard`/`full`/`perf`) rather than this file's. An asserting in-crate opt-in
 therefore appears in both blocks under the two names that mean the same thing —
 `perf-lane` here, `standard` there — because the harness tier that may carry an
