@@ -9,6 +9,7 @@ pub mod io_err;
 pub mod keyed_udp;
 pub mod mpudp;
 mod mss;
+pub mod nic;
 mod obfuscate;
 #[cfg(test)]
 mod recv_budget_probe;
