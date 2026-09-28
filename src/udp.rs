@@ -1241,6 +1241,7 @@ pub async fn connect_with_socket(
 /// [`wrap_fec_with_mss_and_fec_tuning_and_frame_delivery`], shared by the
 /// socket constructors (`connect_bound`, `accept`) and
 /// [`unreliable_layer_with_config`].
+#[allow(clippy::too_many_arguments)] // one authority for the layer plus the seven post-wrap fields it assigns
 fn apply_layer_tuning(
     layer: &mut UnreliableLayer,
     congestion_lane: CongestionLane,
