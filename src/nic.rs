@@ -1,55 +1,64 @@
-//! Interactive/bulk fair queueing on one NIC.
+//! Interactive/bulk strict-priority arbitration on one NIC.
 //!
-//! This is the kernel fair-queueing idea applied one level up. Where an egress
-//! qdisc such as `fq_codel` is fair *between flows* to keep any one flow's
-//! queue short, this is fair *between the two traffic classes this product
-//! distinguishes* — interactive and bulk — so the interactive class keeps the
-//! short queue no matter how many bulk connections share the device.
+//! This is the kernel fair-queueing idea applied one level up, reduced to the
+//! one decision the product needs: when two connections' datagrams are ready
+//! to leave the same device, the interactive one goes first.
 //!
 //! The unit of contention on the sender is the **NIC**, not the mux connection
 //! and not the destination. When bulk traffic is spread across several
 //! connections (to avoid saturating any one policed destination, or for load
 //! balancing), those connections share one egress device, and no per-connection
-//! scheduler can keep an interactive datagram from sitting behind a bulk queue
-//! at that device. This crate is that device-level queue: the operator
-//! constructs one [`NicScheduler`] per NIC (or several independent ones) and
-//! hands the **same** instance to every connection that egresses it; each
-//! connection wraps its own send path in [`NicWrite`] under a [`Class`].
+//! scheduler can order an interactive datagram against a bulk one there. So the
+//! operator constructs one [`NicScheduler`] per NIC (or several independent
+//! ones) and hands the **same** instance to every connection that egresses it;
+//! each connection wraps its own send path in [`NicWrite`] under a [`Class`].
 //!
 //! The invariant is the one the product's interactive-latency mandate needs:
 //!
 //! > an interactive datagram is never delayed behind a bulk datagram on the
-//! > NIC the queue governs — beyond the one datagram already in flight.
+//! > NIC the arbiter governs — beyond the one bulk datagram already in flight.
 //!
-//! [`Policy::Priority`] enforces it by serving interactive first and letting
-//! bulk consume only the link credit *above* a configured interactive reserve,
-//! so the NIC never carries a standing bulk backlog that an interactive
-//! datagram would have to queue behind. [`Policy::Fifo`] is the control: same
-//! link, arrival order only — the arm an interactive-aware discipline must
-//! beat to prove it changed anything.
+//! # It decides order, not rate
+//!
+//! There is **no rate, no credit, no capacity and no reserve**. The arbiter
+//! never limits throughput and needs to know nothing about the link: it only
+//! decides which class's datagram is emitted first when both are ready. If no
+//! interactive traffic is in flight, bulk is unthrottled; backpressure comes
+//! from the socket buffer and the connection's own transport controller, never
+//! from here. A configured link rate would be an artificial ceiling, wrong the
+//! moment the real capacity differs from the number.
 //!
 //! # Shape
 //!
-//! The scheduler arbitrates **credit**, not datagrams: [`NicScheduler::acquire`]
-//! waits until the policy lets a datagram of the given size go, then returns,
-//! and the connection performs its own send. That keeps the queue composable
-//! with any send path — a bare UDP socket, or `rtp`'s obfuscating write half —
-//! and bounds an interactive datagram's wait to the one bulk datagram already
-//! in flight rather than to a queue depth.
+//! [`NicScheduler::acquire`] returns once the policy admits the datagram, and
+//! the connection performs its own send while holding the returned
+//! [`NicPermit`]. That keeps the arbiter composable with any send path — a
+//! bare UDP socket, or `rtp`'s obfuscating write half — and bounds an
+//! interactive datagram's wait to the one bulk datagram already in flight
+//! rather than to a queue depth.
+//!
+//! # What it does not do
+//!
+//! It orders the **local** send. It cannot drain a network queue that bulk has
+//! already filled; keeping the interactive class off a saturated path is the
+//! lane-isolation lever, not this one. This is the strongest thing a sender
+//! can do at its own egress without cross-layer marking.
 
 use std::{
-    fmt, io,
+    fmt,
     net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
-use tokio::{net::UdpSocket, sync::Notify, time::Instant};
+use tokio::{net::UdpSocket, sync::watch};
 
 use crate::transmission::transmission_layer::{UnreliableLayer, UnreliableRead, UnreliableWrite};
 
-/// The traffic class of a datagram. The scheduler's only job is the ordering
+/// The traffic class of a datagram. The arbiter's only job is the ordering
 /// between these two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -57,135 +66,21 @@ pub enum Class {
     Bulk,
 }
 
-/// How the scheduler arbitrates the link between the classes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Policy {
-    /// Interactive datagrams are served before bulk, and bulk may consume only
-    /// the link credit above `interactive_reserve_bytes_per_sec`, so a reserve
-    /// is always left for interactive even while bulk is saturating. While an
-    /// interactive datagram is waiting for credit, bulk is not admitted at
-    /// all.
-    ///
-    /// The reserve is a **rate**, not a queue depth: it is the link capacity
-    /// held in perpetuity for interactive traffic, which is what makes the
-    /// guarantee independent of how much bulk is queued.
-    Priority {
-        interactive_reserve_bytes_per_sec: f64,
-    },
-    /// Arrival order (the control arm): bulk can occupy the whole link, and an
-    /// interactive datagram waits for whatever bulk credit was granted first.
-    Fifo,
-}
-
-/// Configuration for one [`NicScheduler`].
-#[derive(Debug, Clone, Copy)]
-pub struct NicConfig {
-    /// The egress device's capacity, in bytes per second.
-    pub link_rate_bytes_per_sec: f64,
-    /// The arbitration policy.
-    pub policy: Policy,
-}
-
-impl NicConfig {
-    /// A priority scheduler holding `reserve_bytes_per_sec` of a
-    /// `link_rate_bytes_per_sec` NIC for interactive traffic.
-    pub fn priority(link_rate_bytes_per_sec: f64, reserve_bytes_per_sec: f64) -> Self {
-        Self {
-            link_rate_bytes_per_sec,
-            policy: Policy::Priority {
-                interactive_reserve_bytes_per_sec: reserve_bytes_per_sec,
-            },
-        }
-    }
-
-    /// The control: the same NIC, arrival order only.
-    pub fn fifo(link_rate_bytes_per_sec: f64) -> Self {
-        Self {
-            link_rate_bytes_per_sec,
-            policy: Policy::Fifo,
-        }
-    }
-}
-
-/// The shared credit state for one NIC.
+/// The gate. `interactive_active` is a plain counter of interactive sends in
+/// flight — counting is fine. The **synchronization is not that counter**: a
+/// `watch` channel carries whether bulk may proceed (`true` = no interactive
+/// send is active), and a bulk waiter blocks on the channel's `changed()`,
+/// never on the counter. The counter only decides *when* the channel
+/// transitions (the 1 -> 0 release), so "any interactive active" stays exact
+/// without the counter acting as a semaphore's permit count.
 struct Shared {
-    state: Mutex<Credit>,
-    notify: Notify,
-    rate: f64,
-    reserve: f64,
-    policy: Policy,
+    interactive_active: AtomicUsize,
+    gate: watch::Sender<bool>,
 }
 
-#[derive(Debug)]
-struct Credit {
-    tokens: f64,
-    last: Instant,
-    /// Interactive datagrams currently waiting for credit. While this is
-    /// non-zero, bulk is not admitted: an interactive datagram is never
-    /// behind bulk.
-    interactive_waiters: usize,
-}
-
-impl Shared {
-    fn refill(&self, st: &mut Credit, now: Instant) {
-        let added = self.rate * now.duration_since(st.last).as_secs_f64();
-        // An idle link may not bank an unbounded burst: one second of credit.
-        st.tokens = (st.tokens + added).min(self.rate);
-        st.last = now;
-    }
-
-    /// Try to consume credit for a datagram of `len` bytes under the policy.
-    fn try_take(&self, st: &mut Credit, class: Class, len: usize, now: Instant) -> bool {
-        self.refill(st, now);
-        let bytes = len as f64;
-        match self.policy {
-            Policy::Priority { .. } => match class {
-                Class::Interactive => {
-                    if st.tokens >= bytes {
-                        st.tokens -= bytes;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                Class::Bulk => {
-                    if st.interactive_waiters == 0 && st.tokens - bytes >= self.reserve {
-                        st.tokens -= bytes;
-                        true
-                    } else {
-                        false
-                    }
-                }
-            },
-            Policy::Fifo => {
-                if st.tokens >= bytes {
-                    st.tokens -= bytes;
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    /// How long until a datagram of `len` bytes could be admitted.
-    fn wait_for(&self, st: &mut Credit, class: Class, len: usize, now: Instant) -> Duration {
-        self.refill(st, now);
-        let bytes = len as f64;
-        let secs = match self.policy {
-            Policy::Priority { .. } => match class {
-                Class::Interactive => (bytes - st.tokens) / self.rate,
-                Class::Bulk => (bytes + self.reserve - st.tokens) / self.rate,
-            },
-            Policy::Fifo => (bytes - st.tokens) / self.rate,
-        };
-        Duration::from_secs_f64(secs.max(0.0)).max(Duration::from_micros(10))
-    }
-}
-
-/// A per-NIC egress queue. One instance governs one NIC; construct as many as
-/// there are NICs, and hand the same instance to every connection that
-/// egresses that NIC. Instances share no state.
+/// A per-NIC egress arbiter. One instance governs one NIC; construct as many as
+/// there are NICs, and hand the same instance to every connection that egresses
+/// that NIC. Instances share no state.
 #[derive(Clone)]
 pub struct NicScheduler {
     shared: Arc<Shared>,
@@ -197,81 +92,95 @@ impl fmt::Debug for NicScheduler {
     }
 }
 
+impl Default for NicScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NicScheduler {
-    pub fn new(config: NicConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
-                state: Mutex::new(Credit {
-                    tokens: 0.0,
-                    last: Instant::now(),
-                    interactive_waiters: 0,
-                }),
-                notify: Notify::new(),
-                rate: config.link_rate_bytes_per_sec.max(1.0),
-                reserve: match config.policy {
-                    Policy::Priority {
-                        interactive_reserve_bytes_per_sec,
-                    } => interactive_reserve_bytes_per_sec.max(0.0),
-                    Policy::Fifo => 0.0,
-                },
-                policy: config.policy,
+                interactive_active: AtomicUsize::new(0),
+                gate: watch::channel(true).0,
             }),
         }
     }
 
-    /// Wait until the policy admits a datagram of `len` bytes of `class` on
-    /// this NIC, consuming its credit. The caller sends afterwards.
-    pub async fn acquire(&self, class: Class, len: usize) {
-        if self.try_once(class, len) {
-            return;
-        }
-        let _guard = WaiterGuard::new(&self.shared, class);
-        loop {
-            if self.try_once(class, len) {
-                return;
+    /// Wait until the policy admits a datagram of `class`. An interactive
+    /// datagram is admitted immediately; a bulk one is admitted only when no
+    /// interactive send is active. The caller sends while holding the returned
+    /// permit; dropping it releases the class.
+    pub async fn acquire(&self, class: Class) -> NicPermit {
+        match class {
+            Class::Interactive => {
+                // Count first, then close the gate, so a bulk waiter cannot
+                // observe the gate open across this send.
+                self.shared
+                    .interactive_active
+                    .fetch_add(1, Ordering::AcqRel);
+                self.shared.gate.send_replace(false);
+                NicPermit {
+                    shared: Arc::clone(&self.shared),
+                    interactive: true,
+                }
             }
-            let wait = {
-                let mut st = self.shared.state.lock().unwrap();
-                self.shared.wait_for(&mut st, class, len, Instant::now())
-            };
-            tokio::select! {
-                () = tokio::time::sleep(wait) => {}
-                () = self.shared.notify.notified() => {}
+            Class::Bulk => {
+                let mut open = self.shared.gate.subscribe();
+                while !*open.borrow_and_update() {
+                    if open.changed().await.is_err() {
+                        // The scheduler was dropped; nobody can re-open the
+                        // gate, so do not park forever.
+                        break;
+                    }
+                }
+                NicPermit {
+                    shared: Arc::clone(&self.shared),
+                    interactive: false,
+                }
             }
         }
     }
+}
 
-    fn try_once(&self, class: Class, len: usize) -> bool {
-        let mut st = self.shared.state.lock().unwrap();
-        self.shared.try_take(&mut st, class, len, Instant::now())
+/// Held for the duration of one admitted send. An interactive permit releases
+/// the class (and wakes bulk) when dropped.
+pub struct NicPermit {
+    shared: Arc<Shared>,
+    interactive: bool,
+}
+
+impl fmt::Debug for NicPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NicPermit")
+            .field("interactive", &self.interactive)
+            .finish()
     }
 }
 
-/// Tracks a waiting datagram so bulk stays blocked while any interactive
-/// datagram waits, and so a departing waiter wakes the others.
-struct WaiterGuard<'a> {
-    shared: &'a Shared,
-    class: Class,
-}
-
-impl<'a> WaiterGuard<'a> {
-    fn new(shared: &'a Shared, class: Class) -> Self {
-        if class == Class::Interactive {
-            shared.state.lock().unwrap().interactive_waiters += 1;
-        }
-        Self { shared, class }
-    }
-}
-
-impl Drop for WaiterGuard<'_> {
+impl Drop for NicPermit {
     fn drop(&mut self) {
-        if self.class == Class::Interactive {
-            self.shared.state.lock().unwrap().interactive_waiters -= 1;
+        if self.interactive
+            && self
+                .shared
+                .interactive_active
+                .fetch_sub(1, Ordering::AcqRel)
+                == 1
+        {
+            self.shared.gate.send_replace(true);
         }
-        // A departing waiter may unblock another class (an interactive leaving
-        // lets bulk proceed); wake everyone to re-check.
-        self.shared.notify.notify_waiters();
     }
+}
+
+/// One connection's injection into a per-NIC arbiter: the arbiter it egresses
+/// through and its traffic class. Carried on `ConnectConfig`/`AcceptConfig` so
+/// any layer (rtp, rtp_mux, and rtp_mux's callers) can pass the same per-NIC
+/// instance down to the connection that sends.
+#[derive(Debug, Clone)]
+pub struct NicLink {
+    pub scheduler: NicScheduler,
+    pub class: Class,
 }
 
 /// Wraps any `UnreliableWrite` so each datagram is admitted by the NIC before
@@ -297,25 +206,17 @@ impl<W> NicWrite<W> {
 #[async_trait]
 impl<W: UnreliableWrite> UnreliableWrite for NicWrite<W> {
     async fn send(&mut self, buf: &[u8]) -> Result<usize, crate::IoErr> {
-        self.scheduler.acquire(self.class, buf.len()).await;
+        let _permit = self.scheduler.acquire(self.class).await;
         self.inner.send(buf).await
     }
 
-    async fn send_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> Result<usize, crate::IoErr> {
-        let total: usize = bufs.iter().map(|b| b.len()).sum();
-        self.scheduler.acquire(self.class, total).await;
+    async fn send_vectored(
+        &mut self,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Result<usize, crate::IoErr> {
+        let _permit = self.scheduler.acquire(self.class).await;
         self.inner.send_vectored(bufs).await
     }
-}
-
-/// One connection's injection into a per-NIC scheduler: the scheduler it
-/// egresses through and its traffic class. Carried on `ConnectConfig` /
-/// `AcceptConfig` so any layer (rtp, rtp_mux, and rtp_mux's callers) can pass
-/// the same per-NIC instance down to the connection that sends.
-#[derive(Debug, Clone)]
-pub struct NicLink {
-    pub scheduler: NicScheduler,
-    pub class: Class,
 }
 
 /// One connection's end of a NIC when the connection owns its UDP socket. A
@@ -350,10 +251,10 @@ impl NicEndpoint {
         self.socket.connect(peer).await
     }
 
-    /// Offer a raw datagram through the NIC (the socket sends it after
+    /// Offer a raw datagram through the arbiter (the socket sends it after
     /// admission). For a load source that is not an `rtp` session.
     pub async fn send(&self, data: &[u8]) -> std::io::Result<usize> {
-        self.scheduler.acquire(self.class, data.len()).await;
+        let _permit = self.scheduler.acquire(self.class).await;
         // Inherent `UdpSocket::send` (io::Result), not the `UnreliableWrite`
         // impl on `Arc<UdpSocket>`, which a bare method call would select.
         UdpSocket::send(&self.socket, data).await
@@ -363,9 +264,7 @@ impl NicEndpoint {
     /// to hand to [`crate::socket::socket`]. The `config` is the same
     /// [`crate::udp::ConnectConfig`] a socket connect takes, minus the
     /// transport-leg options that cannot be honoured off a socket (rejected by
-    /// [`crate::udp::unreliable_layer_with_config`]); a `config` whose `nic`
-    /// would double-inject is ignored here because the endpoint already is the
-    /// injection.
+    /// [`crate::udp::unreliable_layer_with_config`]).
     pub fn into_rtp_layer(
         self,
         config: crate::udp::ConnectConfig<'_>,
@@ -383,104 +282,57 @@ impl NicEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    const MIB: f64 = 1_048_576.0;
-    const BULK_LEN: usize = 16_384;
+    const PROBE: Duration = Duration::from_millis(50);
 
-    /// A shared credit state whose clock is pinned, so the credit arithmetic
-    /// does not depend on how long construction took.
-    fn pinned(config: NicConfig) -> (Shared, Instant) {
-        let base = Instant::now();
-        let reserve = match config.policy {
-            Policy::Priority {
-                interactive_reserve_bytes_per_sec,
-            } => interactive_reserve_bytes_per_sec.max(0.0),
-            Policy::Fifo => 0.0,
-        };
-        let shared = Shared {
-            state: Mutex::new(Credit {
-                tokens: 0.0,
-                last: base,
-                interactive_waiters: 0,
-            }),
-            notify: Notify::new(),
-            rate: config.link_rate_bytes_per_sec.max(1.0),
-            reserve,
-            policy: config.policy,
-        };
-        (shared, base)
+    /// An interactive datagram is admitted immediately, even while a bulk send
+    /// is in flight: it never waits behind bulk.
+    #[tokio::test]
+    async fn interactive_never_waits_for_bulk() {
+        let scheduler = NicScheduler::new();
+        let _bulk = scheduler.acquire(Class::Bulk).await;
+        tokio::time::timeout(PROBE, scheduler.acquire(Class::Interactive))
+            .await
+            .expect("an interactive datagram waited behind bulk");
     }
 
-    /// Under priority, an interactive datagram is admitted before any bulk on
-    /// the same credit, and a bulk datagram cannot take the interactive
-    /// reserve.
-    #[test]
-    fn priority_admits_interactive_before_bulk_and_keeps_the_reserve() {
-        let (shared, base) = pinned(NicConfig::priority(MIB, MIB / 2.0));
-        let mut st = Credit {
-            tokens: MIB,
-            last: base,
-            interactive_waiters: 0,
-        };
-        // Bulk may take only above the reserve: it can spend MIB - MIB/2.
-        let mut taken = 0.0;
-        while shared.try_take(&mut st, Class::Bulk, BULK_LEN, base) {
-            taken += BULK_LEN as f64;
+    /// A bulk datagram is not admitted while an interactive send is active, and
+    /// is admitted as soon as none is.
+    #[tokio::test]
+    async fn bulk_waits_for_interactive_then_proceeds() {
+        let scheduler = NicScheduler::new();
+        let interactive = scheduler.acquire(Class::Interactive).await;
+        assert!(
+            tokio::time::timeout(PROBE, scheduler.acquire(Class::Bulk))
+                .await
+                .is_err(),
+            "bulk was admitted while an interactive send was active"
+        );
+        drop(interactive);
+        tokio::time::timeout(PROBE, scheduler.acquire(Class::Bulk))
+            .await
+            .expect("bulk was not admitted after the interactive send finished");
+    }
+
+    /// With no interactive traffic, bulk is unthrottled: the arbiter adds no
+    /// rate and no cap of any kind.
+    #[tokio::test]
+    async fn bulk_is_unthrottled_with_no_interactive_traffic() {
+        let scheduler = NicScheduler::new();
+        for _ in 0..10_000 {
+            let _bulk = scheduler.acquire(Class::Bulk).await;
         }
-        assert!(
-            taken >= MIB / 2.0 - BULK_LEN as f64 && taken <= MIB / 2.0,
-            "bulk spent {taken} bytes of a 1 MiB link with a 0.5 MiB reserve"
-        );
-        assert!(
-            st.tokens >= MIB / 2.0,
-            "the reserve was eaten: {}",
-            st.tokens
-        );
-        // The reserve is still there for interactive.
-        assert!(
-            shared.try_take(&mut st, Class::Interactive, 64, base),
-            "interactive could not use the reserve"
-        );
     }
 
-    /// While an interactive datagram waits for credit, bulk is not admitted:
-    /// an interactive datagram is never behind bulk.
-    #[test]
-    fn priority_blocks_bulk_while_interactive_waits() {
-        let (shared, base) = pinned(NicConfig::priority(MIB, MIB / 2.0));
-        let mut st = Credit {
-            tokens: MIB,
-            last: base,
-            interactive_waiters: 1,
-        };
-        assert!(
-            !shared.try_take(&mut st, Class::Bulk, 64, base),
-            "bulk was admitted while an interactive datagram waited"
-        );
-    }
-
-    /// The control: under FIFO there is no reserve and no class ordering, so
-    /// bulk can drain the link and an interactive datagram must wait for the
-    /// next refill.
-    #[test]
-    fn fifo_has_no_reserve() {
-        let (shared, base) = pinned(NicConfig::fifo(MIB));
-        let mut st = Credit {
-            tokens: MIB,
-            last: base,
-            interactive_waiters: 0,
-        };
-        let mut taken = 0.0;
-        while shared.try_take(&mut st, Class::Bulk, BULK_LEN, base) {
-            taken += BULK_LEN as f64;
-        }
-        assert!(
-            taken >= MIB - BULK_LEN as f64,
-            "fifo bulk did not drain the link: {taken}"
-        );
-        assert!(
-            !shared.try_take(&mut st, Class::Interactive, 64, base),
-            "an interactive datagram was admitted with the link drained"
-        );
+    /// Two bulk senders can be in flight together: the arbiter delays bulk only
+    /// behind interactive, never behind other bulk.
+    #[tokio::test]
+    async fn bulk_does_not_wait_behind_other_bulk() {
+        let scheduler = NicScheduler::new();
+        let _a = scheduler.acquire(Class::Bulk).await;
+        tokio::time::timeout(PROBE, scheduler.acquire(Class::Bulk))
+            .await
+            .expect("a bulk send waited behind another bulk send");
     }
 }
