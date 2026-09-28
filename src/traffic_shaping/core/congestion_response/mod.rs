@@ -56,6 +56,10 @@ pub(crate) struct CongestionInput {
     pub(crate) minimum_rate: f64,
     pub(crate) initial_rate: f64,
     pub(crate) now: Instant,
+    /// Whether this egress path is shared with a live interactive lane (the
+    /// egress path's path signal). On a shared path this connection's own delay gate
+    /// is authoritative and loss does not suppress it.
+    pub(crate) shared_path: bool,
 }
 
 /// Single atomic owner of the congestion-response policy state.
@@ -150,10 +154,17 @@ impl CongestionResponse {
         // queue, so a standing delay there is its own queue and the ordinary
         // drain applies even when the sender is briefly starved.
         let shared_app_limited = self.lane.app_limited_means_cross_traffic(input.app_limited);
+        // On a path shared with an interactive lane, this connection's own
+        // delay gate is authoritative: loss from a buffer this group is itself
+        // filling is not independent evidence, so it must not suppress the
+        // delay drain.  The connection's *own* queue observation drives the
+        // decision, at its own RTT-sample cadence — the only cross-connection
+        // fact needed is that the path is shared.
+        let loss_blocks_delay_control = observation.loss_blocks_delay_control && !input.shared_path;
         let path = select_path(
             observation.queue_building,
             observation.persistent_for.is_some(),
-            observation.loss_blocks_delay_control,
+            loss_blocks_delay_control,
             shared_app_limited,
         );
         if path != ResponsePath::Probe {
@@ -451,6 +462,7 @@ mod tests {
             app_limited: false,
             minimum_rate: 1.0,
             initial_rate: 128.0,
+            shared_path: false,
             now,
         };
         let dedicated_out = dedicated.decide(dedicated_obs, input(enter_at));
@@ -542,6 +554,7 @@ mod tests {
             app_limited: false,
             minimum_rate: 1.0,
             initial_rate: 128.0,
+            shared_path: false,
             now: probe_at,
         };
         let CongestionDecision::Probe {
@@ -594,6 +607,7 @@ mod tests {
             app_limited: false,
             minimum_rate: 1.0,
             initial_rate: 128.0,
+            shared_path: false,
             now,
         };
 
@@ -729,6 +743,7 @@ mod tests {
             app_limited: false,
             minimum_rate: 1.0,
             initial_rate: 128.0,
+            shared_path: false,
             now: t0,
         };
         let mut stock = CongestionResponse::new(t0, false, CongestionLane::Shared);
@@ -786,6 +801,7 @@ mod tests {
             app_limited: true,
             minimum_rate: 1.0,
             initial_rate: 128.0,
+            shared_path: false,
             now,
         };
 
@@ -805,6 +821,54 @@ mod tests {
                 CongestionDecision::Drain { .. }
             ),
             "the same application-limited sample on a dedicated lane must drain: the standing queue is its own"
+        );
+    }
+
+    /// On a path shared with an interactive lane, this connection's *own*
+    /// standing queue must drive the delay drain even when loss-based control
+    /// would otherwise win.
+    #[test]
+    fn a_shared_path_drains_despite_loss() {
+        let now = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        // This connection's own queue is standing (RTT above the floor) and
+        // the path carries loss.
+        let observation = CongestionObservation {
+            floor: control_rtt,
+            tolerance: Duration::from_millis(10),
+            queue_building: true,
+            persistent_for: Some(Duration::from_millis(200)),
+            peak_delivery: 1000.0,
+            loss_blocks_delay_control: true,
+            gentle_exit: None,
+        };
+        let input = |shared_path| CongestionInput {
+            delivery_rate: 1000.0,
+            current_rate: 1000.0,
+            smooth_rtt: Duration::from_millis(300),
+            control_rtt,
+            loss_event_rate: Some(0.5),
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            shared_path,
+            now,
+        };
+        let mut own = CongestionResponse::new(now, false, CongestionLane::Shared);
+        assert!(
+            matches!(
+                own.decide(observation, input(false)).decision(),
+                CongestionDecision::LossBackoff { .. }
+            ),
+            "with loss and no shared path the loss backoff must win"
+        );
+        let mut shared = CongestionResponse::new(now, false, CongestionLane::Shared);
+        assert!(
+            matches!(
+                shared.decide(observation, input(true)).decision(),
+                CongestionDecision::Drain { .. }
+            ),
+            "on a shared path the connection's own standing queue must drain despite loss"
         );
     }
 }

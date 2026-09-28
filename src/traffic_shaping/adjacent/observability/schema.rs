@@ -423,7 +423,7 @@ impl MetricsEvent {
 }
 
 /// A point-in-time snapshot of the reliable transport.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MetricsSnapshot {
     pub pacer_tokens_packets: f64,
     pub send_rate_packets_per_second: f64,
@@ -554,6 +554,31 @@ impl MetricsObserver {
         Self {
             filter: Arc::new(filter),
             callback: Arc::new(callback),
+        }
+    }
+
+    /// An observer that drives both callbacks and asks for a snapshot if
+    /// either would, so one connection can publish to more than one consumer
+    /// (e.g. the egress path arbiter's signal and a test observer) without dropping
+    /// either.
+    pub fn chained(self, other: MetricsObserver) -> Self {
+        let first = self;
+        let second = other;
+        Self {
+            filter: Arc::new(move |event, elapsed| {
+                let a = (first.filter)(event, elapsed);
+                let b = (second.filter)(event, elapsed);
+                if matches!(a, MetricsInterest::Snapshot) || matches!(b, MetricsInterest::Snapshot)
+                {
+                    MetricsInterest::Snapshot
+                } else {
+                    MetricsInterest::Skip
+                }
+            }),
+            callback: Arc::new(move |observation| {
+                (first.callback)(observation);
+                (second.callback)(observation);
+            }),
         }
     }
 

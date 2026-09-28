@@ -185,6 +185,12 @@ fn new_connection_inner(
     if let Some(initial_rtt) = unreliable_layer.initial_rtt {
         reliable_layer.sample_rtt(initial_rtt, now);
     }
+    // Install the egress path's cross-lane congestion signal, if this connection is
+    // egress path-managed.  The controller reads it once per congestion decision, so a
+    // standing queue reported by another lane on the same egress drives this
+    // connection's delay drain even when loss-based control would otherwise
+    // win.
+    reliable_layer.set_shared_congestion(unreliable_layer.shared_congestion.clone());
     // The connection's optional pacer seed: install both the reliable layer's
     // send rate and the token bucket's own rate, so the sender is not served
     // from a standing backlog while its congestion ramp climbs to the lane's
@@ -1013,6 +1019,7 @@ mod tests {
             fec_tuning: FecTuning::default(),
             frame_delivery,
             congestion_lane: crate::CongestionLane::default(),
+            shared_congestion: None,
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,

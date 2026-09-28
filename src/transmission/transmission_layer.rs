@@ -119,6 +119,9 @@ pub struct UnreliableLayer {
     /// shared session state reads it once at construction.  Frame delivery and
     /// byte-stream delivery are orthogonal to this intent.
     pub(crate) congestion_lane: crate::CongestionLane,
+    /// The egress path's cross-lane congestion signal to install on the
+    /// connection's controller, if this transport is egress path-managed.
+    pub(crate) shared_congestion: Option<crate::cc::CcSignal>,
     /// Retransmission-armor duplicate-copy config.  Set once at construction
     /// from the connect/accept config (which reads `RTP_RTX_DUP` in
     /// `Default`); the shared session state is seeded from here.

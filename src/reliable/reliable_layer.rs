@@ -229,6 +229,9 @@ pub struct ReliableLayer {
     /// ordinary probing, and drain-floor hysteresis (see
     /// [`CongestionResponse`]).
     congestion_response: CongestionResponse,
+    /// The egress path's cross-lane congestion signal, if this connection is managed.
+    /// Read once per congestion decision; `None` leaves it egress path-unmanaged.
+    shared_congestion: Option<crate::cc::CcSignal>,
     slow_start: bool,
     slow_start_acked_pkts: usize,
     /// Windowed ACK-clock ramp for the dedicated lane's bounded fast start.
@@ -312,6 +315,7 @@ impl ReliableLayer {
                 frame_delivery.allow_reorder,
                 congestion_lane,
             ),
+            shared_congestion: None,
             slow_start: true,
             slow_start_acked_pkts: 0,
             fast_start: FastStartEpisode::new(now),
@@ -364,6 +368,7 @@ impl ReliableLayer {
                 frame_delivery.allow_reorder,
                 congestion_lane,
             ),
+            shared_congestion: None,
             slow_start: true,
             slow_start_acked_pkts: 0,
             fast_start: FastStartEpisode::new(now),
@@ -503,6 +508,12 @@ impl ReliableLayer {
     /// flips, and only then terminates.
     pub fn recv_window_full(&self) -> bool {
         self.pkt_recv_space.is_full()
+    }
+
+    /// Install the egress path's cross-lane congestion signal (see
+    /// [`crate::cc::CcSignal`]).
+    pub(crate) fn set_shared_congestion(&mut self, input: Option<crate::cc::CcSignal>) {
+        self.shared_congestion = input;
     }
 
     /// Whether the delivery-rate congestion controller currently considers the
@@ -1146,6 +1157,10 @@ impl ReliableLayer {
                 app_limited: sr.is_app_limited(),
                 minimum_rate: MIN_SEND_RATE,
                 initial_rate: INIT_SEND_RATE,
+                shared_path: self
+                    .shared_congestion
+                    .as_ref()
+                    .is_some_and(|s| s.is_shared()),
                 now,
             },
         );

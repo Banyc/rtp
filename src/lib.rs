@@ -1,6 +1,7 @@
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod ack;
+pub mod cc;
 mod clock;
 mod codec;
 mod debug;
@@ -9,7 +10,6 @@ pub mod io_err;
 pub mod keyed_udp;
 pub mod mpudp;
 mod mss;
-pub mod nic;
 mod obfuscate;
 #[cfg(test)]
 mod recv_budget_probe;

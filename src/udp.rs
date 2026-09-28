@@ -350,6 +350,7 @@ impl Listener {
         let key = self.key;
         let policy = self.policy;
         let session_count = Arc::clone(&self.session_count);
+        let local_addr = self.local_addr;
         Ok(Box::pin(async move {
             accept(
                 accepted,
@@ -358,6 +359,7 @@ impl Listener {
                 key,
                 policy,
                 session_count,
+                local_addr,
             )
             .await
         }))
@@ -377,6 +379,7 @@ impl Listener {
             self.key,
             self.policy,
             Arc::clone(&self.session_count),
+            self.local_addr,
         )
         .await
     }
@@ -426,6 +429,7 @@ impl Listener {
                 key,
                 policy,
                 session_count,
+                local_addr,
             )
             .await?;
             let Accepted {
@@ -501,10 +505,13 @@ pub struct AcceptConfig {
     /// data-packet sizes. The peer must use the same policy. `None` (the
     /// default) sends datagrams unpadded.
     pub padding: HarmfulPaddingPolicy,
-    /// Optional per-NIC scheduler this connection egresses through. The same
-    /// instance is shared by every connection on the NIC; the class is this
+    /// Optional per-egress-path scheduler this connection egresses through. The same
+    /// instance is shared by every connection on the egress path; the class is this
     /// connection's lane. `None` keeps the stock per-socket behaviour.
-    pub nic: Option<crate::nic::NicLink>,
+    pub shared_congestion: Option<crate::cc::CcSignal>,
+    /// Attach this connection to a per-egress-path scheduler. The transport resolves
+    /// the `(src, dst)` path group from the socket's own addresses.
+    pub cc_link: Option<crate::cc::CcLink>,
 }
 
 impl Default for AcceptConfig {
@@ -521,7 +528,8 @@ impl Default for AcceptConfig {
             metrics_observer: None,
             obfuscation_key: None,
             padding: HarmfulPaddingPolicy::None,
-            nic: None,
+            shared_congestion: None,
+            cc_link: None,
         }
     }
 }
@@ -571,10 +579,13 @@ pub struct ConnectConfig<'a> {
     /// `AckMimicsData`, so the default is `None`; interactive latency was
     /// not observably affected. Both peers must use the same policy.
     pub padding: HarmfulPaddingPolicy,
-    /// Optional per-NIC scheduler this connection egresses through. The same
-    /// instance is shared by every connection on the NIC; the class is this
+    /// Optional per-egress-path scheduler this connection egresses through. The same
+    /// instance is shared by every connection on the egress path; the class is this
     /// connection's lane. `None` keeps the stock per-socket behaviour.
-    pub nic: Option<crate::nic::NicLink>,
+    pub shared_congestion: Option<crate::cc::CcSignal>,
+    /// Attach this connection to a per-egress-path scheduler. The transport resolves
+    /// the `(src, dst)` path group from the socket's own addresses.
+    pub cc_link: Option<crate::cc::CcLink>,
 }
 
 impl<'a> Default for ConnectConfig<'a> {
@@ -594,7 +605,8 @@ impl<'a> Default for ConnectConfig<'a> {
             watchdog: None,
             obfuscation_key: None,
             padding: HarmfulPaddingPolicy::None,
-            nic: None,
+            shared_congestion: None,
+            cc_link: None,
         }
     }
 }
@@ -615,7 +627,8 @@ struct AcceptSetup {
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
-    nic: Option<crate::nic::NicLink>,
+    shared_congestion: Option<crate::cc::CcSignal>,
+    cc_link: Option<crate::cc::CcLink>,
 }
 
 impl AcceptSetup {
@@ -635,7 +648,8 @@ impl AcceptSetup {
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
             metrics_observer: config.metrics_observer,
-            nic: config.nic,
+            shared_congestion: config.shared_congestion,
+            cc_link: config.cc_link,
         })
     }
 
@@ -679,6 +693,7 @@ async fn accept(
     key: Option<[u8; crate::obfuscate::KEY_LEN]>,
     policy: HarmfulPaddingPolicy,
     session_count: Arc<AtomicUsize>,
+    local_addr: SocketAddr,
 ) -> std::io::Result<Accepted> {
     // Resolve the DPI-hiding policy into its two consumers: the wrapper's
     // padding settings (the profile every datagram is padded to) and the
@@ -695,9 +710,26 @@ async fn accept(
         retransmission_armor,
         instream_group_fec,
         metrics_observer,
-        nic,
+        shared_congestion,
+        cc_link,
     } = setup;
     let peer_addr = *accepted.conn_key();
+    let local_addr_for_path = local_addr;
+    let mut metrics_observer = metrics_observer;
+    let mut shared_congestion = shared_congestion;
+    if let Some(link) = cc_link {
+        let group = link.group(local_addr_for_path.ip(), peer_addr.ip());
+        match link.role() {
+            crate::cc::CcRole::Interactive => {
+                let observer = group.interactive().observer();
+                metrics_observer = Some(match metrics_observer.take() {
+                    Some(existing) => existing.chained(observer),
+                    None => observer,
+                });
+            }
+            crate::cc::CcRole::Bulk => shared_congestion = Some(group.bulk()),
+        }
+    }
     let (read, write) = accepted.split();
     let write = RawFdConnWrite {
         inner: write,
@@ -717,12 +749,6 @@ async fn accept(
             },
         )),
         None => Box::new(write),
-    };
-    // A per-NIC scheduler wraps the (possibly obfuscated) write path, so a
-    // datagram is admitted by the NIC only after any wire transform.
-    let write: Box<dyn UnreliableWrite> = match nic {
-        Some(link) => Box::new(crate::nic::NicWrite::new(write, link.scheduler, link.class)),
-        None => write,
     };
     // The obfuscation nonce is a wire-level overhead on every datagram, so
     // the MSS must leave room for it (the wire datagram stays within the
@@ -751,6 +777,7 @@ async fn accept(
         instream_group_fec,
         metrics_observer,
         ack_padding,
+        shared_congestion,
     );
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
@@ -820,49 +847,9 @@ async fn connect_configured(
     addr: impl tokio::net::ToSocketAddrs,
     config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
-    if let Some(link) = config.nic.clone() {
-        return connect_over_nic(link, bind, addr, config).await;
-    }
     let udp = bind_udp(bind).await?;
     connect_udp(&udp, addr).await?;
     connect_bound(udp, config).await
-}
-
-/// Connect over a caller-provided per-NIC scheduler (`ConnectConfig::nic`):
-/// bind a NIC endpoint on the requested local address, connect it to the peer,
-/// and build the rtp layer over its halves.
-async fn connect_over_nic(
-    link: crate::nic::NicLink,
-    bind: impl tokio::net::ToSocketAddrs,
-    addr: impl tokio::net::ToSocketAddrs,
-    mut config: ConnectConfig<'_>,
-) -> std::io::Result<Connected> {
-    let bind_addr = resolve_one_addr(bind).await?;
-    let peer_addr = resolve_one_addr(addr).await?;
-    let endpoint = crate::nic::NicEndpoint::bind(link.scheduler, link.class, bind_addr).await?;
-    endpoint.connect(peer_addr).await?;
-    let local_addr = endpoint.local_addr()?;
-    // The endpoint *is* the injection; a carried `nic` would re-apply it.
-    config.nic = None;
-    let layer = endpoint.into_rtp_layer(config)?;
-    let (read, write, supervisor) = socket(layer, None);
-    Ok(Connected {
-        read,
-        write,
-        supervisor,
-        local_addr,
-        peer_addr,
-        probe_tap: None,
-    })
-}
-
-async fn resolve_one_addr(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<SocketAddr> {
-    tokio::net::lookup_host(addr).await?.next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "address resolved to no socket address",
-        )
-    })
 }
 
 #[derive(Debug)]
@@ -1142,11 +1129,29 @@ async fn connect_bound(
         watchdog,
         obfuscation_key,
         padding,
-        nic: _,
+        shared_congestion,
+        cc_link,
     } = config;
 
     let local_addr = udp.local_addr()?;
     let peer_addr = udp.peer_addr()?;
+    // The `(src, dst)` pair is derived here, where the socket is, not guessed
+    // by the caller: the path this connection actually egresses.
+    let mut metrics_observer = metrics_observer;
+    let mut shared_congestion = shared_congestion;
+    if let Some(link) = cc_link {
+        let group = link.group(local_addr.ip(), peer_addr.ip());
+        match link.role() {
+            crate::cc::CcRole::Interactive => {
+                let observer = group.interactive().observer();
+                metrics_observer = Some(match metrics_observer.take() {
+                    Some(existing) => existing.chained(observer),
+                    None => observer,
+                });
+            }
+            crate::cc::CcRole::Bulk => shared_congestion = Some(group.bulk()),
+        }
+    }
     let log_config = match log_config {
         Some(c) => Some(
             c.transmission_layer_log_config(local_addr, peer_addr)
@@ -1205,6 +1210,7 @@ async fn connect_bound(
         instream_group_fec,
         metrics_observer,
         ack_padding,
+        shared_congestion,
     );
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
@@ -1227,13 +1233,6 @@ pub async fn connect_with_socket(
     addr: SocketAddr,
     config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
-    if config.nic.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "connect_with_socket cannot carry ConnectConfig::nic: the scheduler owns the \
-             socket; use connect_with",
-        ));
-    }
     socket.connect(dialable_addr(addr)).await?;
     connect_bound(socket, config).await
 }
@@ -1250,8 +1249,10 @@ fn apply_layer_tuning(
     instream_group_fec: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
     ack_padding: crate::obfuscate::padding::AckPaddingMode,
+    shared_congestion: Option<crate::cc::CcSignal>,
 ) {
     layer.congestion_lane = congestion_lane;
+    layer.shared_congestion = shared_congestion;
     layer.initial_send_rate = initial_send_rate;
     layer.retransmission_armor = retransmission_armor;
     layer.instream_group_fec = instream_group_fec;
@@ -1285,6 +1286,7 @@ pub fn unreliable_layer_with_config(
         metrics_observer,
         handshake,
         fec,
+        cc_link: _,
         mss,
         fec_tuning,
         frame_delivery,
@@ -1295,7 +1297,7 @@ pub fn unreliable_layer_with_config(
         watchdog: _,
         obfuscation_key,
         padding,
-        nic: _,
+        shared_congestion,
     } = config;
     if handshake {
         return Err(std::io::Error::new(
@@ -1337,6 +1339,7 @@ pub fn unreliable_layer_with_config(
         instream_group_fec,
         metrics_observer,
         ack_padding,
+        shared_congestion,
     );
     Ok(layer)
 }
@@ -1939,7 +1942,8 @@ mod tests {
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: false,
             metrics_observer: None,
-            nic: None,
+            shared_congestion: None,
+            cc_link: None,
         };
         let forced = setup.force_frame_delivery();
         assert!(forced.frame_delivery.enabled, "frame delivery must be on");
