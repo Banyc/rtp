@@ -2413,6 +2413,102 @@ mod tests {
         );
     }
 
+    /// The operator's two measured stalls — the routine worst **3205 ms** and
+    /// the one-off **19.9 s** — must not terminate a live session under the
+    /// **production default** watchdog tuning. Across both the session is
+    /// slow, not dead, so its teardown deadline must sit above the larger
+    /// one; only a stall past the 30 s floor may fire.
+    ///
+    /// The predicate is evaluated at a caller-supplied instant
+    /// (`send_pkts_at`), so the three crossings cost no wall clock. The
+    /// packet stays in flight because the read underlay is a blackhole, so
+    /// both the NoResponse and the NoProgress arms are live.
+    ///
+    /// Vacuity: `WatchdogTuning::default()`'s `min_no_response` lowered from
+    /// 30 s to 1 s drops the deadline to `max(16 * 1 s, 1 s)` = 16 s and the
+    /// 19.9 s arm fails on the returned `Err(proactive_stall)`. The 3205 ms
+    /// arm is not independently sensitive (the 16 s multiplier term already
+    /// clears it), so the 19.9 s arm is the binding one and the guard's
+    /// single mutation is the floor.
+    #[tokio::test]
+    async fn a_field_spike_does_not_terminate_a_live_session() {
+        use crate::traffic_shaping::redundancy::fec::gate::FecTuning;
+        #[derive(Debug)]
+        struct AcceptingWrite;
+        #[async_trait]
+        impl UnreliableWrite for AcceptingWrite {
+            async fn send(&mut self, buf: &[u8]) -> Result<usize, IoErr> {
+                Ok(buf.len())
+            }
+        }
+        let ul = crate::udp::wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+            Box::new(BlackholeRead),
+            Box::new(AcceptingWrite),
+            false,
+            crate::udp::Mss::try_new(crate::udp::NO_FEC_MSS).unwrap(),
+            FecTuning::default(),
+            crate::delivery::frame::mode::FrameMode::default(),
+        )
+        .unwrap();
+        // `TransmissionLayer::new` is the production default tuning
+        // (`WatchdogTuning::default`), not a test-supplied one.
+        let mut tl = TransmissionLayer::new(ul, None);
+        settle_rtt(&tl, Duration::from_millis(1), 5);
+        let arm_at = Instant::now();
+        {
+            let rl = tl.shared_for_test().reliable_layer_for_test();
+            let mut rl = rl.lock().unwrap();
+            rl.send_data_buf(&[0u8; 100], arm_at).unwrap();
+        }
+        let mut bufs = SendBufs::new();
+        // Drive the arming pass at `arm_at` so the watchdog deadline is
+        // exactly `arm_at + 30 s`, not `Instant::now() + 30 s`.
+        assert!(
+            tl.send_pkts_at(&mut bufs, arm_at).await.is_ok(),
+            "the arming pass must not already be terminal"
+        );
+
+        // 3205 ms — the operator's routine worst. Survives.
+        let routine = arm_at + Duration::from_millis(3_205);
+        let routine_result = tl.send_pkts_at(&mut bufs, routine).await;
+        assert!(
+            routine_result.is_ok(),
+            "a 3205 ms stall terminated the session; a spike must cost time, not the session: {routine_result:?}"
+        );
+        assert!(
+            tl.shared_for_test().check_error().is_ok(),
+            "no terminal error may be pressed at 3205 ms"
+        );
+
+        // 19.9 s — the operator's one-off worst. Survives.
+        let one_off = arm_at + Duration::from_millis(19_900);
+        let one_off_result = tl.send_pkts_at(&mut bufs, one_off).await;
+        assert!(
+            one_off_result.is_ok(),
+            "a 19.9 s stall terminated the session; a spike must cost time, not the session: {one_off_result:?}"
+        );
+        assert!(
+            tl.shared_for_test().check_error().is_ok(),
+            "no terminal error may be pressed at 19.9 s"
+        );
+
+        // 30 s + 1 ms — past the default floor. Fires.
+        let past_floor = arm_at + Duration::from_millis(30_001);
+        let fired = tl.send_pkts_at(&mut bufs, past_floor).await;
+        assert!(
+            fired.is_err(),
+            "the watchdog must fire past its 30 s floor, got {fired:?}"
+        );
+        let msg = tl
+            .shared_for_test()
+            .io_error(std::io::ErrorKind::BrokenPipe.into())
+            .to_string();
+        assert!(
+            msg.contains("trigger=proactive_stall"),
+            "the fired deadline must be the liveness watchdog, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn send_kill_and_abort_publishes_error_before_stalled_fec_tail() {
         use std::sync::atomic::{AtomicUsize, Ordering};

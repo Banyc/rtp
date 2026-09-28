@@ -211,6 +211,69 @@ to share one deadline again — the shape the budget had before this change —
 the relation stays green and the field-spike row fails with `Kind(TimedOut)`
 at 4.02 s, so the shape and the value each have their own guard.
 
+## The timer inventory: which deadlines can fire on slowness
+
+The deployed client multiplexes everything over **one long-lived session** and
+sees a 190 ms RTT floor with maxima of 1063 ms and 3205 ms plus a 19.9 s
+one-off. A spike must cost *time*, not the session, so every deadline that
+could expire on a live-but-slow path (rather than on a dead one) has to sit
+above the larger spike. This table is the inventory, read from the code: each
+row names what re-arms the deadline and what its expiry does. The margin is
+against the routine worst, 3205 ms; where a row's binding field is not the one
+that bounds 3205 ms the 19.9 s one-off is stated too.
+
+| timer / deadline | value (source) | what re-arms it | margin vs 3205 ms | slowness fires it? | what firing does |
+| --- | --- | --- | --- | --- | --- |
+| liveness watchdog, NoResponse | `clamp(rto * 16, 30 s, 120 s)` (`src/traffic_shaping/recovery/liveness.rs:22-25`) | each **delivering** peer ACK (`refresh_waits`, `src/traffic_shaping/recovery/pkt_send_space.rs:940`); first send when unarmed (`on_send`, `:1154`); cleared when the send window empties | **+26 795 ms** (floor 30 s binds) | **yes** — no delivering ACK for 30 000 ms while armed | terminal `BrokenPipe` (`trigger=proactive_stall reason=no_response`) + best-effort KILL: **session death** |
+| liveness watchdog, NoProgress | same clamp; floor `min_no_progress` = 30 s (`src/transmission/watchdog_tuning.rs:51`) | first send when unarmed; cleared only by a **cumulative** ACK advance (`record_progress`, `:869`) or an empty send window | **+26 795 ms** | **yes** — packets in flight with no forward progress for 30 000 ms (pure SACKs do not clear it) | same terminal path, `reason=no_progress`: **session death** |
+| watchdog upper clamp | 120 s (`watchdog_tuning.rs:52`) | n/a | only ever *lengthens* the deadline | no | none |
+| general RTO | `max(srtt + 4*rttvar, 1 s)` (`src/traffic_shaping/recovery/rto.rs:37,180`) | each RTT sample; each send re-arms that packet's `rto_at` (`src/traffic_shaping/recovery/rtx_index.rs:327`) | not a teardown bound | **yes** — any gap over `rto` | **retransmit** (a delay, the correct class) |
+| tail-loss probe, head rung | corroborated repair deadline, floored at 300 ms (`src/traffic_shaping/recovery/tlp.rs:71,120`) | a new tail send / ACK (`tlp.reset`) | n/a | **yes** — an unacked tail older than the rung | one probe retransmit (delay) |
+| post-probe repair floor | `TAIL_PROBED_MIN_RTO` = 300 ms (`tlp.rs:71`) | `MAX_PROBES = 2` spent, then re-armed per send | n/a | **yes** | retransmit (delay) |
+| probe budget / retry cadence | `MAX_PROBES` 2, `MIN_TOL` 10 ms, `INELIGIBLE_RETRY` 1 ms (`tlp.rs:48-55`) | ACK / new send | n/a | not deadlines | bounds retransmit count |
+| opening leg | `OPENING_LEG_TIMEOUT` = 4 s, one per leg (`src/traffic_shaping/control/handshake/opening/mod.rs:35`) | armed at the leg's start only; retries reuse the leg | **+795 ms**; **-15 900 ms vs 19.9 s** | **yes** — a leg (one RTT) over 4 s | opening fails `TimedOut`: **birth failure** (no live session to lose), retried by `rtp_mux` |
+| opening retry / send budget | `RETRY_INTERVAL` 250 ms (+≤50 jitter), `SEND_RETRY_BUDGET` 500 ms, `SEND_RETRY_INTERVAL` 50 ms (`opening/mod.rs:36-44`, `handshake/wire.rs:8`) | per leg | n/a | not session deadlines | retransmits the current leg (delay) |
+| post-open recovery | `POST_OPEN_LIFETIME` 63 s, delays `[1,3,7,15,31] s` (`src/traffic_shaping/control/handshake/post_open.rs:8,15`) | a fresh nonce-bound `Ready` retires it | +59 795 ms | **yes**, but only the recovery arm | stops retransmitting the post-open confirmation; **no teardown** |
+| graceful close | `GRACEFUL_CLOSE_TIMEOUT` = 675 s (`src/transmission/termination.rs:15`) | n/a (post-close wait) | +671 795 ms | no practical fire | resolves the session handle; long on purpose |
+| driver join / KILL tail | `DRIVER_JOIN_TIMEOUT` = 3 s (`src/socket/session.rs:35`) | n/a — **post-terminal only** (`src/socket/session.rs:463-540`) | -205 ms, but not on a live path | only after a terminal error already fired | aborts stuck drivers, discarding staged data (**after** the terminal error) |
+| delayed-ACK age | `ACK_FLUSH_AGE` 3 ms (`src/transmission/ack_feedback/schedule.rs:6`) | each ACK claim | n/a | no teardown | delays an ACK flush |
+| driver wake / pacer cadence | `TARGET_WAKE_INTERVAL` 1 ms, `WOULDBLOCK_RETRY_DELAY` 1 ms, `SEND_PARK_SAFETY` 1 ms (`src/traffic_shaping/core/pacing.rs:7`, `write_half.rs:666`, `connection.rs:56`) | each pass | n/a | no teardown | bounds pass latency |
+| RTT-sample bookkeeping | `MAX_ECHO_RTT`/`MAX_ECHO_AGE` 60 s (`ts_echo.rs:12,66`); probe-nonce `TTL` 10 s (`control/probe.rs:409`) | each sample | +56 795 / -13 095 ms | **yes** (TTL < 19.9 s) | discards a late RTT sample; **no teardown** |
+| CC / measurement windows | `SIGNAL_STALE_AFTER` 1 s, `GENTLE_ENTER_MIN` 1 s, `GENTLE_REENTRY_COOLDOWN` 15 s, `HUGE_DATA_LOSS_CHECK_INTERVAL` 10 ms, `FAST_LOSS_CONFIRM_MS` 18 ms, `DELIVERY_PEAK_BUCKET` 10 s, `QUEUE_RTT_FLOOR` 5 ms, `RTT_MIN_BUCKET` 5 s / `_REORDER` 200 ms, `FIT_INTERVAL` 1 s, `SHARED_ADDITIVE_PROBE_REFERENCE_RTT` 100 ms | each pass / sample | n/a | no teardown | only modulates rate, floors and padding fit |
+
+**The only elapsed-time teardown on a live path is the liveness watchdog, and
+its floor is 30 s.** Both watchdog arms are re-armed by peer activity (NoResponse
+by any delivering ACK; NoProgress by a cumulative advance), so a live-but-slow
+peer cannot be killed by a spike shorter than the floor: the margin is
+**+26 795 ms** against the routine worst and **+10 100 ms** against the 19.9 s
+one-off. Every other sub-3205 ms timer is either a **retransmit** (RTO, the tail
+probe and the repair ladder), an RTT-sample bookkeeping window that discards a
+sample rather than the session, a driver-wake cadence, or — for
+`DRIVER_JOIN_TIMEOUT` — a bound that runs only after a terminal error already
+exists. The healthy long-lived session is bounded by **no** shutdown deadline:
+`reaper_ready` waits indefinitely until an error is pressed
+(`src/socket/session.rs:463-468`).
+
+`transmission::transmission_layer_test_facade::tests::a_field_spike_does_not_terminate_a_live_session`
+holds the watchdog's floor above both field stalls. It drives the production
+default tuning (`TransmissionLayer::new`, i.e. `WatchdogTuning::default`) and
+the real send pass at caller-supplied instants — `arm_at + 3205 ms` and
+`arm_at + 19.9 s` must return `Ok` with no terminal error, `arm_at + 30 001 ms`
+must fire `trigger=proactive_stall` — so the three crossings cost no wall clock
+and the arming instant is exact. Vacuity: with `min_no_response` lowered from
+30 s to 1 s the deadline drops to `max(16 * 1 s, 1 s)` = 16 s and the 19.9 s arm
+fails, naming the fired `Err(proactive_stall)`. The 3205 ms arm is not
+independently sensitive (the 16 s multiplier term already clears it), so the
+19.9 s arm is the binding one and the floor is the guard's single mutation.
+
+The opening leg's **-15 900 ms** margin against the 19.9 s one-off is the one
+row that does not clear the larger spike, and it is deliberate: the opening is a
+*birth*, paid once per session, and a leg that waited 19.9 s would make a
+genuinely dead path cost 19.9 s of detection for the sake of a once-observed
+stall. A 19.9 s opening therefore fails over to `rtp_mux`'s retry ladder, which
+costs time rather than an established session. That is a stated trade, not an
+unnoticed gap.
+
 ## Performance
 
 The operator's product constitution is **three mandates**, and each is an
