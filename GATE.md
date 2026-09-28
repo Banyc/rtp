@@ -1123,6 +1123,7 @@ src/traffic_shaping/recovery/pkt_send_space.rs::applying_many_sacks_remains_line
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = probe
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_sweep = probe
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_under_jitter = probe
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_midstream_single_loss_repair = probe
 src/traffic_shaping/recovery/rtx_index.rs::deferred_loss_cancellation_does_not_rescan_the_pending_set = perf-lane
 tests/rtp_bufferbloat.rs::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
 tests/rtp_burst_loss.rs::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
@@ -1167,6 +1168,7 @@ src/socket/stream.rs::probe_single_symbol_interactive_fec_repair = 4
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_repair_ladder = 12
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_sweep = 3
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_under_jitter = 4
+src/traffic_shaping/recovery/pkt_send_space.rs::probe_midstream_single_loss_repair = 3
 ```
 
 ## Scenario manifest
