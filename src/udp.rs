@@ -15,7 +15,6 @@ use tokio::net::UdpSocket;
 use tokio_udp::UdpSocket as VectoredUdpSocket;
 
 use crate::io_err::IoErr;
-#[cfg(test)]
 use crate::transmission::transmission_layer::UnreliableLayer;
 use crate::{
     CongestionLane,
@@ -723,14 +722,17 @@ async fn accept(
         tuning,
         frame_delivery,
     )?;
-    unreliable_layer.congestion_lane = congestion_lane;
-    unreliable_layer.initial_send_rate = initial_send_rate;
-    unreliable_layer.retransmission_armor = retransmission_armor;
-    unreliable_layer.instream_group_fec = instream_group_fec;
-    unreliable_layer.metrics_observer = metrics_observer;
     // Fitted ACK padding lives in the write half; the policy resolution
     // guarantees it never coexists with a padding profile.
-    unreliable_layer.ack_padding = ack_padding;
+    apply_layer_tuning(
+        &mut unreliable_layer,
+        congestion_lane,
+        initial_send_rate,
+        retransmission_armor,
+        instream_group_fec,
+        metrics_observer,
+        ack_padding,
+    );
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -1133,14 +1135,17 @@ async fn connect_bound(
         fec_tuning,
         frame_delivery,
     )?;
-    unreliable_layer.congestion_lane = congestion_lane;
-    unreliable_layer.initial_send_rate = initial_send_rate;
-    unreliable_layer.retransmission_armor = retransmission_armor;
-    unreliable_layer.instream_group_fec = instream_group_fec;
-    unreliable_layer.metrics_observer = metrics_observer;
     // Fitted ACK padding lives in the write half; the policy resolution
     // guarantees it never coexists with a padding profile.
-    unreliable_layer.ack_padding = ack_padding;
+    apply_layer_tuning(
+        &mut unreliable_layer,
+        congestion_lane,
+        initial_send_rate,
+        retransmission_armor,
+        instream_group_fec,
+        metrics_observer,
+        ack_padding,
+    );
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
     }
@@ -1164,6 +1169,108 @@ pub async fn connect_with_socket(
 ) -> std::io::Result<Connected> {
     socket.connect(dialable_addr(addr)).await?;
     connect_bound(socket, config).await
+}
+
+/// The one authority for the field assignment every constructor applies after
+/// [`wrap_fec_with_mss_and_fec_tuning_and_frame_delivery`], shared by the
+/// socket constructors (`connect_bound`, `accept`) and
+/// [`unreliable_layer_with_config`].
+fn apply_layer_tuning(
+    layer: &mut UnreliableLayer,
+    congestion_lane: CongestionLane,
+    initial_send_rate: Option<f64>,
+    retransmission_armor: RetransmissionArmorConfig,
+    instream_group_fec: bool,
+    metrics_observer: Option<crate::metrics::MetricsObserver>,
+    ack_padding: crate::obfuscate::padding::AckPaddingMode,
+) {
+    layer.congestion_lane = congestion_lane;
+    layer.initial_send_rate = initial_send_rate;
+    layer.retransmission_armor = retransmission_armor;
+    layer.instream_group_fec = instream_group_fec;
+    layer.metrics_observer = metrics_observer;
+    layer.ack_padding = ack_padding;
+}
+
+/// Build a fully-configured [`UnreliableLayer`] over caller-supplied datagram
+/// halves.
+///
+/// This is the datagram-layer entry point for a caller that owns the transport
+/// — a userspace egress scheduler, for example — and wants `rtp`'s reliable
+/// session to run over the caller's read/write halves. The layer tuning is
+/// exactly what [`connect_with`] applies to a socket; the **transport leg
+/// stays the caller's**, so a `config` that asks for the opening handshake,
+/// datagram obfuscation, or a fixed padding profile is **rejected** rather
+/// than silently built without it (the handshake is a wire exchange, and
+/// obfuscation/padding are applied to the socket halves, so none of them can
+/// be honoured here). `config.log_config` is the socket leg's too: hand the
+/// layer log config to [`crate::socket::socket`] instead.
+///
+/// Once built, run the session with [`crate::socket::socket`] (`handshake`
+/// must have been `false`).
+pub fn unreliable_layer_with_config(
+    read: Box<dyn UnreliableRead>,
+    write: Box<dyn UnreliableWrite>,
+    config: ConnectConfig<'_>,
+) -> std::io::Result<UnreliableLayer> {
+    let ConnectConfig {
+        log_config: _,
+        metrics_observer,
+        handshake,
+        fec,
+        mss,
+        fec_tuning,
+        frame_delivery,
+        congestion_lane,
+        initial_send_rate,
+        retransmission_armor,
+        instream_group_fec,
+        watchdog: _,
+        obfuscation_key,
+        padding,
+    } = config;
+    if handshake {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unreliable_layer_with_config: the opening handshake runs on the socket leg; \
+             build the layer with ConnectConfig::handshake = false",
+        ));
+    }
+    if obfuscation_key.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unreliable_layer_with_config: datagram obfuscation wraps the socket halves; \
+             wrap the caller's transport before building the layer",
+        ));
+    }
+    let (profile, ack_padding) = padding.resolve();
+    if profile.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unreliable_layer_with_config: a fixed padding profile is applied on the socket \
+             leg; use HarmfulPaddingPolicy::None or wrap the caller's transport",
+        ));
+    }
+    let mss = mss.resolve()?;
+    validate_padding_against_mss(profile, mss)?;
+    let mut layer = wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
+        read,
+        write,
+        fec,
+        mss,
+        fec_tuning,
+        frame_delivery,
+    )?;
+    apply_layer_tuning(
+        &mut layer,
+        congestion_lane,
+        initial_send_rate,
+        retransmission_armor,
+        instream_group_fec,
+        metrics_observer,
+        ack_padding,
+    );
+    Ok(layer)
 }
 
 #[cfg(test)]
