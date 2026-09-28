@@ -819,10 +819,20 @@ A row whose wall clock appears in no document *and* was not measured is not
 given a number: it is recorded as a gap below, so an unmeasured cost is
 visibly pending instead of plausibly guessed.
 
-The declared sums are `default` 14.30 s of a 60 s budget, `standard` 70.18 s of
-300 s, `perf` 422.00 s of 450 s, and nothing in `full`, whose 6000 s ceiling is
-declared so a later row cannot be added without one — `full` is the tier the
-~90-minute `shared_bneck_fairness_longrun` lives in.
+The declared sums are `default` 14.31 s of a 60 s budget, `standard` 132.18 s
+of 300 s, `perf` 422.00 s of 450 s, and nothing in `full`, whose 6000 s ceiling
+is declared so a later row cannot be added without one — `full` is the tier the
+~90-minute `shared_bneck_fairness_longrun` lives in. The 30 s the `clean-tail`
+family adds to `standard` is its two rows' measured wall clock (20 s for the
+four-cell matrix, 10 s for the two-cell blocking control), which is the
+shortness the family can reach without dropping a cell: the tail's *rate* is the
+statistic a longer window would sharpen, and the rate is the one number this
+family refuses to bound. The two figures this paragraph carried before it were
+both wrong against the block it describes: `default` said 14.30 s against a
+block summing to 14.31 s, and `standard` said 70.18 s against a block summing to
+102.18 s. They are re-derived from the block rather than carried forward — a
+sum that contradicts its own rows is the same defect class as a check that
+cannot fail.
 
 ```gate-perf-design
 rtp_clean::rtp_over_netem_clean_link_delivers_data = default | 0.01 | baseline | transport-delivery@impairment=clean+mss=default+scale=small+metric=byte-exact+shape=bulk+layer=rtp
@@ -861,16 +871,18 @@ lib::socket::stream::tests::probe_single_symbol_interactive_fec_repair = perf | 
 lib::socket::stream::tests::probe_lone_tail_repair_deadline_latency = perf | 162 | composite(handshake,impairment,metric)@probe | probe-deadline@impairment=burst-loss+metric=repair-deadline+layer=rtp+handshake=seeded
 lib::socket::stream::tests::probe_armor_copy_cell = perf | 10 | composite(impairment,metric,scale)@probe | probe-armor@impairment=clean+metric=armour-copy+layer=rtp+scale=cell
 lib::socket::stream::tests::probe_armor_cover_frontier = perf | 31 | composite(impairment,metric,scale)@probe | probe-cover-frontier@impairment=clean+metric=realised-cover+layer=rtp+scale=two-forced-covers
+rtp_clean_tail::clean_tail_shaper_vs_transport_matrix = standard | 20 | baseline@clean-tail | clean-tail@impairment=clean+jitter=5ms+stack=rtp+endpoints=tokio+rate=four-flow
+rtp_clean_tail::clean_tail_blocking_endpoint_control = standard | 10 | composite(endpoints,stack)@clean-tail | clean-tail@impairment=clean+jitter=5ms+stack=raw+endpoints=blocking+rate=four-flow
 ```
 
 ### The families
 
-Seven references cover the declared subset. The **residual** (default) family is
+Eight references cover the declared subset. The **residual** (default) family is
 the always-run transport floors, stated against the clean-link byte-exact
 delivery point; two of its rows are one dimension away from it (`scale`, and
 `mss`) and the rest are labelled with the dimensions they actually move, which
 is the honest reading of pre-existing arms that were never built as a
-one-axis set. The six named families each carry their own reference:
+one-axis set. The seven named families each carry their own reference:
 `padding` (wire-shape at one 256 KiB transfer), `contested` (the
 shared-bottleneck instrument's own sanity pair, one dimension apart),
 `liveness` (the recency/connection-liveness family), `decoder-fuzz` (the
@@ -882,7 +894,10 @@ hold capacity against a paced sender, and that budget's effect on the transport
 at the field's offer and delay) and
 `perf-lane` (the four asserting in-crate scaling gates: one reference, the
 in-order receive-window advance, and the three rows that vary one or two
-dimensions from it). The bulk of the declared rows are `composite` because the
+dimensions from it) and `clean-tail` (where the clean interactive lane's
+loss-independent tail comes from, and the pair of tests that separates the
+shaper and the endpoint runtime from the transport). The bulk of the declared
+rows are `composite` because the
 arms genuinely vary several dimensions at once — labelling them orthogonal
 would be the confound the mandate exists to prevent.
 
@@ -918,12 +933,14 @@ baseline.liveness = rtp_liveness::reverse_traffic_recency_advances_only_on_new_p
 baseline.decoder-fuzz = lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder
 baseline.probe = lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder
 baseline.perf-lane = lib::recv_queue::pkt_recv_space::tests::advancing_the_receive_window_costs_no_more_per_packet
+baseline.clean-tail = rtp_clean_tail::clean_tail_shaper_vs_transport_matrix
 members.padding = padding-wire
 members.contested = contested-instrument
 members.liveness = transport-liveness
 members.decoder-fuzz = decoder-fuzz
 members.probe = probe-*
 members.perf-lane = op-cost-scaling
+members.clean-tail = clean-tail*
 drift = 0.5
 drift_floor_s = 2.0
 ```
@@ -949,6 +966,28 @@ transport-delivery@impairment=correlated-loss = no default-tier row drops four-s
 transport-delivery@metric=goodput-fraction = no default-tier row measures goodput as a fraction of the configured link rate: the capacity-relative floors are opt-in (bufferbloat `standard`, burst-loss `full`). The cell is knowingly empty in the always-run tier because the arm it needs is a multi-second rate-shaped run, which the 60 s budget's headroom over the measured 16.8-18.6 s does not currently buy; the deliberate answer is to measure the opt-in arm rather than to move a floor into a tier that cannot pay for it.
 transport-latency@impairment=burst-loss = the always-run tier's only latency assertion is the 60 ms one-way delay observability check. The sparse-message tail under GE burst loss is opt-in (`full`), and an always-run tail arm would need a window short enough for the default budget and long enough to carry one recovery episode — a new arm, not a shortened probe.
 ```
+
+**The `clean-tail` family, and what it settles.** The lane's tail above the
+link's own no-loss ceiling (`OWD + JITTER = 30 ms`) survives with the shaper's
+drop count at zero, and three cells shadow the baseline.  Measured at load
+average 1.5-2.2 on ten cores, three serialized reps of the four-cell matrix
+plus the two blocking cells (4 s window each, 256 B at the four-flow 1.25 ms
+interleave, loss closed), the reading is: the `rtp` cell's tail over 30 ms is
+`2.85 / 2.25 / 2.53 %` with a median excess of `0.11 / 0.08 / 0.13 ms`; the
+**no-`rtp`** cell's is `2.19 / 2.16 / 1.94 %` at `0.11 / 0.11 / 0.11 ms`; the
+blocking-endpoint cell's is `2.02 / 2.46 / 2.32 %` at `0.13 / 0.12 / 0.15 ms`;
+and with the jitter draw removed every one of those cells measures `0.000 %`
+(one rep of the no-`rtp` cell found `0.188 %`, six samples).  The tail therefore
+does not need `rtp`, does not need the endpoint runtime, and does need the
+jitter draw: it is an **additive sub-millisecond delay on a delay draw the model
+bounds at 30 ms**, produced by the measurement path — the shaper's own runner
+and the endpoint tasks — and not by the transport.  The tail's *rate* is what
+refuses to be bounded: the same cell moved between `0.000 %` and `9.4 %` across
+the reps on record as the host's load average moved between 1.5 and 25, while
+the shape statistic the assertion reads kept its separation (a median excess of
+`0.08-1.00 ms` measured against the `hold` fault's `5.03 ms`).  That is why this
+family asserts its instrument and reads the rate: a bound on a load-dominated
+rate would be a bound on the host, and the arm's own `#[ignore]` reason says so.
 
 ### The long-run fairness surface: `RTP_FAIR_*`, in `gate-env-tier`
 
@@ -1073,6 +1112,7 @@ None of the four is set by a script of this crate, so each row's runner is the
 scriptless marker `-`.
 
 ```gate-env-tier
+clean-tail-fault = RTP_CLEAN_TAIL_FAULT,RTP_CLEAN_TAIL_WINDOW_SECS | - | the fault selector `clean_tail_shaper_vs_transport_matrix` and `clean_tail_blocking_endpoint_control` read to demonstrate that their own integrity and shape assertions are non-vacuous (`tests/rtp_clean_tail.rs`): unset is the real arm, `delay` adds 40 ms to both link directions so the body assertion fails naming the observed p50 (65.93 ms blocking, 66.94 ms over `rtp`), `drop` opens 1 % iid loss on the link the arm declares loss-closed so the loss clause fails naming the count (24 and 30 datagrams), and `hold` writes every second `rtp` message 8 ms after its send stamp — a fixed-offset delay of exactly the class a transport mechanism would add — so the tail leaves the delay model's ceiling and both shape assertions fail, naming what each reads (a median excess of 5.03 ms against the 3 ms bound, and 11.7 % of the 341 tail samples within 1 ms of the ceiling against the 20 % floor). `RTP_CLEAN_TAIL_FAULT` is a selector rather than a size: no count, window or cadence derives from it, so it is the surface's one variable its load total does not factor, while `RTP_CLEAN_TAIL_WINDOW_SECS` (default 4, `tests/rtp_clean_tail.rs`:80-88) sizes each cell's measured seconds and is therefore the whole of the load (`total = 6 x RTP_CLEAN_TAIL_WINDOW_SECS`: the four matrix cells plus the two blocking cells) | clean-tail@knob=RTP_CLEAN_TAIL_FAULT+mode=none, clean-tail@knob=RTP_CLEAN_TAIL_FAULT+mode=delay, clean-tail@knob=RTP_CLEAN_TAIL_FAULT+mode=drop, clean-tail@knob=RTP_CLEAN_TAIL_FAULT+mode=hold | RTP_CLEAN_TAIL_WINDOW_SECS=4,total=6*RTP_CLEAN_TAIL_WINDOW_SECS,wall=30s
 fair-longrun = RTP_FAIR_LONGRUN_REPS,RTP_FAIR_LONGRUN_SECS,RTP_FAIR_SKIP_SECS,RTP_FAIR_WINDOW_SECS,RTP_FAIR_CONFIGS | - | the windowed Jain fairness index and the slower flow's minimum share of two bulk flows' goodput converging on one 10 Mbit/s / 128 KiB shared serialization bottleneck, sampled in 250 ms bins over each sliding RTP_FAIR_WINDOW_SECS-second window after the RTP_FAIR_SKIP_SECS post-join ramp is skipped, for RTP_FAIR_LONGRUN_REPS reps of RTP_FAIR_LONGRUN_SECS measured seconds across six RTT-symmetry and arrival configurations (RTP_FAIR_CONFIGS selects which of the six run — unset means all six — and is a selector rather than a size, so it is the surface's one variable the load total does not factor) | contested-instrument@impairment=none+metric=jain-window+layer=shared-bottleneck+scale=long-run, contested-instrument@impairment=none+metric=share-min+layer=shared-bottleneck+scale=long-run | RTP_FAIR_LONGRUN_REPS=1,RTP_FAIR_LONGRUN_SECS=60,RTP_FAIR_SKIP_SECS=10,RTP_FAIR_WINDOW_SECS=20,total=6*RTP_FAIR_LONGRUN_REPS*RTP_FAIR_LONGRUN_SECS,wall=364s
 reliability-path-defaults = RTP_INSTREAM_GROUP_FEC,RTP_FRAME_DELIVERY,RTP_JITTER_CAP,RTP_MAX_DIVERSITY,RTP_MINDIV,RTP_RTX_DUP | - | the per-process `Default`s of the connect/accept config, each sampled once and cached so a config built later cannot observe a mid-run environment mutation: `RTP_INSTREAM_GROUP_FEC` selects in-stream group FEC parity (`src/traffic_shaping/redundancy/mod.rs:14`), `RTP_FRAME_DELIVERY` selects the receiver's frame-delivery mode (`src/delivery/frame/mode.rs:75`), `RTP_JITTER_CAP` selects the jitter-tolerant fast-retransmit reorder window and is default ON, only an explicit 0/false turning it off (`src/traffic_shaping/recovery/pkt_send_space.rs:121`), `RTP_MAX_DIVERSITY`, with `RTP_MINDIV` as the legacy alias it falls back to, selects the maximum-diversity FEC preset (`src/traffic_shaping/redundancy/fec/gate/tuning.rs:124`), and `RTP_RTX_DUP` (`1`/`true` enables, anything else — including unset — disables) selects whether a recovery send gets a duplicate wire copy, sampled once through a `LazyLock` whose `const` string alias names it (`src/traffic_shaping/redundancy/retransmission_armor/config.rs:13,35`) and read by both config `Default`s (`src/udp.rs:492,549`); each selects a behaviour an explicit per-connection argument overrides, and none sizes a measurement | transport-delivery@knob=RTP_INSTREAM_GROUP_FEC+mode=instream-parity, transport-delivery@knob=RTP_FRAME_DELIVERY+mode=frame-delivery, transport-latency@knob=RTP_JITTER_CAP+window=jitter-margin, transport-delivery@knob=RTP_MAX_DIVERSITY+preset=max-diversity, transport-delivery@knob=RTP_MINDIV+preset=legacy-alias, transport-delivery@knob=RTP_RTX_DUP+mode=armor-dup, transport-delivery@knob=RTP_RTX_DUP+mode=armor-off
 armor-frontier-cell = ARMOR_COPIES,ARMOR_N,ARMOR_CADENCE_MS,ARMOR_BPS,ARMOR_BURST,ARMOR_GAP,ARMOR_SEED | - | the fresh-tail armour copy count `probe_armor_copy_cell` forces through the test-only `fresh_tail_armor_copies_override` so one efficiency-frontier cell is swept independently of the loss-adaptive ladder, `-1` keeping the production ladder (`src/socket/stream.rs:1834`); the probe's load is `ARMOR_N` stamped 256-byte messages sent one per `ARMOR_CADENCE_MS` (`:1833`, `:1844`), so those two size the cost — the measured `wall` below is their product plus the consumer's idle drain (10.57 s, 10.57 s and 10.58 s over three reps) — while `ARMOR_BPS` (iid loss basis points, 0 = off, `:1839`), `ARMOR_BURST` and `ARMOR_GAP` (burst length and fixed quiet gap, burst 0 = off, `:1840-1841`) and `ARMOR_SEED` (`:1842`) only select the injected-loss regime and its reproducible draw (`BurstLoss::new(burst, gap, gap, seed)`, `src/udp/testing.rs:168`); all seven are read by the local `env_usize` closure (`src/socket/stream.rs:1825-1831`), which forwards its `key` argument to `env::var`.  **This cell cannot sweep its knob upward, and must not be read as if it can:** at the 25 ms cadence its load declares, the send pacer grants ~3.2 datagrams per message and a forced cover above ~2.4 copies is never admitted, so `ARMOR_COPIES` 4, 5, 7, 9 and 11 all realise the same 2.393 armour copies and 977 B per message that `ARMOR_COPIES=2` nearly does (2.005 / 868 B).  The cover frontier is measured where the knob is live by `cover-frontier-cell` / `probe_armor_cover_frontier` below. | armor-frontier@knob=ARMOR_COPIES+mode=forced-count, armor-frontier@knob=ARMOR_COPIES+mode=production-ladder, armor-frontier@impairment=iid-loss+knob=ARMOR_BPS, armor-frontier@impairment=burst-loss+knob=ARMOR_BURST | ARMOR_N=400,ARMOR_CADENCE_MS=25,total=ARMOR_N*ARMOR_CADENCE_MS,wall=10.58s
@@ -1126,6 +1166,8 @@ src/traffic_shaping/recovery/pkt_send_space.rs::probe_lone_tail_wire_ladder_unde
 src/traffic_shaping/recovery/pkt_send_space.rs::probe_midstream_single_loss_repair = probe
 src/traffic_shaping/recovery/rtx_index.rs::deferred_loss_cancellation_does_not_rescan_the_pending_set = perf-lane
 tests/rtp_bufferbloat.rs::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
+tests/rtp_clean_tail.rs::clean_tail_blocking_endpoint_control = standard
+tests/rtp_clean_tail.rs::clean_tail_shaper_vs_transport_matrix = standard
 tests/rtp_burst_loss.rs::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
 tests/rtp_burst_loss.rs::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe = full
 tests/rtp_burst_loss.rs::rtp_sparse_message_tail_latency_under_burst_loss = full
@@ -1193,6 +1235,8 @@ lib::recv_queue::pkt_recv_space::tests::withholding_frames_behind_a_hole_costs_n
 lib::traffic_shaping::recovery::pkt_send_space::tests::applying_many_sacks_remains_linear_in_the_send_window = standard
 lib::traffic_shaping::recovery::rtx_index::tests::deferred_loss_cancellation_does_not_rescan_the_pending_set = standard
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound = standard
+rtp_clean_tail::clean_tail_blocking_endpoint_control = standard
+rtp_clean_tail::clean_tail_shaper_vs_transport_matrix = standard
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random = full
 rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe = full
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss = full
@@ -1258,6 +1302,8 @@ rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
 rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe
 rtp_burst_loss::rtp_sparse_message_tail_latency_under_burst_loss
+rtp_clean_tail::clean_tail_blocking_endpoint_control
+rtp_clean_tail::clean_tail_shaper_vs_transport_matrix
 rtp_clean::rtp_over_netem_clean_link_delivers_400kib
 rtp_clean::rtp_over_netem_clean_link_delivers_data
 rtp_clean::rtp_over_netem_latency_is_observable
