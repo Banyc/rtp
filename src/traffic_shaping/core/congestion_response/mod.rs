@@ -34,6 +34,48 @@ pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 /// against), never a production policy.
 const REFERENCE_AIMD_DECREASE_FACTOR: f64 = 0.5;
 
+/// Minimum control-RTT interval between two multiplicative decreases of the
+/// test-only AIMD reference law.
+///
+/// The sampled loss rate is *windowed*, so one loss event keeps it non-zero
+/// for up to two control RTTs; a trigger that fired on every rate sample while
+/// the window is non-zero halved the rate dozens of times per event and pinned
+/// the reference at its floor (measured: two identical references together
+/// delivered 61 % of a shared bottleneck's capacity).  TCP halves about once
+/// per loss event — roughly one event per RTT at steady state — so the
+/// reference mirrors that cadence instead.
+const REFERENCE_AIMD_DECREASE_COOLDOWN_RTTS: u32 = 1;
+
+/// State of the test-only AIMD reference law: whether the law is selected, and
+/// when it last applied its multiplicative decrease.  Kept local to the
+/// reference branch so the production delay/loss policy owns no reference
+/// state and its path stays byte-identical.
+#[derive(Debug, Default)]
+struct ReferenceAimd {
+    enabled: bool,
+    last_decrease_at: Option<Instant>,
+}
+
+impl ReferenceAimd {
+    /// Whether a rate sample must apply the multiplicative decrease now: loss
+    /// is present in the windowed sample and at least one control RTT has
+    /// elapsed since the last decrease.  A `None` windowed rate (too few
+    /// samples to measure) is not a loss event.
+    fn decrease_due(
+        &self,
+        loss_event_rate: Option<f64>,
+        now: Instant,
+        control_rtt: Duration,
+    ) -> bool {
+        if !loss_event_rate.is_some_and(|loss| loss > 0.0) {
+            return false;
+        }
+        let cooldown = control_rtt * REFERENCE_AIMD_DECREASE_COOLDOWN_RTTS;
+        self.last_decrease_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= cooldown)
+    }
+}
+
 /// What the controller observed about the path during one sample.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CongestionObservation {
@@ -83,13 +125,13 @@ pub(crate) struct CongestionResponse {
     /// cross-traffic-protecting tuning.  Declared by the owner (e.g. `rtp_mux`'s
     /// lane class), never inferred from the delivery mode.
     lane: CongestionLane,
-    /// Test-only selector for the AIMD reference law (never set in production):
-    /// when `true` [`Self::decide`] returns the reference's additive-increase /
+    /// Test-only AIMD reference law state (never selected in production): when
+    /// enabled [`Self::decide`] returns the reference's additive-increase /
     /// multiplicative-decrease decision instead of the production delay/loss
     /// policy.  Seeded from the `#[cfg(feature = "testing")]` connect/accept
-    /// `reference_aimd` knob; the production default is `false`, so the
+    /// `reference_aimd` knob; the production default leaves it disabled, so the
     /// ordinary path is byte-identical.
-    reference_aimd: bool,
+    reference_aimd: ReferenceAimd,
 }
 
 impl CongestionResponse {
@@ -103,7 +145,7 @@ impl CongestionResponse {
             queue_response: QueueResponse::default(),
             loss_backoff: LossBackoff::default(),
             lane,
-            reference_aimd: false,
+            reference_aimd: ReferenceAimd::default(),
         }
     }
 
@@ -111,7 +153,7 @@ impl CongestionResponse {
     /// (the connect/accept knob that sets it is behind `#[cfg(feature =
     /// "testing")]`, default off), so the ordinary path is unchanged.
     pub(crate) fn set_reference_aimd(&mut self, enabled: bool) {
-        self.reference_aimd = enabled;
+        self.reference_aimd.enabled = enabled;
     }
 
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
@@ -120,6 +162,7 @@ impl CongestionResponse {
         self.bandwidth_probe.reset();
         self.queue_response.reset();
         self.loss_backoff.reset();
+        self.reference_aimd.last_decrease_at = None;
         gentle_exit
     }
 
@@ -170,7 +213,7 @@ impl CongestionResponse {
         observation: CongestionObservation,
         input: CongestionInput,
     ) -> CongestionOutcome {
-        if self.reference_aimd {
+        if self.reference_aimd.enabled {
             return self.reference_aimd_outcome(input);
         }
         // An application-limited sample can only be *another* flow's queue on
@@ -271,14 +314,19 @@ impl CongestionResponse {
     }
 
     /// The test-only AIMD reference law: an absolute additive increase while
-    /// no loss is sampled, and a multiplicative decrease on any sampled loss.
-    /// It replaces the delay/loss policy wholesale (the flag is never set in
-    /// production).  The decisions reuse the ordinary probe/backoff channels,
-    /// so the sender applies them exactly as it applies production ones: a
-    /// `Probe` smooths toward the additive target, a `LossBackoff` steps the
-    /// send rate down toward the halved target.
+    /// no loss is sampled, and a multiplicative decrease once per loss event
+    /// (at most one decrease per control RTT, `REFERENCE_AIMD_DECREASE_COOLDOWN_RTTS`).
+    /// It replaces the delay/loss policy wholesale (the law is never selected
+    /// in production).  The decisions reuse the ordinary probe/backoff
+    /// channels, so the sender applies them exactly as it applies production
+    /// ones: a `Probe` smooths toward the additive target, a `LossBackoff`
+    /// steps the send rate down toward the halved target.
     fn reference_aimd_outcome(&mut self, input: CongestionInput) -> CongestionOutcome {
-        if input.loss_event_rate.is_some_and(|loss| loss > 0.0) {
+        if self
+            .reference_aimd
+            .decrease_due(input.loss_event_rate, input.now, input.control_rtt)
+        {
+            self.reference_aimd.last_decrease_at = Some(input.now);
             let target =
                 (input.current_rate * REFERENCE_AIMD_DECREASE_FACTOR).max(input.minimum_rate);
             return CongestionOutcome::new(
@@ -885,11 +933,13 @@ mod tests {
 
     /// The test-only AIMD reference law must be a genuine AIMD: an absolute
     /// additive increase with no loss, and a multiplicative decrease (half the
-    /// current rate) on any sampled loss.  Before this law the "loss-only"
-    /// reference used the production rate-match backoff, whose target is
-    /// `max(delivery, floor)` — not proportional to the current rate — so two
-    /// identical reference flows did not converge.  This pins both responses,
-    /// and the ratio check fails on the old rate-match law because its target
+    /// current rate) on a sampled loss — at most once per control RTT, so a
+    /// windowed loss event cannot halve the rate on every rate sample.
+    /// Before this law the "loss-only" reference used the production
+    /// rate-match backoff, whose target is `max(delivery, floor)` — not
+    /// proportional to the current rate — so two identical reference flows did
+    /// not converge.  This pins both responses, the once-per-event cadence, and
+    /// the ratio check fails on the old rate-match law because its target
     /// would not equal `current * 0.5`.
     #[test]
     fn reference_aimd_increases_additively_and_halves_on_loss() {
@@ -950,6 +1000,35 @@ mod tests {
         assert_eq!(target, current * 0.5);
         assert_eq!(floor, current * 0.5);
         assert_eq!(raw, current * 0.5);
+
+        // The decrease is a once-per-loss-event coast, not a per-sample one:
+        // with the loss window still non-zero inside the same control RTT the
+        // law must probe (additive increase), and only a loss sample at or
+        // beyond the cooldown may halve again.  This is the vacuity pin for
+        // the saturation fix — a per-sample trigger fails it by backing off
+        // on the mid-cooldown sample.
+        let mid = t0 + control_rtt + control_rtt / 2;
+        let obs = reference.observe(control_rtt, jitter, Some(0.5), current, mid, control_rtt);
+        let CongestionDecision::Probe { target } = reference
+            .decide(obs, input(current, Some(0.5), mid))
+            .decision()
+        else {
+            panic!(
+                "a loss sample inside the cooldown must not halve again — the reference \
+                 would collapse into its floor as the per-sample trigger did"
+            );
+        };
+        assert_eq!(target, current + step);
+
+        let after = t0 + control_rtt + control_rtt;
+        let obs = reference.observe(control_rtt, jitter, Some(0.5), current, after, control_rtt);
+        let CongestionDecision::LossBackoff { target, .. } = reference
+            .decide(obs, input(current, Some(0.5), after))
+            .decision()
+        else {
+            panic!("a loss sample at the cooldown boundary must halve again");
+        };
+        assert_eq!(target, current * 0.5);
     }
 
     /// On a path shared with an interactive lane, this connection's *own*

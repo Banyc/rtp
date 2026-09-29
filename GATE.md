@@ -989,15 +989,46 @@ only by the `testing`-gated `reference_aimd` knob (default off, production
 byte-identical when unset), and its absolute increase step is the production
 contention lane's own RTP additive step; the arm must not be read as a
 comparison against a kernel TCP stack.
-`aimd_vs_aimd` is the family's **reference-convergence vacuity**: two identical
-reference flows must converge to ~50/50, which is what makes the reference a
-valid AIMD. Measured over three 10 s reps (shares 0.341/0.460/0.405; Jain
-0.909/0.994/0.965, mean 0.956) it clears the 0.90 instrument floor, so the
-floor is an instrument-sanity bound on the reference and not a product fairness
-bound. The superseded rate-match reference split 14 %/86 % (Jain 0.658) and
-fails that floor; a family whose reference cannot converge cannot attribute the
-A/B's contrast to the delay response. No row in this family is a pass/fail gate
-for the product claim.
+`aimd_vs_aimd` is the family's **reference-sanity vacuity**: two identical
+reference flows must both converge to ~50/50 *and* together saturate the link,
+which is what makes the reference a competent AIMD competitor. It asserts both
+halves of that: the two-flow Jain floor of 0.90, and an **aggregate saturation
+floor of 0.80** of the shaped rate. The saturation floor exists because the
+Jain floor is scale-invariant: a reference that halves on every rate sample —
+the pre-fix trigger fired while the *windowed* loss rate stayed non-zero, so it
+halved dozens of times per loss event — converged into its rate floor at 0.614
+of capacity (0.767 MB/s of the 1.25 MB/s link; shares 0.341/0.460/0.405, Jain
+0.909/0.994/0.965, mean 0.956), passing the Jain floor while leaving 39 % of
+the link idle. The fix lengthens the reference's decrease to once per loss
+event (a minimum one-control-RTT cooldown between decreases, mirroring TCP's
+~one event per RTT), which raises the measured aggregate to 0.879/0.872/0.877
+of capacity (the final three-rep run; mean 0.876; per-flow shares
+0.479/0.498/0.477, Jain 0.998/1.000/0.998). The floor is derived from that run:
+0.80 is 0.072 below the worst rep (8.3 % relative headroom, so host-scheduling
+noise cannot trip it) and 0.186 above the pre-fix 0.614, so the pre-fix law
+fails it and the fixed one passes. A second run on the same revision measured
+mean 0.869, so the headroom holds across runs rather than in one sample; a
+scratch run with the decrease trigger reverted to per-sample delivered 0.529 and
+the saturation assertion failed, which is the bound's vacuity. It is an
+instrument bound on the reference, exactly like the Jain floor, and not a
+product fairness or throughput bound. The superseded
+rate-match reference split 14 %/86 % (Jain 0.658) and fails the Jain floor; a
+family whose reference can neither converge nor contest the link cannot
+attribute the A/B's contrast to the delay response. No row in this family is a
+pass/fail gate for the product claim.
+
+The `delay_vs_aimd` arm reads against the saturation-conformant reference (its
+two flows together aggregate 0.916 of capacity, the reference alone 0.520):
+flow A, the production delay-first lane on a `shared_path`, takes mean 0.432 of
+the two flows' aggregate (mean 495 068 B/s against the reference's
+649 870 B/s, per-rep share 0.485/0.378/0.433, Jain 0.999/0.943/0.982), with
+`shared_path` true in all three reps,
+1375/1332/1378 delay drains, 0 loss backoffs and its sampled loss above
+`CC_DATA_LOSS_RATE` throughout. A prior run on the same revision measured flow
+A at 0.354 of the aggregate (395 257 against 721 209 B/s), so the margin moves
+between runs, but the reference out-delivers the delay-first flow in all six
+reps across both runs. The reading is only as strong as the competitor that was
+out-competed, and this reference saturates.
 
 The `padding` family's fitted-ACK arm is the one row whose cost fell without a
 retune: its 24 trials x 2 arms x 256 KiB are now pooled with two transfers in

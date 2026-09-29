@@ -1625,6 +1625,65 @@ impl GateProbe {
 /// `congestion_response/mod.rs`).
 const CC_DATA_LOSS_RATE: f64 = 0.2;
 
+/// The `lossab` reference-vacuity arm's **saturation** floor: the two identical
+/// AIMD reference flows' aggregate delivered bytes, as a fraction of the shared
+/// shaper's serialization capacity.
+///
+/// A convergent reference is not yet a competent one: two references that halve
+/// on every rate sample while the windowed loss rate stays non-zero collapse
+/// into their floor together, delivering 767 438 B/s = 0.614 of the 10 Mbit/s
+/// link (measured with the pre-fix per-sample trigger) and leaving the link 39 %
+/// idle.  The fixed once-per-loss-event trigger delivers 1 098 240 / 1 090 261 /
+/// 1 096 832 B/s across the arm's three reps (0.879 / 0.872 / 0.877, mean
+/// 0.876; a prior run on the same revision measured mean 0.869).  The floor is
+/// set at 0.80: 0.072 below the worst rep (8.3 % relative
+/// headroom, so host scheduling cannot trip it) and 0.186 above the pre-fix
+/// 0.614 (so a reference that does not contest the link fails it).  This is an
+/// instrument bound on the reference, exactly like the Jain floor above — not a
+/// product fairness or throughput bound.
+const MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP: f64 = 0.80;
+
+/// Assert that an arm's two flows together delivered at least
+/// [`MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP`] of the shaped link capacity.  The
+/// Jain floor is scale-invariant, so a pair of references that both sit far
+/// below the link still scores a perfect Jain; only an absolute aggregate can
+/// fail that, and without it the arm's "flow A dominates" reading is not a
+/// claim about a competent competitor.
+fn assert_aggregate_saturates(label: &str, rep: u64, delivered: f64, cap: f64) {
+    let fraction = delivered / cap;
+    assert!(
+        fraction >= MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP,
+        "{label} rep={rep}: the two flows together delivered {delivered:.0} B/s = {fraction:.3} \
+         of the {cap:.0} B/s shaped capacity, below the {MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP:.2} \
+         saturation floor — the reference does not contest the link, so the A/B cannot be read as a \
+         comparison against a competent loss-based competitor"
+    );
+}
+
+/// Vacuity guard for the saturation floor: the pre-fix per-sample decrease's
+/// measured aggregate must trip it while the fixed once-per-loss-event
+/// aggregate clears it.  Without this the floor could silently become
+/// satisfiable by any pair of flows that merely deliver something.
+#[test]
+fn loss_ab_saturation_floor_fires_on_a_reference_that_does_not_contest_the_link() {
+    let cap = FAIRNESS_RATE_BPS as f64 / 8.0;
+    let prefix_undersaturated = 388_530.0 + 378_908.0;
+    let fixed = 564_217.0 + 530_894.0;
+    assert!(
+        fixed / cap >= MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP,
+        "the fixed reference's measured aggregate {:.3} must clear the saturation floor",
+        fixed / cap,
+    );
+    let tripped = std::panic::catch_unwind(|| {
+        assert_aggregate_saturates("aimd_vs_aimd", 0, prefix_undersaturated, cap);
+    });
+    assert!(
+        tripped.is_err(),
+        "the saturation floor must fire on the pre-fix reference aggregate {:.3}",
+        prefix_undersaturated / cap,
+    );
+}
+
 /// Run one three-rep arm of the loss-based A/B and print its per-rep and mean
 /// per-flow goodput, the slower flow's share, and the two-flow Jain.
 ///
@@ -1634,7 +1693,10 @@ const CC_DATA_LOSS_RATE: f64 = 0.2;
 /// from the code path ([`TwoFlowRun::shared_path`], not a format literal).
 /// `interactive` wires the live interactive lane that makes flow A's path
 /// shared; `jain_floor` is `Some` only for the reference-vacuity arm, where a
-/// convergence floor is an instrument-sanity bound.
+/// convergence floor is an instrument-sanity bound, and `saturation_floor` is
+/// likewise `Some` only there, bounding the two references' aggregate delivered
+/// fraction of the shaped rate (a convergent reference that does not contest
+/// the link is not a competent competitor).
 ///
 /// Report-only for the product claim: the asserts are the instrument's own
 /// sanity (both flows deliver, the bins are non-empty) plus, on the wired
@@ -1647,6 +1709,7 @@ async fn run_loss_ab_arm(
     read_gate: bool,
     interactive: bool,
     jain_floor: Option<f64>,
+    saturation_floor: Option<f64>,
 ) {
     const REPS: u64 = 3;
     const OWD_MS: u64 = 20;
@@ -1714,6 +1777,15 @@ async fn run_loss_ab_arm(
                  cannot be a valid instrument"
             );
         }
+        if let Some(floor) = saturation_floor {
+            let cap = FAIRNESS_RATE_BPS as f64 / 8.0;
+            assert_aggregate_saturates(label, rep, ga + gb, cap);
+            eprintln!(
+                "[loss-ab] {label} rep={rep} aggregate={:.0} B/s = {:.3} of cap (floor {floor:.2})",
+                ga + gb,
+                (ga + gb) / cap,
+            );
+        }
         if read_gate {
             let loss = probe.max_congestion_loss_ratio().unwrap_or(0.0);
             let drains = probe.congestion_delay_drains();
@@ -1757,11 +1829,14 @@ async fn run_loss_ab_arm(
     let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
     let mean_a = mean(&goodputs.iter().map(|&(a, _)| a).collect::<Vec<_>>());
     let mean_b = mean(&goodputs.iter().map(|&(_, b)| b).collect::<Vec<_>>());
+    let mean_aggregate = mean_a + mean_b;
     eprintln!(
         "[loss-ab] {label} mean_a={mean_a:.0} B/s mean_b={mean_b:.0} B/s \
-         mean_share_min={:.3} mean_jain={:.3} shared_readings={shared_readings:?}",
+         mean_share_min={:.3} mean_jain={:.3} mean_aggregate={mean_aggregate:.0} B/s = {:.3} of \
+         cap shared_readings={shared_readings:?}",
         mean(&shares),
         mean(&jains),
+        mean_aggregate / (FAIRNESS_RATE_BPS as f64 / 8.0),
     );
 }
 
@@ -1774,7 +1849,7 @@ async fn run_loss_ab_arm(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "shared-bottleneck delay-vs-AIMD A/B: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_loss_ab_delay_vs_aimd() {
-    run_loss_ab_arm("delay_vs_aimd", false, true, true, true, None).await;
+    run_loss_ab_arm("delay_vs_aimd", false, true, true, true, None, None).await;
 }
 
 /// Control: both flows are the production delay-first lane, so the split should
@@ -1782,18 +1857,29 @@ async fn shared_bneck_loss_ab_delay_vs_aimd() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "shared-bottleneck delay-vs-delay control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_loss_ab_delay_vs_delay() {
-    run_loss_ab_arm("delay_vs_delay", false, false, false, false, None).await;
+    run_loss_ab_arm("delay_vs_delay", false, false, false, false, None, None).await;
 }
 
 /// Vacuity control for the reference itself: two identical AIMD reference
-/// flows on one shaper must converge to ~50/50.  If they do not, the reference
-/// law is not a fair AIMD and the A/B's contrast cannot be attributed to the
-/// delay response.  This is the ONE arm allowed a Jain floor: it is an
-/// instrument-sanity bound on the reference, not a product fairness bound.
+/// flows on one shaper must both converge to ~50/50 AND together saturate the
+/// link.  A pair that converges into its floor is not a competent competitor,
+/// and the A/B's contrast could then not be attributed to the delay response.
+/// This is the ONE arm allowed a Jain floor and a saturation floor: both are
+/// instrument-sanity bounds on the reference, not product fairness or
+/// throughput bounds.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "shared-bottleneck AIMD-reference vacuity control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_loss_ab_aimd_vs_aimd() {
-    run_loss_ab_arm("aimd_vs_aimd", true, true, false, false, Some(0.90)).await;
+    run_loss_ab_arm(
+        "aimd_vs_aimd",
+        true,
+        true,
+        false,
+        false,
+        Some(0.90),
+        Some(MIN_LOSS_AB_AGGREGATE_FRACTION_OF_CAP),
+    )
+    .await;
 }
 
 /// Regression: one reply slower than the round-trip bound must not end the
