@@ -20,7 +20,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,8 @@ use netem_test::kit::stats::{HolSummary, combined_stats, print_perf, summarize};
 use netem_test::kit::submit_test_task;
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use rtp::testkit::rtp::{
-    spawn_rtp_bulk_upload_with_lane_and_frame_via, spawn_rtp_byte_sink_server_via,
+    spawn_rtp_bulk_upload_with_lane_and_frame_via,
+    spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via, spawn_rtp_byte_sink_server_via,
     spawn_rtp_echo_server_via,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1215,7 +1216,9 @@ async fn shared_bneck_fairness_longrun() {
 
 /// Spawn two bulk flows through one shared shaper, sampling per-flow delivered
 /// bytes every 250 ms. Returns the raw per-bin series so callers can compute
-/// fairness over any window.
+/// fairness over any window. Both flows use the crate's default congestion
+/// lane; [`two_flow_goodput_with_flows`] is the same substrate with per-flow
+/// lane/gate/observer selection.
 async fn two_flow_goodput(
     owd_a_ms: u64,
     owd_b_ms: u64,
@@ -1223,6 +1226,66 @@ async fn two_flow_goodput(
     total_run: Duration,
     rep: u64,
     frame_delivery: rtp::FrameMode,
+) -> TwoFlowRun {
+    two_flow_goodput_with_flows(
+        owd_a_ms,
+        owd_b_ms,
+        join,
+        total_run,
+        rep,
+        frame_delivery,
+        FlowCongestion::lane(rtp::CongestionLane::default()),
+        FlowCongestion::lane(rtp::CongestionLane::default()),
+    )
+    .await
+}
+
+/// Per-flow congestion selection for the shared-bottleneck substrate: the
+/// declared [`rtp::CongestionLane`], the test-only loss-only delay-gate toggle,
+/// and an optional metrics observer on the connecting end.  The production
+/// shape is [`FlowCongestion::lane`]; [`FlowCongestion::loss_only`] is the
+/// reference flow whose delay gate never fires.
+struct FlowCongestion {
+    congestion_lane: rtp::CongestionLane,
+    disable_delay_gate: bool,
+    observer: Option<rtp::metrics::MetricsObserver>,
+}
+
+impl FlowCongestion {
+    /// The production bulk lane: delay-first, gate active, no observer.
+    fn lane(congestion_lane: rtp::CongestionLane) -> Self {
+        Self {
+            congestion_lane,
+            disable_delay_gate: false,
+            observer: None,
+        }
+    }
+
+    /// The test-only loss-only reference: `Dedicated` with the delay gate
+    /// disabled, so the controller responds to loss only.
+    fn loss_only() -> Self {
+        Self {
+            congestion_lane: rtp::CongestionLane::Dedicated,
+            disable_delay_gate: true,
+            observer: None,
+        }
+    }
+}
+
+/// [`two_flow_goodput`] with an explicit [`FlowCongestion`] per flow.  The ONLY
+/// quantity the delay-vs-loss A/B varies between its two flows is
+/// `FlowCongestion::disable_delay_gate` (both are `Dedicated`); the
+/// delay-vs-delay and loss-vs-loss controls close the loop on the toggle.
+#[allow(clippy::too_many_arguments)] // the substrate's per-flow selection beside the topology
+async fn two_flow_goodput_with_flows(
+    owd_a_ms: u64,
+    owd_b_ms: u64,
+    join: Duration,
+    total_run: Duration,
+    rep: u64,
+    frame_delivery: rtp::FrameMode,
+    flow_a: FlowCongestion,
+    flow_b: FlowCongestion,
 ) -> TwoFlowRun {
     let rate_bps = FAIRNESS_RATE_BPS;
     let limit_bytes = 128 * 1024u64;
@@ -1264,27 +1327,27 @@ async fn two_flow_goodput(
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let stop = Arc::new(AtomicBool::new(false));
             let run_start = Instant::now();
-            spawn_bulk_flow(
+            spawn_bulk_flow_with_gate(
                 &task_tx,
                 pair_a.client_addr(),
                 Arc::clone(&payload),
                 total_run,
                 Arc::clone(&stop),
-                rtp::CongestionLane::default(),
                 frame_delivery,
+                flow_a,
             )
             .await;
             if !join.is_zero() {
                 tokio::time::sleep(join).await;
             }
-            spawn_bulk_flow(
+            spawn_bulk_flow_with_gate(
                 &task_tx,
                 pair_b.client_addr(),
                 Arc::clone(&payload),
                 total_run.saturating_sub(join),
                 Arc::clone(&stop),
-                rtp::CongestionLane::default(),
                 frame_delivery,
+                flow_b,
             )
             .await;
 
@@ -1314,6 +1377,266 @@ async fn two_flow_goodput(
         join,
         total_run,
     }
+}
+
+/// Run a bulk upload through one shared-shaper [`NetemPair`] for `run_for`,
+/// selecting the flow's congestion lane, loss-only gate toggle and an optional
+/// metrics observer.
+async fn spawn_bulk_flow_with_gate(
+    tx: &netem_test::kit::TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    payload: Arc<Vec<u8>>,
+    run_for: Duration,
+    stop: Arc<AtomicBool>,
+    frame_delivery: rtp::FrameMode,
+    congestion: FlowCongestion,
+) {
+    let Ok(mut writer) = spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via(
+        tx,
+        proxy_client_addr,
+        false,
+        congestion.congestion_lane,
+        frame_delivery,
+        congestion.disable_delay_gate,
+        congestion.observer,
+    )
+    .await
+    else {
+        return;
+    };
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let start = Instant::now();
+            let mut offset = 0usize;
+            while start.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
+                match writer.write(&payload[offset..]).await {
+                    Ok(0) => break,
+                    Ok(n) => offset = (offset + n) % payload.len(),
+                    Err(_) => break,
+                }
+            }
+        }),
+    );
+}
+
+/// Snapshot reading of one connection's congestion gate, captured from a
+/// [`rtp::metrics::MetricsObserver`] on the connecting end.  The shared-
+/// bottleneck A/B uses it to read the *delay-first* flow's own loss rate and
+/// whether its delay gate ever declared a queue, which is the confounder the
+/// `CC_DATA_LOSS_RATE` threshold (`loss_event_rate >= 0.2`) can introduce.
+#[derive(Default)]
+struct GateProbe {
+    samples: AtomicU64,
+    loss_ratio_bits: AtomicU64,
+    congestion_loss_ratio_bits: AtomicU64,
+    queue_building_snapshots: AtomicU64,
+    congestion_delay_drains: AtomicU64,
+    congestion_loss_backoffs: AtomicU64,
+}
+
+impl GateProbe {
+    /// An observer that snapshots on each RTT sample and folds the fields the
+    /// caveat needs into this probe.
+    fn observer(probe: &Arc<Self>) -> rtp::metrics::MetricsObserver {
+        let probe = Arc::clone(probe);
+        rtp::metrics::MetricsObserver::filtered(
+            |event, _elapsed| matches!(event, rtp::metrics::MetricsEvent::RttSample),
+            move |observation| {
+                let Some(snapshot) = observation.snapshot else {
+                    return;
+                };
+                probe.samples.fetch_add(1, Ordering::Relaxed);
+                if let Some(loss) = snapshot.loss_ratio {
+                    probe
+                        .loss_ratio_bits
+                        .fetch_max(loss.to_bits(), Ordering::Relaxed);
+                }
+                if let Some(loss) = snapshot.congestion_loss_ratio {
+                    probe
+                        .congestion_loss_ratio_bits
+                        .fetch_max(loss.to_bits(), Ordering::Relaxed);
+                }
+                if snapshot.queue_building {
+                    probe
+                        .queue_building_snapshots
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                probe
+                    .congestion_delay_drains
+                    .store(snapshot.congestion_delay_drains, Ordering::Relaxed);
+                probe
+                    .congestion_loss_backoffs
+                    .store(snapshot.congestion_loss_backoffs, Ordering::Relaxed);
+            },
+        )
+    }
+
+    fn samples(&self) -> u64 {
+        self.samples.load(Ordering::Relaxed)
+    }
+
+    fn max_loss_ratio(&self) -> Option<f64> {
+        Some(f64::from_bits(self.loss_ratio_bits.load(Ordering::Relaxed)))
+    }
+
+    fn max_congestion_loss_ratio(&self) -> Option<f64> {
+        Some(f64::from_bits(
+            self.congestion_loss_ratio_bits.load(Ordering::Relaxed),
+        ))
+    }
+
+    fn queue_building_snapshots(&self) -> u64 {
+        self.queue_building_snapshots.load(Ordering::Relaxed)
+    }
+
+    fn congestion_delay_drains(&self) -> u64 {
+        self.congestion_delay_drains.load(Ordering::Relaxed)
+    }
+
+    fn congestion_loss_backoffs(&self) -> u64 {
+        self.congestion_loss_backoffs.load(Ordering::Relaxed)
+    }
+}
+
+/// Loss rate at or above which the controller's `loss_blocks_delay_control`
+/// vetoes the delay gate on a non-shared path (`CC_DATA_LOSS_RATE` in
+/// `congestion_response/mod.rs`).
+const CC_DATA_LOSS_RATE: f64 = 0.2;
+
+/// Run one three-rep arm of the delay-vs-loss A/B and print its per-rep and
+/// mean per-flow goodput, the slower flow's share, and the two-flow Jain.
+///
+/// `flow_a_loss_only`/`flow_b_loss_only` are the only difference between the
+/// three arms; `read_gate` attaches a [`GateProbe`] to flow A and prints its
+/// measured loss and gate activity, which is the `CC_DATA_LOSS_RATE` confounder
+/// this arm must state rather than hide.  Report-only: the asserts are the
+/// instrument's own sanity (both flows deliver, the bins are non-empty).
+async fn run_delay_vs_loss_arm(
+    label: &str,
+    flow_a_loss_only: bool,
+    flow_b_loss_only: bool,
+    read_gate: bool,
+) {
+    const REPS: u64 = 3;
+    const OWD_MS: u64 = 20;
+    let total_run = Duration::from_secs(10);
+    let mut goodputs = Vec::new();
+    let mut shares = Vec::new();
+    let mut jains = Vec::new();
+    for rep in 0..REPS {
+        let probe = Arc::new(GateProbe::default());
+        let base_a = if flow_a_loss_only {
+            FlowCongestion::loss_only()
+        } else {
+            FlowCongestion::lane(rtp::CongestionLane::Dedicated)
+        };
+        let flow_a = if read_gate {
+            FlowCongestion {
+                observer: Some(GateProbe::observer(&probe)),
+                ..base_a
+            }
+        } else {
+            base_a
+        };
+        let flow_b = if flow_b_loss_only {
+            FlowCongestion::loss_only()
+        } else {
+            FlowCongestion::lane(rtp::CongestionLane::Dedicated)
+        };
+        let run = two_flow_goodput_with_flows(
+            OWD_MS,
+            OWD_MS,
+            Duration::ZERO,
+            total_run,
+            rep,
+            rtp::FrameMode::default(),
+            flow_a,
+            flow_b,
+        )
+        .await;
+        let (ga, gb) = run.steady_goodput();
+        assert!(
+            ga > 0.0 && gb > 0.0,
+            "{label} rep={rep}: both flows must deliver, got a={ga:.0} b={gb:.0} B/s"
+        );
+        assert!(
+            !run.bins_a.is_empty() && !run.bins_b.is_empty(),
+            "{label} rep={rep}: the 250 ms sampler must record both flows' bins"
+        );
+        let jain = jain_index(ga, gb);
+        let slower_share = ga.min(gb) / (ga + gb);
+        eprintln!(
+            "[delay-vs-loss] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} \
+             share_min={slower_share:.3} jain={jain:.3}",
+            ratio = ga / gb,
+        );
+        if read_gate {
+            let loss = probe.max_congestion_loss_ratio().unwrap_or(0.0);
+            let confounded = loss >= CC_DATA_LOSS_RATE;
+            eprintln!(
+                "[delay-vs-loss] {label} rep={rep} gate: samples={} max_loss_ratio={:?} \
+                 max_congestion_loss_ratio={:?} queue_building_snapshots={} \
+                 congestion_delay_drains={} congestion_loss_backoffs={} shared_path=false \
+                 (no CcLink/CcSignal on this egress) confounded={confounded} \
+                 (loss >= CC_DATA_LOSS_RATE={CC_DATA_LOSS_RATE})",
+                probe.samples(),
+                probe.max_loss_ratio(),
+                probe.max_congestion_loss_ratio(),
+                probe.queue_building_snapshots(),
+                probe.congestion_delay_drains(),
+                probe.congestion_loss_backoffs(),
+            );
+            if confounded {
+                eprintln!(
+                    "[delay-vs-loss] {label} rep={rep} WARNING: the delay-first flow's loss \
+                     crossed CC_DATA_LOSS_RATE and shared_path=false, so `loss_blocks_delay_control` \
+                     routed it to LossBackoff rather than the delay drain: this arm is CONFOUNDED \
+                     and the A/B does not isolate the delay gate."
+                );
+            }
+        }
+        goodputs.push((ga, gb));
+        shares.push(slower_share);
+        jains.push(jain);
+    }
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    let mean_a = mean(&goodputs.iter().map(|&(a, _)| a).collect::<Vec<_>>());
+    let mean_b = mean(&goodputs.iter().map(|&(_, b)| b).collect::<Vec<_>>());
+    eprintln!(
+        "[delay-vs-loss] {label} mean_a={mean_a:.0} B/s mean_b={mean_b:.0} B/s \
+         mean_share_min={:.3} mean_jain={:.3}",
+        mean(&shares),
+        mean(&jains),
+    );
+}
+
+/// The A/B under test: flow A is the production delay-first bulk lane
+/// (`Dedicated`), flow B is the test-only loss-only reference (`Dedicated` with
+/// the delay gate disabled).  On a drop-tail FIFO the delay-first flow may
+/// yield capacity to the loss-based competitor; this arm measures the split.
+/// Report-only: the sanity asserts live in [`run_delay_vs_loss_arm`].
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "shared-bottleneck delay-vs-loss A/B: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_loss_ab_delay_vs_loss() {
+    run_delay_vs_loss_arm("delay_vs_loss", false, true, true).await;
+}
+
+/// Control: both flows are the production delay-first lane, so the split should
+/// sit near 50/50 and isolates the topology's left/right asymmetry.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "shared-bottleneck delay-vs-loss control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_loss_ab_delay_vs_delay() {
+    run_delay_vs_loss_arm("delay_vs_delay", false, false, false).await;
+}
+
+/// Vacuity control: both flows are loss-only.  If the A/B's contrast is caused
+/// by the delay response (and not by some left/right asymmetry in the
+/// topology), the split must move back to ~50/50 here.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "shared-bottleneck delay-vs-loss vacuity control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_loss_ab_loss_vs_loss() {
+    run_delay_vs_loss_arm("loss_vs_loss", true, true, false).await;
 }
 
 /// Regression: one reply slower than the round-trip bound must not end the

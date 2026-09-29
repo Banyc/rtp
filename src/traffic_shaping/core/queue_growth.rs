@@ -173,6 +173,13 @@ pub(crate) struct QueueGrowth {
     idle_gap: IdleGap,
     building: bool,
     gentle: GentleMode,
+    /// Test-only loss-only selector (never set in production): when `true` the
+    /// delay gate never declares a queue, so [`Self::observe`] reports
+    /// `building = false` and `persistent_for = None` and the controller's
+    /// `select_path` can only return `Probe` (no loss) or `LossBackoff` (loss).
+    /// Set through the `#[cfg(feature = "testing")]` connect/accept
+    /// `disable_delay_gate` knob; the production default is `false`.
+    delay_gate_disabled: bool,
 }
 
 impl QueueGrowth {
@@ -188,7 +195,16 @@ impl QueueGrowth {
             idle_gap: IdleGap::new(),
             building: false,
             gentle: GentleMode::new(),
+            delay_gate_disabled: false,
         }
+    }
+
+    /// Declare the test-only loss-only mode: the delay gate is bypassed, so the
+    /// controller responds to loss only.  Production never calls this (the
+    /// connect/accept knob that sets it is behind `#[cfg(feature =
+    /// "testing")]`, default off), so the ordinary path is unchanged.
+    pub(crate) fn set_delay_gate_disabled(&mut self, disabled: bool) {
+        self.delay_gate_disabled = disabled;
     }
 
     fn fresh_floor(now: Instant, reorder_tolerant: bool) -> WindowedRttMin {
@@ -300,7 +316,11 @@ impl QueueGrowth {
             QUEUE_RTT_FACTOR * PERSISTENT_QUEUE_RTTVAR_FACTOR,
             floor_scaled,
         );
-        if smooth > floor + persistent_tolerance {
+        if self.delay_gate_disabled {
+            // Loss-only mode: the persistent-queue timer never arms, so the
+            // controller cannot enter `Hold`/`Drain`.
+            self.persistent_since = None;
+        } else if smooth > floor + persistent_tolerance {
             self.persistent_since.get_or_insert(now);
         } else {
             self.persistent_since = None;
@@ -316,7 +336,7 @@ impl QueueGrowth {
         self.clear_persistence_after_gentle_exit(was_gentle);
 
         let tolerance = self.gentle.gate_tol(tolerance);
-        self.building = smooth > floor + tolerance;
+        self.building = !self.delay_gate_disabled && smooth > floor + tolerance;
         QueueGrowthObservation {
             floor,
             tolerance,
@@ -549,6 +569,58 @@ mod tests {
         );
         assert!(observation.building);
         assert_eq!(observation.persistent_for, None);
+    }
+
+    /// Vacuity floor for the loss-only selector: a standing queue that arms the
+    /// default gate's persistent timer must stop arming it once
+    /// `set_delay_gate_disabled(true)` is set, so `observe` reports
+    /// `building = false` and `persistent_for = None` and `select_path` cannot
+    /// return `Hold`/`Drain`.  The two instances see the identical observation
+    /// sequence, so the only difference is the selector.
+    #[test]
+    fn loss_only_mode_reports_no_queue_that_the_default_gate_builds() {
+        let now = Instant::now();
+        let floor = Duration::from_millis(100);
+        let rttvar = Duration::from_millis(1);
+        let jitter = GateJitter::uniform(rttvar);
+        let control_rtt = Duration::from_millis(100);
+
+        let mut default = QueueGrowth::new(now, false);
+        let mut loss_only = QueueGrowth::new(now, false);
+        default.set_lane(CongestionLane::Dedicated);
+        loss_only.set_lane(CongestionLane::Dedicated);
+        loss_only.set_delay_gate_disabled(true);
+
+        // Seed both floors, then offer the identical queue-ramp sequence the
+        // dedicated-lane arming test uses.  The default gate must arm its
+        // persistent timer; the loss-only gate must never report a queue.
+        for growth in [&mut default, &mut loss_only] {
+            growth.observe(floor, jitter, Some(0.0), now, control_rtt);
+        }
+        let step = Duration::from_micros(128);
+        let mut default_armed = false;
+        let mut loss_only_ever_built = false;
+        for i in 1..=400u64 {
+            let excess = step * i as u32;
+            let now_i = now + Duration::from_micros(i * 4_000);
+            let default_obs =
+                default.observe(floor + excess, jitter, Some(0.0), now_i, control_rtt);
+            let loss_only_obs =
+                loss_only.observe(floor + excess, jitter, Some(0.0), now_i, control_rtt);
+            default_armed |= default_obs.building && default_obs.persistent_for.is_some();
+            loss_only_ever_built |=
+                loss_only_obs.building || loss_only_obs.persistent_for.is_some();
+        }
+
+        assert!(
+            default_armed,
+            "the default gate must build a queue and arm its persistent timer on this ramp"
+        );
+        assert!(
+            !loss_only_ever_built,
+            "loss-only mode must never report a queue or a persistent timer, so `select_path` \
+             cannot return Hold/Drain"
+        );
     }
 
     /// A shared lane's drain-trigger margin is common-mode: it may not scale

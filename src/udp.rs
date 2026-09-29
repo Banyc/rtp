@@ -482,6 +482,12 @@ pub struct AcceptConfig {
     /// not declare an intent keep the stock behaviour.  A dedicated bulk pipe
     /// opts into [`CongestionLane::Dedicated`](crate::CongestionLane::Dedicated).
     pub congestion_lane: CongestionLane,
+    /// Test-only loss-only selector, behind `#[cfg(feature = "testing")]` and
+    /// default `false`: when `true` the accepting connection's delay gate never
+    /// declares a queue, so its congestion controller responds to loss only.
+    /// Never set in production builds; the production path is unchanged.
+    #[cfg(feature = "testing")]
+    pub disable_delay_gate: bool,
     /// The accepting peer's own pacer seed; see [`ConnectConfig::initial_send_rate`].
     /// Both peers configure it independently — the seed is a statement about
     /// the traffic *this* end will offer — and `None` keeps the stock seed.
@@ -522,6 +528,8 @@ impl Default for AcceptConfig {
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
             congestion_lane: CongestionLane::default(),
+            #[cfg(feature = "testing")]
+            disable_delay_gate: false,
             initial_send_rate: None,
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
@@ -530,6 +538,21 @@ impl Default for AcceptConfig {
             padding: HarmfulPaddingPolicy::None,
             shared_congestion: None,
             cc_link: None,
+        }
+    }
+}
+
+impl AcceptConfig {
+    /// Whether the test-only loss-only selector is set.  Always `false` in a
+    /// production build, where the field does not exist.
+    pub(crate) fn delay_gate_disabled(&self) -> bool {
+        #[cfg(feature = "testing")]
+        {
+            self.disable_delay_gate
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            false
         }
     }
 }
@@ -552,6 +575,12 @@ pub struct ConnectConfig<'a> {
     /// [`CongestionLane::Shared`](crate::CongestionLane::Shared); see
     /// [`AcceptConfig::congestion_lane`].
     pub congestion_lane: CongestionLane,
+    /// Test-only loss-only selector, behind `#[cfg(feature = "testing")]` and
+    /// default `false`: when `true` the connecting end's delay gate never
+    /// declares a queue, so its congestion controller responds to loss only.
+    /// Never set in production builds; the production path is unchanged.
+    #[cfg(feature = "testing")]
+    pub disable_delay_gate: bool,
     /// The connection owner's optional **pacer seed**: when set, the reliable
     /// sender starts its token bucket and send rate at this many packets per
     /// second instead of the crate's stock seed (`INIT_SEND_RATE`).  A lane
@@ -599,6 +628,8 @@ impl<'a> Default for ConnectConfig<'a> {
             fec_tuning: fec_tuning_from_env(),
             frame_delivery: frame_delivery_from_env(),
             congestion_lane: CongestionLane::default(),
+            #[cfg(feature = "testing")]
+            disable_delay_gate: false,
             initial_send_rate: None,
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: instream_group_fec_from_env(),
@@ -607,6 +638,21 @@ impl<'a> Default for ConnectConfig<'a> {
             padding: HarmfulPaddingPolicy::None,
             shared_congestion: None,
             cc_link: None,
+        }
+    }
+}
+
+impl<'a> ConnectConfig<'a> {
+    /// Whether the test-only loss-only selector is set.  Always `false` in a
+    /// production build, where the field does not exist.
+    pub(crate) fn delay_gate_disabled(&self) -> bool {
+        #[cfg(feature = "testing")]
+        {
+            self.disable_delay_gate
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            false
         }
     }
 }
@@ -623,6 +669,8 @@ struct AcceptSetup {
     tuning: FecTuning,
     frame_delivery: FrameMode,
     congestion_lane: CongestionLane,
+    /// Test-only loss-only selector (see [`ConnectConfig::disable_delay_gate`]).
+    delay_gate_disabled: bool,
     initial_send_rate: Option<f64>,
     retransmission_armor: RetransmissionArmorConfig,
     instream_group_fec: bool,
@@ -637,6 +685,7 @@ impl AcceptSetup {
     /// the with/without-handshake entry points rather than exposing it as a
     /// field on [`AcceptConfig`].
     fn from_config(handshake: bool, config: AcceptConfig) -> std::io::Result<Self> {
+        let delay_gate_disabled = config.delay_gate_disabled();
         Ok(Self {
             handshake,
             fec: config.fec,
@@ -644,6 +693,7 @@ impl AcceptSetup {
             tuning: config.fec_tuning,
             frame_delivery: config.frame_delivery,
             congestion_lane: config.congestion_lane,
+            delay_gate_disabled,
             initial_send_rate: config.initial_send_rate,
             retransmission_armor: config.retransmission_armor,
             instream_group_fec: config.instream_group_fec,
@@ -706,6 +756,7 @@ async fn accept(
         tuning,
         frame_delivery,
         congestion_lane,
+        delay_gate_disabled,
         initial_send_rate,
         retransmission_armor,
         instream_group_fec,
@@ -778,6 +829,7 @@ async fn accept(
         metrics_observer,
         ack_padding,
         shared_congestion,
+        delay_gate_disabled,
     );
     if handshake {
         server_opening_handshake(&mut unreliable_layer).await?;
@@ -1114,6 +1166,7 @@ async fn connect_bound(
     udp: VectoredUdpSocket,
     config: ConnectConfig<'_>,
 ) -> std::io::Result<Connected> {
+    let disable_delay_gate = config.delay_gate_disabled();
     let ConnectConfig {
         log_config,
         metrics_observer,
@@ -1131,6 +1184,7 @@ async fn connect_bound(
         padding,
         shared_congestion,
         cc_link,
+        ..
     } = config;
 
     let local_addr = udp.local_addr()?;
@@ -1211,6 +1265,7 @@ async fn connect_bound(
         metrics_observer,
         ack_padding,
         shared_congestion,
+        disable_delay_gate,
     );
     if handshake {
         client_opening_handshake(&mut unreliable_layer).await?;
@@ -1251,8 +1306,10 @@ fn apply_layer_tuning(
     metrics_observer: Option<crate::metrics::MetricsObserver>,
     ack_padding: crate::obfuscate::padding::AckPaddingMode,
     shared_congestion: Option<crate::cc::CcSignal>,
+    delay_gate_disabled: bool,
 ) {
     layer.congestion_lane = congestion_lane;
+    layer.delay_gate_disabled = delay_gate_disabled;
     layer.shared_congestion = shared_congestion;
     layer.initial_send_rate = initial_send_rate;
     layer.retransmission_armor = retransmission_armor;
@@ -1282,6 +1339,7 @@ pub fn unreliable_layer_with_config(
     write: Box<dyn UnreliableWrite>,
     config: ConnectConfig<'_>,
 ) -> std::io::Result<UnreliableLayer> {
+    let disable_delay_gate = config.delay_gate_disabled();
     let ConnectConfig {
         log_config: _,
         metrics_observer,
@@ -1299,6 +1357,7 @@ pub fn unreliable_layer_with_config(
         obfuscation_key,
         padding,
         shared_congestion,
+        ..
     } = config;
     if handshake {
         return Err(std::io::Error::new(
@@ -1341,6 +1400,7 @@ pub fn unreliable_layer_with_config(
         metrics_observer,
         ack_padding,
         shared_congestion,
+        disable_delay_gate,
     );
     Ok(layer)
 }
@@ -1939,6 +1999,7 @@ mod tests {
             tuning: FecTuning::default(),
             frame_delivery: crate::delivery::frame::mode::FrameMode::enabled_reordering(),
             congestion_lane: CongestionLane::default(),
+            delay_gate_disabled: false,
             initial_send_rate: None,
             retransmission_armor: RetransmissionArmorConfig::default(),
             instream_group_fec: false,

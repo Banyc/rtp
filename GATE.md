@@ -883,9 +883,10 @@ given a number: it is recorded as a gap below, so an unmeasured cost is
 visibly pending instead of plausibly guessed.
 
 The declared sums are `default` 14.31 s of a 60 s budget, `standard` 132.18 s
-of 300 s, `perf` 422.00 s of 450 s, and nothing in `full`, whose 6000 s ceiling
-is declared so a later row cannot be added without one — `full` is the tier the
-~90-minute `shared_bneck_fairness_longrun` lives in. The 30 s the `clean-tail`
+of 300 s, `perf` 422.00 s of 450 s, and 93 s in `full` of its 6000 s ceiling
+(measured 30.3 s each for the three `lossab` arms below; the ~90-minute
+`shared_bneck_fairness_longrun` still declares no wall clock, so the ceiling is
+declared rather than the tier's full cost). The 30 s the `clean-tail`
 family adds to `standard` is its two rows' measured wall clock (20 s for the
 four-cell matrix, 10 s for the two-cell blocking control), which is the
 shortness the family can reach without dropping a cell: the tail's *rate* is the
@@ -912,6 +913,9 @@ rtp_padding_bench::unpadded_wire_sizes_stay_multimodal = default | 0.18 | orthog
 rtp_padding_bench::ack_padding_hides_ack_packets_among_data = default | 4.30 | composite(padding,metric)@padding | padding-wire@padding=ack-mimics-data+impairment=clean+metric=ack-obscurity+scale=256KiB+layer=rtp
 shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase = default | 0.72 | baseline@contested | contested-instrument@impairment=none+metric=sample-retention+layer=shared-bottleneck+scale=unit
 shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = default | 0.01 | orthogonal@contested | contested-instrument@impairment=none+metric=starvation-floor+layer=shared-bottleneck+scale=unit
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay = full | 30.3 | baseline@lossab | loss-based-ab@lanes=delay-delay+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_loss = full | 30.3 | orthogonal@lossab | loss-based-ab@lanes=delay-loss+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
+shared_bottleneck::shared_bneck_loss_ab_loss_vs_loss = full | 30.3 | orthogonal@lossab | loss-based-ab@lanes=loss-loss+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
 rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard | 5 | composite(impairment,metric,scale)@liveness | transport-liveness@impairment=permanent-mtu-hole+metric=connection-liveness+layer=rtp+scale=short-watchdog
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard | 65 | composite(fresh-sacks,impairment,metric)@liveness | transport-liveness@impairment=permanent-mtu-hole+fresh-sacks=on+metric=connection-liveness+layer=rtp
@@ -999,6 +1003,7 @@ perf = 450
 baseline = rtp_clean::rtp_over_netem_clean_link_delivers_data
 baseline.padding = rtp_padding_bench::padded_wire_sizes_converge_to_one_peak
 baseline.contested = shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase
+baseline.lossab = shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay
 baseline.liveness = rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets
 baseline.decoder-fuzz = lib::traffic_shaping::redundancy::fec::tests::a_hostile_datagram_never_escapes_the_fec_decoder
 baseline.probe = lib::traffic_shaping::recovery::pkt_send_space::tests::probe_lone_tail_repair_ladder
@@ -1006,6 +1011,7 @@ baseline.perf-lane = lib::recv_queue::pkt_recv_space::tests::advancing_the_recei
 baseline.clean-tail = rtp_clean_tail::clean_tail_shaper_vs_transport_matrix
 members.padding = padding-wire
 members.contested = contested-instrument
+members.lossab = loss-based-ab
 members.liveness = transport-liveness
 members.decoder-fuzz = decoder-fuzz
 members.probe = probe-*
@@ -1025,7 +1031,7 @@ adding one.
 
 ```gate-coverage-gaps
 attribution@baseline-family=burst-loss = the three full-tier rtp_burst_loss arms (rtp_sparse_message_tail_latency_under_burst_loss and the two bulk-goodput arms) are internally coherent — the tail arm is one impairment away from the shared rate+queue+loss topology the goodput pair already varies — but no document records their wall clock: GATE.md's only figure is "~180-316 s by report", a range and an unattributed report rather than a cost. One streamed release run of the target per row declares the family with no cell change.
-attribution@baseline-family=shared-bottleneck-full = the seven full-tier shared_bottleneck arms share the contested instrument with the two default rows declared above, but their `#[ignore]` reasons state no wall clock; only fairness_longrun has one (~90 minutes). The repair is one streamed run per arm; the family then needs its own reference row because it separates from the declared `contested` family by impairment (bulk-contended rather than unit), which is a second cell name and not a retune of the first.
+attribution@baseline-family=shared-bottleneck-full = the seven pre-existing full-tier shared_bottleneck arms share the contested instrument with the two default rows declared above, but their `#[ignore]` reasons state no wall clock; only fairness_longrun has one (~90 minutes). The repair is one streamed run per arm; the family then needs its own reference row because it separates from the declared `contested` family by impairment (bulk-contended rather than unit), which is a second cell name and not a retune of the first. (The three new `lossab` arms — `shared_bneck_loss_ab_{delay_vs_loss,delay_vs_delay,loss_vs_loss}` — are declared as their own family above and are not part of this gap.)
 attribution@baseline-family=bufferbloat = rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound is a single standard-tier row whose `#[ignore]` reason says only "slow". A one-row family has no member to state a relation against and no citable cost, so both halves are missing: one streamed run plus a `bufferbloat@...` cell name and a reference decides it.
 attribution@baseline-family=gentle = rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains is a single standard-tier row, blocked the same way as bufferbloat, with the extra problem that its two-phase gate-open shape has no second arm in any tier to vary one dimension against — so it is a one-row family until a second arm exists, not merely an uncosted one.
 attribution@baseline-family=fec-diversity = rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss measures a different property from the declared default-tier FEC row (max-diversity cover of single-packet messages versus whole-stream recovery) and is two declared dimensions away from it (fec-mode, metric). The repair is either a max-diversity arm one dimension from the declared FEC row or a composite label naming both, plus the row's cost.
@@ -1275,6 +1281,9 @@ tests/shared_bottleneck.rs::shared_bneck_reorder_tolerant_fairness = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_10mbps = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_2mbps = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_dedicated_bulk_10mbps = full
+tests/shared_bottleneck.rs::shared_bneck_loss_ab_delay_vs_delay = full
+tests/shared_bottleneck.rs::shared_bneck_loss_ab_delay_vs_loss = full
+tests/shared_bottleneck.rs::shared_bneck_loss_ab_loss_vs_loss = full
 ```
 
 The probe inventory of what each probe validates: the count of assertion tokens
@@ -1342,6 +1351,9 @@ shared_bottleneck::shared_bneck_reorder_tolerant_fairness = full
 shared_bottleneck::shared_bneck_rr_under_bulk_10mbps = full
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps = full
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps = full
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay = full
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_loss = full
+shared_bottleneck::shared_bneck_loss_ab_loss_vs_loss = full
 ```
 
 The `gate-default-required` block below pins the asserting scenarios that must
@@ -1383,6 +1395,9 @@ shared_bottleneck::shared_bneck_reorder_tolerant_fairness
 shared_bottleneck::shared_bneck_rr_under_bulk_10mbps
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_loss
+shared_bottleneck::shared_bneck_loss_ab_loss_vs_loss
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
 rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe

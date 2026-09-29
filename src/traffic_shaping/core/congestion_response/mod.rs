@@ -93,6 +93,12 @@ impl CongestionResponse {
         }
     }
 
+    /// Test-only loss-only selector: bypass the delay gate so the controller
+    /// responds to loss only.  Production never calls this.
+    pub(crate) fn set_delay_gate_disabled(&mut self, disabled: bool) {
+        self.queue_growth.set_delay_gate_disabled(disabled);
+    }
+
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
         let gentle_exit = self.queue_growth.reset(now);
         self.delivery_peak = WindowedDeliveryMax::new(now);

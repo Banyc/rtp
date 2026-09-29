@@ -800,6 +800,7 @@ pub async fn spawn_rtp_msg_latency_sink_with_mss_via(
 /// Shared core for [`spawn_rtp_bulk_upload_with_mss`] and its `_via`
 /// variant: opens the connection and hands the read-keepalive future to
 /// `spawn` (either a [`TestScope`] spawn or the bounded reaper submission).
+#[allow(clippy::too_many_arguments)] // the connect knob set, one field per `ConnectConfig` entry
 async fn spawn_rtp_bulk_upload_core(
     spawn: impl FnOnce(TestTask),
     proxy_client_addr: std::net::SocketAddr,
@@ -807,6 +808,8 @@ async fn spawn_rtp_bulk_upload_core(
     mss: usize,
     congestion_lane: crate::CongestionLane,
     frame_delivery: crate::FrameMode,
+    disable_delay_gate: bool,
+    metrics_observer: Option<crate::metrics::MetricsObserver>,
 ) -> std::io::Result<crate::socket::AsyncWriteAdapter> {
     let connected = crate::udp::connect_with(
         "0.0.0.0:0",
@@ -817,6 +820,8 @@ async fn spawn_rtp_bulk_upload_core(
             mss: crate::udp::MssConfig::Custom(mss),
             congestion_lane,
             frame_delivery,
+            disable_delay_gate,
+            metrics_observer,
             ..crate::udp::ConnectConfig::default()
         },
     )
@@ -858,6 +863,8 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
         mss,
         crate::CongestionLane::default(),
         crate::FrameMode::default(),
+        false,
+        None,
     )
     .await
 }
@@ -878,6 +885,8 @@ pub async fn spawn_rtp_bulk_upload_with_mss_via(
         mss,
         crate::CongestionLane::default(),
         crate::FrameMode::default(),
+        false,
+        None,
     )
     .await
 }
@@ -918,6 +927,42 @@ pub async fn spawn_rtp_bulk_upload_with_lane_and_frame_via(
         crate::udp::NO_FEC_MSS,
         congestion_lane,
         frame_delivery,
+        false,
+        None,
+    )
+    .await
+}
+
+/// [`spawn_rtp_bulk_upload_with_lane_and_frame_via`] with the test-only
+/// loss-only congestion gate (`disable_delay_gate`) and an optional metrics
+/// observer on the connecting end.
+///
+/// When `disable_delay_gate` is `true` the connection's delay gate never
+/// declares a queue, so its congestion controller responds to loss only — the
+/// `rtp`-side reference a scenario uses to contrast a loss-based flow against
+/// the production delay-first bulk lane. The observer (when given) captures
+/// the connection's own snapshot stream, so a scenario can read the measured
+/// loss and whether the gate ever saw a queue. Production never sets either:
+/// this entry point is behind the same `testing` feature as the rest of
+/// [`crate::testkit`].
+pub async fn spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via(
+    tx: &TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    fec: bool,
+    congestion_lane: crate::CongestionLane,
+    frame_delivery: crate::FrameMode,
+    disable_delay_gate: bool,
+    metrics_observer: Option<crate::metrics::MetricsObserver>,
+) -> std::io::Result<crate::socket::AsyncWriteAdapter> {
+    spawn_rtp_bulk_upload_core(
+        |fut| submit_test_task(tx, fut),
+        proxy_client_addr,
+        fec,
+        crate::udp::NO_FEC_MSS,
+        congestion_lane,
+        frame_delivery,
+        disable_delay_gate,
+        metrics_observer,
     )
     .await
 }
