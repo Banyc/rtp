@@ -50,6 +50,20 @@ pub(crate) const DRAIN_RATE_FRACTION: f64 = 0.9;
 /// historical purely multiplicative probe.
 pub(crate) const SHARED_ADDITIVE_PROBE_STEP: f64 = 150.0;
 
+/// The absolute additive rate step at `control_rtt`, in the shared lane's
+/// units, scaled by the *square root* of the RTT from
+/// [`SHARED_ADDITIVE_PROBE_REFERENCE_RTT`].  One authority for the shared
+/// lane's ordinary probe and the test-only AIMD reference law's additive
+/// increase, so the two cannot drift apart.
+///
+/// The square root (rather than a full linear RTT compensation) exists because
+/// the shared queue, not each flow's own RTT, gates the accepted-probe
+/// cadence; a linear step over-rewards a high-RTT flow (measured ~2.4x).
+pub(crate) fn additive_probe_step(control_rtt: Duration) -> f64 {
+    let ratio = control_rtt.as_secs_f64() / SHARED_ADDITIVE_PROBE_REFERENCE_RTT.as_secs_f64();
+    SHARED_ADDITIVE_PROBE_STEP * ratio.max(0.0).sqrt()
+}
+
 impl CongestionLane {
     /// The additive rate step this lane adds to one accepted ordinary probe.
     ///
@@ -60,11 +74,7 @@ impl CongestionLane {
     pub(crate) fn ordinary_additive_probe_step(self, control_rtt: Duration) -> f64 {
         match self {
             Self::Dedicated => 0.0,
-            Self::Shared => {
-                let ratio =
-                    control_rtt.as_secs_f64() / SHARED_ADDITIVE_PROBE_REFERENCE_RTT.as_secs_f64();
-                SHARED_ADDITIVE_PROBE_STEP * ratio.max(0.0).sqrt()
-            }
+            Self::Shared => additive_probe_step(control_rtt),
         }
     }
 

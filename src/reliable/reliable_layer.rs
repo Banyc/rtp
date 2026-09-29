@@ -516,12 +516,12 @@ impl ReliableLayer {
         self.shared_congestion = input;
     }
 
-    /// Test-only loss-only selector: bypass the delay gate so this connection
-    /// responds to loss only.  Seeded from the connect/accept
-    /// `#[cfg(feature = "testing")]` `disable_delay_gate` knob; production
-    /// leaves it `false` and the congestion controller is unchanged.
-    pub(crate) fn set_delay_gate_disabled(&mut self, disabled: bool) {
-        self.congestion_response.set_delay_gate_disabled(disabled);
+    /// Declare the test-only AIMD reference law.  Seeded from the
+    /// connect/accept `#[cfg(feature = "testing")]` `reference_aimd` knob;
+    /// production leaves it `false` and the congestion controller is
+    /// unchanged.
+    pub(crate) fn set_reference_aimd(&mut self, enabled: bool) {
+        self.congestion_response.set_reference_aimd(enabled);
     }
 
     /// Whether the delivery-rate congestion controller currently considers the

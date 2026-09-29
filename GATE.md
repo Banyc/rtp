@@ -883,8 +883,8 @@ given a number: it is recorded as a gap below, so an unmeasured cost is
 visibly pending instead of plausibly guessed.
 
 The declared sums are `default` 14.31 s of a 60 s budget, `standard` 132.18 s
-of 300 s, `perf` 422.00 s of 450 s, and 93 s in `full` of its 6000 s ceiling
-(measured 30.3 s each for the three `lossab` arms below; the ~90-minute
+of 300 s, `perf` 422.00 s of 450 s, and 90.9 s in `full` of its 6000 s ceiling
+(3 x the measured 30.3 s each for the three `lossab` arms below; the ~90-minute
 `shared_bneck_fairness_longrun` still declares no wall clock, so the ceiling is
 declared rather than the tier's full cost). The 30 s the `clean-tail`
 family adds to `standard` is its two rows' measured wall clock (20 s for the
@@ -914,8 +914,8 @@ rtp_padding_bench::ack_padding_hides_ack_packets_among_data = default | 4.30 | c
 shared_bottleneck::a_slow_reply_resynchronizes_instead_of_ending_the_phase = default | 0.72 | baseline@contested | contested-instrument@impairment=none+metric=sample-retention+layer=shared-bottleneck+scale=unit
 shared_bottleneck::absolute_starvation_floor_fires_on_a_jain_perfect_collapse = default | 0.01 | orthogonal@contested | contested-instrument@impairment=none+metric=starvation-floor+layer=shared-bottleneck+scale=unit
 shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay = full | 30.3 | baseline@lossab | loss-based-ab@lanes=delay-delay+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
-shared_bottleneck::shared_bneck_loss_ab_delay_vs_loss = full | 30.3 | orthogonal@lossab | loss-based-ab@lanes=delay-loss+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
-shared_bottleneck::shared_bneck_loss_ab_loss_vs_loss = full | 30.3 | orthogonal@lossab | loss-based-ab@lanes=loss-loss+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_aimd = full | 30.3 | orthogonal@lossab | loss-based-ab@lanes=delay-aimd+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
+shared_bottleneck::shared_bneck_loss_ab_aimd_vs_aimd = full | 30.3 | orthogonal@lossab | loss-based-ab@lanes=aimd-aimd+metric=goodput-share+layer=shared-bottleneck+scale=two-flow
 rtp_liveness::reverse_traffic_recency_advances_only_on_new_packets = default | 0.01 | baseline@liveness | transport-liveness@impairment=clean+metric=recency-advance+layer=rtp
 rtp_liveness::rtp_permanent_hole_liveness_smoke = standard | 5 | composite(impairment,metric,scale)@liveness | transport-liveness@impairment=permanent-mtu-hole+metric=connection-liveness+layer=rtp+scale=short-watchdog
 rtp_liveness::rtp_fresh_sacks_beyond_permanent_mtu_hole_do_not_keep_connection_alive = standard | 65 | composite(fresh-sacks,impairment,metric)@liveness | transport-liveness@impairment=permanent-mtu-hole+fresh-sacks=on+metric=connection-liveness+layer=rtp
@@ -975,6 +975,30 @@ rows are `composite` because the
 arms genuinely vary several dimensions at once — labelling them orthogonal
 would be the confound the mandate exists to prevent.
 
+The `lossab` family is the loss-based A/B instrument: three `full`-tier,
+report-only arms on one shared 10 Mbit/s drop-tail bottleneck, differing only in
+which flows run the production delay-first lane and which run the test-only
+**AIMD reference**. `delay_vs_delay` is the reference row (two production lanes,
+so the split isolates the topology's left/right asymmetry). `delay_vs_aimd`
+puts the production lane on a path shared with a live interactive lane — its
+`shared_path` reads `true` from the `rtp::cc::CcSignalHub` group, so the loss
+block no longer suppresses its delay drain — against the reference, and reports
+flow A's loss, delay-drain count, loss-backoff count and `shared_path`. The
+reference is a law **inside RTP's feedback, not wire TCP**: it is selected
+only by the `testing`-gated `reference_aimd` knob (default off, production
+byte-identical when unset), and its absolute increase step is the production
+contention lane's own RTP additive step; the arm must not be read as a
+comparison against a kernel TCP stack.
+`aimd_vs_aimd` is the family's **reference-convergence vacuity**: two identical
+reference flows must converge to ~50/50, which is what makes the reference a
+valid AIMD. Measured over three 10 s reps (shares 0.341/0.460/0.405; Jain
+0.909/0.994/0.965, mean 0.956) it clears the 0.90 instrument floor, so the
+floor is an instrument-sanity bound on the reference and not a product fairness
+bound. The superseded rate-match reference split 14 %/86 % (Jain 0.658) and
+fails that floor; a family whose reference cannot converge cannot attribute the
+A/B's contrast to the delay response. No row in this family is a pass/fail gate
+for the product claim.
+
 The `padding` family's fitted-ACK arm is the one row whose cost fell without a
 retune: its 24 trials x 2 arms x 256 KiB are now pooled with two transfers in
 flight, which is the same units, the same bytes and the same datagrams, at a
@@ -1031,7 +1055,7 @@ adding one.
 
 ```gate-coverage-gaps
 attribution@baseline-family=burst-loss = the three full-tier rtp_burst_loss arms (rtp_sparse_message_tail_latency_under_burst_loss and the two bulk-goodput arms) are internally coherent — the tail arm is one impairment away from the shared rate+queue+loss topology the goodput pair already varies — but no document records their wall clock: GATE.md's only figure is "~180-316 s by report", a range and an unattributed report rather than a cost. One streamed release run of the target per row declares the family with no cell change.
-attribution@baseline-family=shared-bottleneck-full = the seven pre-existing full-tier shared_bottleneck arms share the contested instrument with the two default rows declared above, but their `#[ignore]` reasons state no wall clock; only fairness_longrun has one (~90 minutes). The repair is one streamed run per arm; the family then needs its own reference row because it separates from the declared `contested` family by impairment (bulk-contended rather than unit), which is a second cell name and not a retune of the first. (The three new `lossab` arms — `shared_bneck_loss_ab_{delay_vs_loss,delay_vs_delay,loss_vs_loss}` — are declared as their own family above and are not part of this gap.)
+attribution@baseline-family=shared-bottleneck-full = the seven pre-existing full-tier shared_bottleneck arms share the contested instrument with the two default rows declared above, but their `#[ignore]` reasons state no wall clock; only fairness_longrun has one (~90 minutes). The repair is one streamed run per arm; the family then needs its own reference row because it separates from the declared `contested` family by impairment (bulk-contended rather than unit), which is a second cell name and not a retune of the first. (The three new `lossab` arms — `shared_bneck_loss_ab_{delay_vs_aimd,delay_vs_delay,aimd_vs_aimd}` — are declared as their own family above and are not part of this gap.)
 attribution@baseline-family=bufferbloat = rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound is a single standard-tier row whose `#[ignore]` reason says only "slow". A one-row family has no member to state a relation against and no citable cost, so both halves are missing: one streamed run plus a `bufferbloat@...` cell name and a reference decides it.
 attribution@baseline-family=gentle = rtp_gentle::gentle_mode_exits_via_gate_open_after_a_standing_queue_drains is a single standard-tier row, blocked the same way as bufferbloat, with the extra problem that its two-phase gate-open shape has no second arm in any tier to vary one dimension against — so it is a one-row family until a second arm exists, not merely an uncosted one.
 attribution@baseline-family=fec-diversity = rtp_fec::rtp_max_diversity_fec_covers_single_packet_messages_under_loss measures a different property from the declared default-tier FEC row (max-diversity cover of single-packet messages versus whole-stream recovery) and is two declared dimensions away from it (fec-mode, metric). The repair is either a max-diversity arm one dimension from the declared FEC row or a composite label naming both, plus the row's cost.
@@ -1282,8 +1306,8 @@ tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_10mbps = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_bulk_2mbps = full
 tests/shared_bottleneck.rs::shared_bneck_rr_under_dedicated_bulk_10mbps = full
 tests/shared_bottleneck.rs::shared_bneck_loss_ab_delay_vs_delay = full
-tests/shared_bottleneck.rs::shared_bneck_loss_ab_delay_vs_loss = full
-tests/shared_bottleneck.rs::shared_bneck_loss_ab_loss_vs_loss = full
+tests/shared_bottleneck.rs::shared_bneck_loss_ab_delay_vs_aimd = full
+tests/shared_bottleneck.rs::shared_bneck_loss_ab_aimd_vs_aimd = full
 ```
 
 The probe inventory of what each probe validates: the count of assertion tokens
@@ -1352,8 +1376,8 @@ shared_bottleneck::shared_bneck_rr_under_bulk_10mbps = full
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps = full
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps = full
 shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay = full
-shared_bottleneck::shared_bneck_loss_ab_delay_vs_loss = full
-shared_bottleneck::shared_bneck_loss_ab_loss_vs_loss = full
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_aimd = full
+shared_bottleneck::shared_bneck_loss_ab_aimd_vs_aimd = full
 ```
 
 The `gate-default-required` block below pins the asserting scenarios that must
@@ -1396,8 +1420,8 @@ shared_bottleneck::shared_bneck_rr_under_bulk_10mbps
 shared_bottleneck::shared_bneck_rr_under_bulk_2mbps
 shared_bottleneck::shared_bneck_rr_under_dedicated_bulk_10mbps
 shared_bottleneck::shared_bneck_loss_ab_delay_vs_delay
-shared_bottleneck::shared_bneck_loss_ab_delay_vs_loss
-shared_bottleneck::shared_bneck_loss_ab_loss_vs_loss
+shared_bottleneck::shared_bneck_loss_ab_delay_vs_aimd
+shared_bottleneck::shared_bneck_loss_ab_aimd_vs_aimd
 rtp_bufferbloat::rtp_bulk_bounded_buffer_goodput_and_queue_bound
 rtp_burst_loss::rtp_bulk_goodput_burst_loss_does_not_collapse_vs_random
 rtp_burst_loss::rtp_bulk_goodput_under_iid_loss_keeps_a_high_fraction_of_the_loss_free_pipe

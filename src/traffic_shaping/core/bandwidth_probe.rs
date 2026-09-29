@@ -108,6 +108,20 @@ impl OrdinaryBandwidthProbe {
             }
             ProbeIncrease::Additive => current.max(delivery_rate) + additive,
         };
+        self.paced_increase(current, probed, control_rtt, now)
+    }
+
+    /// Pace a proposed increase to at most one per current control RTT, so a
+    /// delivery sample offering many probe opportunities inside one RTT cannot
+    /// ratchet the rate.  A proposal that cannot raise the current rate does
+    /// not consume the interval.
+    fn paced_increase(
+        &mut self,
+        current: f64,
+        probed: f64,
+        control_rtt: Duration,
+        now: Instant,
+    ) -> f64 {
         if probed <= current {
             return current;
         }
@@ -117,10 +131,23 @@ impl OrdinaryBandwidthProbe {
         {
             return current;
         }
-        if probed > current {
-            self.last_increase_at = Some(now);
-        }
+        self.last_increase_at = Some(now);
         probed
+    }
+
+    /// The test-only AIMD reference law's additive increase: the current rate
+    /// plus an absolute `step`, paced to one increase per control RTT.  Unlike
+    /// the contention lane's additive probe it never refills to the delivered
+    /// rate first, so a multiplicative decrease is not immediately undone by a
+    /// stale delivery sample.
+    pub(crate) fn reference_additive_target(
+        &mut self,
+        current: f64,
+        step: f64,
+        control_rtt: Duration,
+        now: Instant,
+    ) -> f64 {
+        self.paced_increase(current, current + step, control_rtt, now)
     }
 }
 

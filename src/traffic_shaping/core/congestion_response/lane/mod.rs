@@ -35,6 +35,7 @@ pub enum CongestionLane {
 }
 
 pub(crate) use probe_base::peak_scaled_probe_base;
+pub(crate) use tuning::additive_probe_step;
 
 #[cfg(test)]
 pub(crate) use tuning::{

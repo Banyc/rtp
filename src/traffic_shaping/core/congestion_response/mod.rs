@@ -28,6 +28,12 @@ pub(crate) use queue_response::DRAIN_FLOOR_PEAK_FRACTION;
 
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 
+/// Multiplicative-decrease factor of the test-only AIMD reference law: any
+/// sampled loss halves the current send rate.  The reference is an instrument
+/// (a loss-based competitor to contrast the production delay-first bulk lane
+/// against), never a production policy.
+const REFERENCE_AIMD_DECREASE_FACTOR: f64 = 0.5;
+
 /// What the controller observed about the path during one sample.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CongestionObservation {
@@ -77,6 +83,13 @@ pub(crate) struct CongestionResponse {
     /// cross-traffic-protecting tuning.  Declared by the owner (e.g. `rtp_mux`'s
     /// lane class), never inferred from the delivery mode.
     lane: CongestionLane,
+    /// Test-only selector for the AIMD reference law (never set in production):
+    /// when `true` [`Self::decide`] returns the reference's additive-increase /
+    /// multiplicative-decrease decision instead of the production delay/loss
+    /// policy.  Seeded from the `#[cfg(feature = "testing")]` connect/accept
+    /// `reference_aimd` knob; the production default is `false`, so the
+    /// ordinary path is byte-identical.
+    reference_aimd: bool,
 }
 
 impl CongestionResponse {
@@ -90,13 +103,15 @@ impl CongestionResponse {
             queue_response: QueueResponse::default(),
             loss_backoff: LossBackoff::default(),
             lane,
+            reference_aimd: false,
         }
     }
 
-    /// Test-only loss-only selector: bypass the delay gate so the controller
-    /// responds to loss only.  Production never calls this.
-    pub(crate) fn set_delay_gate_disabled(&mut self, disabled: bool) {
-        self.queue_growth.set_delay_gate_disabled(disabled);
+    /// Declare the test-only AIMD reference law.  Production never calls this
+    /// (the connect/accept knob that sets it is behind `#[cfg(feature =
+    /// "testing")]`, default off), so the ordinary path is unchanged.
+    pub(crate) fn set_reference_aimd(&mut self, enabled: bool) {
+        self.reference_aimd = enabled;
     }
 
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
@@ -155,6 +170,9 @@ impl CongestionResponse {
         observation: CongestionObservation,
         input: CongestionInput,
     ) -> CongestionOutcome {
+        if self.reference_aimd {
+            return self.reference_aimd_outcome(input);
+        }
         // An application-limited sample can only be *another* flow's queue on
         // a shared lane: a dedicated lane has no competing traffic over its
         // queue, so a standing delay there is its own queue and the ordinary
@@ -250,6 +268,41 @@ impl CongestionResponse {
                 gentle_exit,
             ),
         }
+    }
+
+    /// The test-only AIMD reference law: an absolute additive increase while
+    /// no loss is sampled, and a multiplicative decrease on any sampled loss.
+    /// It replaces the delay/loss policy wholesale (the flag is never set in
+    /// production).  The decisions reuse the ordinary probe/backoff channels,
+    /// so the sender applies them exactly as it applies production ones: a
+    /// `Probe` smooths toward the additive target, a `LossBackoff` steps the
+    /// send rate down toward the halved target.
+    fn reference_aimd_outcome(&mut self, input: CongestionInput) -> CongestionOutcome {
+        if input.loss_event_rate.is_some_and(|loss| loss > 0.0) {
+            let target =
+                (input.current_rate * REFERENCE_AIMD_DECREASE_FACTOR).max(input.minimum_rate);
+            return CongestionOutcome::new(
+                CongestionDecision::LossBackoff {
+                    raw: target,
+                    floor: target,
+                    target,
+                },
+                None,
+                None,
+            );
+        }
+        let step = lane::additive_probe_step(input.control_rtt);
+        let target = self.bandwidth_probe.reference_additive_target(
+            input.current_rate,
+            step,
+            input.control_rtt,
+            input.now,
+        );
+        CongestionOutcome::new(
+            CongestionDecision::Probe { target },
+            Some(ProbeKind::Bandwidth),
+            None,
+        )
     }
 
     /// Bound a probe target on the reorder-tolerant lane.
@@ -369,7 +422,7 @@ mod tests {
 
     use super::lane::{
         DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC, SHARED_ADDITIVE_PROBE_REFERENCE_RTT,
-        SHARED_ADDITIVE_PROBE_STEP,
+        SHARED_ADDITIVE_PROBE_STEP, additive_probe_step,
     };
     use super::*;
     use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
@@ -828,6 +881,75 @@ mod tests {
             ),
             "the same application-limited sample on a dedicated lane must drain: the standing queue is its own"
         );
+    }
+
+    /// The test-only AIMD reference law must be a genuine AIMD: an absolute
+    /// additive increase with no loss, and a multiplicative decrease (half the
+    /// current rate) on any sampled loss.  Before this law the "loss-only"
+    /// reference used the production rate-match backoff, whose target is
+    /// `max(delivery, floor)` — not proportional to the current rate — so two
+    /// identical reference flows did not converge.  This pins both responses,
+    /// and the ratio check fails on the old rate-match law because its target
+    /// would not equal `current * 0.5`.
+    #[test]
+    fn reference_aimd_increases_additively_and_halves_on_loss() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let mut reference = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        reference.set_reference_aimd(true);
+
+        let input = |current, loss, now| CongestionInput {
+            delivery_rate: current * 3.0,
+            current_rate: current,
+            smooth_rtt: control_rtt,
+            control_rtt,
+            loss_event_rate: loss,
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            shared_path: false,
+            now,
+        };
+        let jitter = GateJitter::uniform(Duration::from_millis(1));
+        let step = additive_probe_step(control_rtt);
+
+        // No loss: the target is `current + step`, and the deliberately high
+        // delivery sample must not leak in as the contention lane's
+        // `max(current, delivery) + step` would.
+        let current = 500.0;
+        let obs = reference.observe(control_rtt, jitter, Some(0.0), current, t0, control_rtt);
+        let CongestionDecision::Probe { target } = reference
+            .decide(obs, input(current, Some(0.0), t0))
+            .decision()
+        else {
+            panic!("the reference law must probe while no loss is sampled");
+        };
+        assert_eq!(
+            target,
+            current + step,
+            "the no-loss reference increase must be the absolute additive step, not a \
+             delivery-scaled proposal"
+        );
+
+        // Loss: the target is exactly half the current rate, independent of the
+        // delivery sample.
+        let obs = reference.observe(
+            control_rtt,
+            jitter,
+            Some(0.5),
+            current,
+            t0 + control_rtt,
+            control_rtt,
+        );
+        let CongestionDecision::LossBackoff { target, floor, raw } = reference
+            .decide(obs, input(current, Some(0.5), t0 + control_rtt))
+            .decision()
+        else {
+            panic!("the reference law must back off on loss");
+        };
+        assert_eq!(target, current * 0.5);
+        assert_eq!(floor, current * 0.5);
+        assert_eq!(raw, current * 0.5);
     }
 
     /// On a path shared with an interactive lane, this connection's *own*

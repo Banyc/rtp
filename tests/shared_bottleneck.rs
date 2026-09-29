@@ -29,9 +29,8 @@ use netem_test::kit::stats::{HolSummary, combined_stats, print_perf, summarize};
 use netem_test::kit::submit_test_task;
 use netem_test::{BottleneckShaper, NetemConfig, NetemPair};
 use rtp::testkit::rtp::{
-    spawn_rtp_bulk_upload_with_lane_and_frame_via,
-    spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via, spawn_rtp_byte_sink_server_via,
-    spawn_rtp_echo_server_via,
+    spawn_rtp_bulk_upload_with_lane_and_frame_via, spawn_rtp_bulk_upload_with_options_via,
+    spawn_rtp_byte_sink_server_via, spawn_rtp_echo_server_via,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -851,6 +850,11 @@ struct TwoFlowRun {
     bin_width: Duration,
     join: Duration,
     total_run: Duration,
+    /// Whether the `(src, dst)` path group this run's flows egress through was
+    /// observed shared (a live interactive lane published presence) at least
+    /// once during the run.  `None` when the run carried no interactive lane,
+    /// so the reading is only meaningful for the arm that wires one.
+    shared_path: Option<bool>,
 }
 
 impl TwoFlowRun {
@@ -1214,11 +1218,77 @@ async fn shared_bneck_fairness_longrun() {
     }
 }
 
+/// The loopback `(src, dst)` path both the bulk flow A and the interactive
+/// lane egress through: the destination is flow A's client-facing pair
+/// address, the source is the loopback address the OS picks when connecting to
+/// it.  The two must connect to the same destination IP for their
+/// [`rtp::cc::CcSignalHub`] groups to coincide.
+fn loopback_path(dst: std::net::SocketAddr) -> (std::net::IpAddr, std::net::IpAddr) {
+    let local = match dst {
+        std::net::SocketAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::SocketAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    };
+    (local, dst.ip())
+}
+
+/// Spawn a light interactive RTP lane on a `CcRole::Interactive` link to
+/// `hub`, echoing a 64-byte message every 50 ms so its metrics observer keeps
+/// publishing `RttSample` presence to the path group.  The lane runs on its
+/// own unshaped [`NetemPair`], so it marks the path without materially
+/// contending with the bulk flows.
+async fn spawn_interactive_presence(
+    tx: &netem_test::kit::TestTaskSubmitter,
+    proxy_client_addr: std::net::SocketAddr,
+    hub: rtp::cc::CcSignalHub,
+    run_for: Duration,
+    stop: Arc<AtomicBool>,
+) {
+    let connected = rtp::udp::connect_with(
+        "0.0.0.0:0",
+        &proxy_client_addr.to_string(),
+        rtp::udp::ConnectConfig {
+            handshake: false,
+            fec: false,
+            mss: rtp::udp::MssConfig::Custom(rtp::udp::NO_FEC_MSS),
+            congestion_lane: rtp::CongestionLane::Shared,
+            cc_link: Some(rtp::cc::CcLink::new(hub, rtp::cc::CcRole::Interactive)),
+            ..rtp::udp::ConnectConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut read = connected.read.into_async_read();
+    let mut write = connected.write.into_async_write();
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let _ = connected.supervisor.await;
+        }),
+    );
+    submit_test_task(
+        tx,
+        Box::pin(async move {
+            let payload = [0u8; 64];
+            let mut buf = [0u8; 64];
+            let start = Instant::now();
+            while start.elapsed() < run_for && !stop.load(Ordering::Relaxed) {
+                if write.write_all(&payload).await.is_err() {
+                    break;
+                }
+                if read.read_exact(&mut buf).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }),
+    );
+}
+
 /// Spawn two bulk flows through one shared shaper, sampling per-flow delivered
 /// bytes every 250 ms. Returns the raw per-bin series so callers can compute
 /// fairness over any window. Both flows use the crate's default congestion
 /// lane; [`two_flow_goodput_with_flows`] is the same substrate with per-flow
-/// lane/gate/observer selection.
+/// lane/reference/observer selection.
 async fn two_flow_goodput(
     owd_a_ms: u64,
     owd_b_ms: u64,
@@ -1236,46 +1306,56 @@ async fn two_flow_goodput(
         frame_delivery,
         FlowCongestion::lane(rtp::CongestionLane::default()),
         FlowCongestion::lane(rtp::CongestionLane::default()),
+        None,
     )
     .await
 }
 
 /// Per-flow congestion selection for the shared-bottleneck substrate: the
-/// declared [`rtp::CongestionLane`], the test-only loss-only delay-gate toggle,
-/// and an optional metrics observer on the connecting end.  The production
-/// shape is [`FlowCongestion::lane`]; [`FlowCongestion::loss_only`] is the
-/// reference flow whose delay gate never fires.
+/// declared [`rtp::CongestionLane`], the test-only AIMD reference selector, an
+/// optional metrics observer on the connecting end, and an optional
+/// cross-connection congestion link.  The production shape is
+/// [`FlowCongestion::lane`]; [`FlowCongestion::reference`] is the test-only
+/// AIMD reference law.
 struct FlowCongestion {
     congestion_lane: rtp::CongestionLane,
-    disable_delay_gate: bool,
+    reference_aimd: bool,
     observer: Option<rtp::metrics::MetricsObserver>,
+    cc_link: Option<rtp::cc::CcLink>,
 }
 
 impl FlowCongestion {
-    /// The production bulk lane: delay-first, gate active, no observer.
+    /// The production bulk lane: delay-first, gate active, no observer, no
+    /// cross-connection link.
     fn lane(congestion_lane: rtp::CongestionLane) -> Self {
         Self {
             congestion_lane,
-            disable_delay_gate: false,
+            reference_aimd: false,
             observer: None,
+            cc_link: None,
         }
     }
 
-    /// The test-only loss-only reference: `Dedicated` with the delay gate
-    /// disabled, so the controller responds to loss only.
-    fn loss_only() -> Self {
+    /// The test-only AIMD reference: `Dedicated` with the reference law.
+    fn reference() -> Self {
         Self {
             congestion_lane: rtp::CongestionLane::Dedicated,
-            disable_delay_gate: true,
+            reference_aimd: true,
             observer: None,
+            cc_link: None,
         }
     }
 }
 
-/// [`two_flow_goodput`] with an explicit [`FlowCongestion`] per flow.  The ONLY
-/// quantity the delay-vs-loss A/B varies between its two flows is
-/// `FlowCongestion::disable_delay_gate` (both are `Dedicated`); the
-/// delay-vs-delay and loss-vs-loss controls close the loop on the toggle.
+/// [`two_flow_goodput`] with an explicit [`FlowCongestion`] per flow and an
+/// optional interactive-lane presence.
+///
+/// The delay-vs-AIMD A/B varies the reference law between its two flows (flow A
+/// is the production `Dedicated` lane carrying a `CcRole::Bulk` link so its
+/// `shared_path` reads `true`); the delay-vs-delay and AIMD-vs-AIMD controls
+/// close the loop.  When `interactive_hub` is `Some`, a light interactive lane
+/// is spawned on the same `(src, dst)` group and the run reports whether that
+/// group was observed shared.
 #[allow(clippy::too_many_arguments)] // the substrate's per-flow selection beside the topology
 async fn two_flow_goodput_with_flows(
     owd_a_ms: u64,
@@ -1286,6 +1366,7 @@ async fn two_flow_goodput_with_flows(
     frame_delivery: rtp::FrameMode,
     flow_a: FlowCongestion,
     flow_b: FlowCongestion,
+    interactive_hub: Option<rtp::cc::CcSignalHub>,
 ) -> TwoFlowRun {
     let rate_bps = FAIRNESS_RATE_BPS;
     let limit_bytes = 128 * 1024u64;
@@ -1293,7 +1374,7 @@ async fn two_flow_goodput_with_flows(
 
     let mut tasks = netem_test::kit::TestScope::new();
     let task_tx = tasks.submitter(netem_test::kit::TEST_TASK_QUEUE_BOUND);
-    let (bins_a, bins_b, pair_a, pair_b) = tasks
+    let (bins_a, bins_b, pair_a, pair_b, shared_path) = tasks
         .run(async {
             let (sink_a_addr, delivered_a) = spawn_rtp_byte_sink_server_via(&task_tx, false)
                 .await
@@ -1326,6 +1407,37 @@ async fn two_flow_goodput_with_flows(
 
             let payload = Arc::new(cyclic_payload(64 * 1024 * 1024));
             let stop = Arc::new(AtomicBool::new(false));
+            // The path signal the bulk link resolved, read from the same
+            // `(src, dst)` group.  `loopback_path` mirrors the key the
+            // transport derives from flow A's socket.
+            let shared_signal = interactive_hub.as_ref().map(|hub| {
+                let (src, dst) = loopback_path(pair_a.client_addr());
+                hub.group(src, dst).bulk()
+            });
+            // The interactive lane publishes presence on that group.  Its pair
+            // is held for the whole run: dropping a `NetemPair` stops its
+            // proxy, which would silence the presence the arm depends on.
+            let _interactive_pair = if let Some(hub) = &interactive_hub {
+                let echo_addr = spawn_rtp_echo_server_via(&task_tx, false).await.unwrap();
+                let pair = NetemPair::spawn(
+                    echo_addr,
+                    cfg(owd_a_ms, 300 + rep * 7),
+                    cfg(owd_a_ms, 301 + rep * 7),
+                )
+                .unwrap();
+                spawn_interactive_presence(
+                    &task_tx,
+                    pair.client_addr(),
+                    hub.clone(),
+                    total_run,
+                    Arc::clone(&stop),
+                )
+                .await;
+                Some(pair)
+            } else {
+                None
+            };
+            let mut shared_path = None;
             let run_start = Instant::now();
             spawn_bulk_flow_with_gate(
                 &task_tx,
@@ -1362,9 +1474,16 @@ async fn two_flow_goodput_with_flows(
                 bins_b.push(now_b - last_b);
                 last_a = now_a;
                 last_b = now_b;
+                if let Some(signal) = &shared_signal {
+                    // Latch sharedness once seen: the signal goes stale within
+                    // `SIGNAL_STALE_AFTER` of the interactive lane's last
+                    // sample, so a single sample is not representative but any
+                    // observed sample is.
+                    shared_path = Some(shared_path.unwrap_or(false) || signal.is_shared());
+                }
             }
             stop.store(true, Ordering::Relaxed);
-            (bins_a, bins_b, pair_a, pair_b)
+            (bins_a, bins_b, pair_a, pair_b, shared_path)
         })
         .await;
     pair_a.stop();
@@ -1376,12 +1495,13 @@ async fn two_flow_goodput_with_flows(
         bin_width,
         join,
         total_run,
+        shared_path,
     }
 }
 
 /// Run a bulk upload through one shared-shaper [`NetemPair`] for `run_for`,
-/// selecting the flow's congestion lane, loss-only gate toggle and an optional
-/// metrics observer.
+/// selecting the flow's congestion lane, AIMD reference selector, an optional
+/// metrics observer and an optional cross-connection link.
 async fn spawn_bulk_flow_with_gate(
     tx: &netem_test::kit::TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
@@ -1391,14 +1511,15 @@ async fn spawn_bulk_flow_with_gate(
     frame_delivery: rtp::FrameMode,
     congestion: FlowCongestion,
 ) {
-    let Ok(mut writer) = spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via(
+    let Ok(mut writer) = spawn_rtp_bulk_upload_with_options_via(
         tx,
         proxy_client_addr,
         false,
         congestion.congestion_lane,
         frame_delivery,
-        congestion.disable_delay_gate,
+        congestion.reference_aimd,
         congestion.observer,
+        congestion.cc_link,
     )
     .await
     else {
@@ -1504,19 +1625,28 @@ impl GateProbe {
 /// `congestion_response/mod.rs`).
 const CC_DATA_LOSS_RATE: f64 = 0.2;
 
-/// Run one three-rep arm of the delay-vs-loss A/B and print its per-rep and
-/// mean per-flow goodput, the slower flow's share, and the two-flow Jain.
+/// Run one three-rep arm of the loss-based A/B and print its per-rep and mean
+/// per-flow goodput, the slower flow's share, and the two-flow Jain.
 ///
-/// `flow_a_loss_only`/`flow_b_loss_only` are the only difference between the
-/// three arms; `read_gate` attaches a [`GateProbe`] to flow A and prints its
-/// measured loss and gate activity, which is the `CC_DATA_LOSS_RATE` confounder
-/// this arm must state rather than hide.  Report-only: the asserts are the
-/// instrument's own sanity (both flows deliver, the bins are non-empty).
-async fn run_delay_vs_loss_arm(
+/// `flow_a_reference`/`flow_b_reference` select the test-only AIMD reference
+/// law per flow; `read_gate` attaches a [`GateProbe`] to flow A and prints its
+/// measured loss and gate activity, plus the `shared_path` the bulk link read
+/// from the code path ([`TwoFlowRun::shared_path`], not a format literal).
+/// `interactive` wires the live interactive lane that makes flow A's path
+/// shared; `jain_floor` is `Some` only for the reference-vacuity arm, where a
+/// convergence floor is an instrument-sanity bound.
+///
+/// Report-only for the product claim: the asserts are the instrument's own
+/// sanity (both flows deliver, the bins are non-empty) plus, on the wired
+/// delay-vs-AIMD arm, that the shared-path wiring took effect (flow A's
+/// `shared_path` read `true` and it drained rather than backing off).
+async fn run_loss_ab_arm(
     label: &str,
-    flow_a_loss_only: bool,
-    flow_b_loss_only: bool,
+    flow_a_reference: bool,
+    flow_b_reference: bool,
     read_gate: bool,
+    interactive: bool,
+    jain_floor: Option<f64>,
 ) {
     const REPS: u64 = 3;
     const OWD_MS: u64 = 20;
@@ -1524,23 +1654,26 @@ async fn run_delay_vs_loss_arm(
     let mut goodputs = Vec::new();
     let mut shares = Vec::new();
     let mut jains = Vec::new();
+    let mut shared_readings = Vec::new();
     for rep in 0..REPS {
         let probe = Arc::new(GateProbe::default());
-        let base_a = if flow_a_loss_only {
-            FlowCongestion::loss_only()
+        // The hub is wired only when this arm needs a live interactive lane; a
+        // `CcLink` on a hub with no interactive lane would read `false`.
+        let hub = interactive.then(rtp::cc::CcSignalHub::new);
+        let flow_a = if flow_a_reference {
+            FlowCongestion::reference()
         } else {
-            FlowCongestion::lane(rtp::CongestionLane::Dedicated)
-        };
-        let flow_a = if read_gate {
             FlowCongestion {
-                observer: Some(GateProbe::observer(&probe)),
-                ..base_a
+                congestion_lane: rtp::CongestionLane::Dedicated,
+                reference_aimd: false,
+                observer: read_gate.then(|| GateProbe::observer(&probe)),
+                cc_link: hub
+                    .as_ref()
+                    .map(|hub| rtp::cc::CcLink::new(hub.clone(), rtp::cc::CcRole::Bulk)),
             }
-        } else {
-            base_a
         };
-        let flow_b = if flow_b_loss_only {
-            FlowCongestion::loss_only()
+        let flow_b = if flow_b_reference {
+            FlowCongestion::reference()
         } else {
             FlowCongestion::lane(rtp::CongestionLane::Dedicated)
         };
@@ -1553,6 +1686,7 @@ async fn run_delay_vs_loss_arm(
             rtp::FrameMode::default(),
             flow_a,
             flow_b,
+            hub,
         )
         .await;
         let (ga, gb) = run.steady_goodput();
@@ -1567,76 +1701,99 @@ async fn run_delay_vs_loss_arm(
         let jain = jain_index(ga, gb);
         let slower_share = ga.min(gb) / (ga + gb);
         eprintln!(
-            "[delay-vs-loss] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} \
-             share_min={slower_share:.3} jain={jain:.3}",
+            "[loss-ab] {label} rep={rep} a={ga:.0} B/s b={gb:.0} B/s ratio={ratio:.2} \
+             share_min={slower_share:.3} jain={jain:.3} shared_path={:?}",
+            run.shared_path,
             ratio = ga / gb,
         );
+        if let Some(floor) = jain_floor {
+            assert!(
+                jain >= floor,
+                "{label} rep={rep}: the reference-vs-reference Jain {jain:.3} is below the \
+                 {floor:.2} convergence floor — the AIMD reference did not converge and \
+                 cannot be a valid instrument"
+            );
+        }
         if read_gate {
             let loss = probe.max_congestion_loss_ratio().unwrap_or(0.0);
-            let confounded = loss >= CC_DATA_LOSS_RATE;
+            let drains = probe.congestion_delay_drains();
+            let backoffs = probe.congestion_loss_backoffs();
             eprintln!(
-                "[delay-vs-loss] {label} rep={rep} gate: samples={} max_loss_ratio={:?} \
+                "[loss-ab] {label} rep={rep} gate: samples={} max_loss_ratio={:?} \
                  max_congestion_loss_ratio={:?} queue_building_snapshots={} \
-                 congestion_delay_drains={} congestion_loss_backoffs={} shared_path=false \
-                 (no CcLink/CcSignal on this egress) confounded={confounded} \
-                 (loss >= CC_DATA_LOSS_RATE={CC_DATA_LOSS_RATE})",
+                 congestion_delay_drains={drains} congestion_loss_backoffs={backoffs} \
+                 shared_path={:?} (read from the CcSignal group) loss_at_or_above_threshold={} \
+                 (CC_DATA_LOSS_RATE={CC_DATA_LOSS_RATE})",
                 probe.samples(),
                 probe.max_loss_ratio(),
                 probe.max_congestion_loss_ratio(),
                 probe.queue_building_snapshots(),
-                probe.congestion_delay_drains(),
-                probe.congestion_loss_backoffs(),
+                run.shared_path,
+                loss >= CC_DATA_LOSS_RATE,
             );
-            if confounded {
-                eprintln!(
-                    "[delay-vs-loss] {label} rep={rep} WARNING: the delay-first flow's loss \
-                     crossed CC_DATA_LOSS_RATE and shared_path=false, so `loss_blocks_delay_control` \
-                     routed it to LossBackoff rather than the delay drain: this arm is CONFOUNDED \
-                     and the A/B does not isolate the delay gate."
-                );
-            }
+            assert_eq!(
+                run.shared_path,
+                Some(true),
+                "{label} rep={rep}: flow A's path group must be observed shared (a live \
+                 interactive lane publishing presence), otherwise the delay drain is \
+                 loss-blocked and this arm is a mixture"
+            );
+            assert!(
+                drains > 0,
+                "{label} rep={rep}: flow A's delay drain must be active on the shared path \
+                 (congestion_delay_drains = {drains})"
+            );
+            assert_eq!(
+                backoffs, 0,
+                "{label} rep={rep}: on a shared path the loss block must not route flow A to \
+                 LossBackoff (congestion_loss_backoffs = {backoffs})"
+            );
         }
         goodputs.push((ga, gb));
         shares.push(slower_share);
         jains.push(jain);
+        shared_readings.push(run.shared_path);
     }
     let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
     let mean_a = mean(&goodputs.iter().map(|&(a, _)| a).collect::<Vec<_>>());
     let mean_b = mean(&goodputs.iter().map(|&(_, b)| b).collect::<Vec<_>>());
     eprintln!(
-        "[delay-vs-loss] {label} mean_a={mean_a:.0} B/s mean_b={mean_b:.0} B/s \
-         mean_share_min={:.3} mean_jain={:.3}",
+        "[loss-ab] {label} mean_a={mean_a:.0} B/s mean_b={mean_b:.0} B/s \
+         mean_share_min={:.3} mean_jain={:.3} shared_readings={shared_readings:?}",
         mean(&shares),
         mean(&jains),
     );
 }
 
 /// The A/B under test: flow A is the production delay-first bulk lane
-/// (`Dedicated`), flow B is the test-only loss-only reference (`Dedicated` with
-/// the delay gate disabled).  On a drop-tail FIFO the delay-first flow may
-/// yield capacity to the loss-based competitor; this arm measures the split.
-/// Report-only: the sanity asserts live in [`run_delay_vs_loss_arm`].
+/// (`Dedicated`) on a path shared with a live interactive lane (so its
+/// `shared_path` is `true`), flow B is the test-only AIMD reference.  On a
+/// drop-tail FIFO the delay-first flow may yield capacity to the loss-based
+/// competitor; this arm measures the split.  Report-only: the sanity asserts
+/// live in [`run_loss_ab_arm`].
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "shared-bottleneck delay-vs-loss A/B: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
-async fn shared_bneck_loss_ab_delay_vs_loss() {
-    run_delay_vs_loss_arm("delay_vs_loss", false, true, true).await;
+#[ignore = "shared-bottleneck delay-vs-AIMD A/B: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_loss_ab_delay_vs_aimd() {
+    run_loss_ab_arm("delay_vs_aimd", false, true, true, true, None).await;
 }
 
 /// Control: both flows are the production delay-first lane, so the split should
 /// sit near 50/50 and isolates the topology's left/right asymmetry.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "shared-bottleneck delay-vs-loss control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
+#[ignore = "shared-bottleneck delay-vs-delay control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
 async fn shared_bneck_loss_ab_delay_vs_delay() {
-    run_delay_vs_loss_arm("delay_vs_delay", false, false, false).await;
+    run_loss_ab_arm("delay_vs_delay", false, false, false, false, None).await;
 }
 
-/// Vacuity control: both flows are loss-only.  If the A/B's contrast is caused
-/// by the delay response (and not by some left/right asymmetry in the
-/// topology), the split must move back to ~50/50 here.
+/// Vacuity control for the reference itself: two identical AIMD reference
+/// flows on one shaper must converge to ~50/50.  If they do not, the reference
+/// law is not a fair AIMD and the A/B's contrast cannot be attributed to the
+/// delay response.  This is the ONE arm allowed a Jain floor: it is an
+/// instrument-sanity bound on the reference, not a product fairness bound.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "shared-bottleneck delay-vs-loss vacuity control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
-async fn shared_bneck_loss_ab_loss_vs_loss() {
-    run_delay_vs_loss_arm("loss_vs_loss", true, true, false).await;
+#[ignore = "shared-bottleneck AIMD-reference vacuity control: 3 x 10 s reps; run with --ignored --nocapture --test-threads=1 (see module header)"]
+async fn shared_bneck_loss_ab_aimd_vs_aimd() {
+    run_loss_ab_arm("aimd_vs_aimd", true, true, false, false, Some(0.90)).await;
 }
 
 /// Regression: one reply slower than the round-trip bound must not end the

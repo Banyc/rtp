@@ -56,7 +56,7 @@ pub(crate) fn wrap_fec_with_mss_and_fec_tuning_and_frame_delivery(
         fec_tuning: tuning,
         frame_delivery,
         congestion_lane: CongestionLane::default(),
-        delay_gate_disabled: false,
+        reference_aimd: false,
         shared_congestion: None,
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,

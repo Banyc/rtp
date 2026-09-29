@@ -119,12 +119,13 @@ pub struct UnreliableLayer {
     /// shared session state reads it once at construction.  Frame delivery and
     /// byte-stream delivery are orthogonal to this intent.
     pub(crate) congestion_lane: crate::CongestionLane,
-    /// Test-only loss-only selector (never set in production): when `true` the
-    /// connection's delay gate never declares a queue, so the reliable layer's
-    /// congestion controller responds to loss only.  Seeded from the
-    /// `#[cfg(feature = "testing")]` connect/accept `disable_delay_gate` knob;
-    /// every production constructor leaves it `false`.
-    pub(crate) delay_gate_disabled: bool,
+    /// Test-only AIMD reference selector (never set in production): when
+    /// `true` the reliable layer's congestion controller runs the reference
+    /// additive-increase / multiplicative-decrease law instead of the
+    /// delay/loss policy.  Seeded from the `#[cfg(feature = "testing")]`
+    /// connect/accept `reference_aimd` knob; every production constructor
+    /// leaves it `false`.
+    pub(crate) reference_aimd: bool,
     /// The egress path's cross-lane congestion signal to install on the
     /// connection's controller, if this transport is egress path-managed.
     pub(crate) shared_congestion: Option<crate::cc::CcSignal>,

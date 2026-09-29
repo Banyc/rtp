@@ -808,8 +808,9 @@ async fn spawn_rtp_bulk_upload_core(
     mss: usize,
     congestion_lane: crate::CongestionLane,
     frame_delivery: crate::FrameMode,
-    disable_delay_gate: bool,
+    reference_aimd: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
+    cc_link: Option<crate::cc::CcLink>,
 ) -> std::io::Result<crate::socket::AsyncWriteAdapter> {
     let connected = crate::udp::connect_with(
         "0.0.0.0:0",
@@ -820,8 +821,9 @@ async fn spawn_rtp_bulk_upload_core(
             mss: crate::udp::MssConfig::Custom(mss),
             congestion_lane,
             frame_delivery,
-            disable_delay_gate,
+            reference_aimd,
             metrics_observer,
+            cc_link,
             ..crate::udp::ConnectConfig::default()
         },
     )
@@ -865,6 +867,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss(
         crate::FrameMode::default(),
         false,
         None,
+        None,
     )
     .await
 }
@@ -886,6 +889,7 @@ pub async fn spawn_rtp_bulk_upload_with_mss_via(
         crate::CongestionLane::default(),
         crate::FrameMode::default(),
         false,
+        None,
         None,
     )
     .await
@@ -929,30 +933,36 @@ pub async fn spawn_rtp_bulk_upload_with_lane_and_frame_via(
         frame_delivery,
         false,
         None,
+        None,
     )
     .await
 }
 
-/// [`spawn_rtp_bulk_upload_with_lane_and_frame_via`] with the test-only
-/// loss-only congestion gate (`disable_delay_gate`) and an optional metrics
-/// observer on the connecting end.
+/// [`spawn_rtp_bulk_upload_with_lane_and_frame_via`] with the test-only AIMD
+/// reference selector (`reference_aimd`), an optional metrics observer on the
+/// connecting end, and an optional cross-connection congestion link.
 ///
-/// When `disable_delay_gate` is `true` the connection's delay gate never
-/// declares a queue, so its congestion controller responds to loss only — the
-/// `rtp`-side reference a scenario uses to contrast a loss-based flow against
-/// the production delay-first bulk lane. The observer (when given) captures
-/// the connection's own snapshot stream, so a scenario can read the measured
-/// loss and whether the gate ever saw a queue. Production never sets either:
-/// this entry point is behind the same `testing` feature as the rest of
-/// [`crate::testkit`].
-pub async fn spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via(
+/// When `reference_aimd` is `true` the connection's congestion controller runs
+/// the reference additive-increase / multiplicative-decrease law instead of
+/// the production delay/loss policy — the `rtp`-side loss-based competitor a
+/// scenario contrasts against the production delay-first bulk lane.  The
+/// observer (when given) captures the connection's own snapshot stream, so a
+/// scenario can read the measured loss and gate activity.  `cc_link` attaches
+/// the connection to a [`crate::cc::CcSignalHub`] path group; a bulk link makes
+/// the path's sharedness (a live interactive lane on the same `(src, dst)`) an
+/// input to this connection's congestion control.  Production never sets any
+/// of them: this entry point is behind the same `testing` feature as the rest
+/// of [`crate::testkit`].
+#[allow(clippy::too_many_arguments)] // the connect knob set, one field per `ConnectConfig` entry
+pub async fn spawn_rtp_bulk_upload_with_options_via(
     tx: &TestTaskSubmitter,
     proxy_client_addr: std::net::SocketAddr,
     fec: bool,
     congestion_lane: crate::CongestionLane,
     frame_delivery: crate::FrameMode,
-    disable_delay_gate: bool,
+    reference_aimd: bool,
     metrics_observer: Option<crate::metrics::MetricsObserver>,
+    cc_link: Option<crate::cc::CcLink>,
 ) -> std::io::Result<crate::socket::AsyncWriteAdapter> {
     spawn_rtp_bulk_upload_core(
         |fut| submit_test_task(tx, fut),
@@ -961,8 +971,9 @@ pub async fn spawn_rtp_bulk_upload_with_lane_frame_and_loss_only_via(
         crate::udp::NO_FEC_MSS,
         congestion_lane,
         frame_delivery,
-        disable_delay_gate,
+        reference_aimd,
         metrics_observer,
+        cc_link,
     )
     .await
 }

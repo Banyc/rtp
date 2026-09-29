@@ -483,7 +483,7 @@ fn fec_layer(
         fec_tuning: tuning,
         frame_delivery: FrameMode::default(),
         congestion_lane: crate::CongestionLane::default(),
-        delay_gate_disabled: false,
+        reference_aimd: false,
         shared_congestion: None,
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,

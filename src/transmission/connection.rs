@@ -164,7 +164,7 @@ fn new_connection_inner(
     };
     let frame_delivery = unreliable_layer.frame_delivery;
     let congestion_lane = unreliable_layer.congestion_lane;
-    let delay_gate_disabled = unreliable_layer.delay_gate_disabled;
+    let reference_aimd = unreliable_layer.reference_aimd;
     let metrics_observer = unreliable_layer.metrics_observer.clone();
     let (mut reliable_layer, send_rate_limiter) = match watchdog_tuning {
         Some(tuning) => ReliableLayer::new_with_watchdog_tuning_at(
@@ -192,10 +192,10 @@ fn new_connection_inner(
     // connection's delay drain even when loss-based control would otherwise
     // win.
     reliable_layer.set_shared_congestion(unreliable_layer.shared_congestion.clone());
-    // The test-only loss-only selector: seeded from the connect/accept
-    // `disable_delay_gate` knob.  Production leaves it `false`, so the delay
-    // gate is untouched.
-    reliable_layer.set_delay_gate_disabled(delay_gate_disabled);
+    // The test-only AIMD reference selector: seeded from the connect/accept
+    // `reference_aimd` knob.  Production leaves it `false`, so the production
+    // congestion policy is untouched.
+    reliable_layer.set_reference_aimd(reference_aimd);
     // The connection's optional pacer seed: install both the reliable layer's
     // send rate and the token bucket's own rate, so the sender is not served
     // from a standing backlog while its congestion ramp climbs to the lane's
@@ -1024,7 +1024,7 @@ mod tests {
             fec_tuning: FecTuning::default(),
             frame_delivery,
             congestion_lane: crate::CongestionLane::default(),
-            delay_gate_disabled: false,
+            reference_aimd: false,
             shared_congestion: None,
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
