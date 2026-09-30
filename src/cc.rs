@@ -154,7 +154,7 @@ impl CcSignal {
         let mut latest: Option<u64> = None;
         for signal in signals.iter().filter_map(Weak::upgrade) {
             let offer = signal.offer_ms.load(Ordering::Acquire);
-            if offer != 0 {
+            if offer != u64::MAX {
                 latest = Some(latest.map_or(offer, |current| current.max(offer)));
             }
         }
@@ -234,8 +234,10 @@ struct SignalState {
     /// Set on every application offer (a write, or data pending on the send
     /// path).  The stand-off's activity witness reads this instead of
     /// `updated_ms`, so a lane whose packets are queued — and whose
-    /// `RttSample`s have therefore stopped — still reads as active.  `0` is the
-    /// "never offered" sentinel, which `store` below never produces.
+    /// `RttSample`s have therefore stopped — still reads as active.
+    /// `u64::MAX` is the "never offered" sentinel, so an offer recorded in
+    /// the first millisecond of the group's life (its timestamp is `0`) is not
+    /// mistaken for no offer at all.
     offer_ms: AtomicU64,
     min_rtt_ns: AtomicU64,
     srtt_ns: AtomicU64,
@@ -248,7 +250,7 @@ impl CcSignalSource {
                 group: Arc::clone(group),
                 start,
                 updated_ms: AtomicU64::new(0),
-                offer_ms: AtomicU64::new(0),
+                offer_ms: AtomicU64::new(u64::MAX),
                 min_rtt_ns: AtomicU64::new(0),
                 srtt_ns: AtomicU64::new(0),
             }),
