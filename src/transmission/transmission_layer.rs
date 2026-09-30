@@ -129,6 +129,12 @@ pub struct UnreliableLayer {
     /// The egress path's cross-lane congestion signal to install on the
     /// connection's controller, if this transport is egress path-managed.
     pub(crate) shared_congestion: Option<crate::cc::CcSignal>,
+    /// This connection's own interactive-lane offer handle, when it is the
+    /// interactive side of a CC path.  Installed on the reliable layer so the
+    /// application write path (and a send pass with data pending) refreshes the
+    /// bulk stand-off's activity witness.  `None` for a bulk connection and for
+    /// a connection with no CC link.
+    pub(crate) interactive_offer: Option<crate::cc::CcSignalSource>,
     /// Retransmission-armor duplicate-copy config.  Set once at construction
     /// from the connect/accept config (which reads `RTP_RTX_DUP` in
     /// `Default`); the shared session state is seeded from here.

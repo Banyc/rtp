@@ -132,16 +132,21 @@ impl AimdDecrease {
 /// [`crate::cc::STANDOFF_WINDOW`], and drain below the competing rate for
 /// [`STANDOFF_HOLD`] whenever it resumes.
 ///
-/// The gate is the *interactive lane's activity*, not sampled loss: with the
-/// lane quiet, loss is either a competitor's signal or the bulk's own queue and
-/// competing is the right answer either way; with the lane active, the shipped
+/// The gate is the *interactive lane's application activity* — its **offer**
+/// clock, not its `RttSample` freshness: with the lane quiet (not offering),
+/// loss is either a competitor's signal or the bulk's own queue and competing
+/// is the right answer either way; with the lane offering, the shipped
 /// delay-first policy yields and the hold clears the queue the competing
-/// episode built.  When no CC link is attached the whole mechanism is inert and
-/// the connection's policy is byte-identical to the delay-first one.
+/// episode built.  An offer is recorded on the write path (and while send-path
+/// data is pending), so it does not gap when the lane's packets queue behind
+/// the bulk — reading the `RttSample` clock here made a queued lane look idle
+/// and let the bulk compete with the very lane it stands off for.  When no CC
+/// link is attached the whole mechanism is inert and the connection's policy is
+/// byte-identical to the delay-first one.
 #[derive(Debug)]
 struct Standoff {
     /// The controller's creation (or last reset) time, used as the quiet
-    /// clock's origin when no interactive lane has ever published on the path.
+    /// clock's origin when no interactive lane has ever offered on the path.
     started: Instant,
     /// Whether the lane is in the quiet-window competing episode.
     competing: bool,
@@ -166,11 +171,13 @@ impl Standoff {
     }
 
     /// One stand-off decision, or `None` to let the shipped delay-first policy
-    /// decide.  The gate is `quiet_for >= STANDOFF_WINDOW`, where `quiet_for`
-    /// is clamped to zero while `shared_path` holds, so an active lane never
-    /// competes and a window of zero competes unconditionally (the vacuity
-    /// probe).  The hold is checked before the gate resumes competing, so a
-    /// resuming lane's buffer is drained even if the lane has gone quiet again.
+    /// decide.  The gate is `offer_quiet >= STANDOFF_WINDOW`, where
+    /// `offer_quiet` is the time since the interactive lane's last application
+    /// offer, read *only* from the offer witness: `RttSample` freshness does
+    /// not gate it, so a queued lane that is still offering keeps the bulk
+    /// yielded.  A window of zero competes unconditionally (the vacuity probe).
+    /// The hold is checked before the gate resumes competing, so a resuming
+    /// lane's buffer is drained even if the lane has gone quiet again.
     fn decide(
         &mut self,
         probe: &mut OrdinaryBandwidthProbe,
@@ -181,13 +188,9 @@ impl Standoff {
             self.hold_until = None;
             return None;
         }
-        let quiet_for = if input.shared_path {
-            Duration::ZERO
-        } else {
-            input
-                .interactive_quiet
-                .unwrap_or_else(|| input.now.saturating_duration_since(self.started))
-        };
+        let quiet_for = input
+            .interactive_quiet
+            .unwrap_or_else(|| input.now.saturating_duration_since(self.started));
         if quiet_for >= crate::cc::STANDOFF_WINDOW {
             self.hold_until = None;
             self.competing = true;
@@ -263,10 +266,12 @@ pub(crate) struct CongestionInput {
     /// test-only hub can disarm it).  When `false` the stand-off is inert and
     /// the connection keeps the pure delay-first policy byte-for-byte.
     pub(crate) standoff_armed: bool,
-    /// How long the path's interactive lane has been quiet, or `None` when no
-    /// interactive lane has ever published on it (see
-    /// [`crate::cc::CcSignal::quiet_for`]).  A connection with no CC link
-    /// carries `None` and never consults it.
+    /// How long the path's interactive lane has been without an *application
+    /// offer*, or `None` when no interactive lane has ever offered on it (see
+    /// [`crate::cc::CcSignal::offered_quiet_for`]).  This is the stand-off's
+    /// activity witness and **not** `RttSample` freshness: an offer does not
+    /// gap when the lane's packets queue.  A connection with no CC link carries
+    /// `None` and never consults it.
     pub(crate) interactive_quiet: Option<Duration>,
 }
 
@@ -390,10 +395,10 @@ impl CongestionResponse {
         // CC link, so a connection that never joined a path keeps the pure
         // delay-first policy.  An active or within-window sample falls through
         // to that shipped policy.
-        if self.lane.stands_off_for_interactive() {
-            if let Some(outcome) = self.standoff.decide(&mut self.bandwidth_probe, input) {
-                return outcome;
-            }
+        if self.lane.stands_off_for_interactive()
+            && let Some(outcome) = self.standoff.decide(&mut self.bandwidth_probe, input)
+        {
+            return outcome;
         }
         // An application-limited sample can only be *another* flow's queue on
         // a shared lane: a dedicated lane has no competing traffic over its
@@ -1197,10 +1202,12 @@ mod tests {
     }
 
     /// The bulk stand-off's gate, state machine, and inertness.  A `Dedicated`
-    /// lane with a CC link competes only while the interactive lane has been
-    /// quiet past [`crate::cc::STANDOFF_WINDOW`]; while the lane is active it
-    /// drains (the shipped policy), and the transition from competing back to
-    /// active holds the rate below the competing rate for `STANDOFF_HOLD`.  A
+    /// lane with a CC link competes only while the interactive lane has not
+    /// *offered* for [`crate::cc::STANDOFF_WINDOW`]; while the lane is offering
+    /// it drains (the shipped policy), and the transition from competing back
+    /// to offering holds the rate below the competing rate for
+    /// `STANDOFF_HOLD`.  The gate reads the offer clock only, so a fresh
+    /// `shared_path` (`RttSample` freshness) does not hold it shut.  A
     /// connection with no CC link never leaves the shipped path, so this
     /// mechanism is inert for every caller that never joined a path.
     #[test]
@@ -1245,9 +1252,9 @@ mod tests {
             "without a CC link the stand-off must be inert"
         );
 
-        // A live interactive lane: still the shipped drain, and a forced-true
-        // `shared_path` with an otherwise-quiet clock must not compete either
-        // (the vacuity probe at the unit level).
+        // A fresh offer keeps the shipped drain even on a path whose RTT
+        // clock says shared: the gate reads the offer clock, which is what a
+        // queued-but-still-offering lane carries.
         let mut active = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
         assert!(
             matches!(
@@ -1256,17 +1263,21 @@ mod tests {
                     .decision(),
                 CongestionDecision::Drain { .. }
             ),
-            "an active interactive lane must keep the shipped drain"
+            "a fresh offer must keep the shipped drain"
         );
-        let mut forced_shared = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        // An *old* offer with a fresh RTT clock (`shared_path` true) must
+        // compete: `RttSample` freshness is not the gate, so a lane whose
+        // packets queued and whose samples stopped cannot be mistaken for an
+        // idle one in the dangerous direction.
+        let mut stale_offer = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
         assert!(
             matches!(
-                forced_shared
-                    .decide(observation, input(t0, true, Some(quiet * 10), true))
+                stale_offer
+                    .decide(observation, input(t0, true, Some(quiet), true))
                     .decision(),
-                CongestionDecision::Drain { .. }
+                CongestionDecision::Probe { .. }
             ),
-            "a shared path must clamp the quiet clock to zero so an active lane never competes"
+            "an old offer must let the bulk compete even with a fresh RTT clock"
         );
 
         // Quiet past the window with a link: compete additively.

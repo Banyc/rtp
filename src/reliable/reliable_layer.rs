@@ -232,6 +232,12 @@ pub struct ReliableLayer {
     /// The egress path's cross-lane congestion signal, if this connection is managed.
     /// Read once per congestion decision; `None` leaves it egress path-unmanaged.
     shared_congestion: Option<crate::cc::CcSignal>,
+    /// This connection's own interactive-lane offer handle, if it is the
+    /// interactive side of a CC path.  Refreshed on the application write path
+    /// and while send-path data is pending, so the bulk stand-off's activity
+    /// witness cannot gap when this lane's packets queue.  `None` on a bulk
+    /// connection (and on every connection with no CC link).
+    interactive_offer: Option<crate::cc::CcSignalSource>,
     slow_start: bool,
     slow_start_acked_pkts: usize,
     /// Windowed ACK-clock ramp for the dedicated lane's bounded fast start.
@@ -316,6 +322,7 @@ impl ReliableLayer {
                 congestion_lane,
             ),
             shared_congestion: None,
+            interactive_offer: None,
             slow_start: true,
             slow_start_acked_pkts: 0,
             fast_start: FastStartEpisode::new(now),
@@ -369,6 +376,7 @@ impl ReliableLayer {
                 congestion_lane,
             ),
             shared_congestion: None,
+            interactive_offer: None,
             slow_start: true,
             slow_start_acked_pkts: 0,
             fast_start: FastStartEpisode::new(now),
@@ -514,6 +522,24 @@ impl ReliableLayer {
     /// [`crate::cc::CcSignal`]).
     pub(crate) fn set_shared_congestion(&mut self, input: Option<crate::cc::CcSignal>) {
         self.shared_congestion = input;
+    }
+
+    /// Install this connection's own interactive-lane offer handle.  Set only
+    /// on an interactive (`CcRole::Interactive`) connection: every application
+    /// offer refreshes the clock the bulk lane's stand-off reads.  `None` on a
+    /// bulk connection and on every connection with no CC link.
+    pub(crate) fn set_interactive_offer(&mut self, input: Option<crate::cc::CcSignalSource>) {
+        self.interactive_offer = input;
+    }
+
+    /// Refresh this connection's offer clock when it is the interactive lane.
+    /// Called on the application write path and while send-path data is
+    /// pending, so the bulk stand-off's activity witness does not gap when this
+    /// lane's packets queue and its `RttSample`s stop.
+    fn note_interactive_offer(&self) {
+        if let Some(offer) = self.interactive_offer.as_ref() {
+            offer.offer();
+        }
     }
 
     /// Declare the test-only AIMD reference law.  Seeded from the
@@ -662,6 +688,7 @@ impl ReliableLayer {
 
     pub fn send_data_buf(&mut self, buf: &[u8], now: Instant) -> Result<usize, IoErr> {
         self.ensure_write_open()?;
+        self.note_interactive_offer();
         self.detect_application_limited_phases(now);
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap =
@@ -686,6 +713,7 @@ impl ReliableLayer {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
         crate::delivery::frame::send::validate_frame(frame)?;
+        self.note_interactive_offer();
         self.detect_application_limited_phases(now);
         let stage_pkts = (self.send_rate.get() * STAGE_WINDOW_SECS).ceil() as usize;
         let cap = (stage_pkts.max(2) * self.max_data_size_per_pkt()).min(MAX_FRAME_LEN);
@@ -715,6 +743,12 @@ impl ReliableLayer {
         now: Instant,
         reserved_bytes: usize,
     ) -> Option<DataPkt> {
+        // A send pass with staged application data left is an ongoing
+        // application offer: refresh the stand-off's witness even on a pass
+        // that produces no new packet (a full window still has data pending).
+        if !self.is_send_buf_empty() {
+            self.note_interactive_offer();
+        }
         self.detect_application_limited_phases(now);
         if crate::debug::debug_send() {
             eprintln!(
@@ -1156,15 +1190,18 @@ impl ReliableLayer {
         let current = self.send_rate.get();
         // The cross-lane CC link has two observables: whether the path is
         // currently shared (the existing loss-gate signal), and how long our
-        // interactive lane has been quiet (the bulk stand-off's clock).  The
-        // stand-off is armed only when a hub that runs it is attached, so the
-        // shipped policy is unchanged for a hub that is disarmed for an A/B.
+        // interactive lane has gone without an *application offer* (the bulk
+        // stand-off's clock).  The offer clock is deliberately not the
+        // `RttSample` clock: a queued lane's samples stop, and gating on them
+        // made the bulk compete with the lane it stands off for.  The stand-off
+        // is armed only when a hub that runs it is attached, so the shipped
+        // policy is unchanged for a hub that is disarmed for an A/B.
         let (shared_path, standoff_armed, interactive_quiet) = match self.shared_congestion.as_ref()
         {
             Some(signal) => (
                 signal.is_shared(),
                 signal.standoff_enabled(),
-                signal.quiet_for(),
+                signal.offered_quiet_for(),
             ),
             None => (false, false, None),
         };
@@ -2094,6 +2131,42 @@ mod tests {
         );
         pacer.set_min_burst_for_test(64, now);
         layer
+    }
+
+    /// The interactive lane's offer clock is refreshed by its application
+    /// write path, and only by that path: a connection with no offer handle (a
+    /// bulk lane) writing data must not publish an offer, and a connection with
+    /// a handle must publish one on a write.  This is the load-bearing wiring
+    /// for the offer-side stand-off witness.
+    #[test]
+    fn the_interactive_offer_clock_is_refreshed_by_the_write_path() {
+        use crate::cc::CcSignalHub;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let now = Instant::now();
+        let hub = CcSignalHub::new();
+        let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let dst = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1));
+        let group = hub.group(src, dst);
+
+        // A bulk connection (no offer handle) writing data publishes nothing.
+        let mut bulk = test_layer(now);
+        bulk.send_data_buf(b"bulk", now).unwrap();
+        assert_eq!(
+            group.bulk().offered_quiet_for(),
+            None,
+            "a connection with no offer handle must not publish an offer"
+        );
+
+        // An interactive connection writes -> the offer clock starts.
+        let mut interactive = test_layer(now);
+        let source = group.interactive();
+        interactive.set_interactive_offer(Some(source));
+        interactive.send_data_buf(b"interactive", now).unwrap();
+        assert!(
+            group.bulk().offered_quiet_for().is_some(),
+            "an application write on the interactive lane must publish an offer"
+        );
     }
 
     /// The sender-rate setter is the single total bridge from a computed

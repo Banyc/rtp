@@ -485,6 +485,7 @@ fn fec_layer(
         congestion_lane: crate::CongestionLane::default(),
         reference_aimd: false,
         shared_congestion: None,
+        interactive_offer: None,
         retransmission_armor: RetransmissionArmorConfig::disabled(),
         instream_group_fec: false,
         ack_padding: AckPaddingMode::None,

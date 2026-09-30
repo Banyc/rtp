@@ -192,6 +192,10 @@ fn new_connection_inner(
     // connection's delay drain even when loss-based control would otherwise
     // win.
     reliable_layer.set_shared_congestion(unreliable_layer.shared_congestion.clone());
+    // An interactive connection publishes its own application offers so the
+    // bulk lane's stand-off can read its activity without depending on
+    // `RttSample` freshness (which gaps while the lane's packets queue).
+    reliable_layer.set_interactive_offer(unreliable_layer.interactive_offer.take());
     // The test-only AIMD reference selector: seeded from the connect/accept
     // `reference_aimd` knob.  Production leaves it `false`, so the production
     // congestion policy is untouched.
@@ -1026,6 +1030,7 @@ mod tests {
             congestion_lane: crate::CongestionLane::default(),
             reference_aimd: false,
             shared_congestion: None,
+            interactive_offer: None,
             retransmission_armor: RetransmissionArmorConfig::disabled(),
             instream_group_fec: false,
             ack_padding: AckPaddingMode::None,

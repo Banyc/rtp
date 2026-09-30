@@ -770,15 +770,18 @@ async fn accept(
     let local_addr_for_path = local_addr;
     let mut metrics_observer = metrics_observer;
     let mut shared_congestion = shared_congestion;
+    let mut interactive_offer = None;
     if let Some(link) = cc_link {
         let group = link.group(local_addr_for_path.ip(), peer_addr.ip());
         match link.role() {
             crate::cc::CcRole::Interactive => {
-                let observer = group.interactive().observer();
+                let source = group.interactive();
+                let observer = source.observer();
                 metrics_observer = Some(match metrics_observer.take() {
                     Some(existing) => existing.chained(observer),
                     None => observer,
                 });
+                interactive_offer = Some(source);
             }
             crate::cc::CcRole::Bulk => shared_congestion = Some(group.bulk()),
         }
@@ -831,6 +834,7 @@ async fn accept(
         metrics_observer,
         ack_padding,
         shared_congestion,
+        interactive_offer,
         reference_aimd,
     );
     if handshake {
@@ -1195,15 +1199,18 @@ async fn connect_bound(
     // by the caller: the path this connection actually egresses.
     let mut metrics_observer = metrics_observer;
     let mut shared_congestion = shared_congestion;
+    let mut interactive_offer = None;
     if let Some(link) = cc_link {
         let group = link.group(local_addr.ip(), peer_addr.ip());
         match link.role() {
             crate::cc::CcRole::Interactive => {
-                let observer = group.interactive().observer();
+                let source = group.interactive();
+                let observer = source.observer();
                 metrics_observer = Some(match metrics_observer.take() {
                     Some(existing) => existing.chained(observer),
                     None => observer,
                 });
+                interactive_offer = Some(source);
             }
             crate::cc::CcRole::Bulk => shared_congestion = Some(group.bulk()),
         }
@@ -1267,6 +1274,7 @@ async fn connect_bound(
         metrics_observer,
         ack_padding,
         shared_congestion,
+        interactive_offer,
         reference_aimd,
     );
     if handshake {
@@ -1308,11 +1316,13 @@ fn apply_layer_tuning(
     metrics_observer: Option<crate::metrics::MetricsObserver>,
     ack_padding: crate::obfuscate::padding::AckPaddingMode,
     shared_congestion: Option<crate::cc::CcSignal>,
+    interactive_offer: Option<crate::cc::CcSignalSource>,
     reference_aimd: bool,
 ) {
     layer.congestion_lane = congestion_lane;
     layer.reference_aimd = reference_aimd;
     layer.shared_congestion = shared_congestion;
+    layer.interactive_offer = interactive_offer;
     layer.initial_send_rate = initial_send_rate;
     layer.retransmission_armor = retransmission_armor;
     layer.instream_group_fec = instream_group_fec;
@@ -1402,6 +1412,7 @@ pub fn unreliable_layer_with_config(
         metrics_observer,
         ack_padding,
         shared_congestion,
+        None,
         reference_aimd,
     );
     Ok(layer)

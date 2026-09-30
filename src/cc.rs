@@ -136,6 +136,30 @@ impl CcSignal {
     pub fn quiet_for(&self) -> Option<Duration> {
         self.group.aggregate.quiet_for()
     }
+
+    /// How long the path's interactive lane has gone without an *application
+    /// offer*: the wall time since the most recent offer from a live
+    /// interactive connection, or `None` when no live lane has ever offered.
+    ///
+    /// This is the bulk stand-off's activity witness, deliberately separate
+    /// from [`Self::quiet_for`]: an offer is recorded on the application write
+    /// path (and while send-path data is pending), so it does **not** gap when
+    /// the lane's own packets queue behind the bulk and its `RttSample`s stop.
+    /// Reading the RTT clock here is what made a queued lane look idle and let
+    /// the bulk compete with the very lane it was standing off for.
+    pub fn offered_quiet_for(&self) -> Option<Duration> {
+        let now_ms = self.group.aggregate.start.elapsed().as_millis() as u64;
+        let mut signals = self.group.signals.lock().unwrap();
+        signals.retain(|signal| signal.strong_count() > 0);
+        let mut latest: Option<u64> = None;
+        for signal in signals.iter().filter_map(Weak::upgrade) {
+            let offer = signal.offer_ms.load(Ordering::Acquire);
+            if offer != 0 {
+                latest = Some(latest.map_or(offer, |current| current.max(offer)));
+            }
+        }
+        latest.map(|offer| Duration::from_millis(now_ms.saturating_sub(offer)))
+    }
 }
 
 #[derive(Debug)]
@@ -207,6 +231,12 @@ struct SignalState {
     /// Reset on every observation. There is no other state: presence is the
     /// whole signal.
     updated_ms: AtomicU64,
+    /// Set on every application offer (a write, or data pending on the send
+    /// path).  The stand-off's activity witness reads this instead of
+    /// `updated_ms`, so a lane whose packets are queued — and whose
+    /// `RttSample`s have therefore stopped — still reads as active.  `0` is the
+    /// "never offered" sentinel, which `store` below never produces.
+    offer_ms: AtomicU64,
     min_rtt_ns: AtomicU64,
     srtt_ns: AtomicU64,
 }
@@ -218,10 +248,22 @@ impl CcSignalSource {
                 group: Arc::clone(group),
                 start,
                 updated_ms: AtomicU64::new(0),
+                offer_ms: AtomicU64::new(0),
                 min_rtt_ns: AtomicU64::new(0),
                 srtt_ns: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Record that this lane's application offered data: an application write,
+    /// or data pending on its send path.  The bulk stand-off reads this clock,
+    /// not `RttSample` freshness, so a lane whose packets are queued still
+    /// reads as active.
+    pub fn offer(&self) {
+        self.inner.offer_ms.store(
+            self.inner.start.elapsed().as_millis() as u64,
+            Ordering::Release,
+        );
     }
 
     fn update(&self, snapshot: &MetricsSnapshot) {
@@ -609,6 +651,78 @@ mod tests {
         assert!(
             quiet >= Duration::from_secs(1) && quiet < Duration::from_secs(3),
             "the clock must measure the silence since the update: {quiet:?}"
+        );
+    }
+
+    /// An `RttSample` is **not** an application offer: the offer clock stays
+    /// `None` while the RTT clock marks the path shared.  This separation is
+    /// the whole fix — reading the RTT clock made a queued lane look idle.
+    #[test]
+    fn an_rtt_update_is_not_an_application_offer() {
+        let scheduler = CcSignalHub::new();
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        let interactive = group.interactive();
+        interactive.update(&sample());
+        assert!(bulk.is_shared(), "the RTT update marks the path shared");
+        assert_eq!(
+            bulk.offered_quiet_for(),
+            None,
+            "an RTT update is not an application offer"
+        );
+    }
+
+    /// The offer clock restarts at each offer, measures silence since it, and
+    /// ignores RTT updates entirely; it also forgets a lane once it is gone, so
+    /// an ended connection cannot hold the gate shut forever.
+    #[test]
+    fn the_offer_clock_is_the_standoffs_activity_witness() {
+        // Epoch three seconds in the past so backdating the offer exercises
+        // the elapsed-time arithmetic without waiting on the wall clock.
+        let scheduler = CcSignalHub::with_epoch(Instant::now() - Duration::from_secs(3));
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        let interactive = group.interactive();
+        assert_eq!(
+            bulk.offered_quiet_for(),
+            None,
+            "no offer yet means no clock"
+        );
+        interactive.offer();
+        let fresh = bulk
+            .offered_quiet_for()
+            .expect("an offer starts the offer clock");
+        assert!(
+            fresh < Duration::from_millis(200),
+            "the offer clock restarts at the offer: {fresh:?}"
+        );
+        // An RTT update must not refresh the offer clock: the stored offer
+        // stamp is unchanged by an `update`.
+        let stamp = interactive.inner.offer_ms.load(Ordering::Acquire);
+        interactive.update(&sample());
+        assert_eq!(
+            interactive.inner.offer_ms.load(Ordering::Acquire),
+            stamp,
+            "an RTT update must not refresh the offer clock"
+        );
+        // Backdate the signal's offer stamp: the clock measures silence since
+        // the offer, not since the epoch.
+        interactive.inner.offer_ms.store(1_000, Ordering::Release);
+        let quiet = bulk
+            .offered_quiet_for()
+            .expect("the offer clock keeps running once started");
+        assert!(
+            quiet >= Duration::from_secs(1) && quiet < Duration::from_secs(3),
+            "the clock must measure silence since the offer: {quiet:?}"
+        );
+        // A dead lane's offer stops counting: with no live signal the path is
+        // no longer witnessed as offering, so the gate cannot stay shut on a
+        // connection that has ended.
+        drop(interactive);
+        assert_eq!(
+            bulk.offered_quiet_for(),
+            None,
+            "a dropped lane must not keep the offer clock alive"
         );
     }
 
