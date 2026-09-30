@@ -73,6 +73,187 @@ use crate::metrics::{MetricsEvent, MetricsObserver, MetricsSnapshot};
 /// not stay "shared" on a connection that has ended.
 pub const SIGNAL_STALE_AFTER: Duration = Duration::from_secs(1);
 
+/// How many of a publishing lane's own control RTTs its state stays valid.
+///
+/// A payload is published on every `RttSample`, so a fresh payload is never
+/// more than one control RTT old; a statement older than that cannot improve
+/// on the consumer's own fresh sample and must be read as **absent**, never as
+/// zero and never as "unchanged". The horizon is deliberately not
+/// [`SIGNAL_STALE_AFTER`]: that one decides *presence* (is a lane there at
+/// all), while this one decides whether the lane's *sampled quantities* may be
+/// used in a decision.
+pub const PAYLOAD_VALID_RTTS: u32 = 1;
+
+/// Sentinel for an absent `Option<Duration>` stored in an `AtomicU64` as
+/// nanoseconds. `u64::MAX` ns is ~584 years, beyond any live path, so it can
+/// never collide with a real value.
+const NONE_NS: u64 = u64::MAX;
+
+fn store_opt_ns(slot: &AtomicU64, value: Option<Duration>) {
+    slot.store(
+        value.map_or(NONE_NS, |d| d.as_nanos().min(NONE_NS as u128 - 1) as u64),
+        Ordering::Relaxed,
+    );
+}
+
+fn load_opt_ns(slot: &AtomicU64) -> Option<Duration> {
+    let raw = slot.load(Ordering::Relaxed);
+    (raw != NONE_NS).then(|| Duration::from_nanos(raw))
+}
+
+fn store_opt_f64(slot: &AtomicU64, value: Option<f64>) {
+    slot.store(value.map_or(NONE_NS, f64::to_bits), Ordering::Relaxed);
+}
+
+fn load_opt_f64(slot: &AtomicU64) -> Option<f64> {
+    let raw = slot.load(Ordering::Relaxed);
+    (raw != NONE_NS).then(|| f64::from_bits(raw))
+}
+
+fn min_opt(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+fn max_opt(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+fn max_opt_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (some, None) | (None, some) => some,
+    }
+}
+
+/// One interactive connection's statement about its egress path, as published
+/// to the bulk connections that share it and then discarded once it is older
+/// than [`PAYLOAD_VALID_RTTS`] control RTTs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathLaneState {
+    /// `congestion_rtt_floor`: the lane's windowed, queue-free RTT floor.
+    pub floor: Option<Duration>,
+    /// `congestion_control_rtt - floor`, saturating: the standing queue this
+    /// lane sees, measured by the lane with the least of its own queue.
+    pub queue_delay: Option<Duration>,
+    /// `congestion_queue_tolerance`: this lane's own ordinary drain margin.
+    pub tolerance: Option<Duration>,
+    /// `congestion_persistent_queue_for`: this lane's own persistent-queue
+    /// latch. `Some` means the lane's own drain gate has fired.
+    pub persistent_for: Option<Duration>,
+    /// `send_rate_packets_per_second`: the lane's offered packet rate.
+    pub offered_pps: f64,
+    /// `pending_send_bytes`: data waiting on the lane's send path.
+    pub pending_bytes: usize,
+    /// `application_write_waiters`: applications blocked on the lane's send
+    /// path.
+    pub write_waiters: usize,
+    /// `congestion_loss_ratio`: the lane's windowed loss evidence.
+    pub loss: Option<f64>,
+    /// `congestion_delivery_peak_packets_per_second`: carried with its
+    /// validity flag so no reader mistakes a sparse lane's offer for capacity.
+    pub capacity_pps: Option<f64>,
+    /// `delivery_sample_app_limited == Some(false)`: the last sample saturated
+    /// the path, so `capacity_pps` is a capacity reading at all.
+    pub saturating: bool,
+    /// `congestion_control_rtt`: the lane's control interval, which dates every
+    /// sampled field above.
+    pub control_rtt: Option<Duration>,
+    /// When this state was published (elapsed since the hub's epoch).
+    pub stamp: Duration,
+}
+
+impl PathLaneState {
+    /// Whether this lane's sampled fields are within [`PAYLOAD_VALID_RTTS`]
+    /// control RTTs of `now`. A lane that has never recorded a control RTT
+    /// cannot date its fields, so it is never fresh.
+    pub fn is_fresh(&self, now: Duration) -> bool {
+        let Some(rtt) = self.control_rtt else {
+            return false;
+        };
+        if rtt.is_zero() {
+            return false;
+        }
+        now.saturating_sub(self.stamp) <= rtt * PAYLOAD_VALID_RTTS
+    }
+}
+
+/// The aggregate of every fresh lane on one `(src, dst)` path, as read by a
+/// bulk connection's congestion controller.
+///
+/// `None` from [`CcSignal::state`] means no lane on the path published a fresh
+/// payload; every consumer must treat that as *absent*, never as zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathState {
+    /// The newest contributing lane's stamp.
+    pub stamp: Duration,
+    /// The tightest (smallest) queue-free floor over the fresh lanes.
+    pub floor: Option<Duration>,
+    /// The least-queued lane's standing queue.
+    pub queue_delay: Option<Duration>,
+    /// The strictest ordinary drain margin over the fresh lanes.
+    pub tolerance: Option<Duration>,
+    /// The longest-armed persistent-queue latch over the fresh lanes.
+    pub persistent_for: Option<Duration>,
+    /// The summed offered packet rate over the fresh lanes.
+    pub offered_pps: f64,
+    /// The summed pending send bytes over the fresh lanes.
+    pub pending_bytes: usize,
+    /// The summed application write waiters over the fresh lanes.
+    pub write_waiters: usize,
+    /// The worst windowed loss over the fresh lanes.
+    pub loss: Option<f64>,
+    /// The largest delivery peak over the saturating fresh lanes.
+    pub capacity_pps: Option<f64>,
+    /// Whether any fresh lane's last sample saturated the path.
+    pub saturating: bool,
+    /// The widest control-RTT horizon over the fresh lanes.
+    pub control_rtt: Option<Duration>,
+}
+
+impl PathState {
+    /// The identity element for [`Self::merge`].
+    fn absent() -> Self {
+        Self {
+            stamp: Duration::ZERO,
+            floor: None,
+            queue_delay: None,
+            tolerance: None,
+            persistent_for: None,
+            offered_pps: 0.0,
+            pending_bytes: 0,
+            write_waiters: 0,
+            loss: None,
+            capacity_pps: None,
+            saturating: false,
+            control_rtt: None,
+        }
+    }
+
+    /// Fold one fresh lane's state into the group aggregate. `min` for the
+    /// queue-free baselines, `max` for the longest latch and the worst loss,
+    /// and `sum` for the activity counters.
+    fn merge(&mut self, lane: &PathLaneState) {
+        self.stamp = self.stamp.max(lane.stamp);
+        self.floor = min_opt(self.floor, lane.floor);
+        self.queue_delay = min_opt(self.queue_delay, lane.queue_delay);
+        self.tolerance = min_opt(self.tolerance, lane.tolerance);
+        self.persistent_for = max_opt(self.persistent_for, lane.persistent_for);
+        self.offered_pps += lane.offered_pps;
+        self.pending_bytes = self.pending_bytes.saturating_add(lane.pending_bytes);
+        self.write_waiters = self.write_waiters.saturating_add(lane.write_waiters);
+        self.loss = max_opt_f64(self.loss, lane.loss);
+        self.capacity_pps = max_opt_f64(self.capacity_pps, lane.capacity_pps);
+        self.saturating |= lane.saturating;
+        self.control_rtt = max_opt(self.control_rtt, lane.control_rtt);
+    }
+}
+
 /// How long the interactive lane may be quiet before a bulk lane on the same
 /// path treats the path as free to contest against an external loss-based
 /// competitor.
@@ -160,6 +341,29 @@ impl CcSignal {
         }
         latest.map(|offer| Duration::from_millis(now_ms.saturating_sub(offer)))
     }
+
+    /// The aggregated cross-lane payload for this path, or `None` when no live
+    /// lane has published a fresh one.
+    ///
+    /// A lane contributes only while its payload is within
+    /// [`PAYLOAD_VALID_RTTS`] control RTTs of now; a stale payload is absent,
+    /// never zero and never "unchanged". `None` therefore means the consumer
+    /// must fall back to its own measurements, and must not read the absence
+    /// as either "idle" or "busy".
+    pub fn state(&self) -> Option<PathState> {
+        let now = Duration::from_millis(self.group.aggregate.start.elapsed().as_millis() as u64);
+        let mut signals = self.group.signals.lock().unwrap();
+        signals.retain(|signal| signal.strong_count() > 0);
+        let mut state = PathState::absent();
+        let mut any = false;
+        for signal in signals.iter().filter_map(Weak::upgrade) {
+            if let Some(lane) = signal.fresh_lane_state(now) {
+                state.merge(&lane);
+                any = true;
+            }
+        }
+        any.then_some(state)
+    }
 }
 
 #[derive(Debug)]
@@ -228,6 +432,10 @@ struct SignalState {
     /// alive; the group refers back to the signal only `Weak`.
     group: Arc<Group>,
     start: Instant,
+    /// Whether an `RttSample` has ever updated this lane. An explicit flag
+    /// rather than an `updated_ms == 0` sentinel, because an update in the
+    /// group's first millisecond also stamps `0`.
+    observed: AtomicBool,
     /// Reset on every observation. There is no other state: presence is the
     /// whole signal.
     updated_ms: AtomicU64,
@@ -241,6 +449,56 @@ struct SignalState {
     offer_ms: AtomicU64,
     min_rtt_ns: AtomicU64,
     srtt_ns: AtomicU64,
+    /// `send_rate_packets_per_second`, as `f64::to_bits`.
+    send_rate_bits: AtomicU64,
+    /// `pending_send_bytes`.
+    pending_bytes: AtomicU64,
+    /// `application_write_waiters`.
+    write_waiters: AtomicU64,
+    /// `congestion_persistent_queue_for`, as nanoseconds; `NONE_NS` is absent.
+    persistent_for_ns: AtomicU64,
+    /// `congestion_rtt_floor`, as nanoseconds; `NONE_NS` is absent.
+    floor_ns: AtomicU64,
+    /// `congestion_queue_tolerance`, as nanoseconds; `NONE_NS` is absent.
+    tolerance_ns: AtomicU64,
+    /// `congestion_loss_ratio`, as `f64::to_bits`; `NONE_NS` is absent.
+    loss_bits: AtomicU64,
+    /// `congestion_control_rtt`, as nanoseconds; `NONE_NS` is absent.
+    control_rtt_ns: AtomicU64,
+    /// `congestion_delivery_peak_packets_per_second`, as `f64::to_bits`.
+    capacity_pps_bits: AtomicU64,
+    /// `delivery_sample_app_limited == Some(false)`.
+    saturating: AtomicBool,
+}
+
+impl SignalState {
+    /// This lane's payload, or `None` when it has never published or its
+    /// payload is older than [`PAYLOAD_VALID_RTTS`] control RTTs.
+    fn fresh_lane_state(&self, now: Duration) -> Option<PathLaneState> {
+        if !self.observed.load(Ordering::Acquire) {
+            return None;
+        }
+        let updated_ms = self.updated_ms.load(Ordering::Acquire);
+        let control_rtt = load_opt_ns(&self.control_rtt_ns);
+        let floor = load_opt_ns(&self.floor_ns);
+        let lane = PathLaneState {
+            floor,
+            queue_delay: control_rtt
+                .zip(floor)
+                .map(|(rtt, floor)| rtt.saturating_sub(floor)),
+            tolerance: load_opt_ns(&self.tolerance_ns),
+            persistent_for: load_opt_ns(&self.persistent_for_ns),
+            offered_pps: f64::from_bits(self.send_rate_bits.load(Ordering::Relaxed)),
+            pending_bytes: self.pending_bytes.load(Ordering::Relaxed) as usize,
+            write_waiters: self.write_waiters.load(Ordering::Relaxed) as usize,
+            loss: load_opt_f64(&self.loss_bits),
+            capacity_pps: load_opt_f64(&self.capacity_pps_bits),
+            saturating: self.saturating.load(Ordering::Relaxed),
+            control_rtt,
+            stamp: Duration::from_millis(updated_ms),
+        };
+        lane.is_fresh(now).then_some(lane)
+    }
 }
 
 impl CcSignalSource {
@@ -249,10 +507,21 @@ impl CcSignalSource {
             inner: Arc::new(SignalState {
                 group: Arc::clone(group),
                 start,
+                observed: AtomicBool::new(false),
                 updated_ms: AtomicU64::new(0),
                 offer_ms: AtomicU64::new(u64::MAX),
                 min_rtt_ns: AtomicU64::new(0),
                 srtt_ns: AtomicU64::new(0),
+                send_rate_bits: AtomicU64::new(0),
+                pending_bytes: AtomicU64::new(0),
+                write_waiters: AtomicU64::new(0),
+                persistent_for_ns: AtomicU64::new(NONE_NS),
+                floor_ns: AtomicU64::new(NONE_NS),
+                tolerance_ns: AtomicU64::new(NONE_NS),
+                loss_bits: AtomicU64::new(NONE_NS),
+                control_rtt_ns: AtomicU64::new(NONE_NS),
+                capacity_pps_bits: AtomicU64::new(NONE_NS),
+                saturating: AtomicBool::new(false),
             }),
         }
     }
@@ -277,6 +546,41 @@ impl CcSignalSource {
         self.inner
             .srtt_ns
             .store(snapshot.smoothed_rtt.as_nanos() as u64, Ordering::Relaxed);
+        // The cross-lane payload. Everything below is stored relaxed and then
+        // published by the `observed`/`updated_ms` release stores at the end,
+        // so a reader that acquires `updated_ms` sees a coherent set.
+        self.inner.send_rate_bits.store(
+            snapshot.send_rate_packets_per_second.to_bits(),
+            Ordering::Relaxed,
+        );
+        self.inner.pending_bytes.store(
+            snapshot.pending_send_bytes.min(u64::MAX as usize) as u64,
+            Ordering::Relaxed,
+        );
+        self.inner.write_waiters.store(
+            snapshot.application_write_waiters.min(u64::MAX as usize) as u64,
+            Ordering::Relaxed,
+        );
+        store_opt_ns(
+            &self.inner.persistent_for_ns,
+            snapshot.congestion_persistent_queue_for,
+        );
+        store_opt_ns(&self.inner.floor_ns, snapshot.congestion_rtt_floor);
+        store_opt_ns(
+            &self.inner.tolerance_ns,
+            snapshot.congestion_queue_tolerance,
+        );
+        store_opt_f64(&self.inner.loss_bits, snapshot.congestion_loss_ratio);
+        store_opt_ns(&self.inner.control_rtt_ns, snapshot.congestion_control_rtt);
+        store_opt_f64(
+            &self.inner.capacity_pps_bits,
+            snapshot.congestion_delivery_peak_packets_per_second,
+        );
+        self.inner.saturating.store(
+            snapshot.delivery_sample_app_limited == Some(false),
+            Ordering::Relaxed,
+        );
+        self.inner.observed.store(true, Ordering::Release);
         self.inner.updated_ms.store(
             self.inner.start.elapsed().as_millis() as u64,
             Ordering::Release,
@@ -790,5 +1094,116 @@ mod tests {
         let bulk_b = g(&b, CLIENT_A).bulk();
         g(&a, CLIENT_A).interactive().update(&sample());
         assert!(!bulk_b.is_shared());
+    }
+
+    /// A snapshot with the whole cross-lane payload populated, so each test can
+    /// vary exactly the field it is about.
+    fn payload_sample(control_rtt: Duration) -> MetricsSnapshot {
+        MetricsSnapshot {
+            send_rate_packets_per_second: 40.0,
+            pending_send_bytes: 0,
+            application_write_waiters: 0,
+            congestion_persistent_queue_for: None,
+            congestion_rtt_floor: Some(Duration::from_millis(50)),
+            congestion_queue_tolerance: Some(Duration::from_millis(6)),
+            congestion_loss_ratio: Some(0.0),
+            congestion_control_rtt: Some(control_rtt),
+            congestion_delivery_peak_packets_per_second: Some(1200.0),
+            delivery_sample_app_limited: Some(false),
+            ..MetricsSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn a_path_has_no_payload_until_a_lane_publishes_one() {
+        let scheduler = CcSignalHub::new();
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        assert_eq!(bulk.state(), None);
+        let interactive = group.interactive();
+        interactive.update(&payload_sample(Duration::from_millis(100)));
+        assert!(bulk.state().is_some());
+    }
+
+    /// The group aggregate is `min` for the queue-free baselines, `max` for the
+    /// longest latch and the worst loss, and `sum` for the activity counters —
+    /// so a bulk lane reads the tightest floor, the least-queued lane's queue
+    /// delay, and the group's total activity.
+    #[test]
+    fn the_payload_aggregates_as_min_max_and_sum_over_fresh_lanes() {
+        let scheduler = CcSignalHub::new();
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        let a = group.interactive();
+        let b = group.interactive();
+        a.update(&MetricsSnapshot {
+            send_rate_packets_per_second: 40.0,
+            pending_send_bytes: 5,
+            application_write_waiters: 1,
+            congestion_persistent_queue_for: Some(Duration::from_millis(20)),
+            congestion_rtt_floor: Some(Duration::from_millis(50)),
+            congestion_queue_tolerance: Some(Duration::from_millis(6)),
+            congestion_loss_ratio: Some(0.1),
+            congestion_control_rtt: Some(Duration::from_millis(100)),
+            ..MetricsSnapshot::default()
+        });
+        b.update(&MetricsSnapshot {
+            send_rate_packets_per_second: 10.0,
+            pending_send_bytes: 0,
+            application_write_waiters: 0,
+            congestion_persistent_queue_for: None,
+            congestion_rtt_floor: Some(Duration::from_millis(30)),
+            congestion_queue_tolerance: Some(Duration::from_millis(3)),
+            congestion_loss_ratio: Some(0.3),
+            congestion_control_rtt: Some(Duration::from_millis(80)),
+            ..MetricsSnapshot::default()
+        });
+        let state = bulk.state().expect("two fresh lanes must aggregate");
+        assert_eq!(state.floor, Some(Duration::from_millis(30)));
+        assert_eq!(state.tolerance, Some(Duration::from_millis(3)));
+        assert_eq!(state.persistent_for, Some(Duration::from_millis(20)));
+        assert_eq!(state.control_rtt, Some(Duration::from_millis(100)));
+        assert_eq!(state.pending_bytes, 5);
+        assert_eq!(state.write_waiters, 1);
+        assert_eq!(state.offered_pps, 50.0);
+        assert_eq!(state.loss, Some(0.3));
+        // The least-queued lane is `b`: 80 ms control RTT less its 30 ms floor.
+        assert_eq!(state.queue_delay, Some(Duration::from_millis(50)));
+    }
+
+    /// The freshness policy, and the vacuity it exists for: a payload older
+    /// than [`PAYLOAD_VALID_RTTS`] control RTTs reads as **absent**, not as a
+    /// valid reading. Backdate the lane's stamp and the same state must
+    /// disappear.
+    #[test]
+    fn a_payload_older_than_the_validity_horizon_reads_as_absent() {
+        let scheduler = CcSignalHub::with_epoch(Instant::now() - Duration::from_secs(3));
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        let interactive = group.interactive();
+        interactive.update(&payload_sample(Duration::from_millis(100)));
+        assert!(
+            bulk.state().is_some(),
+            "a just-published payload must be fresh"
+        );
+        // The lane has not sampled for one control RTT: the payload is stale
+        // and must vanish. `now` is ~3000 ms since the epoch, so a 2750 ms
+        // stamp is ~250 ms old against a 100 ms horizon.
+        interactive.inner.updated_ms.store(2_750, Ordering::Release);
+        assert_eq!(
+            bulk.state(),
+            None,
+            "a payload past one control RTT must read as absent, not as a valid reading"
+        );
+        // A wider control RTT widens the horizon and the same stamp is fresh
+        // again, proving the horizon is the publisher's own control RTT.
+        interactive.inner.control_rtt_ns.store(
+            Duration::from_millis(500).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        assert!(
+            bulk.state().is_some(),
+            "the horizon must scale with the control RTT the payload carries"
+        );
     }
 }
