@@ -35,10 +35,11 @@ pub enum CongestionLane {
 }
 
 pub(crate) use probe_base::peak_scaled_probe_base;
+pub(crate) use tuning::GENTLE_DRAIN_FRAC;
 pub(crate) use tuning::additive_probe_step;
 
 #[cfg(test)]
 pub(crate) use tuning::{
-    DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN, GENTLE_DRAIN_FRAC,
+    DEDICATED_GENTLE_BW_PROBE_GAIN, DRAIN_RATE_FRACTION, GENTLE_BW_PROBE_GAIN,
     SHARED_ADDITIVE_PROBE_REFERENCE_RTT, SHARED_ADDITIVE_PROBE_STEP,
 };

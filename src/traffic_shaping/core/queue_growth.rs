@@ -235,6 +235,10 @@ impl QueueGrowth {
         );
     }
 
+    /// The no-override observation, used by tests and by callers with no
+    /// cross-lane floor to attribute. Production goes through
+    /// [`Self::observe_with_floor`].
+    #[cfg(test)]
     pub(crate) fn observe(
         &mut self,
         smooth: Duration,
@@ -243,9 +247,32 @@ impl QueueGrowth {
         now: Instant,
         control_rtt: Duration,
     ) -> QueueGrowthObservation {
+        self.observe_with_floor(smooth, None, jitter, loss_event_rate, now, control_rtt)
+    }
+
+    /// Observe with an optional attributed floor (R3): a tighter, queue-free
+    /// baseline published by a sibling lane sharing the bottleneck replaces
+    /// this flow's own queue-poisoned floor. `None` is exactly
+    /// [`Self::observe`].
+    pub(crate) fn observe_with_floor(
+        &mut self,
+        smooth: Duration,
+        floor_override: Option<Duration>,
+        jitter: GateJitter,
+        loss_event_rate: Option<f64>,
+        now: Instant,
+        control_rtt: Duration,
+    ) -> QueueGrowthObservation {
         // The floor is deliberately fed by smoothed RTT.  The raw-min variant
         // measured worse; the separate RTT-variance terms protect jitter.
-        let floor = self.floor.update(now, smooth);
+        let own_floor = self.floor.update(now, smooth);
+        // The cross-lane floor is taken while the sibling lane's offered rate
+        // is near zero, so it is at most an upper bound the true propagation
+        // floor; this flow's own windowed minimum can only be inflated by its
+        // own queue, so the tighter of the two is the better baseline. This
+        // does not subtract the sibling's queue delay (both lanes see the same
+        // physical queue), it only replaces a floor this flow's queue inflated.
+        let floor = floor_override.map_or(own_floor, |shared| own_floor.min(shared));
         // A gap in observations voids the continuity of every timer this
         // controller owns -- the persistent-queue timer and the gentle
         // drain episode -- in one step, so neither can count a quiet stretch
@@ -1150,6 +1177,41 @@ mod tests {
             again.persistent_for,
             Some(Duration::ZERO),
             "the new excursion must start its own stretch, not resume the old one"
+        );
+    }
+
+    /// R3: an attributed cross-lane floor replaces this flow's own floor when it
+    /// is tighter, and a `None` override is exactly the own floor.  This is the
+    /// mechanism that un-poisons the gate: the sibling lane measures a
+    /// queue-free baseline while this flow's own windowed minimum is inflated by
+    /// the queue it is building.
+    #[test]
+    fn an_attributed_floor_replaces_a_higher_own_floor() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let jitter = GateJitter::uniform(Duration::from_millis(1));
+        let own = Duration::from_millis(200);
+        let shared = Duration::from_millis(50);
+
+        let mut unoverridden = QueueGrowth::new(t0, false);
+        let obs = unoverridden.observe_with_floor(own, None, jitter, None, t0, control_rtt);
+        assert_eq!(
+            obs.floor, own,
+            "without an override the windowed own floor stands"
+        );
+
+        let mut overridden = QueueGrowth::new(t0, false);
+        let obs = overridden.observe_with_floor(own, Some(shared), jitter, None, t0, control_rtt);
+        assert_eq!(
+            obs.floor, shared,
+            "a tighter cross-lane floor must replace the own floor"
+        );
+        // The own floor is the tighter of the two: the override cannot raise it.
+        let mut own_tighter = QueueGrowth::new(t0, false);
+        let obs = own_tighter.observe_with_floor(shared, Some(own), jitter, None, t0, control_rtt);
+        assert_eq!(
+            obs.floor, shared,
+            "an override looser than the own floor must not raise it"
         );
     }
 }

@@ -11,7 +11,8 @@ mod spare_capacity;
 
 pub(crate) use bandwidth_probe::{ORDINARY_PROBE_MAX_GAIN, OrdinaryBandwidthProbe, ProbeIncrease};
 pub(crate) use congestion_response::{
-    CongestionDecision, CongestionInput, CongestionResponse, ProbeKind, linear_backoff_step,
+    CongestionDecision, CongestionInput, CongestionResponse, ProbeKind, SharedPath,
+    linear_backoff_step,
 };
 pub(crate) use fast_start::{FastStartEpisode, FastStartStep};
 pub(crate) use gentle::GentleExitCause;

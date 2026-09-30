@@ -37,7 +37,8 @@ use crate::{
     traffic_shaping::core::fast_start::should_exit_slow_start,
     traffic_shaping::core::{
         CongestionDecision, CongestionInput, CongestionResponse, FastStartEpisode, FastStartStep,
-        GentleExitCause, ProbeKind, SendPacer, linear_backoff_step, settle_computed_rate,
+        GentleExitCause, ProbeKind, SendPacer, SharedPath, linear_backoff_step,
+        settle_computed_rate,
     },
     traffic_shaping::recovery::pkt_send_space::{
         CWND_BDP_CAP_ENGAGE_RTT_FACTOR, CWND_BDP_CAP_SCALE, CWND_SEND_RATE_SCALE, INIT_CWND,
@@ -1141,8 +1142,29 @@ impl ReliableLayer {
             &self.pkt_send_space,
             self.congestion_response.reorder_tolerant(),
         );
-        let observation = self.congestion_response.observe(
+        // The cross-lane CC link has three observables: the path-shared signal
+        // (the existing loss-gate input), the offer clock (the stand-off's
+        // activity witness), and the aggregated payload the interactive lane
+        // publishes on every RTT sample.  The payload is dated by the
+        // publisher's own control RTT; `CcSignal::state` has already dropped
+        // every stale lane, so `None` here means "no fresh cross-lane evidence"
+        // and the payload-gated rules are skipped.
+        let (shared_path, standoff_armed, interactive_quiet, path_state) =
+            match self.shared_congestion.as_ref() {
+                Some(signal) => (
+                    signal.is_shared(),
+                    signal.standoff_enabled(),
+                    signal.offered_quiet_for(),
+                    signal.state(),
+                ),
+                None => (false, false, None, None),
+            };
+        // R3: the attributed floor.  The fresh cross-lane floor replaces this
+        // flow's own queue-inflated floor in the queue gate.
+        let floor_override = path_state.and_then(|state| state.floor);
+        let observation = self.congestion_response.observe_with_floor(
             smooth,
+            floor_override,
             gate_jitter,
             loss_event_rate,
             sr.delivery_rate(),
@@ -1188,23 +1210,10 @@ impl ReliableLayer {
             }
         }
         let current = self.send_rate.get();
-        // The cross-lane CC link has two observables: whether the path is
-        // currently shared (the existing loss-gate signal), and how long our
-        // interactive lane has gone without an *application offer* (the bulk
-        // stand-off's clock).  The offer clock is deliberately not the
-        // `RttSample` clock: a queued lane's samples stop, and gating on them
-        // made the bulk compete with the lane it stands off for.  The stand-off
-        // is armed only when a hub that runs it is attached, so the shipped
-        // policy is unchanged for a hub that is disarmed for an A/B.
-        let (shared_path, standoff_armed, interactive_quiet) = match self.shared_congestion.as_ref()
-        {
-            Some(signal) => (
-                signal.is_shared(),
-                signal.standoff_enabled(),
-                signal.offered_quiet_for(),
-            ),
-            None => (false, false, None),
-        };
+        // The aggregated payload: `None` when no lane published fresh
+        // evidence, so every payload-gated rule is skipped and the decision is
+        // the shipped policy byte-for-byte.
+        let payload = path_state.map(|state| SharedPath::from_state(&state));
         let outcome = self.congestion_response.decide(
             observation,
             CongestionInput {
@@ -1219,6 +1228,7 @@ impl ReliableLayer {
                 shared_path,
                 standoff_armed,
                 interactive_quiet,
+                payload,
                 now,
             },
         );

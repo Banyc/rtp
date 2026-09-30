@@ -12,19 +12,22 @@ use super::{OrdinaryBandwidthProbe, ProbeIncrease, QueueGrowth, WindowedDelivery
 use crate::traffic_shaping::recovery::reorder_tolerance::cap_probe_target;
 use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
 use decision::{ResponsePath, select_path};
-use lane::{CongestionLane, peak_scaled_probe_base};
+use lane::{CongestionLane, GENTLE_DRAIN_FRAC, peak_scaled_probe_base};
 use loss_backoff::{LossBackoff, LossBackoffInput};
 use queue_response::{DrainInput, QueueResponse};
+use shared_path::{claim_armed, reclaim_armed};
 
 mod decision;
 pub(crate) mod lane;
 mod loss_backoff;
 mod queue_response;
+mod shared_path;
 
 pub(crate) use decision::{CongestionDecision, CongestionOutcome, ProbeKind};
 pub(crate) use loss_backoff::linear_backoff_step;
 #[cfg(test)]
 pub(crate) use queue_response::DRAIN_FLOOR_PEAK_FRACTION;
+pub(crate) use shared_path::SharedPath;
 
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 
@@ -188,10 +191,17 @@ impl Standoff {
             self.hold_until = None;
             return None;
         }
+        // R1: a fresh payload gates the quiet-window claim on the interactive
+        // lane's *genuine* idleness, and a significant loss sample vetoes the
+        // claim. With no payload the gate is the offer clock alone, exactly as
+        // shipped.
+        let claim_permitted = input
+            .payload
+            .is_none_or(|shared| claim_armed(&shared, input.loss_event_rate));
         let quiet_for = input
             .interactive_quiet
             .unwrap_or_else(|| input.now.saturating_duration_since(self.started));
-        if quiet_for >= crate::cc::STANDOFF_WINDOW {
+        if quiet_for >= crate::cc::STANDOFF_WINDOW && claim_permitted {
             self.hold_until = None;
             self.competing = true;
             return Some(self.decrease.outcome(probe, input));
@@ -273,6 +283,12 @@ pub(crate) struct CongestionInput {
     /// gap when the lane's packets queue.  A connection with no CC link carries
     /// `None` and never consults it.
     pub(crate) interactive_quiet: Option<Duration>,
+    /// The aggregated cross-lane payload for this path, or `None` when no live
+    /// interactive lane published a fresh one.  `None` (no CC link, no
+    /// interactive lane, or a stale payload) leaves every payload-gated rule
+    /// skipped, so the decision is byte-for-byte the shipped policy.  A stale
+    /// payload is *absent*, never read as zero or as "unchanged".
+    pub(crate) payload: Option<SharedPath>,
 }
 
 /// Single atomic owner of the congestion-response policy state.
@@ -354,6 +370,10 @@ impl CongestionResponse {
         self.delivery_peak.peek()
     }
 
+    /// The no-override observation, used by tests and by callers with no
+    /// cross-lane floor to attribute. Production goes through
+    /// [`Self::observe_with_floor`].
+    #[cfg(test)]
     pub(crate) fn observe(
         &mut self,
         smooth_rtt: Duration,
@@ -363,10 +383,40 @@ impl CongestionResponse {
         now: Instant,
         control_rtt: Duration,
     ) -> CongestionObservation {
+        self.observe_with_floor(
+            smooth_rtt,
+            None,
+            jitter,
+            loss_event_rate,
+            delivery_rate,
+            now,
+            control_rtt,
+        )
+    }
+
+    /// Observe with R3's attributed floor: a fresh cross-lane floor replaces
+    /// this flow's own queue-poisoned floor in the queue gate. `None` is exactly
+    /// [`Self::observe`].
+    #[allow(clippy::too_many_arguments)] // the gate's full observation plus one attributed floor
+    pub(crate) fn observe_with_floor(
+        &mut self,
+        smooth_rtt: Duration,
+        floor_override: Option<Duration>,
+        jitter: GateJitter,
+        loss_event_rate: Option<f64>,
+        delivery_rate: f64,
+        now: Instant,
+        control_rtt: Duration,
+    ) -> CongestionObservation {
         let peak_delivery = self.delivery_peak.update(now, delivery_rate);
-        let queue =
-            self.queue_growth
-                .observe(smooth_rtt, jitter, loss_event_rate, now, control_rtt);
+        let queue = self.queue_growth.observe_with_floor(
+            smooth_rtt,
+            floor_override,
+            jitter,
+            loss_event_rate,
+            now,
+            control_rtt,
+        );
         CongestionObservation {
             floor: queue.floor,
             tolerance: queue.tolerance,
@@ -412,12 +462,21 @@ impl CongestionResponse {
         // decision, at its own RTT-sample cadence — the only cross-connection
         // fact needed is that the path is shared.
         let loss_blocks_delay_control = observation.loss_blocks_delay_control && !input.shared_path;
-        let path = select_path(
-            observation.queue_building,
-            observation.persistent_for.is_some(),
-            loss_blocks_delay_control,
-            shared_app_limited,
-        );
+        // R2: a fresh payload whose interactive lane has armed its own drain
+        // gate means the queue on this path belongs to this lane; force the
+        // delay path and drain at the shared lane's deeper fraction. Guarded by
+        // `input.payload`, so a connection with no payload is unchanged.
+        let reclaiming = input.payload.is_some_and(|shared| reclaim_armed(&shared));
+        let path = if reclaiming {
+            ResponsePath::Drain
+        } else {
+            select_path(
+                observation.queue_building,
+                observation.persistent_for.is_some(),
+                loss_blocks_delay_control,
+                shared_app_limited,
+            )
+        };
         if path != ResponsePath::Probe {
             self.queue_growth.clear_gate_open();
         }
@@ -461,9 +520,14 @@ impl CongestionResponse {
                 CongestionOutcome::new(CongestionDecision::Hold, None, gentle_exit)
             }
             ResponsePath::Drain => {
+                let drain_fraction = if reclaiming {
+                    GENTLE_DRAIN_FRAC
+                } else {
+                    self.queue_growth.drain_frac()
+                };
                 let decision = self.queue_response.decide_drain(DrainInput {
                     delivery_rate: input.delivery_rate,
-                    drain_fraction: self.queue_growth.drain_frac(),
+                    drain_fraction,
                     peak_delivery: observation.peak_delivery,
                     current_rate: input.current_rate,
                     minimum_rate: input.minimum_rate,
@@ -627,8 +691,8 @@ mod tests {
     use std::time::Instant;
 
     use super::lane::{
-        DRAIN_RATE_FRACTION, GENTLE_DRAIN_FRAC, SHARED_ADDITIVE_PROBE_REFERENCE_RTT,
-        SHARED_ADDITIVE_PROBE_STEP, additive_probe_step,
+        DRAIN_RATE_FRACTION, SHARED_ADDITIVE_PROBE_REFERENCE_RTT, SHARED_ADDITIVE_PROBE_STEP,
+        additive_probe_step,
     };
     use super::*;
     use crate::traffic_shaping::recovery::rtt_stats::GateJitter;
@@ -730,6 +794,7 @@ mod tests {
             shared_path: false,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now,
         };
         let dedicated_out = dedicated.decide(dedicated_obs, input(enter_at));
@@ -824,6 +889,7 @@ mod tests {
             shared_path: false,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now: probe_at,
         };
         let CongestionDecision::Probe {
@@ -879,6 +945,7 @@ mod tests {
             shared_path: false,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now,
         };
 
@@ -1017,6 +1084,7 @@ mod tests {
             shared_path: false,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now: t0,
         };
         let mut stock = CongestionResponse::new(t0, false, CongestionLane::Shared);
@@ -1077,6 +1145,7 @@ mod tests {
             shared_path: false,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now,
         };
 
@@ -1128,6 +1197,7 @@ mod tests {
             shared_path: false,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now,
         };
         let jitter = GateJitter::uniform(Duration::from_millis(1));
@@ -1235,6 +1305,7 @@ mod tests {
             shared_path,
             standoff_armed,
             interactive_quiet: quiet,
+            payload: None,
             now,
         };
         let quiet = crate::cc::STANDOFF_WINDOW + Duration::from_millis(1);
@@ -1354,6 +1425,7 @@ mod tests {
             shared_path,
             standoff_armed: false,
             interactive_quiet: None,
+            payload: None,
             now,
         };
         let mut own = CongestionResponse::new(now, false, CongestionLane::Shared);
@@ -1371,6 +1443,138 @@ mod tests {
                 CongestionDecision::Drain { .. }
             ),
             "on a shared path the connection's own standing queue must drain despite loss"
+        );
+    }
+
+    /// The absent-payload path is the shipped policy.  A controller with no
+    /// fresh cross-lane payload decides exactly as one whose payload is the
+    /// *neutral* element (an idle lane, no latch, no floor), so the guard -- not
+    /// the rule -- is what keeps the absent case unchanged.  A non-neutral
+    /// payload does change the decision, proving the rule is live and the
+    /// equivalence above is not an unguarded no-op.
+    #[test]
+    fn the_absent_payload_path_is_the_shipped_policy() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let quiet = crate::cc::STANDOFF_WINDOW + Duration::from_millis(1);
+        // The bulk's own queue is persistent, so the shipped policy's fallback
+        // is `Drain`; the stand-off would instead claim with a `Probe`.
+        let observation = CongestionObservation {
+            floor: control_rtt,
+            tolerance: Duration::from_millis(10),
+            queue_building: true,
+            persistent_for: Some(Duration::from_millis(200)),
+            peak_delivery: 1000.0,
+            loss_blocks_delay_control: false,
+            gentle_exit: None,
+        };
+        let input = |payload| CongestionInput {
+            delivery_rate: 1000.0,
+            current_rate: 1000.0,
+            smooth_rtt: Duration::from_millis(100),
+            control_rtt,
+            loss_event_rate: Some(0.0),
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            shared_path: true,
+            standoff_armed: true,
+            interactive_quiet: Some(quiet),
+            payload,
+            now: t0,
+        };
+        let neutral = SharedPath {
+            pending_bytes: 0,
+            write_waiters: 0,
+            offered_pps: 0.0,
+            control_rtt: Some(control_rtt),
+            reclaiming: false,
+            floor: None,
+            tolerance: None,
+            queue_delay: None,
+        };
+        let absent = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
+            .decide(observation, input(None))
+            .decision();
+        let neutral_out = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
+            .decide(observation, input(Some(neutral)))
+            .decision();
+        assert_eq!(
+            absent, neutral_out,
+            "the absent payload must decide as the neutral payload"
+        );
+        // A busy lane blocks the claim the absent payload permits, so the
+        // absent case is a real fallback and not one arm of an unguarded rule.
+        let mut busy = neutral;
+        busy.pending_bytes = 1;
+        let busy_out = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
+            .decide(observation, input(Some(busy)))
+            .decision();
+        assert_ne!(
+            absent, busy_out,
+            "a busy payload must block the claim the absent payload permits"
+        );
+        assert!(
+            matches!(busy_out, CongestionDecision::Drain { .. }),
+            "with the claim blocked the shipped delay-first policy must run: {busy_out:?}"
+        );
+    }
+
+    /// R2: the interactive lane's own latch forces the bulk's reclaim drain
+    /// even when the bulk's own queue is not persistent, and it uses the shared
+    /// lane's deeper `GENTLE_DRAIN_FRAC`; without the payload the shipped probe
+    /// runs instead.
+    #[test]
+    fn a_latched_interactive_lane_forces_the_bulk_reclaim_drain() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let observation = CongestionObservation {
+            floor: control_rtt,
+            tolerance: Duration::from_millis(10),
+            queue_building: false,
+            persistent_for: None,
+            peak_delivery: 1000.0,
+            loss_blocks_delay_control: false,
+            gentle_exit: None,
+        };
+        let input = |payload| CongestionInput {
+            delivery_rate: 1000.0,
+            current_rate: 1000.0,
+            smooth_rtt: Duration::from_millis(100),
+            control_rtt,
+            loss_event_rate: Some(0.0),
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            shared_path: true,
+            standoff_armed: false,
+            interactive_quiet: None,
+            payload,
+            now: t0,
+        };
+        let latched = SharedPath {
+            pending_bytes: 0,
+            write_waiters: 0,
+            offered_pps: 0.0,
+            control_rtt: Some(control_rtt),
+            reclaiming: true,
+            floor: Some(control_rtt),
+            tolerance: Some(Duration::from_millis(10)),
+            queue_delay: Some(Duration::from_millis(3)),
+        };
+        let reclaimed = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
+            .decide(observation, input(Some(latched)))
+            .decision();
+        let CongestionDecision::Drain { target, .. } = reclaimed else {
+            panic!("the interactive lane's latch must force a reclaim drain: {reclaimed:?}");
+        };
+        assert_eq!(target, 1000.0 * GENTLE_DRAIN_FRAC);
+        let absent = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
+            .decide(observation, input(None))
+            .decision();
+        assert!(
+            matches!(absent, CongestionDecision::Probe { .. }),
+            "without the payload the bulk's own (empty) queue must probe: {absent:?}"
         );
     }
 }
