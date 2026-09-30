@@ -28,35 +28,51 @@ pub(crate) use queue_response::DRAIN_FLOOR_PEAK_FRACTION;
 
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 
-/// Multiplicative-decrease factor of the test-only AIMD reference law: any
-/// sampled loss halves the current send rate.  The reference is an instrument
-/// (a loss-based competitor to contrast the production delay-first bulk lane
-/// against), never a production policy.
-const REFERENCE_AIMD_DECREASE_FACTOR: f64 = 0.5;
+/// Multiplicative-decrease factor of the AIMD law: any sampled loss halves
+/// the current send rate.  One authority for the test-only AIMD reference law
+/// and the bulk lane's stand-off competing response, so the two cannot drift.
+const AIMD_DECREASE_FACTOR: f64 = 0.5;
 
 /// Minimum control-RTT interval between two multiplicative decreases of the
-/// test-only AIMD reference law.
+/// AIMD law.
 ///
 /// The sampled loss rate is *windowed*, so one loss event keeps it non-zero
 /// for up to two control RTTs; a trigger that fired on every rate sample while
 /// the window is non-zero halved the rate dozens of times per event and pinned
 /// the reference at its floor (measured: two identical references together
 /// delivered 61 % of a shared bottleneck's capacity).  TCP halves about once
-/// per loss event — roughly one event per RTT at steady state — so the
-/// reference mirrors that cadence instead.
-const REFERENCE_AIMD_DECREASE_COOLDOWN_RTTS: u32 = 1;
+/// per loss event — roughly one event per RTT at steady state — so both the
+/// reference and the stand-off competing response mirror that cadence.
+const AIMD_DECREASE_COOLDOWN_RTTS: u32 = 1;
 
-/// State of the test-only AIMD reference law: whether the law is selected, and
-/// when it last applied its multiplicative decrease.  Kept local to the
-/// reference branch so the production delay/loss policy owns no reference
-/// state and its path stays byte-identical.
+/// Fraction of its own send rate the bulk lane drains toward while it stands
+/// off after the interactive lane resumes.  Half the competing rate is below
+/// the bottleneck's serialization rate (so the queue the bulk filled drains
+/// instead of standing) while still leaving the lane a live probe rather than
+/// yielding the link outright, which would cost M3 goodput on every resume.
+const STANDOFF_HOLD_RATE_FRACTION: f64 = 0.5;
+
+/// How long the bulk lane drains below its competing rate after the
+/// interactive lane resumes.
+///
+/// The transition is the mechanism's whole risk: without a hold, the first
+/// interactive packets after a pause queue behind the standing queue the bulk
+/// built while competing, and the tail spikes.  One control RTT is the latency
+/// floor; the drop-tail bottleneck the harness models drains its 128 KiB buffer
+/// at 1 MiB/s in ~128 ms, so 300 ms clears a full queue with margin for one
+/// scheduling RTT before the lane returns to the delay-first policy.
+const STANDOFF_HOLD: Duration = Duration::from_millis(300);
+
+/// One additive-increase / multiplicative-decrease law: an absolute additive
+/// increase per control RTT with a multiplicative decrease on a sampled loss.
+/// Shared by the test-only AIMD reference and the bulk stand-off competing
+/// response so their decrease cadence cannot drift.
 #[derive(Debug, Default)]
-struct ReferenceAimd {
-    enabled: bool,
+struct AimdDecrease {
     last_decrease_at: Option<Instant>,
 }
 
-impl ReferenceAimd {
+impl AimdDecrease {
     /// Whether a rate sample must apply the multiplicative decrease now: loss
     /// is present in the windowed sample and at least one control RTT has
     /// elapsed since the last decrease.  A `None` windowed rate (too few
@@ -70,10 +86,144 @@ impl ReferenceAimd {
         if !loss_event_rate.is_some_and(|loss| loss > 0.0) {
             return false;
         }
-        let cooldown = control_rtt * REFERENCE_AIMD_DECREASE_COOLDOWN_RTTS;
+        let cooldown = control_rtt * AIMD_DECREASE_COOLDOWN_RTTS;
         self.last_decrease_at
             .is_none_or(|last| now.saturating_duration_since(last) >= cooldown)
     }
+
+    /// One AIMD decision: a multiplicative decrease on a sampled loss (paced to
+    /// at most one per control RTT), otherwise the absolute additive increase.
+    /// The additive step is the shared lane's [`lane::additive_probe_step`] —
+    /// an absolute rate, independent of this flow's current share — so two RTP
+    /// flows contending for one bottleneck converge to equal rates.  The
+    /// decisions reuse the ordinary probe/backoff channels, so the sender
+    /// applies them exactly as it applies production delay-first ones.
+    fn outcome(
+        &mut self,
+        probe: &mut OrdinaryBandwidthProbe,
+        input: CongestionInput,
+    ) -> CongestionOutcome {
+        if self.decrease_due(input.loss_event_rate, input.now, input.control_rtt) {
+            self.last_decrease_at = Some(input.now);
+            let target = (input.current_rate * AIMD_DECREASE_FACTOR).max(input.minimum_rate);
+            return CongestionOutcome::new(
+                CongestionDecision::LossBackoff {
+                    raw: target,
+                    floor: target,
+                    target,
+                },
+                None,
+                None,
+            );
+        }
+        let step = lane::additive_probe_step(input.control_rtt);
+        let target =
+            probe.aimd_additive_target(input.current_rate, step, input.control_rtt, input.now);
+        CongestionOutcome::new(
+            CongestionDecision::Probe { target },
+            Some(ProbeKind::Bandwidth),
+            None,
+        )
+    }
+}
+
+/// The bulk lane's interactive stand-off: compete with an external loss-based
+/// flow only while the interactive lane has been quiet for at least
+/// [`crate::cc::STANDOFF_WINDOW`], and drain below the competing rate for
+/// [`STANDOFF_HOLD`] whenever it resumes.
+///
+/// The gate is the *interactive lane's activity*, not sampled loss: with the
+/// lane quiet, loss is either a competitor's signal or the bulk's own queue and
+/// competing is the right answer either way; with the lane active, the shipped
+/// delay-first policy yields and the hold clears the queue the competing
+/// episode built.  When no CC link is attached the whole mechanism is inert and
+/// the connection's policy is byte-identical to the delay-first one.
+#[derive(Debug)]
+struct Standoff {
+    /// The controller's creation (or last reset) time, used as the quiet
+    /// clock's origin when no interactive lane has ever published on the path.
+    started: Instant,
+    /// Whether the lane is in the quiet-window competing episode.
+    competing: bool,
+    /// When the interactive lane resumed while competing; the drain hold runs
+    /// until this plus [`STANDOFF_HOLD`].
+    hold_until: Option<Instant>,
+    decrease: AimdDecrease,
+}
+
+impl Standoff {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            competing: false,
+            hold_until: None,
+            decrease: AimdDecrease::default(),
+        }
+    }
+
+    fn reset(&mut self, now: Instant) {
+        *self = Self::new(now);
+    }
+
+    /// One stand-off decision, or `None` to let the shipped delay-first policy
+    /// decide.  The gate is `quiet_for >= STANDOFF_WINDOW`, where `quiet_for`
+    /// is clamped to zero while `shared_path` holds, so an active lane never
+    /// competes and a window of zero competes unconditionally (the vacuity
+    /// probe).  The hold is checked before the gate resumes competing, so a
+    /// resuming lane's buffer is drained even if the lane has gone quiet again.
+    fn decide(
+        &mut self,
+        probe: &mut OrdinaryBandwidthProbe,
+        input: CongestionInput,
+    ) -> Option<CongestionOutcome> {
+        if !input.standoff_armed {
+            self.competing = false;
+            self.hold_until = None;
+            return None;
+        }
+        let quiet_for = if input.shared_path {
+            Duration::ZERO
+        } else {
+            input
+                .interactive_quiet
+                .unwrap_or_else(|| input.now.saturating_duration_since(self.started))
+        };
+        if quiet_for >= crate::cc::STANDOFF_WINDOW {
+            self.hold_until = None;
+            self.competing = true;
+            return Some(self.decrease.outcome(probe, input));
+        }
+        if self.competing {
+            self.competing = false;
+            self.hold_until = Some(input.now + STANDOFF_HOLD);
+        }
+        if let Some(until) = self.hold_until {
+            if input.now < until {
+                let target =
+                    (input.current_rate * STANDOFF_HOLD_RATE_FRACTION).max(input.minimum_rate);
+                return Some(CongestionOutcome::new(
+                    CongestionDecision::Drain {
+                        floor: input.minimum_rate,
+                        target,
+                    },
+                    None,
+                    None,
+                ));
+            }
+            self.hold_until = None;
+        }
+        None
+    }
+}
+
+/// State of the test-only AIMD reference law: whether the law is selected, and
+/// the shared AIMD decrease state.  Kept local to the reference branch so the
+/// production delay/loss policy owns no reference state and its path stays
+/// byte-identical.
+#[derive(Debug, Default)]
+struct ReferenceAimd {
+    enabled: bool,
+    decrease: AimdDecrease,
 }
 
 /// What the controller observed about the path during one sample.
@@ -108,6 +258,16 @@ pub(crate) struct CongestionInput {
     /// egress path's path signal). On a shared path this connection's own delay gate
     /// is authoritative and loss does not suppress it.
     pub(crate) shared_path: bool,
+    /// Whether this connection's bulk interactive stand-off is armed: a
+    /// cross-lane CC link is attached *and* the hub runs the stand-off (a
+    /// test-only hub can disarm it).  When `false` the stand-off is inert and
+    /// the connection keeps the pure delay-first policy byte-for-byte.
+    pub(crate) standoff_armed: bool,
+    /// How long the path's interactive lane has been quiet, or `None` when no
+    /// interactive lane has ever published on it (see
+    /// [`crate::cc::CcSignal::quiet_for`]).  A connection with no CC link
+    /// carries `None` and never consults it.
+    pub(crate) interactive_quiet: Option<Duration>,
 }
 
 /// Single atomic owner of the congestion-response policy state.
@@ -125,6 +285,10 @@ pub(crate) struct CongestionResponse {
     /// cross-traffic-protecting tuning.  Declared by the owner (e.g. `rtp_mux`'s
     /// lane class), never inferred from the delivery mode.
     lane: CongestionLane,
+    /// The bulk lane's interactive stand-off.  Inert when no CC link is
+    /// attached; for a bulk (`Dedicated`) lane with a link it competes while
+    /// the interactive lane is quiet and drains when it resumes.
+    standoff: Standoff,
     /// Test-only AIMD reference law state (never selected in production): when
     /// enabled [`Self::decide`] returns the reference's additive-increase /
     /// multiplicative-decrease decision instead of the production delay/loss
@@ -145,6 +309,7 @@ impl CongestionResponse {
             queue_response: QueueResponse::default(),
             loss_backoff: LossBackoff::default(),
             lane,
+            standoff: Standoff::new(now),
             reference_aimd: ReferenceAimd::default(),
         }
     }
@@ -162,7 +327,8 @@ impl CongestionResponse {
         self.bandwidth_probe.reset();
         self.queue_response.reset();
         self.loss_backoff.reset();
-        self.reference_aimd.last_decrease_at = None;
+        self.standoff.reset(now);
+        self.reference_aimd.decrease = AimdDecrease::default();
         gentle_exit
     }
 
@@ -215,6 +381,19 @@ impl CongestionResponse {
     ) -> CongestionOutcome {
         if self.reference_aimd.enabled {
             return self.reference_aimd_outcome(input);
+        }
+        // The bulk (`Dedicated`) lane stands off for our own interactive lane:
+        // while that lane has been quiet past the stand-off window it competes
+        // with an external loss-based flow on TCP's terms, and when the lane
+        // resumes it drains below the competing rate so the queue it built is
+        // cleared before the interactive packets traverse it.  Inert without a
+        // CC link, so a connection that never joined a path keeps the pure
+        // delay-first policy.  An active or within-window sample falls through
+        // to that shipped policy.
+        if self.lane.stands_off_for_interactive() {
+            if let Some(outcome) = self.standoff.decide(&mut self.bandwidth_probe, input) {
+                return outcome;
+            }
         }
         // An application-limited sample can only be *another* flow's queue on
         // a shared lane: a dedicated lane has no competing traffic over its
@@ -315,42 +494,16 @@ impl CongestionResponse {
 
     /// The test-only AIMD reference law: an absolute additive increase while
     /// no loss is sampled, and a multiplicative decrease once per loss event
-    /// (at most one decrease per control RTT, `REFERENCE_AIMD_DECREASE_COOLDOWN_RTTS`).
+    /// (at most one decrease per control RTT, `AIMD_DECREASE_COOLDOWN_RTTS`).
     /// It replaces the delay/loss policy wholesale (the law is never selected
     /// in production).  The decisions reuse the ordinary probe/backoff
     /// channels, so the sender applies them exactly as it applies production
     /// ones: a `Probe` smooths toward the additive target, a `LossBackoff`
     /// steps the send rate down toward the halved target.
     fn reference_aimd_outcome(&mut self, input: CongestionInput) -> CongestionOutcome {
-        if self
-            .reference_aimd
-            .decrease_due(input.loss_event_rate, input.now, input.control_rtt)
-        {
-            self.reference_aimd.last_decrease_at = Some(input.now);
-            let target =
-                (input.current_rate * REFERENCE_AIMD_DECREASE_FACTOR).max(input.minimum_rate);
-            return CongestionOutcome::new(
-                CongestionDecision::LossBackoff {
-                    raw: target,
-                    floor: target,
-                    target,
-                },
-                None,
-                None,
-            );
-        }
-        let step = lane::additive_probe_step(input.control_rtt);
-        let target = self.bandwidth_probe.reference_additive_target(
-            input.current_rate,
-            step,
-            input.control_rtt,
-            input.now,
-        );
-        CongestionOutcome::new(
-            CongestionDecision::Probe { target },
-            Some(ProbeKind::Bandwidth),
-            None,
-        )
+        self.reference_aimd
+            .decrease
+            .outcome(&mut self.bandwidth_probe, input)
     }
 
     /// Bound a probe target on the reorder-tolerant lane.
@@ -570,6 +723,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path: false,
+            standoff_armed: false,
+            interactive_quiet: None,
             now,
         };
         let dedicated_out = dedicated.decide(dedicated_obs, input(enter_at));
@@ -662,6 +817,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path: false,
+            standoff_armed: false,
+            interactive_quiet: None,
             now: probe_at,
         };
         let CongestionDecision::Probe {
@@ -715,6 +872,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path: false,
+            standoff_armed: false,
+            interactive_quiet: None,
             now,
         };
 
@@ -851,6 +1010,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path: false,
+            standoff_armed: false,
+            interactive_quiet: None,
             now: t0,
         };
         let mut stock = CongestionResponse::new(t0, false, CongestionLane::Shared);
@@ -909,6 +1070,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path: false,
+            standoff_armed: false,
+            interactive_quiet: None,
             now,
         };
 
@@ -958,6 +1121,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path: false,
+            standoff_armed: false,
+            interactive_quiet: None,
             now,
         };
         let jitter = GateJitter::uniform(Duration::from_millis(1));
@@ -1031,6 +1196,123 @@ mod tests {
         assert_eq!(target, current * 0.5);
     }
 
+    /// The bulk stand-off's gate, state machine, and inertness.  A `Dedicated`
+    /// lane with a CC link competes only while the interactive lane has been
+    /// quiet past [`crate::cc::STANDOFF_WINDOW`]; while the lane is active it
+    /// drains (the shipped policy), and the transition from competing back to
+    /// active holds the rate below the competing rate for `STANDOFF_HOLD`.  A
+    /// connection with no CC link never leaves the shipped path, so this
+    /// mechanism is inert for every caller that never joined a path.
+    #[test]
+    fn bulk_standoff_competes_only_while_the_interactive_lane_is_quiet() {
+        let t0 = Instant::now();
+        let control_rtt = Duration::from_millis(100);
+        let observation = CongestionObservation {
+            floor: control_rtt,
+            tolerance: Duration::from_millis(10),
+            queue_building: true,
+            persistent_for: Some(Duration::from_millis(200)),
+            peak_delivery: 1000.0,
+            loss_blocks_delay_control: true,
+            gentle_exit: None,
+        };
+        let input = |now, shared_path, quiet: Option<Duration>, standoff_armed| CongestionInput {
+            delivery_rate: 1000.0,
+            current_rate: 1000.0,
+            smooth_rtt: Duration::from_millis(300),
+            control_rtt,
+            loss_event_rate: Some(0.0),
+            app_limited: false,
+            minimum_rate: 1.0,
+            initial_rate: 128.0,
+            shared_path,
+            standoff_armed,
+            interactive_quiet: quiet,
+            now,
+        };
+        let quiet = crate::cc::STANDOFF_WINDOW + Duration::from_millis(1);
+
+        // No CC link: the same standing queue with loss takes the shipped
+        // loss backoff, never a competing additive probe.
+        let mut no_link = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        assert!(
+            matches!(
+                no_link
+                    .decide(observation, input(t0, false, None, false))
+                    .decision(),
+                CongestionDecision::LossBackoff { .. }
+            ),
+            "without a CC link the stand-off must be inert"
+        );
+
+        // A live interactive lane: still the shipped drain, and a forced-true
+        // `shared_path` with an otherwise-quiet clock must not compete either
+        // (the vacuity probe at the unit level).
+        let mut active = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        assert!(
+            matches!(
+                active
+                    .decide(observation, input(t0, true, Some(Duration::ZERO), true))
+                    .decision(),
+                CongestionDecision::Drain { .. }
+            ),
+            "an active interactive lane must keep the shipped drain"
+        );
+        let mut forced_shared = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        assert!(
+            matches!(
+                forced_shared
+                    .decide(observation, input(t0, true, Some(quiet * 10), true))
+                    .decision(),
+                CongestionDecision::Drain { .. }
+            ),
+            "a shared path must clamp the quiet clock to zero so an active lane never competes"
+        );
+
+        // Quiet past the window with a link: compete additively.
+        let mut competing = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        let CongestionDecision::Probe { target } = competing
+            .decide(observation, input(t0, false, Some(quiet), true))
+            .decision()
+        else {
+            panic!("a quiet interactive lane must let the bulk lane compete");
+        };
+        assert_eq!(target, 1000.0 + additive_probe_step(control_rtt));
+
+        // The lane resumes: the bulk must hold below its competing rate, not
+        // fall straight back into the shipped policy at full rate.
+        let resumed = t0 + Duration::from_millis(50);
+        let CongestionDecision::Drain { target, .. } = competing
+            .decide(
+                observation,
+                input(resumed, true, Some(Duration::ZERO), true),
+            )
+            .decision()
+        else {
+            panic!("a resuming interactive lane must trigger the hold drain");
+        };
+        assert_eq!(
+            target,
+            1000.0 * STANDOFF_HOLD_RATE_FRACTION,
+            "the hold must drain well below the competing rate"
+        );
+
+        // The hold expires: the shipped delay-first policy resumes.
+        let settled = resumed + STANDOFF_HOLD + Duration::from_millis(1);
+        assert!(
+            matches!(
+                competing
+                    .decide(
+                        observation,
+                        input(settled, true, Some(Duration::ZERO), true)
+                    )
+                    .decision(),
+                CongestionDecision::Drain { .. }
+            ),
+            "after the hold the shipped delay-first policy must run"
+        );
+    }
+
     /// On a path shared with an interactive lane, this connection's *own*
     /// standing queue must drive the delay drain even when loss-based control
     /// would otherwise win.
@@ -1059,6 +1341,8 @@ mod tests {
             minimum_rate: 1.0,
             initial_rate: 128.0,
             shared_path,
+            standoff_armed: false,
+            interactive_quiet: None,
             now,
         };
         let mut own = CongestionResponse::new(now, false, CongestionLane::Shared);

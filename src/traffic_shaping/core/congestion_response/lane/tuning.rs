@@ -123,6 +123,17 @@ impl CongestionLane {
         app_limited && matches!(self, Self::Shared)
     }
 
+    /// Whether this lane runs the interactive stand-off: compete with an
+    /// external loss-based flow while our own interactive lane is quiet, and
+    /// yield while it is active.
+    ///
+    /// The bulk (`Dedicated`) lane does.  The interactive (`Shared`) lane does
+    /// not: its own delay-first response is what keeps a shared path's
+    /// interactive traffic prompt, and a lane never stands off for itself.
+    pub(crate) fn stands_off_for_interactive(self) -> bool {
+        matches!(self, Self::Dedicated)
+    }
+
     /// Whether this lane owns the windowed ACK-clock fast start.  Only the
     /// dedicated bulk lane does; the shared lane keeps the stock
     /// accumulator/exit.

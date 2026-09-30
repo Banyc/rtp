@@ -73,6 +73,28 @@ use crate::metrics::{MetricsEvent, MetricsObserver, MetricsSnapshot};
 /// not stay "shared" on a connection that has ended.
 pub const SIGNAL_STALE_AFTER: Duration = Duration::from_secs(1);
 
+/// How long the interactive lane may be quiet before a bulk lane on the same
+/// path treats the path as free to contest against an external loss-based
+/// competitor.
+///
+/// This is deliberately **not** [`SIGNAL_STALE_AFTER`]: staleness decides when
+/// the path stops being *shared* for the loss gate (one second), while this
+/// window decides when the interactive lane has been idle long enough that the
+/// bulk lane can claim the link without harming it. A window at the staleness
+/// horizon would let the bulk lane re-enter on the first user think-time pause
+/// and start filling the buffer a resuming interactive packet would queue
+/// behind; a window many times the interactive lane's own cadence keeps the
+/// bulk yielded through consecutive request/response turns while reclaiming the
+/// link within a second or two of a genuine idle gap.
+///
+/// The value is one and a half seconds: longer than a normal interactive
+/// round-trip pause (the operator's client multiplexes a Minecraft-shaped
+/// workload whose bursts are hundreds of milliseconds apart) and short enough
+/// that an idle link is back under competition before the second second of
+/// silence. It is an explicit knob rather than a reuse of the staleness
+/// horizon, so a change to one cannot silently move the other.
+pub const STANDOFF_WINDOW: Duration = Duration::from_millis(1500);
+
 /// The path's sharedness signal, as consumed by one bulk connection's
 /// congestion control. Cheap to clone; shared by every bulk connection on the
 /// same `(src, dst)` path. Holding one keeps the path's group alive.
@@ -94,6 +116,25 @@ impl CcSignal {
     /// controller's own delay gate is authoritative even under loss.
     pub fn is_shared(&self) -> bool {
         self.group.aggregate.read()
+    }
+
+    /// Whether this path runs the bulk interactive stand-off.  Production
+    /// hubs always do (a hub never disables it); the test-only
+    /// [`CcSignalHub::without_standoff`] constructor turns it off so an arm can
+    /// A/B the mechanism against the shipped delay-first policy with the CC
+    /// link otherwise attached and the loss gate unchanged.
+    pub fn standoff_enabled(&self) -> bool {
+        self.group.standoff
+    }
+
+    /// How long the interactive lane has been quiet on this path: the wall time
+    /// since its last `RttSample`-driven update, or `None` when no interactive
+    /// lane has ever published here. A fresh path that has never seen an
+    /// interactive lane therefore reports `None`, and a bulk lane that needs a
+    /// quiet clock falls back to its own connection age (see
+    /// `CongestionResponse`).
+    pub fn quiet_for(&self) -> Option<Duration> {
+        self.group.aggregate.quiet_for()
     }
 }
 
@@ -125,6 +166,19 @@ impl CongestionCell {
         let fresh = now_ms.saturating_sub(self.updated_ms.load(Ordering::Acquire))
             <= SIGNAL_STALE_AFTER.as_millis() as u64;
         fresh && self.shared.load(Ordering::Acquire)
+    }
+
+    /// Time since the last interactive update, or `None` if there has never
+    /// been one. `updated_ms == 0` is the "never" sentinel: [`Self::store`] is
+    /// only reached from an interactive update, so a cell that has been live at
+    /// least once always carries a non-zero stamp.
+    fn quiet_for(&self) -> Option<Duration> {
+        let updated_ms = self.updated_ms.load(Ordering::Acquire);
+        if updated_ms == 0 {
+            return None;
+        }
+        let now_ms = self.start.elapsed().as_millis() as u64;
+        Some(Duration::from_millis(now_ms.saturating_sub(updated_ms)))
     }
 }
 
@@ -214,6 +268,9 @@ impl CcSignalSource {
 
 struct PathMap {
     start: Instant,
+    /// Whether bulk connections on this hub run the bulk interactive stand-off.
+    /// See [`CcSignalHub::without_standoff`].
+    standoff: bool,
     /// Presence domains keyed by the egress path `(src, dst)`, held weakly: a
     /// path with no live connection is removed by [`Group::drop`], so the map
     /// stays proportional to live paths rather than to every path ever seen.
@@ -222,6 +279,9 @@ struct PathMap {
 
 struct Group {
     key: (IpAddr, IpAddr),
+    /// Whether bulk connections here run the interactive stand-off; copied from
+    /// the hub so a signal can read it without reaching back to the map.
+    standoff: bool,
     /// Back-reference used to remove this path's entry when the last handle to
     /// the group goes away. `Weak`, so a map entry never keeps its own group
     /// alive.
@@ -286,12 +346,27 @@ impl CcSignalHub {
     }
 
     fn with_epoch(start: Instant) -> Self {
+        Self::with_epoch_and_standoff(start, true)
+    }
+
+    /// A hub whose bulk connections run the interactive stand-off (production).
+    fn with_epoch_and_standoff(start: Instant, standoff: bool) -> Self {
         Self {
             map: Arc::new(PathMap {
                 start,
+                standoff,
                 groups: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// A hub whose bulk connections keep the shipped delay-first policy: the
+    /// path signal still suppresses the loss gate, but the interactive
+    /// stand-off is disarmed.  Test-only (behind `testing`), the control arm
+    /// that isolates the stand-off from the rest of the CC signal.
+    #[cfg(feature = "testing")]
+    pub fn without_standoff() -> Self {
+        Self::with_epoch_and_standoff(Instant::now(), false)
     }
 
     /// The presence domain for one egress path, identified by the local source
@@ -362,6 +437,7 @@ impl Group {
     fn new(key: (IpAddr, IpAddr), map: &Arc<PathMap>) -> Self {
         Self {
             key,
+            standoff: map.standoff,
             map: Arc::downgrade(map),
             signals: Mutex::new(Vec::new()),
             aggregate: Arc::new(CongestionCell::new(map.start)),
@@ -487,6 +563,53 @@ mod tests {
         interactive.inner.updated_ms.store(0, Ordering::Release);
         recompute(&group.group);
         assert!(!bulk.is_shared());
+    }
+
+    /// A fresh path that has never carried an interactive lane has no quiet
+    /// clock: `None`, not `Some(0)`, so the stand-off can fall back to the
+    /// connection's own age instead of competing from the first sample.
+    #[test]
+    fn a_never_used_path_has_no_quiet_clock() {
+        let scheduler = CcSignalHub::new();
+        let bulk = g(&scheduler, CLIENT_A).bulk();
+        assert_eq!(bulk.quiet_for(), None);
+        assert!(!bulk.is_shared());
+    }
+
+    /// Once an interactive lane has published, the quiet clock runs from its
+    /// last update: it is `None` before the first update, near zero right
+    /// after one, and grows as the lane goes silent.
+    #[test]
+    fn the_quiet_clock_runs_from_the_last_interactive_update() {
+        // Epoch three seconds in the past so a backdated update exercises the
+        // elapsed-time arithmetic without waiting on the wall clock.
+        let scheduler = CcSignalHub::with_epoch(Instant::now() - Duration::from_secs(3));
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        let interactive = group.interactive();
+        assert_eq!(bulk.quiet_for(), None, "no update yet means no clock");
+        interactive.update(&sample());
+        let fresh = bulk.quiet_for().expect("an update starts the quiet clock");
+        assert!(
+            fresh < Duration::from_millis(200),
+            "the clock restarts at the update, not at the epoch: {fresh:?}"
+        );
+        // Backdate the aggregate's last-update stamp and re-derive: the clock
+        // measures the silence since the update, not since the epoch.  (The
+        // aggregate, not the signal, carries the clock: it is the cell every
+        // bulk handle reads.)
+        group
+            .group
+            .aggregate
+            .updated_ms
+            .store(1_000, Ordering::Release);
+        let quiet = bulk
+            .quiet_for()
+            .expect("the clock keeps running once started");
+        assert!(
+            quiet >= Duration::from_secs(1) && quiet < Duration::from_secs(3),
+            "the clock must measure the silence since the update: {quiet:?}"
+        );
     }
 
     /// A badly-connected client must not change another client's response.

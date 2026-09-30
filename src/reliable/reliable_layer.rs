@@ -1154,6 +1154,20 @@ impl ReliableLayer {
             }
         }
         let current = self.send_rate.get();
+        // The cross-lane CC link has two observables: whether the path is
+        // currently shared (the existing loss-gate signal), and how long our
+        // interactive lane has been quiet (the bulk stand-off's clock).  The
+        // stand-off is armed only when a hub that runs it is attached, so the
+        // shipped policy is unchanged for a hub that is disarmed for an A/B.
+        let (shared_path, standoff_armed, interactive_quiet) = match self.shared_congestion.as_ref()
+        {
+            Some(signal) => (
+                signal.is_shared(),
+                signal.standoff_enabled(),
+                signal.quiet_for(),
+            ),
+            None => (false, false, None),
+        };
         let outcome = self.congestion_response.decide(
             observation,
             CongestionInput {
@@ -1165,10 +1179,9 @@ impl ReliableLayer {
                 app_limited: sr.is_app_limited(),
                 minimum_rate: MIN_SEND_RATE,
                 initial_rate: INIT_SEND_RATE,
-                shared_path: self
-                    .shared_congestion
-                    .as_ref()
-                    .is_some_and(|s| s.is_shared()),
+                shared_path,
+                standoff_armed,
+                interactive_quiet,
                 now,
             },
         );

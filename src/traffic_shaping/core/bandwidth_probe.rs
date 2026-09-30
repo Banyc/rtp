@@ -135,12 +135,14 @@ impl OrdinaryBandwidthProbe {
         probed
     }
 
-    /// The test-only AIMD reference law's additive increase: the current rate
+    /// The AIMD law's additive increase: the current rate
     /// plus an absolute `step`, paced to one increase per control RTT.  Unlike
     /// the contention lane's additive probe it never refills to the delivered
     /// rate first, so a multiplicative decrease is not immediately undone by a
-    /// stale delivery sample.
-    pub(crate) fn reference_additive_target(
+    /// stale delivery sample.  Used by the test-only AIMD reference law and the
+    /// production bulk lane's stand-off competing response, so the two share
+    /// one increase cadence.
+    pub(crate) fn aimd_additive_target(
         &mut self,
         current: f64,
         step: f64,
