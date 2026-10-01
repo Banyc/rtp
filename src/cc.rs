@@ -300,18 +300,27 @@ pub const STANDOFF_WINDOW: Duration = Duration::from_millis(1500);
 
 /// The bulk stand-off's multiplicative-decrease factor on a sampled loss.
 ///
-/// One half makes the competing response identical to the reference AIMD an
-/// external TCP-family flow runs, so a symmetric stand-off splits the
-/// bottleneck fairly and holds no advantage.  It is a *distinct, named*
-/// constant rather than a reuse of the reference law's factor precisely so the
-/// two can be measured against each other: a gentler value keeps more of the
-/// rate through a loss event and is the lever that would let the bulk lane
-/// take share from a competitor that halves.
+/// The shipped value is three quarters.  One half makes the competing response
+/// identical to the reference AIMD an external TCP-family flow runs, so a
+/// symmetric stand-off splits the bottleneck fairly and holds no advantage; a
+/// test-only hub sets that value to be a control.  Three quarters is the
+/// certified production value: a gentler decrease keeps more of the rate
+/// through a loss event, which reclaims the quiet-phase share the symmetric
+/// response leaves below half -- measured `0.5027` of the pair's delivered
+/// bytes against a reference-AIMD competitor, a fair split rather than
+/// domination, paired `+0.0392 [+0.0245,+0.0539]` over the `0.4635` control.
+/// The next step, `0.90`, adds a further `1.7` pp that is *not resolved* as an
+/// incremental effect and costs a resolved `+63..+74` ms on the interactive
+/// lane's first ~`30` messages after every quiet-gap resume -- the tail M1
+/// ranks first -- so the gentler, costless value is the one that ships.
+///
+/// It is a *distinct, named* constant rather than a reuse of the reference
+/// law's factor precisely so the two can be measured against each other.
 ///
 /// A test-only hub can set another value per path
 /// ([`CcSignalHub::with_standoff_decrease_factor`]); production hubs always use
 /// this one.
-pub const STANDOFF_DECREASE_FACTOR: f64 = 0.5;
+pub const STANDOFF_DECREASE_FACTOR: f64 = 0.75;
 
 /// The path's sharedness signal, as consumed by one bulk connection's
 /// congestion control. Cheap to clone; shared by every bulk connection on the
@@ -1411,6 +1420,43 @@ mod tests {
             heartbeat_interval(Some(Duration::ZERO)),
             None,
             "a zero control RTT cannot date a payload"
+        );
+    }
+
+    /// The shipped stand-off decrease factor is the certified three quarters,
+    /// and a production hub carries it: the constant and the hub's readback
+    /// are pinned together so neither can drift from the other.  A change here
+    /// moves the deployed bulk lane's multiplicative-decrease response on every
+    /// path.
+    #[test]
+    fn the_shipped_standoff_decrease_factor_is_the_certified_three_quarters() {
+        assert_eq!(
+            STANDOFF_DECREASE_FACTOR, 0.75,
+            "the shipped stand-off decrease factor must be the certified 0.75"
+        );
+        let scheduler = CcSignalHub::new();
+        let production = g(&scheduler, CLIENT_A).bulk().standoff_decrease_factor();
+        assert_eq!(
+            production, 0.75,
+            "a production hub must read back the shipped stand-off factor"
+        );
+    }
+
+    /// The per-path test hook still overrides the shipped default, so the beta
+    /// arms can sweep a factor the production hub never carries (the `0.5`
+    /// control and the `0.9` alternate).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn the_test_hook_still_overrides_the_shipped_standoff_decrease_factor() {
+        let scheduler = CcSignalHub::with_standoff_decrease_factor(0.5);
+        let overridden = g(&scheduler, CLIENT_A).bulk().standoff_decrease_factor();
+        assert_eq!(
+            overridden, 0.5,
+            "the test hook must apply the factor it was given"
+        );
+        assert_ne!(
+            overridden, STANDOFF_DECREASE_FACTOR,
+            "the overridden factor must differ from the shipped default"
         );
     }
 }
