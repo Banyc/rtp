@@ -192,6 +192,12 @@ fn new_connection_inner(
     // connection's delay drain even when loss-based control would otherwise
     // win.
     reliable_layer.set_shared_congestion(unreliable_layer.shared_congestion.clone());
+    // The stand-off's competing response reads its multiplicative-decrease
+    // factor off the same path signal.  A connection with no CC link keeps the
+    // crate's default, so an unmanaged path is byte-identical.
+    if let Some(signal) = unreliable_layer.shared_congestion.as_ref() {
+        reliable_layer.set_standoff_decrease_factor(signal.standoff_decrease_factor());
+    }
     // An interactive connection publishes its own application offers so the
     // bulk lane's stand-off can read its activity without depending on
     // `RttSample` freshness (which gaps while the lane's packets queue).

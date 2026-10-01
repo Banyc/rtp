@@ -551,6 +551,15 @@ impl ReliableLayer {
         self.congestion_response.set_reference_aimd(enabled);
     }
 
+    /// Declare the bulk stand-off's multiplicative-decrease factor, seeded from
+    /// the path's CC signal (see
+    /// [`CongestionResponse::set_standoff_decrease_factor`]).  A connection with
+    /// no CC link keeps [`crate::cc::STANDOFF_DECREASE_FACTOR`].
+    pub(crate) fn set_standoff_decrease_factor(&mut self, factor: f64) {
+        self.congestion_response
+            .set_standoff_decrease_factor(factor);
+    }
+
     /// Whether the delivery-rate congestion controller currently considers the
     /// bottleneck queue to be building (smooth RTT above the floor plus the
     /// gate tolerance).  Used by the transmission layer to suppress

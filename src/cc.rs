@@ -298,6 +298,21 @@ impl PathState {
 /// horizon, so a change to one cannot silently move the other.
 pub const STANDOFF_WINDOW: Duration = Duration::from_millis(1500);
 
+/// The bulk stand-off's multiplicative-decrease factor on a sampled loss.
+///
+/// One half makes the competing response identical to the reference AIMD an
+/// external TCP-family flow runs, so a symmetric stand-off splits the
+/// bottleneck fairly and holds no advantage.  It is a *distinct, named*
+/// constant rather than a reuse of the reference law's factor precisely so the
+/// two can be measured against each other: a gentler value keeps more of the
+/// rate through a loss event and is the lever that would let the bulk lane
+/// take share from a competitor that halves.
+///
+/// A test-only hub can set another value per path
+/// ([`CcSignalHub::with_standoff_decrease_factor`]); production hubs always use
+/// this one.
+pub const STANDOFF_DECREASE_FACTOR: f64 = 0.5;
+
 /// The path's sharedness signal, as consumed by one bulk connection's
 /// congestion control. Cheap to clone; shared by every bulk connection on the
 /// same `(src, dst)` path. Holding one keeps the path's group alive.
@@ -328,6 +343,13 @@ impl CcSignal {
     /// link otherwise attached and the loss gate unchanged.
     pub fn standoff_enabled(&self) -> bool {
         self.group.standoff
+    }
+
+    /// The multiplicative-decrease factor this path's bulk stand-off applies
+    /// on a sampled loss.  [`STANDOFF_DECREASE_FACTOR`] unless a test-only hub
+    /// overrode it (see [`CcSignalHub::with_standoff_decrease_factor`]).
+    pub fn standoff_decrease_factor(&self) -> f64 {
+        self.group.standoff_decrease_factor
     }
 
     /// How long the interactive lane has been quiet on this path: the wall time
@@ -707,6 +729,10 @@ struct PathMap {
     /// Whether bulk connections on this hub run the bulk interactive stand-off.
     /// See [`CcSignalHub::without_standoff`].
     standoff: bool,
+    /// The stand-off's multiplicative-decrease factor on a sampled loss; see
+    /// [`STANDOFF_DECREASE_FACTOR`] and
+    /// [`CcSignalHub::with_standoff_decrease_factor`].
+    standoff_decrease_factor: f64,
     /// Presence domains keyed by the egress path `(src, dst)`, held weakly: a
     /// path with no live connection is removed by [`Group::drop`], so the map
     /// stays proportional to live paths rather than to every path ever seen.
@@ -718,6 +744,9 @@ struct Group {
     /// Whether bulk connections here run the interactive stand-off; copied from
     /// the hub so a signal can read it without reaching back to the map.
     standoff: bool,
+    /// The stand-off's multiplicative-decrease factor, copied from the hub for
+    /// the same reason as `standoff`.
+    standoff_decrease_factor: f64,
     /// Back-reference used to remove this path's entry when the last handle to
     /// the group goes away. `Weak`, so a map entry never keeps its own group
     /// alive.
@@ -782,15 +811,17 @@ impl CcSignalHub {
     }
 
     fn with_epoch(start: Instant) -> Self {
-        Self::with_epoch_and_standoff(start, true)
+        Self::with_standoff_and_factor(start, true, STANDOFF_DECREASE_FACTOR)
     }
 
-    /// A hub whose bulk connections run the interactive stand-off (production).
-    fn with_epoch_and_standoff(start: Instant, standoff: bool) -> Self {
+    /// The one constructor: the hub's stand-off enable flag and the competing
+    /// response's multiplicative-decrease factor.
+    fn with_standoff_and_factor(start: Instant, standoff: bool, decrease_factor: f64) -> Self {
         Self {
             map: Arc::new(PathMap {
                 start,
                 standoff,
+                standoff_decrease_factor: decrease_factor,
                 groups: Mutex::new(HashMap::new()),
             }),
         }
@@ -802,7 +833,17 @@ impl CcSignalHub {
     /// that isolates the stand-off from the rest of the CC signal.
     #[cfg(feature = "testing")]
     pub fn without_standoff() -> Self {
-        Self::with_epoch_and_standoff(Instant::now(), false)
+        Self::with_standoff_and_factor(Instant::now(), false, STANDOFF_DECREASE_FACTOR)
+    }
+
+    /// A hub whose bulk stand-off applies `decrease_factor` on a sampled loss
+    /// instead of [`STANDOFF_DECREASE_FACTOR`].  Test-only: the bulk lane's
+    /// multiplicative-decrease factor is otherwise one shared constant, so this
+    /// is the only way a scenario can measure the share a *gentler* competing
+    /// decrease claims against a competitor that keeps halving.
+    #[cfg(feature = "testing")]
+    pub fn with_standoff_decrease_factor(decrease_factor: f64) -> Self {
+        Self::with_standoff_and_factor(Instant::now(), true, decrease_factor)
     }
 
     /// The presence domain for one egress path, identified by the local source
@@ -874,6 +915,7 @@ impl Group {
         Self {
             key,
             standoff: map.standoff,
+            standoff_decrease_factor: map.standoff_decrease_factor,
             map: Arc::downgrade(map),
             signals: Mutex::new(Vec::new()),
             aggregate: Arc::new(CongestionCell::new(map.start)),

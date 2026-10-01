@@ -31,10 +31,12 @@ pub(crate) use shared_path::SharedPath;
 
 pub(crate) const CC_DATA_LOSS_RATE: f64 = 0.2;
 
-/// Multiplicative-decrease factor of the AIMD law: any sampled loss halves
-/// the current send rate.  One authority for the test-only AIMD reference law
-/// and the bulk lane's stand-off competing response, so the two cannot drift.
-const AIMD_DECREASE_FACTOR: f64 = 0.5;
+/// Multiplicative-decrease factor of the test-only AIMD reference law: any
+/// sampled loss halves the current send rate.  This is the factor the
+/// *competitor* halves by; the bulk stand-off's own factor is
+/// [`crate::cc::STANDOFF_DECREASE_FACTOR`], deliberately separate so the two
+/// can be contrasted (see [`AimdDecrease::outcome`]).
+const REFERENCE_AIMD_DECREASE_FACTOR: f64 = 0.5;
 
 /// Minimum control-RTT interval between two multiplicative decreases of the
 /// AIMD law.
@@ -83,14 +85,21 @@ impl AimdDecrease {
     /// flows contending for one bottleneck converge to equal rates.  The
     /// decisions reuse the ordinary probe/backoff channels, so the sender
     /// applies them exactly as it applies production delay-first ones.
+    /// `decrease_factor` is the caller's own multiplicative-decrease factor:
+    /// the reference law passes [`REFERENCE_AIMD_DECREASE_FACTOR`], the bulk
+    /// stand-off passes its own [`crate::cc::STANDOFF_DECREASE_FACTOR`] (or the
+    /// per-path override a test-only hub set).  Keeping it a parameter is what
+    /// lets the two laws be asymmetric, so a reading of the delivered split is
+    /// a reading about the factor rather than about two identical controls.
     fn outcome(
         &mut self,
         probe: &mut OrdinaryBandwidthProbe,
         input: CongestionInput,
+        decrease_factor: f64,
     ) -> CongestionOutcome {
         if self.decrease_due(input.loss_event_rate, input.now, input.control_rtt) {
             self.last_decrease_at = Some(input.now);
-            let target = (input.current_rate * AIMD_DECREASE_FACTOR).max(input.minimum_rate);
+            let target = (input.current_rate * decrease_factor).max(input.minimum_rate);
             return CongestionOutcome::new(
                 CongestionDecision::LossBackoff {
                     raw: target,
@@ -141,6 +150,11 @@ struct Standoff {
     /// R2 cannot fire without a preceding claim, and cleared when the lane's
     /// own gate falls (the queue this episode built is gone).
     shed_queue: bool,
+    /// The competing response's multiplicative-decrease factor.  Defaults to
+    /// [`crate::cc::STANDOFF_DECREASE_FACTOR`] and is overridden per path by the
+    /// CC signal (a test-only hub constructor); see
+    /// [`CongestionResponse::set_standoff_decrease_factor`].
+    decrease_factor: f64,
     decrease: AimdDecrease,
 }
 
@@ -150,6 +164,7 @@ impl Standoff {
             started: now,
             competing: false,
             shed_queue: false,
+            decrease_factor: crate::cc::STANDOFF_DECREASE_FACTOR,
             decrease: AimdDecrease::default(),
         }
     }
@@ -201,7 +216,7 @@ impl Standoff {
         }
         if claim_due {
             self.competing = true;
-            return Some(self.decrease.outcome(probe, input));
+            return Some(self.decrease.outcome(probe, input, self.decrease_factor));
         }
         // The lane is offering again: stop competing and let R2 (armed by the
         // episode above) shed the queue immediately, closed-loop on the lane's
@@ -333,6 +348,15 @@ impl CongestionResponse {
     /// "testing")]`, default off), so the ordinary path is unchanged.
     pub(crate) fn set_reference_aimd(&mut self, enabled: bool) {
         self.reference_aimd.enabled = enabled;
+    }
+
+    /// Declare the bulk stand-off's multiplicative-decrease factor.  Seeded
+    /// from the path's CC signal at connection construction
+    /// ([`crate::cc::CcSignal::standoff_decrease_factor`]); a connection with no
+    /// CC link keeps [`crate::cc::STANDOFF_DECREASE_FACTOR`], so a production
+    /// path is byte-identical.
+    pub(crate) fn set_standoff_decrease_factor(&mut self, factor: f64) {
+        self.standoff.decrease_factor = factor;
     }
 
     pub(crate) fn reset(&mut self, now: Instant) -> Option<GentleExitCause> {
@@ -569,9 +593,11 @@ impl CongestionResponse {
     /// ones: a `Probe` smooths toward the additive target, a `LossBackoff`
     /// steps the send rate down toward the halved target.
     fn reference_aimd_outcome(&mut self, input: CongestionInput) -> CongestionOutcome {
-        self.reference_aimd
-            .decrease
-            .outcome(&mut self.bandwidth_probe, input)
+        self.reference_aimd.decrease.outcome(
+            &mut self.bandwidth_probe,
+            input,
+            REFERENCE_AIMD_DECREASE_FACTOR,
+        )
     }
 
     /// Bound a probe target on the reorder-tolerant lane.
