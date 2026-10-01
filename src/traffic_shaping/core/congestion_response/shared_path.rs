@@ -82,6 +82,25 @@ impl SharedPath {
         }
         self.pending_bytes == 0 && self.write_waiters == 0 && self.offered_pps < 1.0 / rtt
     }
+
+    /// R3's attribution test: whether this lane's queue-free floor is
+    /// authoritative for the bulk's queue gate.
+    ///
+    /// It is authoritative only while the interactive lane is genuinely idle
+    /// (R1: the lane holds no share and the path's standing queue cannot be
+    /// its) or while the lane's own drain gate has fired (R2: the queue is
+    /// explicitly the lane's and the bulk must drain it). While the lane is
+    /// *active* the queue is common to both lanes, so the bulk's own windowed
+    /// floor is the honest baseline: substituting the lane's lower queue-free
+    /// floor there would read the lane's clean floor as queue the bulk built
+    /// and cap the bulk below the link it is using.
+    pub(crate) fn attribution_floor(&self, loss_event_rate: Option<f64>) -> Option<Duration> {
+        if claim_armed(self, loss_event_rate) || reclaim_armed(self) {
+            self.floor
+        } else {
+            None
+        }
+    }
 }
 
 /// R1: whether a fresh payload authorizes the bulk lane to claim the path.
@@ -187,5 +206,44 @@ mod tests {
         equal.queue_delay = Some(Duration::from_millis(6));
         equal.tolerance = Some(Duration::from_millis(6));
         assert!(!reclaim_armed(&equal));
+    }
+
+    /// R3: the cross-lane floor is attributed only while the sibling lane is
+    /// idle (R1) or has latched its own gate (R2). While the lane is active the
+    /// bulk's own floor is the honest baseline, so the attribution is `None`;
+    /// an active lane plus an armed latch is R2 and *does* attribute.
+    #[test]
+    fn the_cross_lane_floor_applies_only_while_the_lane_is_idle_or_reclaiming() {
+        // Idle: the claim is armed and the clean floor is authoritative.
+        let mut idle_lane = idle();
+        idle_lane.floor = Some(Duration::from_millis(50));
+        assert_eq!(
+            idle_lane.attribution_floor(Some(0.0)),
+            Some(Duration::from_millis(50)),
+            "an idle lane's queue-free floor must attribute"
+        );
+        // Active: the queue is common to both lanes, so attribution is off.
+        let mut active = idle();
+        active.pending_bytes = 1;
+        active.floor = Some(Duration::from_millis(50));
+        assert_eq!(
+            active.attribution_floor(Some(0.0)),
+            None,
+            "an active lane's floor must not cap the bulk"
+        );
+        // An armed latch is R2 and attributes even while the lane is active.
+        let mut latched = active;
+        latched.reclaiming = true;
+        assert_eq!(
+            latched.attribution_floor(Some(0.0)),
+            Some(Duration::from_millis(50)),
+            "an armed reclaim must attribute the cross-lane floor"
+        );
+        // Loss vetoes an idle claim, so it also vetoes the attribution.
+        assert_eq!(
+            idle_lane.attribution_floor(Some(CC_DATA_LOSS_RATE)),
+            None,
+            "loss must veto the idle claim and its attribution"
+        );
     }
 }

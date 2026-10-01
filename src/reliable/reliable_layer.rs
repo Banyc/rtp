@@ -1160,8 +1160,12 @@ impl ReliableLayer {
                 None => (false, false, None, None),
             };
         // R3: the attributed floor.  The fresh cross-lane floor replaces this
-        // flow's own queue-inflated floor in the queue gate.
-        let floor_override = path_state.and_then(|state| state.floor);
+        // flow's own queue-inflated floor in the queue gate, but only while the
+        // interactive lane is genuinely idle (R1) or has latched its own drain
+        // gate (R2).  While the lane is active the queue is common to both and
+        // this flow's own floor is the honest baseline.
+        let payload = path_state.map(|state| SharedPath::from_state(&state));
+        let floor_override = payload.and_then(|shared| shared.attribution_floor(loss_event_rate));
         let observation = self.congestion_response.observe_with_floor(
             smooth,
             floor_override,
@@ -1213,7 +1217,6 @@ impl ReliableLayer {
         // The aggregated payload: `None` when no lane published fresh
         // evidence, so every payload-gated rule is skipped and the decision is
         // the shipped policy byte-for-byte.
-        let payload = path_state.map(|state| SharedPath::from_state(&state));
         let outcome = self.congestion_response.decide(
             observation,
             CongestionInput {

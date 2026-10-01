@@ -89,6 +89,28 @@ pub const PAYLOAD_VALID_RTTS: u32 = 1;
 /// never collide with a real value.
 const NONE_NS: u64 = u64::MAX;
 
+/// How long a live interactive lane may go without an `RttSample` before it
+/// republishes its state as a heartbeat.
+///
+/// The payload gates the stand-off's [`STANDOFF_WINDOW`] and is itself valid
+/// for [`PAYLOAD_VALID_RTTS`] of the publisher's own control RTTs, so the
+/// heartbeat must be at least as fresh as the tighter of the two horizons:
+///
+/// ```text
+/// heartbeat = min(PAYLOAD_VALID_RTTS * control_rtt, STANDOFF_WINDOW)
+/// ```
+///
+/// The control-RTT term keeps the payload inside its own validity window (a
+/// heartbeat at the control RTT is the last moment before `is_fresh` would
+/// drop it); the window term keeps a long-RTT lane at least as fresh as the
+/// decision the payload feeds, so a consumer never reads an idle statement
+/// older than the gate it gates. A lane with no control RTT cannot date its
+/// fields, so it has no heartbeat and its payload stays absent once stale.
+fn heartbeat_interval(control_rtt: Option<Duration>) -> Option<Duration> {
+    let rtt = control_rtt?;
+    (!rtt.is_zero()).then(|| (rtt * PAYLOAD_VALID_RTTS).min(STANDOFF_WINDOW))
+}
+
 fn store_opt_ns(slot: &AtomicU64, value: Option<Duration>) {
     slot.store(
         value.map_or(NONE_NS, |d| d.as_nanos().min(NONE_NS as u128 - 1) as u64),
@@ -350,6 +372,12 @@ impl CcSignal {
     /// never zero and never "unchanged". `None` therefore means the consumer
     /// must fall back to its own measurements, and must not read the absence
     /// as either "idle" or "busy".
+    ///
+    /// A live lane that has gone quiet produces no `RttSample`, so before this
+    /// read every live lane is given the chance to [republish its state as a
+    /// heartbeat](SignalState::heartbeat). The consumer's own read cadence is
+    /// the heartbeat's clock, so the payload is refreshed at
+    /// [`heartbeat_interval`] and never expires between the reads that need it.
     pub fn state(&self) -> Option<PathState> {
         let now = Duration::from_millis(self.group.aggregate.start.elapsed().as_millis() as u64);
         let mut signals = self.group.signals.lock().unwrap();
@@ -357,6 +385,7 @@ impl CcSignal {
         let mut state = PathState::absent();
         let mut any = false;
         for signal in signals.iter().filter_map(Weak::upgrade) {
+            signal.heartbeat(now);
             if let Some(lane) = signal.fresh_lane_state(now) {
                 state.merge(&lane);
                 any = true;
@@ -498,6 +527,65 @@ impl SignalState {
             stamp: Duration::from_millis(updated_ms),
         };
         lane.is_fresh(now).then_some(lane)
+    }
+
+    /// Republish this lane's state as a heartbeat when it has gone quiet.
+    ///
+    /// `RttSample`s are the only publication path, so an idle lane — exactly
+    /// the lane whose idleness R1 must see — stops publishing and its payload
+    /// expires within one control RTT. This is called from
+    /// [`CcSignal::state`] before the freshness read and re-stamps
+    /// `updated_ms` at [`heartbeat_interval`], so a consumer reads a *fresh*
+    /// idle rather than an absent payload.
+    ///
+    /// The heartbeat only ever refreshes a lane that is **live**: a lane that
+    /// has never published (`observed == false`), and a lane whose last
+    /// publication is older than [`SIGNAL_STALE_AFTER`], publish nothing, so
+    /// an absent payload keeps meaning "no live lane" and every payload-gated
+    /// rule stays skipped. A lane with no control RTT cannot date its fields
+    /// and also publishes nothing.
+    ///
+    /// When the lane has not made an application offer within one control RTT
+    /// it is idle, and the heartbeat carries the idle activity triple
+    /// (`pending == 0`, `write_waiters == 0`, offered rate `0`). When it is
+    /// still offering, the last sampled (busy) triple stands and only the
+    /// stamp moves: an offering lane publishes its own fresh payload on every
+    /// `RttSample`, so the heartbeat must not overwrite a live offer reading
+    /// with a zero.
+    fn heartbeat(&self, now: Duration) {
+        if !self.observed.load(Ordering::Acquire) {
+            return;
+        }
+        let now_ms = now.as_millis() as u64;
+        let updated_ms = self.updated_ms.load(Ordering::Acquire);
+        // A lane unseen for longer than the presence horizon is gone, not
+        // idle: leave the payload absent rather than resurrect it.
+        if now_ms.saturating_sub(updated_ms) > SIGNAL_STALE_AFTER.as_millis() as u64 {
+            return;
+        }
+        let control_rtt = load_opt_ns(&self.control_rtt_ns);
+        let Some(interval) = heartbeat_interval(control_rtt) else {
+            return;
+        };
+        if now_ms.saturating_sub(updated_ms) < interval.as_millis() as u64 {
+            return;
+        }
+        // `offer_ms` is refreshed on the application write path and on any
+        // send pass with staged data pending, so a quiet offer clock is a
+        // sufficient condition for "nothing pending": the lane is idle.
+        let offer_ms = self.offer_ms.load(Ordering::Acquire);
+        let idle = offer_ms == u64::MAX
+            || now_ms.saturating_sub(offer_ms)
+                >= control_rtt
+                    .expect("a heartbeat interval needs a control RTT")
+                    .as_millis() as u64;
+        if idle {
+            self.send_rate_bits
+                .store(0.0f64.to_bits(), Ordering::Relaxed);
+            self.pending_bytes.store(0, Ordering::Relaxed);
+            self.write_waiters.store(0, Ordering::Relaxed);
+        }
+        self.updated_ms.store(now_ms, Ordering::Release);
     }
 }
 
@@ -1171,12 +1259,15 @@ mod tests {
         assert_eq!(state.queue_delay, Some(Duration::from_millis(50)));
     }
 
-    /// The freshness policy, and the vacuity it exists for: a payload older
-    /// than [`PAYLOAD_VALID_RTTS`] control RTTs reads as **absent**, not as a
-    /// valid reading. Backdate the lane's stamp and the same state must
-    /// disappear.
+    /// The freshness policy, the heartbeat, and the vacuity each exists for.
+    /// A **live** lane that has gone quiet is heartbeated back to a fresh
+    /// *idle* payload, so R1 reads a fresh idle instead of an absent payload;
+    /// a lane whose last publication is older than [`SIGNAL_STALE_AFTER`] is
+    /// gone and reads as **absent** (never as idle), so an absent payload
+    /// keeps meaning "no information". The horizon also scales with the
+    /// publisher's own control RTT.
     #[test]
-    fn a_payload_older_than_the_validity_horizon_reads_as_absent() {
+    fn a_live_lane_heartbeats_while_a_dead_one_reads_as_absent() {
         let scheduler = CcSignalHub::with_epoch(Instant::now() - Duration::from_secs(3));
         let group = g(&scheduler, CLIENT_A);
         let bulk = group.bulk();
@@ -1186,17 +1277,37 @@ mod tests {
             bulk.state().is_some(),
             "a just-published payload must be fresh"
         );
-        // The lane has not sampled for one control RTT: the payload is stale
-        // and must vanish. `now` is ~3000 ms since the epoch, so a 2750 ms
-        // stamp is ~250 ms old against a 100 ms horizon.
+        // The lane has not sampled for one control RTT but is still live: the
+        // heartbeat republishes its idle state rather than letting the payload
+        // vanish. `now` is ~3000 ms since the epoch, so a 2750 ms stamp is
+        // ~250 ms old against a 100 ms horizon.
         interactive.inner.updated_ms.store(2_750, Ordering::Release);
+        let heartbeat = bulk
+            .state()
+            .expect("a live idle lane must heartbeat, not vanish");
+        assert_eq!(
+            heartbeat.pending_bytes, 0,
+            "the idle heartbeat carries no pending bytes"
+        );
+        assert_eq!(
+            heartbeat.write_waiters, 0,
+            "the idle heartbeat carries no blocked writer"
+        );
+        assert_eq!(
+            heartbeat.offered_pps, 0.0,
+            "the idle heartbeat carries no offer"
+        );
+        // Past the presence horizon the lane is gone and the heartbeat must not
+        // resurrect it: absent means unknown, not idle.
+        interactive.inner.updated_ms.store(1_000, Ordering::Release);
         assert_eq!(
             bulk.state(),
             None,
-            "a payload past one control RTT must read as absent, not as a valid reading"
+            "a lane gone past the presence horizon must read as absent, not as idle"
         );
         // A wider control RTT widens the horizon and the same stamp is fresh
         // again, proving the horizon is the publisher's own control RTT.
+        interactive.inner.updated_ms.store(2_750, Ordering::Release);
         interactive.inner.control_rtt_ns.store(
             Duration::from_millis(500).as_nanos() as u64,
             Ordering::Relaxed,
@@ -1204,6 +1315,60 @@ mod tests {
         assert!(
             bulk.state().is_some(),
             "the horizon must scale with the control RTT the payload carries"
+        );
+    }
+
+    /// The heartbeat must not turn a **busy** lane into an idle one: while the
+    /// lane is still offering, the last sampled activity triple stands and the
+    /// bulk's R1 claim stays blocked. Without this the heartbeat would itself
+    /// manufacture the idle evidence R1 exists to require.
+    #[test]
+    fn an_offering_lane_is_not_heartbeated_to_idle() {
+        let scheduler = CcSignalHub::with_epoch(Instant::now() - Duration::from_secs(3));
+        let group = g(&scheduler, CLIENT_A);
+        let bulk = group.bulk();
+        let interactive = group.interactive();
+        interactive.update(&payload_sample(Duration::from_millis(100)));
+        // The application is still offering: the offer clock is current even
+        // though no new `RttSample` has arrived for more than one control RTT.
+        interactive.offer();
+        interactive.inner.updated_ms.store(2_750, Ordering::Release);
+        let state = bulk.state().expect("a live offering lane must stay fresh");
+        assert_eq!(
+            state.offered_pps, 40.0,
+            "an offering lane's sampled rate must survive the heartbeat"
+        );
+        assert!(
+            !crate::traffic_shaping::core::congestion_response::SharedPath::from_state(&state)
+                .lane_idle(),
+            "an offering lane must not read as idle"
+        );
+    }
+
+    /// The heartbeat interval is the tighter of the payload's own validity and
+    /// the gate horizon it feeds, and a lane that cannot date its fields has
+    /// none.
+    #[test]
+    fn the_heartbeat_interval_is_the_tighter_of_validity_and_window() {
+        assert_eq!(
+            heartbeat_interval(Some(Duration::from_millis(100))),
+            Some(Duration::from_millis(100)),
+            "a short control RTT keeps the payload inside its own validity window"
+        );
+        assert_eq!(
+            heartbeat_interval(Some(Duration::from_secs(10))),
+            Some(STANDOFF_WINDOW),
+            "a long control RTT keeps the payload as fresh as the gate horizon"
+        );
+        assert_eq!(
+            heartbeat_interval(None),
+            None,
+            "a lane with no control RTT cannot be dated"
+        );
+        assert_eq!(
+            heartbeat_interval(Some(Duration::ZERO)),
+            None,
+            "a zero control RTT cannot date a payload"
         );
     }
 }
