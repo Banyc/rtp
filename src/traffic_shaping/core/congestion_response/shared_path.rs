@@ -109,9 +109,12 @@ pub(crate) fn claim_armed(shared: &SharedPath, loss_event_rate: Option<f64>) -> 
     shared.lane_idle() && !loss_blocks(loss_event_rate)
 }
 
-/// R2: whether the interactive lane's own gate has fired, so the bulk must
-/// drain the queue it built. The target is the interactive lane's own latch or
-/// its `queue_delay > tolerance` gate -- closed loop, with no picked constant.
+/// R2's sibling-gate predicate: whether the interactive lane's own gate has
+/// fired. It is the latch or its `queue_delay > tolerance` gate -- closed loop,
+/// with no picked constant.  This alone does **not** arm the bulk's reclaim;
+/// the caller conjoins the bulk's own recorded compete episode, so a lane's
+/// latch can only shed a queue this bulk built (see the bulk controller's
+/// `Standoff::holds_shed_queue`).
 pub(crate) fn reclaim_armed(shared: &SharedPath) -> bool {
     shared.reclaiming
         || shared

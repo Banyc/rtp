@@ -48,24 +48,6 @@ const AIMD_DECREASE_FACTOR: f64 = 0.5;
 /// reference and the stand-off competing response mirror that cadence.
 const AIMD_DECREASE_COOLDOWN_RTTS: u32 = 1;
 
-/// Fraction of its own send rate the bulk lane drains toward while it stands
-/// off after the interactive lane resumes.  Half the competing rate is below
-/// the bottleneck's serialization rate (so the queue the bulk filled drains
-/// instead of standing) while still leaving the lane a live probe rather than
-/// yielding the link outright, which would cost M3 goodput on every resume.
-const STANDOFF_HOLD_RATE_FRACTION: f64 = 0.5;
-
-/// How long the bulk lane drains below its competing rate after the
-/// interactive lane resumes.
-///
-/// The transition is the mechanism's whole risk: without a hold, the first
-/// interactive packets after a pause queue behind the standing queue the bulk
-/// built while competing, and the tail spikes.  One control RTT is the latency
-/// floor; the drop-tail bottleneck the harness models drains its 128 KiB buffer
-/// at 1 MiB/s in ~128 ms, so 300 ms clears a full queue with margin for one
-/// scheduling RTT before the lane returns to the delay-first policy.
-const STANDOFF_HOLD: Duration = Duration::from_millis(300);
-
 /// One additive-increase / multiplicative-decrease law: an absolute additive
 /// increase per control RTT with a multiplicative decrease on a sampled loss.
 /// Shared by the test-only AIMD reference and the bulk stand-off competing
@@ -132,20 +114,20 @@ impl AimdDecrease {
 
 /// The bulk lane's interactive stand-off: compete with an external loss-based
 /// flow only while the interactive lane has been quiet for at least
-/// [`crate::cc::STANDOFF_WINDOW`], and drain below the competing rate for
-/// [`STANDOFF_HOLD`] whenever it resumes.
+/// [`crate::cc::STANDOFF_WINDOW`], and reclaim the queue the competing episode
+/// built the moment the lane resumes.
 ///
 /// The gate is the *interactive lane's application activity* — its **offer**
 /// clock, not its `RttSample` freshness: with the lane quiet (not offering),
 /// loss is either a competitor's signal or the bulk's own queue and competing
 /// is the right answer either way; with the lane offering, the shipped
-/// delay-first policy yields and the hold clears the queue the competing
-/// episode built.  An offer is recorded on the write path (and while send-path
-/// data is pending), so it does not gap when the lane's packets queue behind
-/// the bulk — reading the `RttSample` clock here made a queued lane look idle
-/// and let the bulk compete with the very lane it stands off for.  When no CC
-/// link is attached the whole mechanism is inert and the connection's policy is
-/// byte-identical to the delay-first one.
+/// delay-first policy yields and the reclaim drain clears the queue the
+/// competing episode built.  An offer is recorded on the write path (and while
+/// send-path data is pending), so it does not gap when the lane's packets queue
+/// behind the bulk — reading the `RttSample` clock here made a queued lane look
+/// idle and let the bulk compete with the very lane it stands off for.  When no
+/// CC link is attached the whole mechanism is inert and the connection's policy
+/// is byte-identical to the delay-first one.
 #[derive(Debug)]
 struct Standoff {
     /// The controller's creation (or last reset) time, used as the quiet
@@ -153,9 +135,12 @@ struct Standoff {
     started: Instant,
     /// Whether the lane is in the quiet-window competing episode.
     competing: bool,
-    /// When the interactive lane resumed while competing; the drain hold runs
-    /// until this plus [`STANDOFF_HOLD`].
-    hold_until: Option<Instant>,
+    /// A compete episode this bulk recorded: it claimed the path while our
+    /// interactive lane was quiet, so a standing queue the lane now reports may
+    /// be the one this episode built.  Set only in the claim branch below, so
+    /// R2 cannot fire without a preceding claim, and cleared when the lane's
+    /// own gate falls (the queue this episode built is gone).
+    shed_queue: bool,
     decrease: AimdDecrease,
 }
 
@@ -164,7 +149,7 @@ impl Standoff {
         Self {
             started: now,
             competing: false,
-            hold_until: None,
+            shed_queue: false,
             decrease: AimdDecrease::default(),
         }
     }
@@ -179,18 +164,15 @@ impl Standoff {
     /// offer, read *only* from the offer witness: `RttSample` freshness does
     /// not gate it, so a queued lane that is still offering keeps the bulk
     /// yielded.  A window of zero competes unconditionally (the vacuity probe).
-    /// The hold is checked before the gate resumes competing, so a resuming
-    /// lane's buffer is drained even if the lane has gone quiet again.
+    ///
+    /// The claim branch records the compete episode; the resume is handled by
+    /// R2 ([`Self::holds_shed_queue`]), which starts the reclaim drain on the
+    /// very sample the lane resumes rather than after a fixed hold.
     fn decide(
         &mut self,
         probe: &mut OrdinaryBandwidthProbe,
         input: CongestionInput,
     ) -> Option<CongestionOutcome> {
-        if !input.standoff_armed {
-            self.competing = false;
-            self.hold_until = None;
-            return None;
-        }
         // R1: a fresh payload gates the quiet-window claim on the interactive
         // lane's *genuine* idleness, and a significant loss sample vetoes the
         // claim. With no payload the gate is the offer clock alone, exactly as
@@ -201,31 +183,42 @@ impl Standoff {
         let quiet_for = input
             .interactive_quiet
             .unwrap_or_else(|| input.now.saturating_duration_since(self.started));
-        if quiet_for >= crate::cc::STANDOFF_WINDOW && claim_permitted {
-            self.hold_until = None;
+        let claim_due = quiet_for >= crate::cc::STANDOFF_WINDOW && claim_permitted;
+        // The quiet window is the bulk's compete episode: the interactive lane
+        // has been quiet long enough that this bulk owns the path, so a queue
+        // the lane reports on resume may be the one this episode built.  Record
+        // it whether or not the stand-off is armed -- a disarmed stand-off still
+        // competes on the shipped delay-first policy through the same window --
+        // so the episode tracks *our* competing, not the sibling's activity.  A
+        // lane that never opens the window (m1_nic's continuously-offering one)
+        // records nothing and R2 stays inert.
+        if claim_due {
+            self.shed_queue = true;
+        }
+        if !input.standoff_armed {
+            self.competing = false;
+            return None;
+        }
+        if claim_due {
             self.competing = true;
             return Some(self.decrease.outcome(probe, input));
         }
-        if self.competing {
-            self.competing = false;
-            self.hold_until = Some(input.now + STANDOFF_HOLD);
-        }
-        if let Some(until) = self.hold_until {
-            if input.now < until {
-                let target =
-                    (input.current_rate * STANDOFF_HOLD_RATE_FRACTION).max(input.minimum_rate);
-                return Some(CongestionOutcome::new(
-                    CongestionDecision::Drain {
-                        floor: input.minimum_rate,
-                        target,
-                    },
-                    None,
-                    None,
-                ));
-            }
-            self.hold_until = None;
-        }
+        // The lane is offering again: stop competing and let R2 (armed by the
+        // episode above) shed the queue immediately, closed-loop on the lane's
+        // own gate.
+        self.competing = false;
         None
+    }
+
+    /// R2's arming, from the bulk's own recorded compete episode.  Reclaim only
+    /// when this bulk claimed the path and the interactive lane's queue gate is
+    /// still armed, so the queue it is asked to shed is one it built; a lane
+    /// whose gate falls clears the episode, so a queue that is gone does not
+    /// keep the bulk draining.
+    fn holds_shed_queue(&mut self, shared: Option<SharedPath>) -> bool {
+        let gate = shared.is_some_and(|state| reclaim_armed(&state));
+        self.shed_queue &= gate;
+        self.shed_queue
     }
 }
 
@@ -462,11 +455,13 @@ impl CongestionResponse {
         // decision, at its own RTT-sample cadence — the only cross-connection
         // fact needed is that the path is shared.
         let loss_blocks_delay_control = observation.loss_blocks_delay_control && !input.shared_path;
-        // R2: a fresh payload whose interactive lane has armed its own drain
-        // gate means the queue on this path belongs to this lane; force the
-        // delay path and drain at the shared lane's deeper fraction. Guarded by
-        // `input.payload`, so a connection with no payload is unchanged.
-        let reclaiming = input.payload.is_some_and(|shared| reclaim_armed(&shared));
+        // R2: force the delay path only when this bulk recorded the compete
+        // episode that built the queue the interactive lane now reports.  The
+        // episode latch is set in the claim branch and falls with the lane's
+        // gate, so a queue this bulk never contributed to (another flow's, or
+        // the lane's own) cannot force it to drain.  A connection with no
+        // payload, or one that never competed, is unchanged.
+        let reclaiming = self.standoff.holds_shed_queue(input.payload);
         let path = if reclaiming {
             ResponsePath::Drain
         } else {
@@ -520,6 +515,10 @@ impl CongestionResponse {
                 CongestionOutcome::new(CongestionDecision::Hold, None, gentle_exit)
             }
             ResponsePath::Drain => {
+                // A reclaim yields the path the compete episode took: the
+                // shared lane's deeper drain, applied from the resume sample
+                // itself, so the queue it built is shed in the turn the lane
+                // resumes rather than after a fixed hold.
                 let drain_fraction = if reclaiming {
                     GENTLE_DRAIN_FRAC
                 } else {
@@ -1293,21 +1292,22 @@ mod tests {
             loss_blocks_delay_control: true,
             gentle_exit: None,
         };
-        let input = |now, shared_path, quiet: Option<Duration>, standoff_armed| CongestionInput {
-            delivery_rate: 1000.0,
-            current_rate: 1000.0,
-            smooth_rtt: Duration::from_millis(300),
-            control_rtt,
-            loss_event_rate: Some(0.0),
-            app_limited: false,
-            minimum_rate: 1.0,
-            initial_rate: 128.0,
-            shared_path,
-            standoff_armed,
-            interactive_quiet: quiet,
-            payload: None,
-            now,
-        };
+        let input =
+            |now, shared_path, quiet: Option<Duration>, standoff_armed, payload| CongestionInput {
+                delivery_rate: 1000.0,
+                current_rate: 1000.0,
+                smooth_rtt: Duration::from_millis(300),
+                control_rtt,
+                loss_event_rate: Some(0.0),
+                app_limited: false,
+                minimum_rate: 1.0,
+                initial_rate: 128.0,
+                shared_path,
+                standoff_armed,
+                interactive_quiet: quiet,
+                payload,
+                now,
+            };
         let quiet = crate::cc::STANDOFF_WINDOW + Duration::from_millis(1);
 
         // No CC link: the same standing queue with loss takes the shipped
@@ -1316,7 +1316,7 @@ mod tests {
         assert!(
             matches!(
                 no_link
-                    .decide(observation, input(t0, false, None, false))
+                    .decide(observation, input(t0, false, None, false, None))
                     .decision(),
                 CongestionDecision::LossBackoff { .. }
             ),
@@ -1330,7 +1330,10 @@ mod tests {
         assert!(
             matches!(
                 active
-                    .decide(observation, input(t0, true, Some(Duration::ZERO), true))
+                    .decide(
+                        observation,
+                        input(t0, true, Some(Duration::ZERO), true, None),
+                    )
                     .decision(),
                 CongestionDecision::Drain { .. }
             ),
@@ -1344,7 +1347,7 @@ mod tests {
         assert!(
             matches!(
                 stale_offer
-                    .decide(observation, input(t0, true, Some(quiet), true))
+                    .decide(observation, input(t0, true, Some(quiet), true, None))
                     .decision(),
                 CongestionDecision::Probe { .. }
             ),
@@ -1354,45 +1357,66 @@ mod tests {
         // Quiet past the window with a link: compete additively.
         let mut competing = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
         let CongestionDecision::Probe { target } = competing
-            .decide(observation, input(t0, false, Some(quiet), true))
+            .decide(observation, input(t0, false, Some(quiet), true, None))
             .decision()
         else {
             panic!("a quiet interactive lane must let the bulk lane compete");
         };
         assert_eq!(target, 1000.0 + additive_probe_step(control_rtt));
 
-        // The lane resumes: the bulk must hold below its competing rate, not
-        // fall straight back into the shipped policy at full rate.
+        // The lane resumes with a latched queue gate: the stand-off stops
+        // competing and hands the reclaim to R2 on the resume sample itself
+        // (no fixed open-loop hold), draining one AIMD decrease below the
+        // delivery rate so the queue the episode built is shed now.  The
+        // observation has no queue of the bulk's own, so only R2 can force the
+        // drain -- which is R2's whole purpose.
+        let no_own_queue = CongestionObservation {
+            queue_building: false,
+            persistent_for: None,
+            ..observation
+        };
         let resumed = t0 + Duration::from_millis(50);
-        let CongestionDecision::Drain { target, .. } = competing
-            .decide(
-                observation,
-                input(resumed, true, Some(Duration::ZERO), true),
-            )
-            .decision()
+        let resume_input = input(
+            resumed,
+            true,
+            Some(Duration::ZERO),
+            true,
+            Some(latched(control_rtt)),
+        );
+        let CongestionDecision::Drain { target, .. } =
+            competing.decide(no_own_queue, resume_input).decision()
         else {
-            panic!("a resuming interactive lane must trigger the hold drain");
+            panic!("a recorded compete episode must reclaim on the resume");
         };
         assert_eq!(
             target,
-            1000.0 * STANDOFF_HOLD_RATE_FRACTION,
-            "the hold must drain well below the competing rate"
+            1000.0 * GENTLE_DRAIN_FRAC,
+            "the reclaim must drain at the shared lane's deeper fraction"
         );
-
-        // The hold expires: the shipped delay-first policy resumes.
-        let settled = resumed + STANDOFF_HOLD + Duration::from_millis(1);
+        // A controller that never claimed has no episode, so R2 cannot fire
+        // however the interactive lane's gate reads: the shipped delay-first
+        // policy runs instead.
+        let mut never = CongestionResponse::new(t0, false, CongestionLane::Dedicated);
+        let never_out = never.decide(no_own_queue, resume_input).decision();
         assert!(
-            matches!(
-                competing
-                    .decide(
-                        observation,
-                        input(settled, true, Some(Duration::ZERO), true)
-                    )
-                    .decision(),
-                CongestionDecision::Drain { .. }
-            ),
-            "after the hold the shipped delay-first policy must run"
+            matches!(never_out, CongestionDecision::Probe { .. }),
+            "R2 must not fire without a preceding claim: {never_out:?}"
         );
+    }
+
+    /// A payload whose interactive lane has latched its own persistent queue:
+    /// R2's sibling-gate input.
+    fn latched(control_rtt: Duration) -> SharedPath {
+        SharedPath {
+            pending_bytes: 0,
+            write_waiters: 0,
+            offered_pps: 0.0,
+            control_rtt: Some(control_rtt),
+            reclaiming: true,
+            floor: Some(control_rtt),
+            tolerance: Some(Duration::from_millis(10)),
+            queue_delay: Some(Duration::from_millis(3)),
+        }
     }
 
     /// On a path shared with an interactive lane, this connection's *own*
@@ -1520,12 +1544,13 @@ mod tests {
         );
     }
 
-    /// R2: the interactive lane's own latch forces the bulk's reclaim drain
-    /// even when the bulk's own queue is not persistent, and it uses the shared
-    /// lane's deeper `GENTLE_DRAIN_FRAC`; without the payload the shipped probe
-    /// runs instead.
+    /// R2 is gated on the bulk's own compete episode, not merely on the
+    /// interactive lane's latch.  A connection whose stand-off never armed --
+    /// the `Yield` control arm, `standoff_armed == false` -- records no
+    /// episode, so a latched payload cannot force the reclaim drain; the
+    /// shipped policy (Probe over the bulk's empty own queue) runs instead.
     #[test]
-    fn a_latched_interactive_lane_forces_the_bulk_reclaim_drain() {
+    fn a_latched_interactive_lane_cannot_reclaim_without_a_compete_episode() {
         let t0 = Instant::now();
         let control_rtt = Duration::from_millis(100);
         let observation = CongestionObservation {
@@ -1562,13 +1587,13 @@ mod tests {
             tolerance: Some(Duration::from_millis(10)),
             queue_delay: Some(Duration::from_millis(3)),
         };
-        let reclaimed = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
+        let out = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
             .decide(observation, input(Some(latched)))
             .decision();
-        let CongestionDecision::Drain { target, .. } = reclaimed else {
-            panic!("the interactive lane's latch must force a reclaim drain: {reclaimed:?}");
-        };
-        assert_eq!(target, 1000.0 * GENTLE_DRAIN_FRAC);
+        assert!(
+            matches!(out, CongestionDecision::Probe { .. }),
+            "a latch without a compete episode must not force a reclaim: {out:?}"
+        );
         let absent = CongestionResponse::new(t0, false, CongestionLane::Dedicated)
             .decide(observation, input(None))
             .decision();
