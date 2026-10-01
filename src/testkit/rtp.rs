@@ -433,13 +433,101 @@ where
     got
 }
 
+/// The byte sinks' payload period: a verified byte at stream offset
+/// `offset + j` must equal `(offset + j) % BYTE_SINK_PAYLOAD_PERIOD`.
+pub const BYTE_SINK_PAYLOAD_PERIOD: u64 = 251;
+
+/// The phase of a byte-sink stream, as [`ByteSinkVerifier`] tracks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SinkPhase {
+    /// The one-byte tag a tagged producer writes ahead of the payload has not
+    /// been seen yet.
+    Tag,
+    /// The payload is being verified against `(offset + j) % 251` from the
+    /// payload's own offset 0.
+    Payload,
+    /// A byte broke the declared stream; nothing further can be counted.
+    Desynced,
+}
+
+/// Verifies a byte sink's `(offset + j) % 251` payload, with an optional
+/// one-byte tag the producer writes before it.
+///
+/// The sink's phase assumption is explicit rather than implicit.  The verified
+/// pattern is anchored at the **payload's** offset 0, so a tag byte written
+/// ahead of the payload shifts the whole stream: a sink that assumes the
+/// payload starts at stream offset 0 then drops every read and its delivered
+/// counter freezes silently (the read does not error).  That is what happened
+/// to `standoff_burst` and `standoff_nonconvergent`, whose product bulk writes
+/// the `b"B"` tag copied from the mux-shaped arms (whose dual-lane sink decodes
+/// a tag) but whose peer is this plain `rtp` sink.  A tagged producer therefore
+/// declares its tag, the sink consumes it, and the payload is verified from the
+/// payload's own offset 0; an undeclared tag desynchronises the sink exactly as
+/// a corrupted first byte would, which is the failure the declaration exists to
+/// surface.
+#[derive(Clone, Copy, Debug)]
+struct ByteSinkVerifier {
+    phase: SinkPhase,
+    tag: Option<u8>,
+    offset: u64,
+}
+
+impl ByteSinkVerifier {
+    fn new(tag: Option<u8>) -> Self {
+        Self {
+            phase: if tag.is_some() {
+                SinkPhase::Tag
+            } else {
+                SinkPhase::Payload
+            },
+            tag,
+            offset: 0,
+        }
+    }
+
+    /// Consume `bytes` and return the number of newly verified payload bytes.
+    /// A declared tag is consumed but not counted: it is framing, not payload.
+    /// A mismatch at any position fails the whole read and freezes the verifier
+    /// (the sink keeps reading, but counts nothing further), matching the
+    /// pre-existing behaviour for an untagged stream while making the tagged
+    /// case count instead of freeze.
+    fn consume(&mut self, bytes: &[u8]) -> u64 {
+        let payload = match self.phase {
+            SinkPhase::Desynced => return 0,
+            SinkPhase::Tag => match (bytes.split_first(), self.tag) {
+                (Some((&first, rest)), Some(expected)) if first == expected => {
+                    self.phase = SinkPhase::Payload;
+                    rest
+                }
+                _ => {
+                    self.phase = SinkPhase::Desynced;
+                    return 0;
+                }
+            },
+            SinkPhase::Payload => bytes,
+        };
+        for (j, &actual) in payload.iter().enumerate() {
+            if actual != ((self.offset + j as u64) % BYTE_SINK_PAYLOAD_PERIOD) as u8 {
+                self.phase = SinkPhase::Desynced;
+                return 0;
+            }
+        }
+        self.offset += payload.len() as u64;
+        payload.len() as u64
+    }
+}
+
 /// Shared core for [`spawn_rtp_byte_sink_server_with_mss`] and its `_via`
 /// variant: binds the listener and hands the sink-server future to `spawn`
 /// (either a [`TestScope`] spawn or the bounded reaper submission).
+///
+/// `tag` is the optional one-byte framing prefix the producer writes ahead of
+/// the payload; see [`ByteSinkVerifier`].
 async fn spawn_rtp_byte_sink_server_core(
     spawn: impl FnOnce(TestTask),
     fec: bool,
     mss: usize,
+    tag: Option<u8>,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
     let listener =
         crate::udp::Listener::bind("127.0.0.1:0", crate::udp::ListenerConfig::default()).await?;
@@ -491,7 +579,7 @@ async fn spawn_rtp_byte_sink_server_core(
             let supervisor = accepted.supervisor;
             tokio::pin!(supervisor);
             let mut buf = vec![0u8; 64 * 1024];
-            let mut offset: u64 = 0;
+            let mut verifier = ByteSinkVerifier::new(tag);
             loop {
                 tokio::select! {
                     () = &mut supervisor => break, // session drivers exited; terminate the server
@@ -504,17 +592,9 @@ async fn spawn_rtp_byte_sink_server_core(
                         match n {
                             Ok(0) => break,
                             Ok(n) => {
-                                let mut ok = true;
-                                for (j, &actual) in buf[..n].iter().enumerate() {
-                                    let expected = ((offset + j as u64) % 251) as u8;
-                                    if actual != expected {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                                if ok {
-                                    offset += n as u64;
-                                    delivered_for_server.fetch_add(n as u64, Ordering::Relaxed);
+                                let verified = verifier.consume(&buf[..n]);
+                                if verified > 0 {
+                                    delivered_for_server.fetch_add(verified, Ordering::Relaxed);
                                 }
                             }
                             Err(_) => break,
@@ -533,7 +613,7 @@ pub async fn spawn_rtp_byte_sink_server_with_mss(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
-    spawn_rtp_byte_sink_server_core(|fut| tasks.spawn(fut), fec, mss).await
+    spawn_rtp_byte_sink_server_core(|fut| tasks.spawn(fut), fec, mss, None).await
 }
 
 /// Spawn an `rtp` byte sink server through the bounded task-submission
@@ -544,7 +624,32 @@ pub async fn spawn_rtp_byte_sink_server_with_mss_via(
     fec: bool,
     mss: usize,
 ) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
-    spawn_rtp_byte_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss).await
+    spawn_rtp_byte_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss, None).await
+}
+
+/// Spawn a byte sink whose producer writes a one-byte `tag` ahead of the
+/// `(offset + j) % 251` payload.
+///
+/// The tag is framing rather than payload: it is verified against `tag` and
+/// consumed, and the counter then counts only payload bytes.  Pass the tag the
+/// producer writes (`standoff_burst` and `standoff_nonconvergent` write
+/// `b'B'`) instead of leaving the sink's phase anchored at stream offset 0.
+pub async fn spawn_rtp_byte_sink_server_tagged_with_mss_via(
+    tx: &TestTaskSubmitter,
+    fec: bool,
+    mss: usize,
+    tag: u8,
+) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
+    spawn_rtp_byte_sink_server_core(|fut| submit_test_task(tx, fut), fec, mss, Some(tag)).await
+}
+
+/// [`spawn_rtp_byte_sink_server_tagged_with_mss_via`] at the default MSS.
+pub async fn spawn_rtp_byte_sink_server_tagged_via(
+    tx: &TestTaskSubmitter,
+    fec: bool,
+    tag: u8,
+) -> std::io::Result<(std::net::SocketAddr, Arc<AtomicU64>)> {
+    spawn_rtp_byte_sink_server_tagged_with_mss_via(tx, fec, crate::udp::NO_FEC_MSS, tag).await
 }
 
 /// Spawn an `rtp` server that accepts one connection and reads into a 64 KiB
@@ -1001,4 +1106,85 @@ pub async fn spawn_rtp_bulk_upload_via(
     fec: bool,
 ) -> std::io::Result<crate::socket::AsyncWriteAdapter> {
     spawn_rtp_bulk_upload_with_mss_via(tx, proxy_client_addr, fec, crate::udp::NO_FEC_MSS).await
+}
+
+#[cfg(test)]
+mod byte_sink_verifier_tests {
+    use super::{BYTE_SINK_PAYLOAD_PERIOD, ByteSinkVerifier};
+
+    /// A payload of `periods` whole periods, starting at the pattern's offset 0.
+    fn payload(periods: usize) -> Vec<u8> {
+        (0..periods * BYTE_SINK_PAYLOAD_PERIOD as usize)
+            .map(|i| (i % BYTE_SINK_PAYLOAD_PERIOD as usize) as u8)
+            .collect()
+    }
+
+    /// The defect this verifier exists to fix: with the payload preceded by a
+    /// tag byte, an **untagged** sink counts nothing, because its phase is
+    /// anchored at stream offset 0 and the first byte is `b'B'`, not the `0`
+    /// the pattern expects.
+    #[test]
+    fn an_undeclared_tag_freezes_the_untagged_sink() {
+        let mut stream = vec![b'B'];
+        stream.extend_from_slice(&payload(4));
+        let mut sink = ByteSinkVerifier::new(None);
+        assert_eq!(
+            sink.consume(&stream),
+            0,
+            "the untagged sink counted bytes despite the tag shifting its phase"
+        );
+        assert_eq!(
+            sink.consume(&payload(4)),
+            0,
+            "the sink re-locked by accident"
+        );
+    }
+
+    /// The repair: the same stream, with the tag declared, counts every payload
+    /// byte and excludes the tag itself.
+    #[test]
+    fn a_declared_tag_is_consumed_and_the_payload_is_counted() {
+        let body = payload(4);
+        let mut stream = vec![b'B'];
+        stream.extend_from_slice(&body);
+        let mut sink = ByteSinkVerifier::new(Some(b'B'));
+        let counted = sink.consume(&stream);
+        assert_eq!(
+            counted,
+            body.len() as u64,
+            "the tagged sink did not count the whole payload"
+        );
+        // The stream continues: the next read is verified from the payload's
+        // own offset, with no phase shift left over from the tag.
+        assert_eq!(sink.consume(&body), body.len() as u64);
+    }
+
+    /// A tag split across reads is still consumed exactly once: the tag's own
+    /// read carries no payload, the next carries all of it.
+    #[test]
+    fn a_tag_in_its_own_read_is_consumed() {
+        let body = payload(2);
+        let mut sink = ByteSinkVerifier::new(Some(b'B'));
+        assert_eq!(sink.consume(&[b'B']), 0);
+        assert_eq!(sink.consume(&body), body.len() as u64);
+    }
+
+    /// A wrong tag is a broken stream, not payload: the tagged sink counts
+    /// nothing and stays frozen, so the failure is loud rather than silent.
+    #[test]
+    fn a_wrong_tag_freezes_the_tagged_sink() {
+        let mut stream = vec![b'X'];
+        stream.extend_from_slice(&payload(4));
+        let mut sink = ByteSinkVerifier::new(Some(b'B'));
+        assert_eq!(sink.consume(&stream), 0);
+        assert_eq!(sink.consume(&payload(4)), 0);
+    }
+
+    /// The untagged path is unchanged: a pure payload is counted whole.
+    #[test]
+    fn an_untagged_stream_is_counted_whole() {
+        let body = payload(3);
+        let mut sink = ByteSinkVerifier::new(None);
+        assert_eq!(sink.consume(&body), body.len() as u64);
+    }
 }
