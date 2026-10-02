@@ -1165,7 +1165,7 @@ mod byte_sink_verifier_tests {
     fn a_tag_in_its_own_read_is_consumed() {
         let body = payload(2);
         let mut sink = ByteSinkVerifier::new(Some(b'B'));
-        assert_eq!(sink.consume(&[b'B']), 0);
+        assert_eq!(sink.consume(b"B"), 0);
         assert_eq!(sink.consume(&body), body.len() as u64);
     }
 
