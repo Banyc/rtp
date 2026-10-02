@@ -11,8 +11,8 @@ csv = "1"
 dre = { git = "https://github.com/Banyc/dre.git", tag = "v0.0.3" }
 fec = { git = "https://github.com/Banyc/fec.git", tag = "v0.0.4" }
 # fec = { path = "../fec" }
-mpudp = { git = "https://github.com/Banyc/mpudp.git", tag = "v0.0.3" }
-primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.59" }
+mpudp = { git = "https://github.com/Banyc/mpudp.git", tag = "v0.0.4" }
+primitive = { git = "https://github.com/Banyc/primitive.git", tag = "v0.0.61" }
 rand = "0.10"
 self_assign = { git = "https://github.com/Banyc/self_assign.git", tag = "v0.0.3" }
 serde = { version = "1", features = ["derive"] }
@@ -23,7 +23,7 @@ tokio-util = "0.7"
 tokio_chacha20 = { git = "https://github.com/Banyc/tokio_chacha20.git", tag = "v0.0.8" }
 tokio_udp = { git = "https://github.com/Banyc/tokio_udp.git", tag = "v0.0.6" }
 # tokio_udp = { path = "../tokio_udp" }
-udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.22" }
+udp_listener = { git = "https://github.com/Banyc/udp_listener.git", tag = "v0.0.23" }
 # udp_listener = { path = "../udp_listener" }
 # The layer-testing kit (`rtp::testkit`, behind `testing`) consumes the
 # generic helpers and the impairment instrument from the local harness
