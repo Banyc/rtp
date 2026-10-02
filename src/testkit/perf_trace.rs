@@ -470,16 +470,46 @@ impl GentleExitCounters {
     }
 }
 
-/// Exact per-reason ACK-flush claim counters. Only successful transactional
-/// claims are counted (never resume wake requests), and the aggregate atomics
-/// never consume bounded state-row capacity.
-#[derive(Debug, Default)]
+/// Exact per-reason ACK-flush claim counters and the realised cadence
+/// (interval between consecutive successful claims). Only successful
+/// transactional claims are counted (never resume wake requests), and the
+/// aggregate atomics never consume bounded state-row capacity. The interval
+/// is measured from the claim timestamps the [`MetricsEvent::AckFlush`]
+/// stream already carries, so the delivered period (`nominal ACK_FLUSH_AGE`
+/// plus the tokio timer resolution) is reported by every perf run rather
+/// than inferred from the constant.
+#[derive(Debug)]
 struct AckFlushCounters {
     initial: AtomicU64,
     age: AtomicU64,
     count: AtomicU64,
     fin: AtomicU64,
     explicit: AtomicU64,
+    interval_count: AtomicU64,
+    interval_sum_us: AtomicU64,
+    interval_min_us: AtomicU64,
+    interval_max_us: AtomicU64,
+    interval_last_us: AtomicU64,
+    /// `elapsed` of the previous claim, or `u64::MAX` before the first.
+    last_claim_elapsed_us: AtomicU64,
+}
+
+impl Default for AckFlushCounters {
+    fn default() -> Self {
+        Self {
+            initial: AtomicU64::new(0),
+            age: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            fin: AtomicU64::new(0),
+            explicit: AtomicU64::new(0),
+            interval_count: AtomicU64::new(0),
+            interval_sum_us: AtomicU64::new(0),
+            interval_min_us: AtomicU64::new(u64::MAX),
+            interval_max_us: AtomicU64::new(0),
+            interval_last_us: AtomicU64::new(0),
+            last_claim_elapsed_us: AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 impl AckFlushCounters {
@@ -497,10 +527,52 @@ impl AckFlushCounters {
         self.counter(reason).fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Fold one successful claim's connection-relative timestamp into the
+    /// realised-cadence stats. The first claim has no predecessor and is
+    /// recorded only as the anchor for the next interval.
+    fn record_interval(&self, elapsed_us: u64) {
+        let previous = self
+            .last_claim_elapsed_us
+            .swap(elapsed_us, Ordering::Relaxed);
+        if previous == u64::MAX || elapsed_us <= previous {
+            return;
+        }
+        let interval = elapsed_us - previous;
+        self.interval_count.fetch_add(1, Ordering::Relaxed);
+        self.interval_sum_us.fetch_add(interval, Ordering::Relaxed);
+        self.interval_min_us.fetch_min(interval, Ordering::Relaxed);
+        self.interval_max_us.fetch_max(interval, Ordering::Relaxed);
+        self.interval_last_us.store(interval, Ordering::Relaxed);
+    }
+
+    /// `(count, mean_us, min_us, max_us, last_us)`, or `None` before the
+    /// first interval has been observed.
+    fn intervals(&self) -> Option<(u64, u64, u64, u64, u64)> {
+        let count = self.interval_count.load(Ordering::Relaxed);
+        if count == 0 {
+            return None;
+        }
+        let sum = self.interval_sum_us.load(Ordering::Relaxed);
+        Some((
+            count,
+            sum / count,
+            self.interval_min_us.load(Ordering::Relaxed),
+            self.interval_max_us.load(Ordering::Relaxed),
+            self.interval_last_us.load(Ordering::Relaxed),
+        ))
+    }
+
     fn reset(&self) {
         for reason in MetricsAckFlushReason::ALL {
             self.counter(reason).store(0, Ordering::Relaxed);
         }
+        self.interval_count.store(0, Ordering::Relaxed);
+        self.interval_sum_us.store(0, Ordering::Relaxed);
+        self.interval_min_us.store(u64::MAX, Ordering::Relaxed);
+        self.interval_max_us.store(0, Ordering::Relaxed);
+        self.interval_last_us.store(0, Ordering::Relaxed);
+        self.last_claim_elapsed_us
+            .store(u64::MAX, Ordering::Relaxed);
     }
 
     fn load(&self, reason: MetricsAckFlushReason) -> u64 {
@@ -1000,6 +1072,11 @@ impl RtpCapture {
             MetricsEvent::AckFlush(reason) => {
                 // A successful transactional claim, not a resume wake request.
                 self.ack_flushes.increment(reason);
+                // The same claim timestamp the event carries is the realised
+                // flush cadence's sample; folding it here keeps the interval
+                // an aggregate that consumes no bounded row capacity.
+                self.ack_flushes
+                    .record_interval(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
                 return MetricsInterest::Skip;
             }
             _ => {}
@@ -1333,6 +1410,25 @@ fn write_capture_health(
                 &capture.ack_flushes.load(reason).to_string(),
             ],
         )?;
+    }
+    // The realised ACK flush cadence: the interval between consecutive
+    // successful claims, which is `ACK_FLUSH_AGE` plus the tokio time
+    // driver's 1 ms resolution at a saturating rate. Emitted alongside the
+    // per-reason claim counts so the delivered period is read from the run
+    // rather than inferred from the constant.
+    if let Some((count, mean_us, min_us, max_us, last_us)) = capture.ack_flushes.intervals() {
+        for (suffix, value) in [
+            ("interval_count", count),
+            ("interval_mean_us", mean_us),
+            ("interval_min_us", min_us),
+            ("interval_max_us", max_us),
+            ("interval_last_us", last_us),
+        ] {
+            write_csv_row(
+                out,
+                &[&format!("{prefix}_ack_flush_{suffix}"), &value.to_string()],
+            )?;
+        }
     }
     for (wake, count) in [
         (
@@ -2320,6 +2416,58 @@ mod tests {
             capture.ack_flushes.load(MetricsAckFlushReason::Initial),
             0,
             "begin_measurement must reset the claim counters"
+        );
+    }
+
+    #[test]
+    fn ack_flush_intervals_are_the_realised_cadence() {
+        use crate::metrics::MetricsAckFlushReason;
+        let capture = capture(Instant::now(), 8);
+        // Claim timestamps at 0, 3.5 ms, 7.0 ms and 11.0 ms. The first claim
+        // only anchors the cadence; the three intervals are 3.5, 3.5 and
+        // 4.0 ms, whose mean is 3_666 us.
+        for us in [0u64, 3_500, 7_000, 11_000] {
+            assert_eq!(
+                capture.interest(
+                    MetricsEvent::AckFlush(MetricsAckFlushReason::Age),
+                    Duration::from_micros(us)
+                ),
+                MetricsInterest::Skip,
+                "a cadence sample is an aggregate, never a state row"
+            );
+        }
+        assert_eq!(
+            capture.ack_flushes.intervals(),
+            Some((3, 3_666, 3_500, 4_000, 4_000)),
+            "the realised cadence is the claim-to-claim interval: count, mean, \
+             min, max, last"
+        );
+        assert_eq!(
+            capture.observations.lock().unwrap().len(),
+            0,
+            "cadence sampling must not consume bounded state-row capacity"
+        );
+        // The measurement boundary restarts the cadence: the first
+        // post-boundary claim is an anchor, not an interval that imports the
+        // warmup gap.
+        capture.begin_measurement(capture.trace_start.elapsed());
+        assert_eq!(
+            capture.ack_flushes.intervals(),
+            None,
+            "begin_measurement must reset the realised-cadence stats"
+        );
+        capture.interest(
+            MetricsEvent::AckFlush(MetricsAckFlushReason::Age),
+            Duration::from_micros(50_000),
+        );
+        capture.interest(
+            MetricsEvent::AckFlush(MetricsAckFlushReason::Age),
+            Duration::from_micros(54_000),
+        );
+        assert_eq!(
+            capture.ack_flushes.intervals(),
+            Some((1, 4_000, 4_000, 4_000, 4_000)),
+            "the first post-boundary interval is measured from the boundary anchor"
         );
     }
 

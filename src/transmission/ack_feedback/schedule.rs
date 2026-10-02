@@ -3,6 +3,14 @@ use std::time::{Duration, Instant};
 use crate::metrics::MetricsAckFlushReason;
 
 pub(crate) const ACK_FLUSH_COUNT: usize = 8;
+/// Nominal ACK coalescing age. This is the deadline the send driver arms
+/// (`last_ack_flush + ACK_FLUSH_AGE`), **not** the delivered cadence: the
+/// tokio time driver has a 1 ms resolution and rounds the deadline up to the
+/// next tick, so a saturating session measures a ~3.96 ms p50 between ACK
+/// flushes (~245 ACK/s) on a clean link, roughly 1 ms above this constant.
+/// The delivered interval is exported by the perf trace as
+/// `rtp_ack_flush_interval_*`; do not read this constant as the realised
+/// period.
 pub(crate) const ACK_FLUSH_AGE: Duration = Duration::from_millis(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
